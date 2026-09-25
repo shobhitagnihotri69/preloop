@@ -28,6 +28,8 @@ import type {
   TranscriptStepGroupItem,
 } from '../utils/transcript';
 import { buildConversation } from '../utils/transcript';
+import { getApprovalRepository } from '../utils/approval-identity';
+import './repository-chip';
 import { SESSION_EVENTS_PAGE_REQUESTED_EVENT } from '../utils/session-observer';
 
 const MESSAGE_PREVIEW_CHARS = 2000;
@@ -793,6 +795,13 @@ export class SessionChatView extends LitElement {
       <div class="step step-kind-${step.kind}">
         <div class="step-header">
           <span class="step-label">${step.label}</span>
+          ${
+            getApprovalRepository(step.repositoryArgs)
+              ? html`<repository-chip
+                  .toolArgs=${step.repositoryArgs}
+                ></repository-chip>`
+              : nothing
+          }
           ${step.serverName ? html`<span>${step.serverName}</span>` : nothing}
           <span>${this.formatTime(step.timestamp)}</span>
           ${
@@ -843,10 +852,10 @@ export class SessionChatView extends LitElement {
             ? html`
                 <pre class="step-text">
 ${
-  displayText.length > STEP_PREVIEW_CHARS && !expanded
-    ? `${displayText.slice(0, STEP_PREVIEW_CHARS)}…`
-    : displayText
-}</pre>
+                    displayText.length > STEP_PREVIEW_CHARS && !expanded
+                      ? `${displayText.slice(0, STEP_PREVIEW_CHARS)}…`
+                      : displayText
+                  }</pre>
               `
             : nothing
         }

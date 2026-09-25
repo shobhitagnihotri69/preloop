@@ -894,6 +894,335 @@ async def test_explicit_cold_source_reserves_once_then_requires_own_checkpoint(
                 )
 
 
+def test_first_repair_without_a_session_uses_the_published_branch(
+    database: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Uploads being off must not fail the first repair of a session-less publisher.
+
+    reserve() increments turns before the worker resolves, so that repair sees
+    turns == 1. A later turn still fails closed.
+    """
+    from preloop.config import settings
+    from preloop.services.flow_feedback import resolve_native_checkpoint
+
+    monkeypatch.setattr(settings, "flow_artifact_direct_upload", False)
+    with Session(database) as db:
+        thread = create_thread(db)
+        prior = db.get(models.FlowExecution, thread.latest_execution_id)
+        assert prior is not None
+        prior.cli_session = None
+        repair = models.FlowExecution(
+            id=uuid.uuid4(),
+            flow_id=thread.flow_id,
+            status="PENDING",
+            trigger_event_details={},
+        )
+        db.add(repair)
+        thread.active_execution_id = repair.id
+        thread.turns = 1
+        db.commit()
+        resume = {
+            "thread_id": str(thread.id),
+            "execution_id": str(prior.id),
+            "pr_url": thread.pr_url,
+            "source_branch": thread.branch,
+        }
+        assert resolve_native_checkpoint(
+            db,
+            account_id=thread.account_id,
+            flow_id=thread.flow_id,
+            execution_id=repair.id,
+            resume=resume,
+        ) == {"cold_handoff_authorized": True}
+        prior.cli_session = {
+            "agent_type": "codex",
+            "session_id": str(uuid.uuid4()),
+        }
+        db.commit()
+        with pytest.raises(ValueError, match="checkpoint uploads disabled"):
+            resolve_native_checkpoint(
+                db,
+                account_id=thread.account_id,
+                flow_id=thread.flow_id,
+                execution_id=repair.id,
+                resume=resume,
+            )
+        prior.cli_session = None
+        thread.turns = 2
+        db.commit()
+        with pytest.raises(ValueError, match="checkpoint uploads disabled"):
+            resolve_native_checkpoint(
+                db,
+                account_id=thread.account_id,
+                flow_id=thread.flow_id,
+                execution_id=repair.id,
+                resume=resume,
+            )
+        failed = models.FlowExecution(
+            id=uuid.uuid4(),
+            flow_id=thread.flow_id,
+            status="FAILED",
+            trigger_event_details={},
+            cli_session=None,
+        )
+        db.add(failed)
+        thread.latest_execution_id = failed.id
+        db.commit()
+        failed_resume = {**resume, "execution_id": str(failed.id)}
+        assert resolve_native_checkpoint(
+            db,
+            account_id=thread.account_id,
+            flow_id=thread.flow_id,
+            execution_id=repair.id,
+            resume=failed_resume,
+        ) == {"cold_handoff_authorized": True}
+        failed.status = "TIMED_OUT"
+        db.commit()
+        assert resolve_native_checkpoint(
+            db,
+            account_id=thread.account_id,
+            flow_id=thread.flow_id,
+            execution_id=repair.id,
+            resume=failed_resume,
+        ) == {"cold_handoff_authorized": True}
+        failed.cli_session = {
+            "agent_type": "codex",
+            "session_id": str(uuid.uuid4()),
+        }
+        db.commit()
+        with pytest.raises(ValueError, match="checkpoint uploads disabled"):
+            resolve_native_checkpoint(
+                db,
+                account_id=thread.account_id,
+                flow_id=thread.flow_id,
+                execution_id=repair.id,
+                resume=failed_resume,
+            )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["FAILED", "TIMED_OUT"])
+async def test_failed_launch_without_a_session_retries_the_published_branch(
+    database: Engine, monkeypatch: pytest.MonkeyPatch, status: str
+) -> None:
+    """A private-runner launch that dies before a session still owes its review.
+
+    The failed execution already consumed the review and incremented the turn.
+    The next reconciliation puts the review back and continues on the published
+    branch instead of demanding a checkpoint that was never stored.
+    """
+    from preloop.config import settings
+    from preloop.services.flow_feedback import resolve_native_checkpoint
+
+    monkeypatch.setattr(settings, "flow_artifact_direct_upload", False)
+    with Session(database) as db:
+        thread = create_thread(db)
+        publisher = db.get(models.FlowExecution, thread.latest_execution_id)
+        assert publisher is not None
+        routing = publisher.trigger_event_details["_model_routing"]
+        crud_flow_feedback.ingest(
+            db, thread_id=thread.id, events=[event("review")], now=NOW
+        )
+        receipts = crud_flow_feedback.pending(db, thread.id)
+        failed = crud_flow_feedback.reserve(
+            db,
+            *crud_flow_feedback.claim_due(db, now=NOW)[0],
+            event_data={
+                "_model_routing": routing,
+                "_thread_id": str(thread.id),
+            },
+            receipt_ids=[item.id for item in receipts],
+            head_sha="head",
+            now=NOW,
+        )
+        assert failed is not None
+        failed.status = status
+        failed.cli_session = None
+        db.commit()
+        provider = SimpleNamespace(
+            read=AsyncMock(
+                return_value=FeedbackState("head", feedback=[event("review")])
+            )
+        )
+        with (
+            patch(
+                "preloop.services.flow_feedback.FeedbackProvider.for_thread",
+                AsyncMock(return_value=provider),
+            ),
+            patch(
+                "preloop.services.flow_execution_dispatcher.flow_execution_worker_enabled",
+                return_value=True,
+            ),
+            patch(
+                "preloop.services.flow_execution_dispatcher.dispatch_execute",
+                AsyncMock(return_value=False),
+            ),
+        ):
+            await _reconcile(
+                db,
+                *crud_flow_feedback.claim_due(db, now=NOW + timedelta(seconds=31))[0],
+                now=NOW + timedelta(seconds=31),
+            )
+        db.refresh(thread)
+        assert thread.turns == 2
+        assert thread.active_execution_id != failed.id
+        repair = db.get(models.FlowExecution, thread.active_execution_id)
+        assert repair is not None
+        assert resolve_native_checkpoint(
+            db,
+            account_id=thread.account_id,
+            flow_id=thread.flow_id,
+            execution_id=repair.id,
+            resume=repair.trigger_event_details["_resume"],
+        ) == {"cold_handoff_authorized": True}
+        assert crud_flow_feedback.pending(db, thread.id) == []
+
+
+@pytest.mark.asyncio
+async def test_stopped_sessionless_thread_is_picked_up_again(
+    database: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two launches that never ran must not retire the review.
+
+    The second one previously counted as no progress and the scheduler
+    stopped claiming the thread. A stopped thread in that state is returned
+    to the queue, and the next session-less failure does not stop it again.
+    """
+    from preloop.config import settings
+    from preloop.services.flow_feedback import (
+        resolve_native_checkpoint,
+        run_feedback_tick,
+    )
+
+    monkeypatch.setattr(settings, "flow_artifact_direct_upload", False)
+    with Session(database) as db:
+        thread = create_thread(db)
+        publisher = db.get(models.FlowExecution, thread.latest_execution_id)
+        assert publisher is not None
+        failed = models.FlowExecution(
+            id=uuid.uuid4(),
+            flow_id=thread.flow_id,
+            status="FAILED",
+            trigger_event_details={
+                "_model_routing": publisher.trigger_event_details["_model_routing"]
+            },
+            cli_session=None,
+            error_message="resume_failed: checkpoint uploads disabled",
+        )
+        db.add(failed)
+        thread.latest_execution_id = failed.id
+        thread.active_execution_id = None
+        thread.turns = 2
+        thread.no_progress = 2
+        thread.state = "stopped"
+        thread.stop_reason = "no_progress"
+        thread.due_at = NOW
+        db.commit()
+        crud_flow_feedback.ingest(
+            db, thread_id=thread.id, events=[event("review")], now=NOW
+        )
+        provider = SimpleNamespace(
+            read=AsyncMock(
+                return_value=FeedbackState("head", feedback=[event("review")])
+            )
+        )
+        with (
+            patch(
+                "preloop.services.flow_feedback.FeedbackProvider.for_thread",
+                AsyncMock(return_value=provider),
+            ),
+            patch(
+                "preloop.services.flow_execution_dispatcher.flow_execution_worker_enabled",
+                return_value=True,
+            ),
+            patch(
+                "preloop.services.flow_execution_dispatcher.dispatch_execute",
+                AsyncMock(return_value=False),
+            ),
+        ):
+            await run_feedback_tick(db, now=NOW)
+            db.refresh(thread)
+            assert thread.state != "stopped"
+            assert thread.no_progress == 0
+            assert thread.turns == 3
+            repair = db.get(models.FlowExecution, thread.active_execution_id)
+            assert repair is not None
+            assert resolve_native_checkpoint(
+                db,
+                account_id=thread.account_id,
+                flow_id=thread.flow_id,
+                execution_id=repair.id,
+                resume=repair.trigger_event_details["_resume"],
+            ) == {"cold_handoff_authorized": True}
+            repair.status = "FAILED"
+            repair.cli_session = None
+            thread.due_at = NOW
+            db.commit()
+            await run_feedback_tick(db, now=NOW + timedelta(seconds=31))
+        db.refresh(thread)
+        assert thread.no_progress == 0
+        assert thread.state != "stopped"
+        assert thread.turns == 4
+
+
+def test_permanent_stops_do_not_crowd_out_a_sessionless_thread(
+    database: Engine,
+) -> None:
+    """A full window of genuine stops must not hide one revivable thread."""
+    with Session(database) as db:
+        thread = create_thread(db)
+        failed = models.FlowExecution(
+            id=uuid.uuid4(),
+            flow_id=thread.flow_id,
+            status="FAILED",
+            cli_session=None,
+        )
+        db.add(failed)
+        thread.latest_execution_id = failed.id
+        thread.state = "stopped"
+        thread.stop_reason = "no_progress"
+        thread.due_at = NOW + timedelta(days=1)
+        for index in range(21):
+            finished = models.FlowExecution(
+                id=uuid.uuid4(),
+                flow_id=thread.flow_id,
+                status="SUCCEEDED",
+                cli_session={"agent_type": "codex", "session_id": f"sess-{index}"},
+            )
+            db.add(finished)
+            db.flush()
+            db.add(
+                models.FlowThread(
+                    id=uuid.uuid4(),
+                    account_id=thread.account_id,
+                    flow_id=thread.flow_id,
+                    tracker_id=thread.tracker_id,
+                    repository_id=thread.repository_id,
+                    pr_number=str(100 + index),
+                    pr_url=f"https://github.com/example/repo/pull/{100 + index}",
+                    provider="github",
+                    branch=f"branch-{index}",
+                    context={},
+                    policy={},
+                    cursor={},
+                    state="stopped",
+                    stop_reason="no_progress",
+                    latest_execution_id=finished.id,
+                    due_at=NOW + timedelta(seconds=index),
+                    expires_at=NOW + timedelta(days=7),
+                )
+            )
+        db.commit()
+        found = crud_flow_feedback.stopped_for_no_progress(db)
+        assert [row.id for row in found] == [thread.id]
+        assert crud_flow_feedback.revive(db, thread.id, now=NOW) is True
+        assert crud_flow_feedback.revive(db, thread.id, now=NOW) is False
+        db.refresh(thread)
+        assert thread.state == "waiting"
+        assert thread.stop_reason is None
+        assert thread.no_progress == 0
+
+
 @pytest.mark.parametrize(
     "existing_mode", ["new", "unadopted", "native_resume", "other_source"]
 )

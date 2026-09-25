@@ -159,18 +159,32 @@ The controller writes the chosen rule or default onto the execution under reserv
 Failed executions always appear as console attention items of kind `flow`, and there is no failure comment: `on_failure.comment_on_trigger_issue` (removed 2026-09) and `on_failure.attention_item` are parsed and ignored so flows stored before the removal still load. `notifications` is a JSONB column, so nothing is migrated; a save from the console writes the blob back without the `on_failure` block.
 
 **Evidence packs.** Audit-style flows (`backend/presets/004`–`007`) write a
-human-readable evidence pack under `/workspace/evidence/`. With
-`FLOW_ARTIFACT_DIRECT_UPLOAD` unset, the runner captures a size-capped tar.gz
-(Docker archive API, or the Kubernetes log-channel emission capped at
-`MAX_EVIDENCE_ARCHIVE_BYTES`) and stores it on `flow_execution.evidence_archive`.
-With the flag set, hosted containers and private Docker runners upload through
-the shared encrypted artifact API (`kind=evidence`); Kubernetes logs carry
-status markers only. `GET .../result` and `GET .../evidence-status` report the
-persisted receipt (`kind=evidence`) without decrypt; download verifies digest
-and tenancy and reports `available` / `missing` / `expired` / `failed`
-distinctly. Packs are signed at capture with the account Ed25519 key; the
-signature lives beside the archive so the content-addressed digest does not
-change. See
+human-readable evidence pack under `/workspace/evidence/`. Two transports
+move that pack to the control plane. Direct upload
+(`FLOW_ARTIFACT_DIRECT_UPLOAD`) gives hosted containers and private Docker
+runners an execution-scoped PUT to the encrypted artifact store
+(`kind=evidence`). Kubernetes logs then carry status markers only, including
+when the upload fails: there is no plaintext fallback. The legacy transport
+is the default. Docker copies the directory through the engine archive API
+and does not use the log channel, so `FLOW_EVIDENCE_LOG_PLAINTEXT` does not
+change Docker capture. Kubernetes, with the plaintext switch left at its
+default `true`, emits a size-capped base64 block (`MAX_EVIDENCE_ARCHIVE_BYTES`,
+2 MiB) of `result.json`, the evidence pack, and the workspace snapshot into
+the pod log. That default is an exposure window: base64 is not encryption,
+and anyone who can read retained pod logs can read the artifacts. Set
+`FLOW_EVIDENCE_LOG_PLAINTEXT=false` to refuse that channel. Without an
+upload token the wrapper fails closed (markers `unavailable` /
+`skipped` with reason `plaintext_disabled`, no artifact bytes). The receipt
+is `failed` with error `plaintext_disabled`, which means unavailable by
+policy, and result capture reports a missing result rather than a decoded
+payload. The switch does not cover pod-spec access or ordinary agent
+stdout. Encrypted log transport with per-execution keys is a separate
+decision tracked in issue #268. `GET .../result` and `GET .../evidence-status`
+report the persisted receipt (`kind=evidence`) without decrypt; download
+verifies digest and tenancy and reports `available` / `missing` / `expired`
+/ `failed` distinctly. Packs are signed at capture with the account Ed25519
+key; the signature lives beside the archive so the content-addressed digest
+does not change. See
 [evidence-storage.md](../guide/flows/evidence-storage.md). This is operational
 retention, not object-lock.
 
@@ -210,7 +224,7 @@ A flow run crosses two systems that fail independently and briefly: the Kubernet
 
 **Layer 3 — whole-attempt retry (`_run_agent_with_retries`).** When the agent process itself dies, the run is retried from scratch only where that is provably safe; otherwise it fails with a category. The safety boundary is the container's post-execution block (git push, PR/MR creation), which the entrypoints run only on exit 0. So an attempt is retried only when *all* of: the agent exited non-zero (no push/PR happened), no actions were recorded on the timeline, and the failure was classified transient by the executor's analysis of the full logs. An unknown exit code counts as unsafe. Bounds: `FLOW_EXECUTION_MAX_ATTEMPTS` (default 2) and `FLOW_EXECUTION_RETRY_BACKOFF_SECONDS` (default 15, doubling). Retries are never silent: each one writes an `execution_retry_scheduled` milestone, a timeline warning, and an `execution_retry` update; exhaustion writes `execution_retries_exhausted`.
 
-**Failure categories.** Every terminal non-success execution stores a coarse `failure_category` (`flow_execution.failure_category`, indexed; exposed on the execution list and detail schemas) from a closed vocabulary: `runner_conflict`, `runner_error`, `model_transient`, `model_auth`, `provider_billing`, `model_quota`, `model_config`, `no_confirmation`, `agent_no_progress`, `setup_failed`, `verification_failed`, `verification_blocked`, `tool_error`, `agent_error`, `timeout`, `cancelled`, `unknown`. It is derived once at failure time by `preloop.services.flow_failure_category.derive_failure_category` from the best evidence available, in order: a category named by the raising code (e.g. `AgentStartError`), structural message shapes that identify the failing layer regardless of provider noise (runner conflict, runner error, timeout, cancellation, missing completion confirmation, publication-gate denial), then the agent executor's failure analysis of the full logs (which shares the `upstream_errors` taxonomy with the gateway), then provider-message patterns. Anything unmatched is `unknown` rather than being folded into `agent_error` — a rising `unknown` share is the signal to extend the module. `error_message` remains the human-readable detail; the category is what you group by. Existing rows are not backfilled: categories are derived from live failure context, and guessing them from historical prose would launder a heuristic into stored data.
+**Failure categories.** Every terminal non-success execution stores a coarse `failure_category` (`flow_execution.failure_category`, indexed; exposed on the execution list and detail schemas) from a closed vocabulary: `runner_conflict`, `runner_error`, `model_transient`, `model_auth`, `provider_billing`, `budget_exceeded`, `model_quota`, `model_config`, `no_confirmation`, `agent_no_progress`, `setup_failed`, `verification_failed`, `verification_blocked`, `tool_error`, `agent_error`, `timeout`, `cancelled`, `unknown`. It is derived once at failure time by `preloop.services.flow_failure_category.derive_failure_category` from the best evidence available, in order: a category named by the raising code (e.g. `AgentStartError`), structural message shapes that identify the failing layer regardless of provider noise (runner conflict, runner error, timeout, cancellation, missing completion confirmation, publication-gate denial), then the agent executor's failure analysis of the full logs (which shares the `upstream_errors` taxonomy with the gateway), then provider-message patterns. Anything unmatched is `unknown` rather than being folded into `agent_error` — a rising `unknown` share is the signal to extend the module. `error_message` remains the human-readable detail; the category is what you group by. Existing rows are not backfilled: categories are derived from live failure context, and guessing them from historical prose would launder a heuristic into stored data.
 
 
 The legacy verifier runs in the same sandbox as the agent. Its producer label,
@@ -334,7 +348,32 @@ initial/repair execution links and published SHAs while preserving human edits
 outside that region, including metadata-only repairs. Links use `PRELOOP_URL`
 and existing authorization-protected console routes; tokens and transcripts
 are never provenance inputs. Legacy publication adds the current execution
-block on creation; continuation provenance updates require the isolated path.
+block on creation. When an open pull request or merge request already exists
+for the branch, legacy mode fetches that description, appends the current
+execution id and head SHA to the owned block when that pair is not already
+present, and updates only the body. Human prose and the title stay as they
+were. A malformed owned region or an oversized rewrite warns through
+`PRELOOP_PR_METADATA_WARNING` and leaves the owned provenance region unchanged;
+the independent failure-disclosure refresh still runs. A failed provider update
+is surfaced and never reported as successful publication.
+Isolated GitLab publication stays unsupported until a broker can enforce
+credential scope and lifetime.
+
+Publication acceptance matrix (issue #431). Each cell is delivered (test
+name) or unsupported by design.
+
+| Mode | Provider | Create | Continuation push to an existing PR | Metadata-only retry | Failure disclosure | Human edits preserved | Provider failure surfaced |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| legacy | github | delivered (`TestWritePrPayloadPy.test_commit_fallback_single_commit_includes_execution_link`; create script calls `upsert_provenance` once) | delivered (`test_github_continuation_appends_record_and_keeps_prose`) | delivered (`test_repeated_continuation_is_idempotent_and_reuses_the_pr`, `test_missing_metadata_warns_and_keeps_existing_prose`) | delivered (`test_already_pushed_commits_refresh_existing_failure_notice`, `test_existing_body_preserved_and_notice_idempotent`) | delivered (`test_github_continuation_appends_record_and_keeps_prose`) | delivered (`test_provider_update_failure_is_not_success`; a create miss is `test_no_url_anywhere_emits_no_marker`) |
+| legacy | gitlab | delivered (same create script, `kind == "gitlab"`) | delivered (`test_gitlab_continuation_appends_record`) | delivered (`test_repeated_continuation_is_idempotent_and_reuses_the_pr`) | delivered (same failure-disclosure tests, GitLab payload) | delivered (`test_gitlab_continuation_appends_record`) | delivered (`test_provider_update_failure_is_not_success`) |
+| isolated | github | delivered (`test_provider_create_retry_metadata_update_preserves_human_edits`) | delivered (same test, repair upsert) | delivered (same test: one POST, later upserts only) | out of scope (issue #599; the isolated publisher upserts provenance only) | delivered (same test) | delivered (`test_provider_failure_is_observable`) |
+| isolated | gitlab | unsupported by design (flows.md: "Stored PATs and GitLab publication are rejected in this mode until a broker can enforce their scope and lifetime") | unsupported by design (same) | unsupported by design (same) | unsupported by design (same) | unsupported by design (same) | unsupported by design (same) |
+
+Continuation append keeps the first execution record and the most recent 199 repair records (`PROVENANCE_RECENT_RECORDS`). The 201st continuation still lands (`test_append_provenance_keeps_the_first_record_and_recent_199`).
+
+The standalone metadata client still accepts a GitLab payload shape. Isolated
+mode does not: `validate_publication_tracker` rejects PAT and GitLab
+credentials before a lease is minted.
 
 Preset synchronization updates uncustomized fields and marks customized saved
 flows as having an available update. Inspect the effective saved prompt and

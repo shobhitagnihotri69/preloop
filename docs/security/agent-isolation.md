@@ -198,7 +198,15 @@ The limits worth knowing:
   hours the token is as powerful as the user it belongs to.
 - **The allow lists live in the token context, not in the token check.**
   `allowed_mcp_servers` and `allowed_mcp_tools` scope what the MCP layer
-  offers the agent; they are not a second authorization boundary.
+  offers the agent; they are not a second authorization boundary. Codex
+  does not open a Preloop MCP session when both lists are empty, so an
+  unused client cannot reconnect until the flow timeout.
+- **Shell is a separate control.** `agent_config.sandbox_type: read-only`
+  launches Codex with `--sandbox read-only`, disables the `shell_tool`
+  feature, and does not pass `--yolo`. `config.toml` pins
+  `approval_policy = "never"`, which `codex exec` already defaults to, so
+  the run does not wait for a person. Any other value, including the
+  preset default `exec`, keeps `--yolo`.
 
 Reducing that blast radius is a backend change, not a chart change: enforce
 the scopes on the key, and give the runtime principal its own role instead
@@ -223,7 +231,9 @@ of the primary user's.
   inside the cluster, not what it can post to a pastebin. Deployments that
   need that constraint should replace the `0.0.0.0/0` rule with an FQDN
   policy or route agents through a proxy (`extraEgress` plus the proxy env
-  in `agentExecution`).
+  in `agentExecution`). A sandboxed browser uses the allowlist sidecar in
+  `environments/egress-proxy` (`environments/egress-proxy/README.md`); that
+  proxy, not an MCP tool list, is the network boundary.
 - **The API is still one hop away.** MCP and the model gateway are exactly
   what the agent is supposed to reach, so the credential above, not the
   network, is what limits it.

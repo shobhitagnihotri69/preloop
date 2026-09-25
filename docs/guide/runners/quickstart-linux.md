@@ -320,7 +320,10 @@ model must match this map. The scheduler selects a runner advertising that
 identifier, and the runner passes the mapped alias to Cursor. The legacy
 `pass_model` field does not bypass this mapping.
 The selected API model's credentials are never delivered to the host. Leave
-the requested model empty to use the profile default. An actual model is
+the requested model empty to use Cursor Auto. Auto is Cursor's own
+selector, not a named model such as Grok 4.7. Set the flow's Cursor model
+to a Cursor id such as `grok-4.7-high` and map that same id in `model_map`
+to pin it. An actual model is
 recorded only when Cursor reports it, never inferred from the request.
 
 The lease supplies the prompt as one argument after `--`, plus the profile,
@@ -350,6 +353,7 @@ plan; no unlimited usage or inferred billing is promised.
 Success requires exit zero and a successful Cursor stream-json result; exit
 zero alone fails. Remote repository clone/setup, custom commands, workspace
 seeds, native CLI session resume and isolated PR publication are rejected.
+Isolated publication mode is rejected before execution.
 The workspace starts empty. Use the Docker harness for repository
 implementation flows that need the managed checkout/test/publication pipeline.
 

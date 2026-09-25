@@ -160,6 +160,14 @@ WAITING_FOR_HUMAN_STATUS = "WAITING_FOR_HUMAN"
 WAITING_FOR_CHILDREN_STATUS = "WAITING_FOR_CHILDREN"
 PARKED_STATUSES = frozenset({WAITING_FOR_HUMAN_STATUS, WAITING_FOR_CHILDREN_STATUS})
 
+# Terminal outcomes that leave a pending approval with nowhere to land.
+# SUCCEEDED ran the tool after a decision. STOPPED is an operator halt and
+# is left to the stop path. TIMEOUT is the spelling some monitors write;
+# the agent monitor itself reports a timeout as FAILED.
+_APPROVAL_CANCEL_ON_TERMINAL = frozenset(
+    {"FAILED", "CANCELLED", "CANCELED", "TIMEOUT", "TIMED_OUT"}
+)
+
 # Sentinel string that agents print when completing successfully.
 FLOW_SUCCESS_SENTINEL = "FLOW_EXECUTION_SUCCESS"
 
@@ -1233,12 +1241,14 @@ class FlowExecutionOrchestrator:
         routing_record = (self.trigger_event_data or {}).get(ROUTING_RECORD_KEY) or {}
         if routing_record:
             logger.info(
-                "Model routing for execution: source=%s rule_id=%s "
-                "agent_type=%s ai_model_id=%s",
+                "Model routing for execution: source=%s rule_id=%s label=%s "
+                "agent_type=%s ai_model_id=%s reasoning_effort=%s",
                 routing_record.get("source"),
                 routing_record.get("rule_id"),
+                routing_record.get("matched_label"),
                 routing_record.get("agent_type"),
                 routing_record.get("ai_model_id"),
+                routing_record.get("reasoning_effort"),
             )
 
         logger.info(f"Found flow: {self.flow.name} (agent_type: {self.agent_type})")
@@ -1289,6 +1299,55 @@ class FlowExecutionOrchestrator:
 
         return resolve_ai_model_runtime(self.ai_model, allow_gateway=True)
 
+    def _apply_routed_reasoning_effort(
+        self, execution_context: Dict[str, Any]
+    ) -> Optional[str]:
+        """Carry the routed label choice into the run (#851).
+
+        A label rule may ask for more thinking rather than a different model,
+        so the effort is layered over the model row's own parameters for this
+        run only. The effort comes from the controller-written routing
+        record, never from the event body. The milestone says which label
+        decided, so the execution page can show why this run is on this model
+        while the flow default says something else.
+
+        Args:
+            execution_context: Context being assembled for the agent.
+
+        Returns:
+            The effort applied, or None when the record asked for none.
+        """
+        record = (self.trigger_event_data or {}).get(ROUTING_RECORD_KEY) or {}
+        raw_effort = record.get("reasoning_effort")
+        effort = (
+            raw_effort.strip().lower()
+            if isinstance(raw_effort, str) and raw_effort.strip()
+            else None
+        )
+        if effort:
+            parameters = dict(execution_context.get("model_parameters") or {})
+            parameters["reasoning_effort"] = effort
+            execution_context["model_parameters"] = parameters
+        if record.get("source") == "label":
+            self.execution_logger.log_milestone(
+                "model_by_label",
+                {
+                    "label": record.get("matched_label"),
+                    "rule_id": record.get("rule_id"),
+                    "ai_model_id": record.get("ai_model_id"),
+                    "agent_type": record.get("agent_type"),
+                    "reasoning_effort": effort,
+                },
+            )
+        if effort:
+            logger.info(
+                "Reasoning effort %s applied by routing (%s, label %s)",
+                effort,
+                record.get("source"),
+                record.get("matched_label") or "none",
+            )
+        return effort
+
     async def _resolve_prompt(self) -> str:
         """
         Resolve dynamic placeholders in the prompt template using registered resolvers.
@@ -1314,11 +1373,18 @@ class FlowExecutionOrchestrator:
         resolved_prompt = prompt_template
 
         # Create resolver context
+        from preloop.services.persistent_workspace import workspace_mode
+
         resolver_context = ResolverContext(
             db=self.db,
             trigger_event_data=self.trigger_event_data,
             flow_id=str(self.flow_id),
             execution_id=str(self.execution_log.id) if self.execution_log else "",
+            workspace_mode=workspace_mode(
+                agent_config=getattr(self.flow, "agent_config", None),
+                git_clone_config=getattr(self.flow, "git_clone_config", None),
+                trigger_event_data=self.trigger_event_data,
+            ),
         )
 
         # Extract all {{placeholder}} patterns, filters included. Dedup on
@@ -1424,6 +1490,10 @@ class FlowExecutionOrchestrator:
             resolver_registry.register(AccountResolver())
         if not resolver_registry.get("execution"):
             resolver_registry.register(ExecutionResolver())
+        if not resolver_registry.get("workspace"):
+            from preloop.services.prompt_resolvers.workspace import WorkspaceResolver
+
+            resolver_registry.register(WorkspaceResolver())
 
     def _sync_runtime_session(
         self,
@@ -2254,13 +2324,19 @@ class FlowExecutionOrchestrator:
 
         profile = host_exec_profile_name(self.flow.agent_config)
         if effective_agent_type == "cursor" or profile:
+            clone_config = self.flow.git_clone_config
+            if isinstance(clone_config, dict):
+                publication_mode = clone_config.get("publication_mode")
+            else:
+                publication_mode = getattr(clone_config, "publication_mode", None)
             error = host_exec_flow_error(
                 agent_type=effective_agent_type,
                 agent_config=self.flow.agent_config,
                 runner_pool=self.flow.runner_pool,
             ) or host_exec_unavailable_reason(
-                git_clone_config=self.flow.git_clone_config,
+                git_clone_config=clone_config,
                 custom_commands=self.flow.custom_commands,
+                publication_mode=publication_mode,
             )
             if error:
                 raise ValueError(error)
@@ -2268,6 +2344,13 @@ class FlowExecutionOrchestrator:
                 raise ValueError(
                     "Host profiles do not support remote workspace seeds or native resume"
                 )
+            config = (
+                self.flow.agent_config
+                if isinstance(self.flow.agent_config, dict)
+                else {}
+            )
+            requested = config.get("cursor_model")
+            cursor_model = requested.strip() if isinstance(requested, str) else ""
             return {
                 "flow_id": str(self.flow_id),
                 "flow_name": self.flow.name,
@@ -2276,11 +2359,11 @@ class FlowExecutionOrchestrator:
                 "agent_type": "cursor",
                 "agent_config": {"host_exec_profile": profile},
                 "account_id": self.flow.account_id,
-                # A request for the local profile's explicit model map. This is
-                # never a claim about the model Cursor actually reported.
-                "model_identifier": self.ai_model.model_identifier
-                if self.ai_model
-                else None,
+                # cursor_model is a Cursor model id. A catalog model remains the
+                # fallback for a saved flow. Neither value is the model Cursor
+                # reports, and an empty value leaves --model unset (Cursor Auto).
+                "model_identifier": cursor_model
+                or (self.ai_model.model_identifier if self.ai_model else None),
             }
 
         # Create short-lived API token for this flow execution
@@ -2463,6 +2546,7 @@ class FlowExecutionOrchestrator:
                     else None
                 )
             )
+            self._apply_routed_reasoning_effort(execution_context)
 
             # Populate the authorized gateway model list so agent config
             # generators (e.g. OpenCode) can include every model the
@@ -2825,13 +2909,25 @@ class FlowExecutionOrchestrator:
         timestamps: list[datetime] = []
         for activity in reversed(activities):
             metadata = activity.metadata_ or {}
+            signature_payload: Dict[str, Any] = {
+                "server_name": activity.server_name,
+                "tool_name": activity.tool_name,
+                # Key names and sizes only; the payload is never
+                # persisted on the activity row (issue #793).
+                "arguments_summary": metadata.get("arguments_summary"),
+            }
+            # Prefer arguments_hash so same-shape/different-value calls
+            # (get_pr(123) vs get_pr(124)) do not share a signature.
+            # Legacy rows without a hash fall back to the redacted arguments
+            # value so they do not all collapse onto one summary-only key.
+            arguments_hash = metadata.get("arguments_hash")
+            if arguments_hash is not None:
+                signature_payload["arguments_hash"] = arguments_hash
+            elif "arguments" in metadata:
+                signature_payload["arguments"] = metadata.get("arguments")
             signatures.append(
                 json.dumps(
-                    {
-                        "server_name": activity.server_name,
-                        "tool_name": activity.tool_name,
-                        "arguments": metadata.get("arguments"),
-                    },
+                    signature_payload,
                     sort_keys=True,
                     default=str,
                 )
@@ -5839,6 +5935,12 @@ class FlowExecutionOrchestrator:
         self.db.refresh(updated_log)
         self.execution_log = updated_log
 
+        # A run that has finished cannot deliver an answer. Cancel questions
+        # it still holds so the console does not offer one. Parked runs omit
+        # status here; their approval stays pending until the human decides.
+        if status in _APPROVAL_CANCEL_ON_TERMINAL:
+            self._cancel_pending_approvals(status)
+
         # Debug: Verify the values were actually set
         if "tool_calls_count" in kwargs or "total_tokens" in kwargs:
             logger.info(
@@ -5861,6 +5963,40 @@ class FlowExecutionOrchestrator:
         await self._publish_update("status_update", status_payload)
 
         logger.debug(f"Execution log updated: status={status}")
+
+    def _cancel_pending_approvals(self, status: str) -> None:
+        """Cancel pending approvals this execution can no longer deliver.
+
+        Never raises: losing the cancel must not rewrite the terminal status
+        that was just committed. The reason is stored on the request so the
+        console can say why the question disappeared.
+        """
+        if self.execution_log is None:
+            return
+        try:
+            from preloop.models.crud import crud_approval_request
+
+            cancelled = crud_approval_request.cancel_pending_for_execution(
+                self.db,
+                execution_id=str(self.execution_log.id),
+                reason=(
+                    f"{crud_approval_request.EXECUTION_ENDED_CANCEL_REASON} "
+                    f"Execution status: {status}."
+                ),
+            )
+        except Exception:
+            logger.exception(
+                "Could not cancel pending approvals for terminal execution %s",
+                getattr(self.execution_log, "id", "unknown"),
+            )
+            return
+        if cancelled:
+            logger.info(
+                "Cancelled %s pending approval(s) on terminal execution %s (%s)",
+                cancelled,
+                self.execution_log.id,
+                status,
+            )
 
     def _emit_execution_finished_webhook(
         self, status: str, failure_category: Optional[str]

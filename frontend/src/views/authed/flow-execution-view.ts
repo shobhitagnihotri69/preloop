@@ -64,6 +64,13 @@ import '../../components/preloop-gateway-event.ts';
 import '../../components/preloop-execution-continuation';
 import '../../components/preloop-execution-tree';
 import '../../components/view-header.ts';
+import '../../components/execution-records-card';
+import '../../components/execution-report-panel';
+import { getEvidenceStatus, type EvidenceStatus } from '../../records-api';
+import {
+  findingsSummaryLabel,
+  sameEvidencePack,
+} from '../../utils/evidence-report';
 import '../../components/json-tree.ts';
 import '../../components/session-chat-view';
 import '@shoelace-style/shoelace/dist/components/badge/badge.js';
@@ -127,6 +134,12 @@ interface FlowExecution {
   park?: ExecutionPark | null;
 }
 
+interface FlowExecutionLimits {
+  max_total_tokens?: number;
+  max_usd?: number;
+  max_turns?: number;
+}
+
 interface Flow {
   id: string;
   name: string;
@@ -135,6 +148,8 @@ interface Flow {
   trigger_event_source: string;
   trigger_event_type: string;
   ai_model_name?: string | null;
+  /** Per-execution ceilings the run is measured against, when configured. */
+  agent_config?: { limits?: FlowExecutionLimits } | null;
 }
 
 interface ToolActivityEntry {
@@ -151,6 +166,7 @@ interface ToolActivityEntry {
 const EXECUTION_TABS = [
   'timeline',
   'output',
+  'report',
   'transcript',
   'logs',
   'input',
@@ -430,6 +446,13 @@ export class FlowExecutionView extends LitElement {
       .strip-link:hover,
       .strip-link:focus-visible {
         text-decoration: underline;
+      }
+      button.strip-link {
+        background: none;
+        border: 0;
+        cursor: pointer;
+        font-family: inherit;
+        padding: 0;
       }
       .strip-value sl-copy-button::part(button) {
         padding: 0 2px;
@@ -854,6 +877,10 @@ export class FlowExecutionView extends LitElement {
   @state()
   private activeTab: ExecutionTab = 'timeline';
 
+  /** Same receipt the Records card reads, so the Report tab cannot disagree. */
+  @state()
+  private evidenceStatus: EvidenceStatus | null = null;
+
   /** Whether the timeline pins itself to the newest entry as items arrive. */
   @state()
   private followLive = true;
@@ -917,6 +944,7 @@ export class FlowExecutionView extends LitElement {
         return;
       this.execution = execution;
       this.hydrateMetricsFromExecution();
+      void this.loadEvidenceStatus(executionId);
     } catch (error) {
       // Preserve live event details if the authoritative read fails.
       console.error('Failed to refresh execution metadata:', error);
@@ -1593,6 +1621,7 @@ export class FlowExecutionView extends LitElement {
       if (!current()) return;
       this.execution = execution;
       this.hydrateMetricsFromExecution();
+      void this.loadEvidenceStatus(executionId);
 
       // Fetch logs
       const INITIAL_FETCH_LIMIT = 500;
@@ -1893,6 +1922,25 @@ export class FlowExecutionView extends LitElement {
       (inputTokensOf(this.tokenUsage) > 0 ||
         outputTokensOf(this.tokenUsage) > 0)
     );
+  }
+
+  /**
+   * The per-execution ceilings the run is measured against, when the flow
+   * configured any. Read straight off the flow's `agent_config.limits`, so the
+   * strip can show "used / allowed" while the run is still going, not only
+   * once the metrics endpoint has a final number.
+   */
+  private get executionLimits(): FlowExecutionLimits | null {
+    const limits = this.flow?.agent_config?.limits;
+    if (!limits) return null;
+    if (
+      limits.max_total_tokens === undefined &&
+      limits.max_usd === undefined &&
+      limits.max_turns === undefined
+    ) {
+      return null;
+    }
+    return limits;
   }
 
   /**
@@ -2205,6 +2253,36 @@ export class FlowExecutionView extends LitElement {
     return 'timeline';
   }
 
+  private packStatus(): string {
+    return this.evidenceStatus?.status || '';
+  }
+
+  private showReportTab(): boolean {
+    return ['available', 'expired', 'failed'].includes(this.packStatus());
+  }
+
+  private async loadEvidenceStatus(executionId: string): Promise<void> {
+    try {
+      const status = await getEvidenceStatus(executionId);
+      if (!this.isConnected || this.executionId !== executionId) return;
+      if (sameEvidencePack(this.evidenceStatus, status)) return;
+      this.evidenceStatus = status;
+      if (!this.showReportTab() && this.activeTab === 'report') {
+        this.activeTab = 'timeline';
+      }
+    } catch {
+      if (this.executionId === executionId && this.evidenceStatus !== null) {
+        this.evidenceStatus = null;
+      }
+    }
+  }
+
+  private openReportTab(): void {
+    if (!this.showReportTab()) return;
+    this.activeTab = 'report';
+    this.rememberTab('report');
+  }
+
   private rememberTab(tab: ExecutionTab) {
     try {
       window.localStorage.setItem(TAB_STORAGE_KEY, tab);
@@ -2498,7 +2576,10 @@ export class FlowExecutionView extends LitElement {
 
     if (item.kind === 'tool' && item.tool) {
       const tool = item.tool;
-      const failed = tool.status === 'error' || tool.status === 'failed';
+      const failed =
+        tool.status === 'error' ||
+        tool.status === 'failed' ||
+        tool.status === 'refused';
       return html`
         <div class="timeline-row timeline-tool">
           ${this.renderTimelineTime(row.timestamp)}
@@ -2907,7 +2988,10 @@ ${execution.resolved_input_prompt}</pre>
   private renderSummaryStrip(execution: FlowExecution) {
     const toolEntries = this.getToolActivityEntries();
     const failedTools = toolEntries.filter(
-      (entry) => entry.status === 'error' || entry.status === 'failed'
+      (entry) =>
+        entry.status === 'error' ||
+        entry.status === 'failed' ||
+        entry.status === 'refused'
     ).length;
     const toolCount = this.getTotalToolCallCount();
     const sessionReference = execution.agent_session_reference;
@@ -2918,8 +3002,56 @@ ${execution.resolved_input_prompt}</pre>
         ? 'Not priced'
         : '—';
 
+    const limits = this.executionLimits;
+    const tokenLimit = limits?.max_total_tokens;
+    const usdLimit = limits?.max_usd;
+    const tokenCeiling =
+      tokenLimit !== undefined
+        ? html`<span class="strip-note">
+            / ${formatTokenCount(tokenLimit)}</span
+          >`
+        : '';
+    const costCeiling =
+      usdLimit !== undefined
+        ? html`<span class="strip-note">
+            / ${formatEstimatedCost(usdLimit)}</span
+          >`
+        : '';
+
+    const verdict = execution.result?.verdict;
+    const findingsLabel = findingsSummaryLabel(
+      execution.result?.findings_summary
+    );
     return html`
       <div class="summary-strip" data-testid="summary-strip">
+        ${
+          verdict || findingsLabel
+            ? html`<div class="strip-item" data-testid="strip-verdict">
+                <span class="strip-label">Verdict</span>
+                <span class="strip-value">
+                  ${
+                    verdict
+                      ? html`<sl-badge pill variant="neutral"
+                          >${verdict}</sl-badge
+                        >`
+                      : ''
+                  }
+                  ${
+                    findingsLabel
+                      ? html`<button
+                          type="button"
+                          class="strip-link"
+                          data-testid="strip-findings"
+                          @click=${() => this.openReportTab()}
+                        >
+                          ${findingsLabel}
+                        </button>`
+                      : ''
+                  }
+                </span>
+              </div>`
+            : ''
+        }
         <div class="strip-item">
           <span class="strip-label">Started</span>
           <span
@@ -2989,12 +3121,14 @@ ${execution.resolved_input_prompt}</pre>
                   : // The same absence the token figures component prints,
                     // drawn the same way on the same page.
                     '-'
-            }</span
+            }${tokenCeiling}</span
           >
         </div>
         <div class="strip-item">
           <span class="strip-label">$ est.</span>
-          <span class="strip-value" data-testid="strip-cost">${costText}</span>
+          <span class="strip-value" data-testid="strip-cost"
+            >${costText}${costCeiling}</span
+          >
         </div>
         <div class="strip-item">
           <span class="strip-label">Tools</span>
@@ -3198,6 +3332,9 @@ ${execution.resolved_input_prompt}</pre>
       <div class="column-layout wide">
         <div class="main-column">
           ${this.renderSummaryStrip(execution)}
+          <execution-records-card
+            execution-id=${execution.id}
+          ></execution-records-card>
           <!-- What this run delegated, and what that cost. Renders one quiet
                line for the overwhelming majority of runs, which delegate
                nothing. -->
@@ -3237,6 +3374,17 @@ ${execution.resolved_input_prompt}</pre>
               ?active=${this.activeTab === 'output'}
               >Output</sl-tab
             >
+            ${
+              this.showReportTab()
+                ? html`<sl-tab
+                    slot="nav"
+                    panel="report"
+                    data-testid="report-tab"
+                    ?active=${this.activeTab === 'report'}
+                    >Report</sl-tab
+                  >`
+                : ''
+            }
             <sl-tab
               slot="nav"
               panel="transcript"
@@ -3261,6 +3409,20 @@ ${execution.resolved_input_prompt}</pre>
             <sl-tab-panel name="output" ?active=${this.activeTab === 'output'}
               >${this.renderOutputPanel(execution)}</sl-tab-panel
             >
+            ${
+              this.showReportTab()
+                ? html`<sl-tab-panel
+                    name="report"
+                    ?active=${this.activeTab === 'report'}
+                  >
+                    <execution-report-panel
+                      execution-id=${execution.id}
+                      .result=${execution.result || null}
+                      .evidence=${this.evidenceStatus}
+                    ></execution-report-panel>
+                  </sl-tab-panel>`
+                : ''
+            }
             <sl-tab-panel
               name="transcript"
               ?active=${this.activeTab === 'transcript'}

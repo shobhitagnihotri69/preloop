@@ -7,6 +7,120 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- The execution page Report tab reads one evidence-pack member at a time
+  (`GET /api/v1/flows/executions/{id}/evidence/members`) and shows the report,
+  findings and register. A verdict or findings summary on the run appears in
+  the header strip and links to that tab. Members above 8 MiB stay on the
+  full pack download.
+
+- The console Settings > Records page shows audit chain status and
+  verification, signing keys, retention, legal holds, and signed period
+  exports. The audit timeline links to that page and marks a row sealed only
+  when the row already carries a chain sequence. A flow execution shows its
+  evidence pack. Approvals and runtime sessions can place or release a legal
+  hold.
+
+- `python -m preloop.cra measure` prints the platform's NTIA minimum-elements
+  measurement for one or more CycloneDX or SPDX JSON files. SBOM Verify and
+  Release Security Audit copy `passed` and `missing` from that object.
+  Persisted SBOM and release audits carry the same object as
+  `minimum_elements_measured` (on `sbom_audit` for a release audit).
+
+- Plain console API keys can opt into a runtime session by sending
+  `X-Preloop-Session-Id` on a gateway request. Vendor session headers and
+  body-level ids still require a runtime principal, and a request with no
+  valid header records usage without creating a session. Refs #912.
+- `FLOW_EVIDENCE_LOG_PLAINTEXT` (default true) keeps today's Kubernetes
+  behavior: without a direct-upload token, `result.json`, the evidence pack,
+  and the workspace snapshot are still written to the pod log as base64.
+  Set it false, and use direct upload, when those bytes must not be in pod
+  logs. If plaintext is off and an execution has no upload token, the
+  wrapper fails closed: no artifact bytes, and an evidence receipt of
+  `failed` / `plaintext_disabled`. Encrypted log transport remains a
+  separate decision in #268.
+
+- `preloop agents install-runtime --desktop` installs a loopback-only headless
+  desktop (Xvfb on `:99`, x11vnc on `127.0.0.1:5900`, Chromium) and exports
+  `DISPLAY=:99`. `POST /api/v1/agent-deployments` accepts `desktop` and reports
+  `installed`, `failed`, or `skipped` without failing a runtime that already
+  validated. Non-root users install packages with `sudo -n`. The VNC password
+  is passed only to `x11vnc -storepasswd` (briefly visible to other local
+  users; VNC DES keeps the first 8 characters) and is not written elsewhere.
+
+### Changed
+
+- At persist, a `minimum_elements.passed: true` claim is replaced when the
+  delivered SBOM bytes are missing elements, and the agent's claim is kept
+  on `verdict_corrected`. The verdict floor then moves the label to `fail`.
+  An agent who already failed minimum elements keeps that claim. When
+  `counts_by_severity` is the only contract failure, it is recomputed from
+  the findings list and recorded per key. A run is never made less severe.
+
+- One-year usage summaries aggregate session and model totals before joining
+  session, agent, flow, and principal labels, and hash the daily series by
+  materialized day bucket. Per-user windows use
+  `ix_api_usage_account_principal_id_ts`. Replay exclusion, retry handling, and
+  the breakdown limit are unchanged. Refs #914.
+
+### Fixed
+
+- A workspace checkpoint that exceeds the storage cap logs
+  `PRELOOP_CHECKPOINT skipped checkpoint_oversized` and lets the run finish.
+  The last completed checkpoint stays the resume point. Other checkpoint
+  errors still block publication.
+- A gated tool call whose approval window is longer than
+  `approval_park_after_seconds` parks the execution when the request is
+  created, instead of polling in process for that long first. The park is
+  stored before the tool result is returned, so a harness that drops the
+  call still leaves a run waiting for the human. A failed, cancelled, or
+  timed out execution cancels approval requests it still holds as pending.
+- Native host execution profiles reject `publication_mode: isolated` before
+  execution. A stored publication snapshot is no longer stripped from the
+  host lease, and a missing snapshot still fails with the existing policy
+  error. Container isolated publication is unchanged.
+- Legacy publication now appends the current execution and head SHA to an
+  existing pull request or merge request, keeping earlier records and human
+  prose. A malformed, oversized, or rejected provider update leaves the
+  description unchanged and is not reported as a successful publication.
+  Isolated GitLab publication is still unsupported.
+- Release SBOMs carry a per-component supplier derived from local package
+  metadata, and the release SBOM job fails when the platform
+  minimum-elements measurement does not pass. The backend runtime image
+  drops pip, setuptools and wheel after install. The frontend lockfile
+  pins the `cookies` dev dependency to 0.9.2. OpenVEX files ship with the
+  SBOM artifact.
+- Harness images pin Node and install Pi and DeepSeek from lockfiles, so
+  Scorecard no longer reports floating image or npm dependencies. Empty
+  `except` handlers that intentionally ignore an optional driver or an
+  expected flush failure now say why.
+- PR follow-up trusts a reviewer by username or GitHub App slug. Enabling
+  follow-up starts with `preloop`, which matches reviews from `preloop[bot]`.
+  An empty list still ignores every bot. Cursor flows no longer ask for a
+  Preloop catalog model. Leave Cursor model blank to use Cursor Auto, or set
+  a Cursor model id such as `grok-4.7-high` and map it on the runner profile.
+  The first repair of a publication that stored no native session continues
+  on the published branch when checkpoint uploads are disabled. A later
+  repair still requires its own checkpoint. A repair that failed or timed
+  out before it stored a session is tried again from that same published
+  branch, and the review it already picked up is not dropped. That failure
+  does not count as no progress, and a thread already stopped for no
+  progress in that situation is picked up again.
+- Pi and DeepSeek can check out a pull request on Kubernetes. The workspace
+  volume stays owned by root, so Git accepted the clone and then refused
+  the commit checkout as dubious ownership. Both harnesses run as that
+  non-root user.
+
+- Codex no longer opens a Preloop MCP session when both MCP allowlists are
+  empty, so a failing HTTP transport cannot reconnect until the flow
+  timeout. `agent_config.sandbox_type: read-only` launches Codex with
+  `--sandbox read-only`, disables the `shell_tool` feature, and does not
+  pass `--yolo`. `codex exec` already defaults to never asking for
+  approval; the read-only config also sets `approval_policy = "never"`
+  so a resume cannot wait on a person. Any other value, including the
+  preset default `exec`, is unchanged.
+
 ## [0.16.0] - 2026-09-21
 
 Highlights: **Alibaba Cloud Model Studio (Qwen)** and **AWS Bedrock** join the
@@ -54,6 +168,16 @@ avatars.
   remain supported. Persistent agent execution,
   matrix runs and delegated triage runs are rejected because those paths cannot
   preserve the required execution scope and shared revision ownership.
+
+- Model by label: `agent_config.model_by_label` maps a complexity label to a
+  model and a reasoning effort, first match wins, evaluated at trigger time
+  after the existing `model_routing` rules. A rule that only names an effort
+  keeps the flow's model and asks it to think harder; Codex receives the
+  choice as `model_reasoning_effort` in `config.toml`. The flow form in the
+  console edits the list, the chosen label and effort are logged on the
+  execution, and a label that arrives on an untrusted webhook payload can
+  never introduce a rule of its own. The list is empty by default, so
+  existing flows route exactly as before.
 
 - Agent harnesses are told the context window and output ceiling of the
   model they run on. Codex gets `model_context_window` and
@@ -1048,6 +1172,14 @@ avatars.
   `/console/settings/emergency`, off the billing surface.
 
 ### Changed
+
+- The issue implementation preset asks for a commit at each milestone, with
+  the first one within 20 minutes of the first edit and WIP commits
+  explicitly allowed, so a run that is cut short keeps the work it already
+  did instead of leaving an empty branch. Phase 1 now asks the agent to read
+  by range with `grep -n` and `sed -n` instead of reading whole files, which
+  leaves context for the edits. Flows derived from this preset are flagged
+  with `preset_update_available`.
 
 - Enable the Policies console by default for users with policy permissions.
   Operators can still hide it with `PRELOOP_POLICIES_CONSOLE=false`.

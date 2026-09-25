@@ -392,6 +392,16 @@ export class PreloopFlowForm extends LitElement {
     agent_type: string;
   }> = [];
 
+  // The short label-to-model shape (agent_config.model_by_label). Held apart
+  // from routingRules because it is stored apart: one label, one model, one
+  // effort, which is what most flows actually want.
+  @state()
+  private labelRules: Array<{
+    label: string;
+    ai_model_id: string;
+    reasoning_effort: string;
+  }> = [];
+
   // The custom container image as typed. Undefined means "not touched on this
   // form", in which case the saved value is read back from agent_config. This
   // keeps a typed draft when the runner selection temporarily hides the
@@ -416,6 +426,9 @@ export class PreloopFlowForm extends LitElement {
 
   @state()
   private pickerSelectedId = '';
+
+  @state()
+  private persistentPresetNotice = '';
 
   @state()
   private pickerCollapsed = false;
@@ -641,6 +654,7 @@ export class PreloopFlowForm extends LitElement {
           this.targetAgentId = cfg.target_agent_id || '';
         }
         this.syncRoutingRulesFromConfig(cfg);
+        this.syncLabelRulesFromConfig(cfg);
       }
 
       // Determine trigger type and load tracker scope data
@@ -1263,6 +1277,197 @@ export class PreloopFlowForm extends LitElement {
     });
   }
 
+  private syncLabelRulesFromConfig(config: unknown) {
+    const cfg =
+      config && typeof config === 'object'
+        ? (config as Record<string, unknown>)
+        : {};
+    const stored = cfg.model_by_label;
+    const rules = Array.isArray(stored) ? stored : [];
+    this.labelRules = rules
+      .filter((rule): rule is Record<string, unknown> =>
+        Boolean(rule && typeof rule === 'object')
+      )
+      .map((rule) => ({
+        label: typeof rule.label === 'string' ? rule.label : '',
+        ai_model_id:
+          typeof rule.ai_model_id === 'string' ? rule.ai_model_id : '',
+        reasoning_effort:
+          typeof rule.reasoning_effort === 'string'
+            ? rule.reasoning_effort
+            : '',
+      }));
+  }
+
+  private normalizedLabelRules() {
+    const seen = new Set<string>();
+    return this.labelRules.map((rule, index) => {
+      const label = rule.label.trim();
+      if (!label) {
+        throw new Error(
+          `Label rule ${index + 1} needs a label. Complete it or remove it before saving.`
+        );
+      }
+      if (!rule.ai_model_id && !rule.reasoning_effort) {
+        throw new Error(
+          `Label rule "${label}" changes nothing. Pick a model, an effort, or remove the rule.`
+        );
+      }
+      if (seen.has(label)) {
+        throw new Error(
+          `Label "${label}" appears twice. Only the first rule would ever apply.`
+        );
+      }
+      seen.add(label);
+      const normalized: Record<string, string> = { label };
+      if (rule.ai_model_id) {
+        normalized.ai_model_id = rule.ai_model_id;
+      }
+      if (rule.reasoning_effort) {
+        normalized.reasoning_effort = rule.reasoning_effort;
+      }
+      return normalized;
+    });
+  }
+
+  private addLabelRule() {
+    this.labelRules = [
+      ...this.labelRules,
+      { label: '', ai_model_id: '', reasoning_effort: '' },
+    ];
+  }
+
+  private removeLabelRule(index: number) {
+    this.labelRules = this.labelRules.filter((_, i) => i !== index);
+  }
+
+  private moveLabelRule(index: number, delta: number) {
+    const target = index + delta;
+    if (target < 0 || target >= this.labelRules.length) {
+      return;
+    }
+    const rules = [...this.labelRules];
+    const [moved] = rules.splice(index, 1);
+    rules.splice(target, 0, moved);
+    this.labelRules = rules;
+  }
+
+  private updateLabelRule(
+    index: number,
+    field: 'label' | 'ai_model_id' | 'reasoning_effort',
+    value: string
+  ) {
+    this.labelRules = this.labelRules.map((rule, i) =>
+      i === index ? { ...rule, [field]: value } : rule
+    );
+  }
+
+  private renderModelByLabelEditor(
+    selectableModels: Array<{ id: string; name: string }>
+  ) {
+    return html`
+      <div data-label-routing-editor>
+        <h5
+          style="font-weight: 600; color: var(--sl-color-neutral-700); margin: var(--sl-spacing-medium) 0 var(--sl-spacing-x-small) 0;"
+        >
+          Model by label
+        </h5>
+        <p class="routing-help">
+          The short form: one label, one model, one reasoning effort. The first
+          rule whose label is on the issue wins, and a rule that sets only an
+          effort keeps this flow's model and asks it to think harder. Routing
+          rules above are evaluated first.
+        </p>
+        <div class="routing-rules">
+          ${this.labelRules.map(
+            (rule, index) => html`
+              <div class="routing-rule" data-label-rule=${index}>
+                <div class="routing-rule-header">
+                  <sl-input
+                    label="Label"
+                    size="small"
+                    placeholder="e.g. complexity:high"
+                    .value=${rule.label}
+                    @sl-input=${(e: Event) =>
+                      this.updateLabelRule(
+                        index,
+                        'label',
+                        (e.target as HTMLInputElement).value
+                      )}
+                    help-text="Matched against the issue's current labels"
+                  ></sl-input>
+                  <div class="routing-rule-actions">
+                    <sl-button
+                      size="small"
+                      variant="text"
+                      ?disabled=${index === 0}
+                      @click=${() => this.moveLabelRule(index, -1)}
+                    >
+                      Up
+                    </sl-button>
+                    <sl-button
+                      size="small"
+                      variant="text"
+                      ?disabled=${index === this.labelRules.length - 1}
+                      @click=${() => this.moveLabelRule(index, 1)}
+                    >
+                      Down
+                    </sl-button>
+                    <sl-button
+                      size="small"
+                      variant="text"
+                      @click=${() => this.removeLabelRule(index)}
+                    >
+                      Remove
+                    </sl-button>
+                  </div>
+                </div>
+                <sl-select
+                  label="Model"
+                  placeholder="This flow's model"
+                  .value=${rule.ai_model_id || ''}
+                  @sl-change=${(e: Event) =>
+                    this.updateLabelRule(
+                      index,
+                      'ai_model_id',
+                      (e.target as HTMLSelectElement).value
+                    )}
+                >
+                  <sl-option value="">This flow's model</sl-option>
+                  ${selectableModels.map(
+                    (m) => html`<sl-option .value=${m.id}>${m.name}</sl-option>`
+                  )}
+                </sl-select>
+                <sl-select
+                  label="Reasoning effort"
+                  .value=${rule.reasoning_effort || ''}
+                  @sl-change=${(e: Event) =>
+                    this.updateLabelRule(
+                      index,
+                      'reasoning_effort',
+                      (e.target as HTMLSelectElement).value
+                    )}
+                >
+                  <sl-option value="">Model default</sl-option>
+                  <sl-option value="low">Low</sl-option>
+                  <sl-option value="medium">Medium</sl-option>
+                  <sl-option value="high">High</sl-option>
+                </sl-select>
+              </div>
+            `
+          )}
+        </div>
+        <sl-button
+          size="small"
+          data-add-label-rule
+          @click=${() => this.addLabelRule()}
+        >
+          Add label rule
+        </sl-button>
+      </div>
+    `;
+  }
+
   private normalizedRoutingRules() {
     return this.routingRules.map((rule, index) => {
       const anyLabels = this.splitLabelList(rule.anyLabels);
@@ -1306,6 +1511,11 @@ export class PreloopFlowForm extends LitElement {
       for (const [key, limit] of Object.entries(FEEDBACK_LIMITS)) {
         if (!(key in feedback)) feedback[key] = limit.default;
       }
+      // A missing list is a new opt-in. A saved empty list means every bot
+      // stays ignored, including after the toggle is switched off and on.
+      if (!('trusted_reviewer_ids' in feedback)) {
+        feedback.trusted_reviewer_ids = ['preloop'];
+      }
     }
     this.flow = {
       ...this.flow,
@@ -1345,18 +1555,23 @@ export class PreloopFlowForm extends LitElement {
               .map((id) => id.trim())
               .filter(Boolean)
           : raw;
-      if (
-        !Array.isArray(ids) ||
-        ids.some(
-          (id) =>
-            !(
-              (typeof id === 'string' && /^[1-9][0-9]*$/.test(id)) ||
-              (typeof id === 'number' && Number.isSafeInteger(id) && id > 0)
-            )
-        )
-      ) {
+      const numeric = (id: unknown) =>
+        (typeof id === 'string' && /^[1-9][0-9]*$/.test(id)) ||
+        (typeof id === 'number' && Number.isSafeInteger(id) && id > 0);
+      const login = (id: unknown) =>
+        typeof id === 'string' &&
+        /^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,37}[A-Za-z0-9])?(?:\[bot\])?$/.test(
+          id
+        );
+      const valid =
+        key === 'trusted_reviewer_ids'
+          ? (id: unknown) => numeric(id) || login(id)
+          : numeric;
+      if (!Array.isArray(ids) || ids.some((id) => !valid(id))) {
         throw new Error(
-          'Follow-up: enter comma-separated numeric provider actor IDs, not usernames.'
+          key === 'trusted_reviewer_ids'
+            ? 'Follow-up: enter reviewer usernames or app slugs such as preloop, or numeric actor IDs.'
+            : 'Follow-up: enter comma-separated numeric provider actor IDs, not usernames.'
         );
       }
       feedback[key] = ids;
@@ -1402,8 +1617,8 @@ export class PreloopFlowForm extends LitElement {
                   ${[
                     [
                       'trusted_reviewer_ids',
-                      'Trusted reviewer actor IDs',
-                      'Comma-separated GitHub or GitLab numeric user IDs from the reviewer account or integration. Unlisted bots are ignored; comment markers do not grant trust.',
+                      'Trusted reviewers',
+                      'Usernames or app slugs, for example preloop. preloop matches reviews posted by the preloop[bot] GitHub App. A staging app is preloop-staging. Numeric actor IDs still work. Unlisted bots are ignored.',
                     ],
                     [
                       'implementer_actor_ids',
@@ -1482,6 +1697,12 @@ export class PreloopFlowForm extends LitElement {
       config.model_routing = { version: 1, rules };
     } else {
       delete config.model_routing;
+    }
+    const labelRules = this.normalizedLabelRules();
+    if (labelRules.length > 0) {
+      config.model_by_label = labelRules;
+    } else {
+      delete config.model_by_label;
     }
     return config;
   }
@@ -1672,8 +1893,24 @@ export class PreloopFlowForm extends LitElement {
       } else {
         delete base.host_exec_profile;
       }
+      const cursorModel =
+        typeof base.cursor_model === 'string' ? base.cursor_model.trim() : '';
+      if (
+        cursorModel &&
+        !/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/.test(cursorModel)
+      ) {
+        throw new Error(
+          'Cursor model must be a Cursor model id such as grok-4.7-high, or blank for Auto.'
+        );
+      }
+      if (cursorModel) {
+        base.cursor_model = cursorModel;
+      } else {
+        delete base.cursor_model;
+      }
     } else {
       delete base.host_exec_profile;
+      delete base.cursor_model;
     }
     this.applyCustomImageOverride(base);
     return base;
@@ -1696,6 +1933,22 @@ export class PreloopFlowForm extends LitElement {
       }
     }
     return [...names].sort();
+  }
+
+  private handleCursorModelInput(event: Event) {
+    const value = (event.target as HTMLInputElement).value;
+    this.flow = {
+      ...this.flow,
+      agent_config: {
+        ...(this.flow.agent_config || {}),
+        cursor_model: value,
+      },
+    };
+  }
+
+  private cursorModelValue(): string {
+    const raw = this.parseAgentConfig(this.flow.agent_config).cursor_model;
+    return typeof raw === 'string' ? raw : '';
   }
 
   private handleHostExecProfileInput(event: Event) {
@@ -2024,6 +2277,45 @@ export class PreloopFlowForm extends LitElement {
     }
   }
 
+  private applyExecutionPath(path: 'ephemeral' | 'persistent') {
+    this.flowExecutionPath = path;
+    if (path !== 'persistent') {
+      this.persistentPresetNotice = '';
+    } else {
+      if (!this.targetAgentId && this.longRunningAgents.length > 0) {
+        const enabledAgents = this.persistentControlAgents();
+        const onlineAgents = enabledAgents.filter(
+          (agent) => getAgentControlState(agent).online
+        );
+        const pick = onlineAgents[0] || enabledAgents[0];
+        if (pick) {
+          this.targetAgentId = pick.id;
+        }
+      }
+      this.updateModelSelectionForAgent();
+      this.clearUnsupportedPersistentPreset();
+    }
+    this.requestUpdate();
+  }
+
+  private clearUnsupportedPersistentPreset() {
+    if (!this.pickerSelectedId || this.pickerSelectedId === BLANK_PRESET_ID) {
+      this.persistentPresetNotice = '';
+      return;
+    }
+    const preset = this.presets.find(
+      (item) => item.id === this.pickerSelectedId
+    );
+    if (!preset || preset.supports_persistent === true) {
+      this.persistentPresetNotice = '';
+      return;
+    }
+    this.pickerSelectedId = '';
+    this.sourcePresetId = null;
+    this.persistentPresetNotice =
+      'This preset does not support persistent execution. It expects an ephemeral checkout. Pick another preset.';
+  }
+
   private async applyPresetSelection(presetId: string) {
     if (presetId === BLANK_PRESET_ID) {
       this.selectBlankFlow();
@@ -2050,6 +2342,7 @@ export class PreloopFlowForm extends LitElement {
     };
     this.triggerType = 'webhook';
     this.routingRules = [];
+    this.labelRules = [];
     this.capturePresetSnapshot();
   }
 
@@ -2083,6 +2376,7 @@ export class PreloopFlowForm extends LitElement {
       is_enabled: true,
     };
     this.syncRoutingRulesFromConfig(preset.agent_config);
+    this.syncLabelRulesFromConfig(preset.agent_config);
     this.sourcePresetId = preset.id;
     await this._autoPopulatePresetFields();
     this.capturePresetSnapshot();
@@ -2810,9 +3104,17 @@ export class PreloopFlowForm extends LitElement {
                   .presets=${this.presets}
                   .selectedId=${this.pickerSelectedId}
                   ?collapsed=${this.pickerCollapsed}
+                  ?persistent=${this.flowExecutionPath === 'persistent'}
                   @preset-select=${this.handlePickerSelect}
                   @preset-change-request=${this.handlePickerChangeRequest}
                 ></preloop-flow-preset-picker>
+                ${
+                  this.persistentPresetNotice
+                    ? html`<p class="persistent-preset-notice">
+                        ${this.persistentPresetNotice}
+                      </p>`
+                    : nothing
+                }
               `
             : nothing
         }
@@ -3004,27 +3306,12 @@ export class PreloopFlowForm extends LitElement {
                     </label>
                     <sl-radio-group
                       value=${this.flowExecutionPath}
-                      @sl-change=${(e: any) => {
-                        this.flowExecutionPath = e.target.value as
-                          'ephemeral' | 'persistent';
-                        if (this.flowExecutionPath === 'persistent') {
-                          if (
-                            !this.targetAgentId &&
-                            this.longRunningAgents.length > 0
-                          ) {
-                            const enabledAgents =
-                              this.persistentControlAgents();
-                            const onlineAgents = enabledAgents.filter(
-                              (a) => getAgentControlState(a).online
-                            );
-                            const pick = onlineAgents[0] || enabledAgents[0];
-                            if (pick) {
-                              this.targetAgentId = pick.id;
-                            }
-                          }
-                          this.updateModelSelectionForAgent();
+                      @sl-change=${(e: Event) => {
+                        const target = e.target as HTMLInputElement | null;
+                        const value = target?.value;
+                        if (value === 'ephemeral' || value === 'persistent') {
+                          this.applyExecutionPath(value);
                         }
-                        this.requestUpdate();
                       }}
                       style="display: flex; gap: var(--sl-spacing-large);"
                     >
@@ -3104,36 +3391,71 @@ export class PreloopFlowForm extends LitElement {
                   </sl-select>
                 `
           }
-
-          <div
-            style="display: flex; flex-direction: column; gap: var(--sl-spacing-2x-small); margin-bottom: var(--sl-spacing-medium);"
-          >
-            <sl-select
-              label=${this.flow.agent_type === 'cursor' ? 'Requested AI Model' : 'AI model'}
-              help-text=${this.flow.agent_type === 'cursor' ? 'The local profile must map this model. The observed Cursor model is recorded only when reported.' : ''}
-              placeholder="Select an AI model"
-              .value=${this.flow.ai_model_id || ''}
-              @sl-change=${(e: any) => {
-                this.flow.ai_model_id = e.target.value;
-              }}
-              style="margin-bottom: 0;"
-            >
-              ${this.flow.agent_type === 'cursor' ? html`<sl-option value="">Profile default</sl-option>` : nothing}
-              ${selectableModels.map(
-                (m) => html`<sl-option .value=${m.id}>${m.name}</sl-option>`
-              )}
-            </sl-select>
-            <sl-button
-              size="small"
-              variant="text"
-              @click=${this.openAddAIModelDialog}
-              style="align-self: flex-start; margin-top: -0.25rem; height: auto; padding: 0;"
-            >
-              <sl-icon slot="prefix" name="plus-lg"></sl-icon> Add AI model
-            </sl-button>
-          </div>
-
-          ${this.renderModelRoutingEditor(selectableModels)}
+          ${
+            this.flow.agent_type === 'cursor'
+              ? html`
+                  <p class="notifications-help">
+                    Cursor runs as cursor-agent on the private runner, using
+                    that machine's Cursor login. Preloop's model catalog is not
+                    Cursor's catalog, so it is hidden here. Leave Cursor model
+                    blank and cursor-agent uses Auto, Cursor's own selector.
+                    Auto is not Grok 4.7. To pin Grok 4.7, enter grok-4.7-high
+                    and map that same id in the runner profile model_map.
+                  </p>
+                  <sl-input
+                    label="Cursor model"
+                    data-cursor-model
+                    placeholder="Auto"
+                    help-text="Optional Cursor model id. The runner passes it as --model only when the profile model_map lists it. Blank uses Auto."
+                    .value=${this.cursorModelValue()}
+                    @sl-input=${this.handleCursorModelInput}
+                  ></sl-input>
+                  ${
+                    this.flow.git_clone_config?.enabled
+                      ? html`<sl-alert variant="warning" open>
+                          <sl-icon
+                            slot="icon"
+                            name="exclamation-triangle"
+                          ></sl-icon>
+                          Host execution cannot clone a repository or open a
+                          pull request. This flow clones a repository, so a
+                          Cursor runner will refuse the run.
+                        </sl-alert>`
+                      : nothing
+                  }
+                `
+              : html`
+                  <div
+                    style="display: flex; flex-direction: column; gap: var(--sl-spacing-2x-small); margin-bottom: var(--sl-spacing-medium);"
+                  >
+                    <sl-select
+                      label="AI model"
+                      placeholder="Select an AI model"
+                      .value=${this.flow.ai_model_id || ''}
+                      @sl-change=${(e: any) => {
+                        this.flow.ai_model_id = e.target.value;
+                      }}
+                      style="margin-bottom: 0;"
+                    >
+                      ${selectableModels.map(
+                        (m) =>
+                          html`<sl-option .value=${m.id}>${m.name}</sl-option>`
+                      )}
+                    </sl-select>
+                    <sl-button
+                      size="small"
+                      variant="text"
+                      @click=${this.openAddAIModelDialog}
+                      style="align-self: flex-start; margin-top: -0.25rem; height: auto; padding: 0;"
+                    >
+                      <sl-icon slot="prefix" name="plus-lg"></sl-icon> Add AI
+                      model
+                    </sl-button>
+                  </div>
+                  ${this.renderModelRoutingEditor(selectableModels)}
+                  ${this.renderModelByLabelEditor(selectableModels)}
+                `
+          }
           ${this.renderRunnerPoolField()} ${this.renderHostExecProfileField()}
           ${this.renderCustomImageField()}
 

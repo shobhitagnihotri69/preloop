@@ -5,10 +5,13 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-from sqlalchemy import case, func, tuple_
+from sqlalchemy import and_, case, func, tuple_
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from preloop.models import models
+from preloop.schemas.browser_step import BrowserStepIn
+from preloop.utils.redaction import redact_dict
 from ...utils.jsonb_sanitize import sanitize_for_jsonb
 from .base import CRUDBase
 
@@ -17,6 +20,72 @@ RuntimeSession = models.RuntimeSession
 RuntimeSessionActivity = models.RuntimeSessionActivity
 
 MAX_AGENT_CONTROL_MESSAGE_SUMMARY_LEN = 2000
+
+# One governed tool call now records ``succeeded``/``refused``/``failed``.
+# ``success`` is kept in the success set so rows written before the outcome
+# split still aggregate as successes.
+TOOL_CALL_SUCCESS_STATUSES = ("success", "succeeded")
+
+
+def _tool_call_failure_count_expr(status_column: Any) -> Any:
+    """Count non-success tool-call statuses, treating NULL like the legacy CASE.
+
+    ``status != 'success'`` is not true when status is NULL, so the old
+    aggregates left NULL out of both success and failure. Keep that behaviour
+    while accepting both ``success`` and ``succeeded``.
+    """
+    return func.coalesce(
+        func.sum(
+            case(
+                (
+                    and_(
+                        status_column.isnot(None),
+                        ~status_column.in_(TOOL_CALL_SUCCESS_STATUSES),
+                    ),
+                    1,
+                ),
+                else_=0,
+            )
+        ),
+        0,
+    )
+
+
+def _redact_browser_text(value: str | None) -> tuple[str | None, bool]:
+    """Mask credential-shaped text, leaving ``None`` and empty values alone."""
+    if not value:
+        return value, False
+    from preloop.services.session_search_index import redact_text
+
+    return redact_text(value)
+
+
+def _browser_step_metadata(step: BrowserStepIn) -> dict[str, Any]:
+    """Build the stored metadata for one browser step.
+
+    Field names are redacted first, then the free-text URL, target and
+    reasoning are masked. ``screenshot`` stays ``None`` until capture
+    exists. ``source`` and ``source_step_id`` are left intact so a retry
+    still matches the idempotency key.
+    """
+    metadata = redact_dict(
+        {
+            "source": step.source,
+            "source_step_id": step.source_step_id,
+            "step_index": step.step_index,
+            "action": step.action,
+            "url": step.url,
+            "target": step.target,
+            "reasoning": step.reasoning,
+            "extra": step.extra,
+            "screenshot": None,
+        }
+    )
+    for key in ("url", "target", "reasoning"):
+        value = metadata.get(key)
+        if isinstance(value, str) and value:
+            metadata[key] = _redact_browser_text(value)[0]
+    return metadata
 
 
 class CRUDRuntimeSessionActivity(CRUDBase[RuntimeSessionActivity]):
@@ -106,6 +175,216 @@ class CRUDRuntimeSessionActivity(CRUDBase[RuntimeSessionActivity]):
 
         self._index_tool_call_chunks(db, activity=db_obj, commit=commit)
         return db_obj
+
+    def log_artifact_evicted(
+        self,
+        db: Session,
+        *,
+        account_id: Any,
+        runtime_session_id: Any,
+        artifact_id: Any,
+        kind: str,
+        commit: bool = True,
+    ) -> RuntimeSessionActivity:
+        """Record that an artifact's bytes were dropped for the account budget.
+
+        Args:
+            db: Database session.
+            account_id: Owning account.
+            runtime_session_id: Session the artifact belonged to.
+            artifact_id: Artifact whose ciphertext was cleared.
+            kind: ``screenshot`` or ``recording``.
+            commit: When True, commit the row. When False, only flush.
+
+        Returns:
+            The new ``artifact_evicted`` activity.
+        """
+        activity_timestamp = datetime.now(timezone.utc)
+        db_obj = RuntimeSessionActivity(
+            account_id=account_id,
+            runtime_session_id=runtime_session_id,
+            activity_type="artifact_evicted",
+            summary="Session artifact evicted for the account storage budget",
+            metadata_=sanitize_for_jsonb(
+                {
+                    "artifact_id": str(artifact_id),
+                    "kind": kind,
+                    "reason": "account_budget",
+                }
+            ),
+            timestamp=activity_timestamp,
+        )
+        db.add(db_obj)
+        self._touch_runtime_session_and_agent(
+            db,
+            account_id=account_id,
+            runtime_session_id=runtime_session_id,
+            activity_timestamp=activity_timestamp,
+        )
+        if commit:
+            db.commit()
+            db.refresh(db_obj)
+        else:
+            db.flush()
+        return db_obj
+
+    def set_browser_step_screenshot_availability(
+        self,
+        db: Session,
+        *,
+        account_id: Any,
+        activity_id: Any,
+        availability: str,
+        commit: bool = True,
+    ) -> bool:
+        """Set ``metadata.screenshot.availability`` on a browser-step activity.
+
+        Args:
+            db: Database session.
+            account_id: Account the caller is allowed to update.
+            activity_id: Activity the artifact illustrates.
+            availability: New availability, for example ``evicted``.
+            commit: When True, commit the update. When False, only flush.
+
+        Returns:
+            True when a ``browser_step`` row in this account was updated.
+        """
+        from sqlalchemy.orm.attributes import flag_modified
+
+        row = (
+            db.query(self.model)
+            .filter(
+                self.model.id == activity_id,
+                self.model.account_id == account_id,
+                self.model.activity_type == "browser_step",
+            )
+            .one_or_none()
+        )
+        if row is None:
+            return False
+        metadata = dict(row.metadata_ or {})
+        screenshot = metadata.get("screenshot")
+        if not isinstance(screenshot, dict):
+            screenshot = {}
+        metadata["screenshot"] = {**screenshot, "availability": availability}
+        row.metadata_ = sanitize_for_jsonb(metadata)
+        flag_modified(row, "metadata_")
+        if commit:
+            db.commit()
+        else:
+            db.flush()
+        return True
+
+    def log_browser_step(
+        self,
+        db: Session,
+        *,
+        account_id: Any,
+        runtime_session_id: Any,
+        api_key_id: Optional[Any],
+        step: BrowserStepIn,
+        commit: bool = True,
+    ) -> tuple[RuntimeSessionActivity, bool]:
+        """Persist one browser step, or return the existing row.
+
+        Idempotency is ``(runtime_session_id, source, source_step_id)``
+        among ``browser_step`` rows. A repeat returns that row unchanged
+        and does not touch the session again. A concurrent insert that
+        wins the unique index is treated the same way.
+
+        Args:
+            db: Database session.
+            account_id: Owning account id.
+            runtime_session_id: Session the step is attached to.
+            api_key_id: Credential that reported the step, if any.
+            step: Validated ``BrowserStepIn``.
+            commit: Whether to commit this row. Batch ingestion passes
+                ``False`` and commits once for the batch.
+
+        Returns:
+            The stored row and whether this call created it.
+        """
+        existing = self._find_browser_step(
+            db,
+            runtime_session_id=runtime_session_id,
+            source=step.source,
+            source_step_id=step.source_step_id,
+        )
+        if existing is not None:
+            return existing, False
+
+        metadata = _browser_step_metadata(step)
+        locator = metadata.get("url") or metadata.get("target") or ""
+        summary = _redact_browser_text(f"{step.action} {locator}")[0]
+        activity_timestamp = step.occurred_at or datetime.now(timezone.utc)
+        if activity_timestamp.tzinfo is None:
+            activity_timestamp = activity_timestamp.replace(tzinfo=timezone.utc)
+        db_obj = RuntimeSessionActivity(
+            account_id=account_id,
+            runtime_session_id=runtime_session_id,
+            api_key_id=api_key_id,
+            activity_type="browser_step",
+            server_name=step.source,
+            tool_name=step.action,
+            status=step.status,
+            summary=summary,
+            metadata_=sanitize_for_jsonb(metadata),
+            timestamp=activity_timestamp,
+        )
+        savepoint = db.begin_nested()
+        try:
+            db.add(db_obj)
+            # Flush the insert before touching the session. A conflicting
+            # key fails here, instead of as an autoflush inside the touch
+            # query, so the savepoint can roll the duplicate back.
+            db.flush()
+        except IntegrityError:
+            savepoint.rollback()
+            if db_obj in db:
+                db.expunge(db_obj)
+            with db.no_autoflush:
+                raced = self._find_browser_step(
+                    db,
+                    runtime_session_id=runtime_session_id,
+                    source=step.source,
+                    source_step_id=step.source_step_id,
+                )
+            if raced is None:
+                raise
+            return raced, False
+        else:
+            if savepoint.is_active:
+                savepoint.commit()
+        self._touch_runtime_session_and_agent(
+            db,
+            account_id=account_id,
+            runtime_session_id=runtime_session_id,
+            activity_timestamp=activity_timestamp,
+        )
+        if commit:
+            db.commit()
+            db.refresh(db_obj)
+        return db_obj, True
+
+    def _find_browser_step(
+        self,
+        db: Session,
+        *,
+        runtime_session_id: Any,
+        source: str,
+        source_step_id: str,
+    ) -> Optional[RuntimeSessionActivity]:
+        """Return the browser step already stored for this idempotency key."""
+        return (
+            db.query(self.model)
+            .filter(
+                self.model.runtime_session_id == runtime_session_id,
+                self.model.activity_type == "browser_step",
+                self.model.metadata_["source"].astext == source,
+                self.model.metadata_["source_step_id"].astext == source_step_id,
+            )
+            .first()
+        )
 
     @staticmethod
     def _index_tool_call_chunks(
@@ -550,11 +829,15 @@ class CRUDRuntimeSessionActivity(CRUDBase[RuntimeSessionActivity]):
                 self.model.server_name,
                 func.count(self.model.id).label("call_count"),
                 func.coalesce(
-                    func.sum(case((self.model.status == "success", 1), else_=0)), 0
+                    func.sum(
+                        case(
+                            (self.model.status.in_(TOOL_CALL_SUCCESS_STATUSES), 1),
+                            else_=0,
+                        )
+                    ),
+                    0,
                 ).label("success_count"),
-                func.coalesce(
-                    func.sum(case((self.model.status != "success", 1), else_=0)), 0
-                ).label("failure_count"),
+                _tool_call_failure_count_expr(self.model.status).label("failure_count"),
                 func.max(self.model.timestamp).label("last_activity_at"),
             )
             .join(RuntimeSession, self.model.runtime_session_id == RuntimeSession.id)
@@ -598,11 +881,15 @@ class CRUDRuntimeSessionActivity(CRUDBase[RuntimeSessionActivity]):
                 self.model.tool_name,
                 func.count(self.model.id).label("call_count"),
                 func.coalesce(
-                    func.sum(case((self.model.status == "success", 1), else_=0)), 0
+                    func.sum(
+                        case(
+                            (self.model.status.in_(TOOL_CALL_SUCCESS_STATUSES), 1),
+                            else_=0,
+                        )
+                    ),
+                    0,
                 ).label("success_count"),
-                func.coalesce(
-                    func.sum(case((self.model.status != "success", 1), else_=0)), 0
-                ).label("failure_count"),
+                _tool_call_failure_count_expr(self.model.status).label("failure_count"),
                 func.max(self.model.timestamp).label("last_activity_at"),
             )
             .join(RuntimeSession, self.model.runtime_session_id == RuntimeSession.id)
@@ -646,11 +933,15 @@ class CRUDRuntimeSessionActivity(CRUDBase[RuntimeSessionActivity]):
             self.model.tool_name,
             func.count(self.model.id).label("call_count"),
             func.coalesce(
-                func.sum(case((self.model.status == "success", 1), else_=0)), 0
+                func.sum(
+                    case(
+                        (self.model.status.in_(TOOL_CALL_SUCCESS_STATUSES), 1),
+                        else_=0,
+                    )
+                ),
+                0,
             ).label("success_count"),
-            func.coalesce(
-                func.sum(case((self.model.status != "success", 1), else_=0)), 0
-            ).label("failure_count"),
+            _tool_call_failure_count_expr(self.model.status).label("failure_count"),
             func.max(self.model.timestamp).label("last_activity_at"),
         ).filter(
             self.model.account_id == account_id,
@@ -802,7 +1093,7 @@ class CRUDRuntimeSessionActivity(CRUDBase[RuntimeSessionActivity]):
             .filter(
                 self.model.flow_execution_id == flow_execution_id,
                 self.model.activity_type == "tool_call",
-                self.model.status == "success",
+                self.model.status.in_(TOOL_CALL_SUCCESS_STATUSES),
             )
             .order_by(self.model.timestamp.desc())
             .limit(limit)
