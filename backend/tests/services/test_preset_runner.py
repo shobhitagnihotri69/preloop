@@ -351,7 +351,7 @@ def test_jira_issue_payload_is_rejected():
     with pytest.raises(PresetRunnerError) as exc:
         build_issue_trigger_payload(issue, project, tracker)
     assert exc.value.status_code == 400
-    assert "GitHub and GitLab" in str(exc.value.detail)
+    assert "GitHub, GitLab and Bitbucket" in str(exc.value.detail)
 
 
 def test_jira_triage_payload_uses_object_attributes():
@@ -1563,3 +1563,45 @@ async def test_batch_item_errors_carry_the_issue_key_when_it_is_known() -> None:
     item = response["results"][0]
     assert item["issue_key"] == "example/repo#42"
     assert item["error"] == "Flow is unavailable"
+
+
+@pytest.mark.parametrize("operation", ["clone", "issue", "triage", "pull_request"])
+def test_dc_execution_never_falls_back_to_cloud(operation):
+    from preloop.services.preset_runner import _repository_clone_fields
+
+    tracker = _Simple(tracker_type="bitbucket_dc")
+    project = _Simple(slug="PRJ/repo", name="repo", meta_data={})
+    with pytest.raises(
+        PresetRunnerError,
+        match="Data Center execution/publication routing is unsupported",
+    ):
+        if operation == "clone":
+            _repository_clone_fields(project, tracker)
+        elif operation == "pull_request":
+            build_pull_request_trigger_payload({"id": 1}, project, tracker)
+        else:
+            build_issue_trigger_payload(
+                _Simple(), project, tracker, git_only=operation != "triage"
+            )
+
+
+@pytest.mark.asyncio
+async def test_dc_preset_fetch_refused_before_provider_io():
+    from preloop.services.preset_runner import _fetch_pull_request_detail
+
+    with patch(
+        "preloop.api.common.get_tracker_client", new_callable=AsyncMock
+    ) as create:
+        with pytest.raises(
+            PresetRunnerError,
+            match="Data Center execution/publication routing is unsupported",
+        ):
+            await _fetch_pull_request_detail(
+                MagicMock(),
+                current_user=_Simple(),
+                project=_Simple(),
+                tracker=_Simple(tracker_type="bitbucket_dc"),
+                organization=_Simple(),
+                number=1,
+            )
+        create.assert_not_called()

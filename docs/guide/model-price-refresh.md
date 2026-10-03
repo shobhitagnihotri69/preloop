@@ -1,5 +1,7 @@
 # Model price refresh
 
+Editions: OSS, Cloud, Enterprise. Unless stated otherwise, everything on this page ships in OSS.
+
 Preloop separates model discovery, price evidence, and current estimates. The
 model-discovery scheduler adds provider model identifiers; it does not refresh
 existing prices. The vendored catalog supplies default estimates. Missing models
@@ -11,6 +13,11 @@ pricing page. Fetch Models, Fetch price, and an unpriced usage lookup can fetch
 native prices into a process-local cache with a 24-hour freshness limit. The
 reviewed feed below distributes verified regional prices to every serving process,
 including already-priced models. Model discovery alone does not do this.
+
+Some provider models have a name the catalog cannot know: an Azure OpenAI
+deployment name or a Bedrock application inference profile ARN. Set a base
+model or a price override for those; see the [Azure OpenAI](providers/azure-openai.md)
+and [Amazon Bedrock](providers/bedrock.md) guides.
 
 ## Reviewed prices without an application deployment
 

@@ -14,9 +14,11 @@ from fastapi import (
     HTTPException,
     Path,
     Query,
+    Response,
     UploadFile,
     status,
 )
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, EmailStr, Field, field_validator
 from sqlalchemy.orm import Session
 
@@ -35,12 +37,14 @@ from preloop.models.crud import (
     crud_managed_agent_enrollment,
     crud_runtime_session,
     crud_runtime_session_activity,
+    crud_runtime_session_artifact,
     crud_user,
 )
 from preloop.models.db.session import get_db_session
 from preloop.models.models.account import Account
 from preloop.models.models.attention_dismissal import AttentionDismissal
 from preloop.models.models.user import User as UserModel
+from preloop.plugins.account_hooks import VISIBLE_MANAGED_AGENT, filter_viewable
 from preloop.schemas.attention import (
     AttentionDismissalListResponse,
     AttentionDismissalResponse,
@@ -93,7 +97,10 @@ from preloop.schemas.subject_governance import (
     SubjectGovernanceConfig,
     SubjectGovernanceResponse,
 )
-from preloop.services.analytics_history import history_cutoff
+from preloop.services.analytics_history import (
+    history_cutoff,
+    require_session_history,
+)
 from preloop.services.account_realtime import (
     ACCOUNT_TOPIC_MANAGED_AGENTS,
     ACCOUNT_TOPIC_AUDIT,
@@ -106,6 +113,9 @@ from preloop.services.account_governance_cache import (
     invalidate_account_governance_cache,
 )
 from preloop.services.event_webhooks.emitters import emit_session_ended
+from preloop.services.spend_outliers import (
+    record_dismissal as record_spend_outlier_dismissal,
+)
 from preloop.services.cache_accounting import (
     build_request_cache_accounting,
     summarize_session_cache,
@@ -154,6 +164,7 @@ AGENT_CONTROL_SUPPORTED_AGENT_KINDS = {
     "opencode",
     "pi",
     "deepseek",
+    "codex",
 }
 AGENT_CONTROL_STATE_UNSUPPORTED = "unsupported"
 AGENT_CONTROL_STATE_INSTALL_PENDING = "install_pending"
@@ -727,6 +738,17 @@ def _managed_agent_control_fields(
         "supports_existing_session": control_enabled,
         "supports_voice": control_enabled and not active_session_only,
         "supports_interrupt": supports_interrupt,
+        "desktop": (
+            snapshot.get("desktop")
+            if snapshot.get("desktop") in ("vnc", "rdp")
+            else "none"
+        ),
+        "desktop_display": (
+            snapshot.get("desktop_display")
+            if snapshot.get("desktop") in ("vnc", "rdp")
+            and isinstance(snapshot.get("desktop_display"), str)
+            else None
+        ),
         "control_session_mode": session_mode,
         "control_last_heartbeat_at": heartbeat_at,
         "supported_input_modes": (
@@ -1058,6 +1080,28 @@ class AccountDetailsResponse(BaseModel):
     updated_at: str
 
 
+class SessionArtifactUsageByKind(BaseModel):
+    """Available plaintext bytes by artifact kind (zero when unused)."""
+
+    screenshot: int = 0
+    recording: int = 0
+    screencast: int = 0
+    audio: int = 0
+    transcript: int = 0
+    document: int = 0
+    generated_file: int = 0
+    trace: int = 0
+
+
+class SessionArtifactUsageResponse(BaseModel):
+    """Account session-artifact usage against the storage budget."""
+
+    used_bytes: int
+    budget_bytes: int
+    by_kind: SessionArtifactUsageByKind
+    evicted_count_30d: int
+
+
 class AccountDetailsUpdate(BaseModel):
     """Account details update request."""
 
@@ -1110,6 +1154,22 @@ async def get_account_details(
         hosted_minutes_remaining=getattr(account, "hosted_minutes_remaining", None),
         created_at=account.created_at.isoformat(),
         updated_at=account.updated_at.isoformat(),
+    )
+
+
+@router.get(
+    "/account/session-artifacts/usage",
+    response_model=SessionArtifactUsageResponse,
+)
+def get_session_artifact_usage(
+    account: Annotated[Account, Depends(get_account_for_user)],
+    db: Session = Depends(get_db_session),
+) -> SessionArtifactUsageResponse:
+    """Return session-artifact bytes used, the budget, and recent evictions."""
+    from preloop.services.session_artifact_budget import account_usage
+
+    return SessionArtifactUsageResponse.model_validate(
+        account_usage(db, account_id=account.id)
     )
 
 
@@ -1295,7 +1355,12 @@ def list_account_managed_agents(
         items=_enrich_managed_agent_summaries(
             db,
             account_id=str(account.id),
-            summaries=[dict(item) for item in result["items"]],
+            summaries=filter_viewable(
+                db,
+                current_user,
+                VISIBLE_MANAGED_AGENT,
+                [dict(item) for item in result["items"]],
+            ),
         ),
     )
 
@@ -2494,6 +2559,33 @@ async def list_account_runtime_sessions(
     end_date: Optional[datetime] = Query(None),
     limit: int = Query(20, ge=1, le=100),
     offset: int = Query(0, ge=0),
+    agent: Optional[str] = Query(
+        None,
+        min_length=1,
+        max_length=255,
+        description="Managed agent id or display name; only that agent's sessions",
+    ),
+    agent_kind: Optional[str] = Query(
+        None,
+        min_length=1,
+        max_length=64,
+        description=(
+            "Agent kind (claude_code, codex, cursor, hermes, ...); sessions of "
+            "managed agents of that kind or recorded from that source"
+        ),
+    ),
+    parent_session_id: Optional[UUID] = Query(
+        None, description="Only sessions this session spawned"
+    ),
+    flow_execution_id: Optional[UUID] = Query(
+        None, description="Only sessions linked to this flow execution"
+    ),
+    active_within_minutes: Optional[int] = Query(
+        None,
+        ge=1,
+        le=1440,
+        description="Only open sessions with activity in the last N minutes",
+    ),
 ):
     """List runtime sessions for the current account."""
     # Off the loop on purpose: the console polls this path, and a saturated
@@ -2509,6 +2601,11 @@ async def list_account_runtime_sessions(
             limit=limit,
             offset=offset,
             background_tasks=background_tasks,
+            agent=agent,
+            agent_kind=agent_kind,
+            parent_session_id=str(parent_session_id) if parent_session_id else None,
+            flow_execution_id=str(flow_execution_id) if flow_execution_id else None,
+            active_within_minutes=active_within_minutes,
         )
     )
 
@@ -2587,6 +2684,76 @@ async def get_account_session_activity_timeline(
     )
 
 
+@router.get(
+    "/runtime-sessions/{runtime_session_id}/artifacts/{artifact_id}",
+    response_class=Response,
+    responses={
+        200: {"description": "Artifact bytes in the stored media type"},
+        404: {"description": "Session or artifact not found in this account"},
+        410: {"description": "Artifact bytes were evicted or expired"},
+    },
+)
+@require_permission("view_runtime_sessions")
+def get_account_session_artifact(
+    runtime_session_id: str,
+    artifact_id: str,
+    account: Annotated[Account, Depends(get_account_for_user)],
+    current_user: UserModel = Depends(get_current_active_user),
+    db: Session = Depends(get_db_session),
+) -> Response:
+    """Return one session artifact's bytes, such as a browser-step screenshot.
+
+    The artifact must belong to this account and to the session in the path.
+    Unavailable bytes return 410 with the reason, so the console can keep
+    the step's metadata and show why the image is gone.
+    """
+    try:
+        session_uuid = UUID(runtime_session_id.strip())
+        artifact_uuid = UUID(artifact_id.strip())
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Artifact not found") from None
+    session = crud_runtime_session.get_account_session(
+        db, account_id=str(account.id), runtime_session_id=str(session_uuid)
+    )
+    if session is None:
+        raise HTTPException(status_code=404, detail="Artifact not found")
+    require_session_history(
+        db,
+        account=account,
+        summary={
+            "started_at": session.started_at,
+            "last_activity_at": session.last_activity_at,
+            "ended_at": session.ended_at,
+        },
+    )
+    artifact = crud_runtime_session_artifact.get(
+        db, account_id=account.id, artifact_id=artifact_uuid
+    )
+    if artifact is None or artifact.runtime_session_id != session_uuid:
+        raise HTTPException(status_code=404, detail="Artifact not found")
+    if artifact.availability != "available" or artifact.ciphertext is None:
+        availability = (
+            artifact.availability if artifact.availability != "available" else "expired"
+        )
+        return JSONResponse(status_code=410, content={"availability": availability})
+    try:
+        content = crud_runtime_session_artifact.decrypt(artifact)
+    except ValueError:
+        logger.exception("Could not decrypt session artifact %s", artifact.id)
+        raise HTTPException(
+            status_code=500, detail="Artifact could not be read"
+        ) from None
+    return Response(
+        content=content,
+        media_type=artifact.content_type,
+        headers={
+            "Cache-Control": "private, max-age=300",
+            "X-Content-Type-Options": "nosniff",
+            "Content-Security-Policy": "default-src 'none'; sandbox",
+        },
+    )
+
+
 def _request_row_to_item(row: Any) -> RuntimeSessionRequestItem:
     """Convert an ApiUsage row into a unified-timeline request item.
 
@@ -2635,6 +2802,7 @@ def _request_row_to_item(row: Any) -> RuntimeSessionRequestItem:
         total_tokens=int(row.total_tokens or 0),
         estimated_cost=float(row.estimated_cost or 0.0),
         endpoint=row.endpoint,
+        auth_subject_type=row.auth_subject_type,
         tools=tools,
         tools_total_schema_tokens=tools_total,
         # NULL cache columns stay NULL through the wire: the UI must say
@@ -3349,6 +3517,15 @@ async def upsert_attention_dismissal(
         snooze_until=snooze_until,
         dismissed_by_user_id=current_user.id,
     )
+    # Spend outlier cards (#960): remember which day's finding was dismissed,
+    # for the weekly digest. A no-op for every other kind.
+    record_spend_outlier_dismissal(
+        db,
+        account_id=account.id,
+        item_id=item_id,
+        fingerprint=payload.fingerprint,
+        dismissed_at=dismissal.created_at.replace(tzinfo=UTC),
+    )
     usernames = _resolve_dismissal_usernames(db, [dismissal])
     return _dismissal_response(dismissal, usernames)
 
@@ -3365,9 +3542,23 @@ async def delete_attention_dismissal(
     db: Session = Depends(get_db_session),
 ) -> None:
     """Restore a silenced item so it shows in the inbox again."""
+    # Read before the delete commits: the row's attributes expire with it.
+    existing = crud_attention_dismissal.get_by_item(
+        db, account_id=account.id, item_id=item_id
+    )
+    restored_fingerprint = existing.fingerprint if existing is not None else None
     removed = crud_attention_dismissal.delete_by_item(
         db, account_id=account.id, item_id=item_id
     )
+    if restored_fingerprint is not None:
+        # Spend outlier cards (#960): the digest no longer lists it dismissed.
+        record_spend_outlier_dismissal(
+            db,
+            account_id=account.id,
+            item_id=item_id,
+            fingerprint=restored_fingerprint,
+            dismissed_at=None,
+        )
     if not removed:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,

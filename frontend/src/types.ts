@@ -54,7 +54,14 @@ export function defaultFlowNotifications(): FlowNotifications {
 }
 
 export interface FlowWebhookConfig {
-  webhook_secret: string;
+  /** Set on webhook-triggered flows only; tracker flows have none. */
+  webhook_secret?: string | null;
+  dedupe_path?: string | null;
+  /**
+   * Stop this flow's run on an older pull request head when a new head
+   * arrives (#1032). Off unless the flow opts in.
+   */
+  supersede_on_update?: boolean;
 }
 
 /** Server-computed schedule state; read-only for the console. */
@@ -104,6 +111,20 @@ export interface Flow {
   icon?: string;
   account_id?: string;
   prompt_template?: string;
+  /**
+   * Blocking review rules for the Pull Request Reviewer. Same markdown as
+   * `.preloop/review-policy.md`. Null or absent means the repository file
+   * is the only source. The reviewer prompt keeps the first 16,384
+   * characters. The API accepts up to 32,768.
+   */
+  review_instructions?: string | null;
+  /**
+   * Catalog identity for a built-in preset. Null on an account flow, whose
+   * name can be edited and is not identity.
+   */
+  slug?: string | null;
+  /** Preset this flow was created from, when it was created from one. */
+  source_preset_id?: string | null;
   agent_type?: string;
   agent_config?: Record<string, unknown>;
   ai_model_id?: string;
@@ -200,6 +221,7 @@ export interface TextToSpeechRequest {
 }
 
 export interface FlowGatewayConversationPreviewMessage {
+  tool_call_ids?: string[];
   source?: string | null;
   role?: string | null;
   text?: string | null;
@@ -287,6 +309,8 @@ export interface FlowGatewayEventsResponse {
     total: number;
     has_more: boolean;
   } | null;
+  /** Execution reads only: rows older than the requested `tail` exist. */
+  has_more?: boolean;
 }
 
 /**
@@ -496,6 +520,8 @@ export interface RuntimeSessionSummary {
   latest_note_author_display?: string | null;
   latest_note_author_auth_method?: string | null;
   latest_note_at?: string | null;
+  /** True while a legal hold freezes this session. */
+  legal_hold?: boolean;
 }
 
 export interface AccountRuntimeSessionListResponse {
@@ -526,6 +552,20 @@ export interface AccountRuntimeSessionDetailResponse {
  */
 export type SessionSearchMode = 'keyword' | 'semantic' | 'hybrid';
 
+/** The artifact an `artifact` search chunk came from (#1082). */
+export interface SessionSearchArtifactRef {
+  artifact_id: string;
+  activity_id: string | null;
+  kind: string | null;
+  name: string | null;
+  content_type: string | null;
+  tool_name?: string | null;
+  labels: Record<string, unknown>;
+  /** Start in seconds of the transcript cue the chunk begins in. */
+  cue_start: number | null;
+  text_truncated: boolean;
+}
+
 export interface SessionSearchSnippet {
   document_id: string;
   runtime_session_id: string;
@@ -537,6 +577,7 @@ export interface SessionSearchSnippet {
   rank: number;
   redaction_state: string;
   text: string | null;
+  artifact?: SessionSearchArtifactRef | null;
 }
 
 export interface SessionSearchResult {
@@ -657,6 +698,9 @@ export interface ManagedAgentSummary {
   supports_existing_session?: boolean;
   supports_voice?: boolean;
   supports_interrupt?: boolean;
+  /** Loopback desktop advertised by the runtime plugin. Missing means none. */
+  desktop?: 'vnc' | 'rdp' | 'none';
+  desktop_display?: string | null;
   control_session_mode?: 'local' | 'remote' | 'queued' | 'offline' | string;
   /** Last Agent Control heartbeat, so the age of the presence signal is readable. */
   control_last_heartbeat_at?: string | null;
@@ -868,12 +912,14 @@ export interface RuntimeSessionUpdateRequest {
 }
 
 export interface RuntimeSessionActivityItem {
+  activity_id?: string | null;
   activity_type:
     | 'model_interaction'
     | 'tool_call'
     | 'session_started'
     | 'session_ended'
     | 'agent_control_message'
+    | 'browser_step'
     | string;
   timestamp: string;
   title: string;
@@ -892,6 +938,48 @@ export interface RuntimeSessionActivityItem {
   is_retry?: boolean;
   retry_of_api_usage_id?: string | null;
   metadata?: Record<string, unknown>;
+}
+
+/**
+ * Availability of a stored session artifact. `evicted` means the per-session
+ * or account bound dropped the bytes; `expired` means retention did.
+ */
+export type SessionArtifactAvailability = 'available' | 'evicted' | 'expired';
+
+/** Pointer to a browser step's screenshot artifact (bytes fetched separately). */
+export interface BrowserStepScreenshotRef {
+  artifact_id: string;
+  availability: SessionArtifactAvailability | string;
+  content_type?: string | null;
+  size_bytes?: number | null;
+}
+
+/**
+ * `metadata` of a `browser_step` activity item, as stored by the browser-step
+ * ingestion API and the Playwright MCP derivation. A step is an observation of
+ * what the agent says it did, never an approval or proof of page state.
+ */
+export interface BrowserStepMetadata {
+  source?: 'api' | 'browser_use' | 'skyvern' | 'playwright_mcp' | string;
+  source_step_id?: string | null;
+  step_index?: number | null;
+  action?:
+    | 'navigate'
+    | 'click'
+    | 'type'
+    | 'select'
+    | 'scroll'
+    | 'screenshot'
+    | 'extract'
+    | 'wait'
+    | 'done'
+    | 'other'
+    | string;
+  url?: string | null;
+  target?: string | null;
+  reasoning?: string | null;
+  extra?: Record<string, unknown> | null;
+  screenshot?: BrowserStepScreenshotRef | null;
 }
 
 export interface RuntimeSessionActivityListResponse {
@@ -936,6 +1024,7 @@ export interface RuntimeSessionRequestItem {
   total_tokens: number;
   estimated_cost: number;
   endpoint: string | null;
+  auth_subject_type?: string | null;
   tools: RuntimeSessionRequestTool[];
   tools_total_schema_tokens: number;
   cache?: RuntimeSessionRequestCache;
@@ -1260,6 +1349,22 @@ export interface RuntimeSessionOptimizationActionListResponse {
   items: RuntimeSessionOptimizationAppliedAction[];
 }
 
+/**
+ * Session artifact bytes against the account storage budget. ``by_kind``
+ * always has screenshot and recording; newer servers add screencast, audio,
+ * transcript, document, generated_file and trace, and may add more later.
+ */
+export interface SessionArtifactUsage {
+  used_bytes: number;
+  budget_bytes: number;
+  by_kind: {
+    screenshot: number;
+    recording: number;
+    [kind: string]: number;
+  };
+  evicted_count_30d: number;
+}
+
 export interface AccountGatewayUsageSummaryResponse {
   period_start: string;
   period_end: string;
@@ -1509,6 +1614,78 @@ export interface CostReconciliationResponse {
   total_drift_pct: number | null;
 }
 
+// GitHub Copilot usage import (Cost page, Copilot tab). Every figure is
+// imported from GitHub and is never gateway usage.
+export interface CopilotConnection {
+  id: string;
+  organization: string;
+  enterprise: string | null;
+  has_enterprise_token: boolean;
+  seat_price_monthly: number | null;
+  currency: string;
+  is_active: boolean;
+  last_synced_at: string | null;
+  last_synced_day: string | null;
+  last_error: string | null;
+  per_user_billing_status: string | null;
+  per_user_billing_reason: string | null;
+  metrics_status: string | null;
+  metrics_reason: string | null;
+  // Non-fatal problem from the last successful import.
+  last_warning: string | null;
+}
+
+export interface CopilotConnectionUpsert {
+  organization: string;
+  enterprise?: string | null;
+  token?: string | null;
+  enterprise_token?: string | null;
+  clear_enterprise_token?: boolean;
+  seat_price_monthly: number | null;
+  is_active?: boolean;
+}
+
+export interface CopilotSeat {
+  login: string;
+  last_activity_at: string | null;
+  last_activity_editor: string | null;
+}
+
+export interface CopilotUsageSummary {
+  metered_by_gateway: false;
+  marker: string;
+  period_start: string;
+  period_end: string;
+  connection: CopilotConnection | null;
+  seats: {
+    total_seats: number | null;
+    plan_type: string | null;
+    as_of: string | null;
+    seat_price_monthly: number | null;
+    currency: string;
+    // Null when no seat price was entered: render no dollar line, not $0.
+    monthly_seat_estimate: number | null;
+    assigned: CopilotSeat[];
+  };
+  premium_requests: {
+    total_net_amount: number | null;
+    currency: string;
+    per_user_status: 'available' | 'unavailable' | 'no_data' | string;
+    per_user_unavailable_reason: string | null;
+    org_aggregate_net_amount: number | null;
+    // Spend on per-developer days that no current seat holder explains.
+    unattributed_net_amount: number | null;
+    aggregate_days: number;
+    by_developer: { login: string; net_amount: number; net_quantity: number }[];
+    by_model: { model: string; net_amount: number; net_quantity: number }[];
+  };
+  model_mix: {
+    login: string;
+    basis: 'net_amount' | 'requests';
+    models: { model: string; value: number; share: number }[];
+  }[];
+}
+
 export interface RepriceResponse {
   provider_lookup?: Record<string, number> | null;
   job_id?: string | null;
@@ -1688,6 +1865,8 @@ export interface Project {
   url?: string;
   organization_id: string;
   tracker_id?: string;
+  /** Grouping inside the organization, e.g. the Bitbucket project. */
+  group?: string | null;
 }
 
 export interface Organization {

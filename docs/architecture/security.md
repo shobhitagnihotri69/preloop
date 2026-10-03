@@ -1,5 +1,7 @@
 # Security Considerations
 
+Editions: OSS. Contributor documentation for this repository.
+
 Auth, tenancy, redaction, and secret custody are platform concerns, not agent self-reporting. This chapter covers the security checklist, redaction policy, secret service, the tamper-evident audit chain and record signatures, security-screen scoring, and `preloop.security`.
 
 ## Security Screen Scoring (QM Proxy Contract)
@@ -19,7 +21,7 @@ Auth, tenancy, redaction, and secret custody are platform concerns, not agent se
 *   **Purpose:** Deterministic, server-side validation of security audit results. It is result validation, not scanning.
 *   **Gap-Register Freeze:** `gap_register.py` validates the `result.json` produced by release security audit runs. Previous SHA+path finding rows are a floor: dropping one without a `resolved` marker plus a reason fails, unclassified rows fail, and `secrets_findings_count` must match the row count. The agent never self-grades the floor.
 *   **Git Guard:** `git_guard.py` allow-lists metadata-only git invocations so no historical blob contents can be dumped into logs or transcripts. It has no production callers yet; it is the enforcement half of the planned follow-up that wires `validate_gap_register` into result ingestion.
-*   **Waiver Inputs:** `waivers.py` deterministically factors human-authored waiver entries (`{id, reason, author, date}`, plus optional scope/expiry/package/version and the platform approval id for interactively collected ones) into a severity-gate outcome: alias-aware matching (a CVE id waives the same advisory surfaced under a GHSA/OSV alias), verbatim echo of applied entries, unmatched/invalid entries surfaced rather than dropped, and an unwaived failure always keeps the gate failed. Interactive `006` waivers bind stored `ask_user` `tool_result`/`responses` (exact finding id and human reason), not `status=approved` or question text. Ambiguous `request_approval` prose, including a `waive_finding` operation, is not a waiver. AI-judged and auto-approved rows cannot authenticate a human waiver or due-diligence decision. The severity gate is KEV or CVSS >= 9.0 unless trigger/CI `gate.fail_on_kev` / `gate.fail_on_cvss_gte` (in `[0, 10]`) override it — never model-authored `gate.policy` display text. There is no per-product policy table.
+*   **Waiver Inputs:** `waivers.py` deterministically factors human-authored waiver entries (`{id, reason, author, date}`, plus optional scope/expiry/package/version and the platform approval id for interactively collected ones) into a severity-gate outcome: alias-aware matching (a CVE id waives the same advisory surfaced under a GHSA/OSV alias), verbatim echo of applied entries, unmatched/invalid entries surfaced rather than dropped, and an unwaived failure always keeps the gate failed. Interactive `006` waivers bind stored `ask_user` `tool_result`/`responses` (exact finding id and human reason), not `status=approved` or question text. Ambiguous `request_approval` prose, including a `waive_finding` operation, is not a waiver. AI-judged and auto-approved rows cannot authenticate a human waiver or due-diligence decision. The severity gate is KEV or CVSS >= 9.0 unless trigger/CI `gate.fail_on_kev` / `gate.fail_on_cvss_gte` (in `[0, 10]`) override it: never model-authored `gate.policy` display text. There is no per-product policy table.
 *   **Scanner Boundary:** Scanners (gitleaks, zizmor) are installed and run inside the agent execution sandbox per the release security audit preset (`backend/presets/006-release-security-audit.yaml`), never on the platform control plane.
 
 ## Tamper-evident audit trail and signed records
@@ -50,9 +52,23 @@ Preloop implements authentication and multi-tenancy:
   at `MAX_SESSION_DAYS` (default 30). CLI login refresh tokens stay
   long-lived (`CLI_JWT_REFRESH_TOKEN_EXPIRE_DAYS`, default 365); revocation
   is the control for those, not the session cap.
-- `POST /oauth/revoke` still revokes opaque MCP tokens. When the token
-  decodes as one of our JWTs it returns 400 `unsupported_token_type` and
-  points at `POST /auth/sessions/revoke-all` instead of claiming success.
+- Each CLI login (`/oauth/token` without PKCE) records a `cli_session` row.
+  Its access and refresh JWTs carry the row id as `sid`; the refresh token
+  also carries a `jti` that must equal `cli_session.refresh_jti`. Rotation
+  swaps the `jti` in one conditional UPDATE, so a refresh token that was
+  already rotated away is rejected. Revoking the row (`POST /oauth/revoke`
+  with either token, `DELETE /auth/sessions/cli/{id}`, `preloop auth logout`)
+  rejects both tokens of that login in `get_current_user`, the WebSocket
+  upgrade and the refresh path; other logins are unaffected.
+  `POST /auth/refresh` does not accept a token with `sid`, so a CLI refresh
+  token cannot be turned into console tokens that escape the row check.
+  A CLI refresh token from before `sid` existed is moved onto a new row the
+  next time it rotates; the old token itself stays covered by the
+  generation check only.
+- `POST /oauth/revoke` still revokes opaque MCP tokens. A JWT without `sid`
+  (console tokens, CLI tokens from before `cli_session`) gets 400
+  `unsupported_token_type` pointing at `POST /auth/sessions/revoke-all`
+  instead of a false success.
 
 **Multi-User Architecture:**
 - **Account Model:** Represents an organization/company
@@ -63,6 +79,15 @@ Preloop implements authentication and multi-tenancy:
 - Password hashing with industry-standard algorithms
 - Account-level data isolation (all queries filtered by `account_id`)
 - User invitation system with secure token-based email verification
+- Email verification and password reset links are bound to one user row (a
+  `uid` claim next to the address). One address can hold a user in several
+  accounts, so a link never resolves by address alone: it is refused if it has
+  no `uid` (links minted before this binding) or if the row's address changed
+  after it was sent, and the person requests a new one. The forgot-password
+  and resend-verification forms send one link per row holding the address,
+  each naming its username. `crud_user.get_by_email` raises
+  `AmbiguousEmailError` rather than choose between rows; use `list_by_email`
+  or an account scope.
 
 **Plugin System:**
 - Extensible plugin architecture for adding custom functionality
@@ -83,6 +108,7 @@ Preloop implements authentication and multi-tenancy:
 - [ ] Rate limiting to prevent abuse (partial implementation exists)
 - [ ] 2FA/MFA support for user accounts
 - [x] Session revocation via per-user token generation (`auth_generation`)
+- [x] Per-login CLI session revocation (`cli_session`, JWT `sid`/`jti`)
 - [ ] Regular security audits and dependency updates
 
 > **Enterprise Security**: Preloop Cloud and Preloop Enterprise add RBAC and comprehensive audit logging. Contact sales@preloop.ai for more information.

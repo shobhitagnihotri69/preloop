@@ -105,8 +105,10 @@ preloop login --loopback             # Force local loopback OAuth
 preloop signup                       # Open the sign-up page, then authenticate the CLI
 preloop auth login                   # Same as preloop login
 preloop auth signup                  # Same as preloop signup
-preloop auth logout                  # Clear local credentials
+preloop auth logout                  # Revoke this login on the server, then clear local credentials
 preloop auth logout --all            # Revoke every session, then clear local credentials
+preloop auth sessions list           # List active CLI logins (this one is marked)
+preloop auth sessions revoke <id>    # Revoke one CLI login
 preloop auth status                  # Show authentication status
 preloop auth token                   # Print token for scripting
 ```
@@ -115,10 +117,21 @@ The login flow resolves the API URL in this order: `--url`, `PRELOOP_URL`, confi
 
 ### Signing out and revoking a login
 
-`preloop auth logout` only deletes the tokens stored on this machine. Other
-CLI hosts and the console stay signed in. To revoke every JWT session for
-the signed-in user (this host, other hosts, and the console), run
-`preloop auth logout --all`. That calls `POST /auth/sessions/revoke-all`,
+`preloop auth logout` posts the stored refresh token to `POST /oauth/revoke`,
+which revokes this login's server-side session (its access and refresh
+token both stop working), then deletes the tokens stored on this machine.
+Other CLI hosts and the console stay signed in. A login made before
+per-login sessions existed cannot be revoked on its own; logout says so and
+points at `--all`. If the server cannot be reached, the local file is still
+cleared and logout warns that this login stays valid.
+
+`preloop auth sessions list` shows every active CLI login of your user with
+its host name (sent as `device_name` at login), client and last use.
+`preloop auth sessions revoke <id>` revokes one of them, for example a
+laptop you no longer have.
+
+To revoke every JWT session for the signed-in user (this host, other hosts,
+and the console), run `preloop auth logout --all`. That calls `POST /auth/sessions/revoke-all`,
 which increments the user's `auth_generation` so every outstanding access
 and refresh token fails the next time it is used. API keys and runner
 tokens are not affected.
@@ -149,6 +162,22 @@ preloop tools exec <tool-name> --args-file ./input.json
 
 `preloop tools` talks directly to the MCP endpoint, so the visible and executable tools are automatically filtered by the current token's policy. Agent tokens only see the tools they are allowed to use.
 
+### Codex CLI Agent Control
+
+```bash
+preloop agents onboard "Codex CLI"
+preloop agents validate "Codex CLI"
+preloop codex sidecar enable
+preloop codex sidecar status
+preloop codex sidecar disable
+```
+
+Onboarding installs `@preloop-ai/codex-plugin` (`preloop-codex-plugin`) and
+writes `~/.codex/preloop-control.json`. `~/.codex/config.toml` stays
+Codex's own file. `preloop codex sidecar run` execs
+`preloop-codex-plugin run`. See
+[docs/guide/codex-cli.md](../docs/guide/codex-cli.md).
+
 ### Cursor Agent CLI
 
 ```bash
@@ -163,6 +192,22 @@ output in `--print` mode. `preloop cursor run` injects
 usage to `/api/v1/usage/ingest`. Runs bill the user's own Cursor account;
 Preloop records estimates, not Cursor billing. See
 [docs/guide/cursor-cli.md](../docs/guide/cursor-cli.md).
+
+### Copilot CLI
+
+```bash
+preloop copilot --model openai/gpt-5
+preloop copilot --model anthropic/claude-sonnet-4-5 --provider anthropic
+```
+
+`preloop copilot` starts the GitHub Copilot CLI with BYOK environment
+variables pointed at the Preloop gateway. A missing binary, credential, or
+model alias exits without launching Copilot. `--token` and `PRELOOP_TOKEN`
+override the enrolled agent credential. See
+[docs/guide/copilot-cli.md](../docs/guide/copilot-cli.md). What Preloop
+governs and meters on each Copilot surface (VS Code Chat, this launcher,
+private-runner flows, the cloud agent, inline completions) is in
+[docs/guide/copilot.md](../docs/guide/copilot.md).
 
 ### Usage
 
@@ -252,7 +297,7 @@ Both flags default to `ask`. With `--yes` alone, the CLI skips the main offboard
 - MCP servers are kept if they are still referenced by another managed agent
 - Recently active shared resources are also skipped
 
-`preloop agents refresh` (alias `sync`) re-fetches the authorized model list and rewrites only the managed model sections of onboarded agent configs. Selection, credentials, MCP config, and local backups are preserved.
+`preloop agents refresh` (alias `sync`) re-fetches the authorized model list and rewrites only the managed model sections of onboarded agent configs. Selection, credentials, MCP config, and local backups are preserved. Claude Code family pins are only moved to a newer alias when the provider's live model list confirms it; when the list cannot be fetched, the current authorized pin is kept and the refresh diff explains why.
 
 ### Operator notes
 
@@ -330,9 +375,12 @@ needs the `view_runtime_sessions` permission.
 preloop models sync                     # Pull newly released provider models into the catalog
 preloop models sync --provider anthropic
 preloop models sync --dry-run           # Report what would be added without writing
+preloop models smoke azure/chat-prod    # Send one tiny chat completion through the gateway
 ```
 
 `preloop models sync` calls `POST /api/v1/ai-models/sync` so newly released provider models enter the account catalog from credentials already stored on existing models. Then run `preloop agents refresh` to push those models into onboarded agent configs.
+
+`preloop models smoke <model-alias>` sends one small chat completion to `/openai/v1/chat/completions` and prints the HTTP status, latency, prompt/completion/total tokens and the usage row id the Cost page counts (from the `X-Preloop-Usage-Id` response header). It exits non-zero on an error status. Flags: `--prompt`, `--max-tokens`, `--timeout`, `--json`. Provider setup guides: [Amazon Bedrock](../docs/guide/providers/bedrock.md), [Azure OpenAI](../docs/guide/providers/azure-openai.md).
 
 ### Flows
 
@@ -379,7 +427,9 @@ release.
 preloop runner fg --labels local     # Foreground: register, heartbeat, lease jobs
 preloop runner fg --concurrency 4    # Hold four executions at once (default 2)
 preloop runner enable                # Install launchd / systemd / scheduled task
-preloop runner disable
+preloop runner disable                  # Remove the service
+preloop runner disable --delete [--force]   # ...and delete the runner on the server
+preloop runner rotate-token             # New runner token, service restarted
 preloop runner start|stop|restart|status
 ```
 
@@ -439,6 +489,8 @@ A shorter budget can deny before a longer workflow completes. Host-enforced
 limits and proxy timeouts can still cut a request short. OpenCode plugin
 onboarding retains its separate account-workflow timeout configuration.
 
+**Repository context.** When the hook event's cwd is inside a git work tree, the hook resolves the toplevel, the `origin` remote, and the path of cwd relative to the toplevel, within 500 ms, and sends that as `repository`. A timeout or any git error omits the field. No `origin` remote is recorded as `no_remote`. A directory outside a work tree records nothing. The value is an observation of the hook cwd, not of tool arguments, and it does not change policy evaluation. Linked worktrees report the worktree toplevel. Only `origin` is read. Strings are bounded to 512 bytes, and the remote is normalized to `host/owner/repo` with credentials removed. See [Tool configuration and approval workflow](../docs/architecture/approvals.md).
+
 Coverage follows the host's actual hook events: Claude Code uses `PreToolUse`;
 Cursor uses `beforeShellExecution`, `beforeMCPExecution`, and `preToolUse`, with
 deduplication only while the corresponding dedicated hook is installed. Cursor
@@ -482,12 +534,16 @@ All commands accept these flags:
 
 - `--token <token>` - Override the access token for this invocation
 - `--url <url>` - Override the API base URL for this invocation
+- `--profile <name>` - Use a named profile from the config file
+- `--account <slug>` - Act in one of the profile's stored accounts
 - `--verbose` / `-v` - Enable verbose output
 
 ### Environment Variables
 
 - `PRELOOP_TOKEN` - Override the access token
 - `PRELOOP_URL` - Override the API base URL
+- `PRELOOP_PROFILE` - Profile to use when `--profile` is not given
+- `PRELOOP_ACCOUNT` - Account to use when `--account` is not given
 
 ### Resolution Priority
 
@@ -495,6 +551,10 @@ Authentication and URL resolution use these rules:
 
 1. Token: `--token`, then `PRELOOP_TOKEN`, then the config file.
 2. API URL: `--url`, then `PRELOOP_URL`, then the config file, then `https://preloop.ai`.
+
+Profiles, per-account sessions, `preloop accounts` and the commands gated on
+server capabilities (`subaccounts`, `share`, `tags`, `access`) are described in
+[docs/guide/accounts-and-profiles.md](../docs/guide/accounts-and-profiles.md).
 
 ## Development
 

@@ -388,6 +388,39 @@ class RuntimeSessionSummary(BaseModel):
             "purge leaves it and its activity alone until the hold is released"
         ),
     )
+    # Fields a terminal list needs to pick the session to steer or attach to
+    # (#1148). All are filled for the current page in batched lookups and
+    # stay at their defaults when a lookup is unavailable.
+    managed_agent_id: Optional[str] = Field(
+        None, description="Managed agent whose runtime principal owns this session"
+    )
+    managed_agent_name: Optional[str] = Field(
+        None, description="Display name of that managed agent"
+    )
+    agent_kind: Optional[str] = Field(
+        None,
+        description=(
+            "Agent kind of that managed agent (claude_code, codex, hermes, ...), "
+            "or null when the session has no managed agent"
+        ),
+    )
+    cwd: Optional[str] = Field(
+        None,
+        description=(
+            "Working directory the agent's hook last reported for this session; "
+            "an observation used for labelling, not a trusted path"
+        ),
+    )
+    tool_call_count: int = Field(
+        0,
+        description=(
+            "Tool calls recorded for this session, or the count its usage hook "
+            "reported when no tool call was recorded server side"
+        ),
+    )
+    pending_approval_count: int = Field(
+        0, description="Approval requests for this session still awaiting a decision"
+    )
 
 
 class AccountRuntimeSessionListResponse(BaseModel):
@@ -463,6 +496,10 @@ class ManagedAgentSummary(BaseModel):
     supports_existing_session: bool = False
     supports_voice: bool = False
     supports_interrupt: bool = False
+    #: Loopback desktop the runtime plugin advertised. ``none`` when the key
+    #: is missing or not a known desktop kind.
+    desktop: Literal["vnc", "rdp", "none"] = "none"
+    desktop_display: Optional[str] = None
     control_session_mode: str = "offline"
     #: Last Agent Control heartbeat this agent's plugin sent. Exposed so an
     #: operator (and staging debugging) can tell "no plugin" from "the plugin
@@ -745,6 +782,7 @@ class RuntimeSessionUpdateRequest(BaseModel):
 class RuntimeSessionActivityItem(BaseModel):
     """One activity item in a runtime session timeline."""
 
+    activity_id: Optional[str] = None
     activity_type: str
     timestamp: datetime
     title: str
@@ -822,6 +860,11 @@ class RuntimeSessionRequestItem(BaseModel):
     total_tokens: int = 0
     estimated_cost: float = 0.0
     endpoint: Optional[str] = None
+    #: Credential class that authorized the request (``api_key``,
+    #: ``oauth_mcp_token`` or ``user_token``). API consumers can tell a
+    #: plain-key session from a principal session; the console timeline
+    #: does not render this field yet.
+    auth_subject_type: Optional[str] = None
     tools: List[RuntimeSessionRequestTool] = Field(default_factory=list)
     tools_total_schema_tokens: int = 0
     cache: RuntimeSessionRequestCache = Field(

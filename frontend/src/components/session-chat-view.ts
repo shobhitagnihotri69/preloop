@@ -1,14 +1,23 @@
+import {
+  renderSessionApproval,
+  renderSessionActivity,
+} from './session-approval-presentation';
+import './session-tool-card';
+import './session-approval-card';
+import './session-live-activity';
+import { type SessionApprovalState } from './session-live-activity';
+import {
+  sessionTools,
+  sessionTimelineTime,
+  type SessionTool,
+} from '../utils/session-live';
+import type { ApprovalRequest } from '../types';
 /**
- * Chat-style session transcript: ONLY top-level user prompts and final agent
- * responses are expanded; tool calls, tool results, system/injected segments
- * and intermediate agent output are nested in collapsed, manually expandable
- * step groups. Reference UX: Claude Code web chat. When in doubt, collapse —
- * except for prompt classification, where doubt keeps the prompt visible
- * (see utils/transcript.ts).
- *
- * Presentational only: events/activity arrive as props from
- * <preloop-session-observer>; paging is requested by re-emitting the
- * observer's existing `session-events-page-requested` event.
+ * Chronological conversation with named captured tools and inline approvals.
+ * System/injected segments and uncorrelated historical steps remain expandable.
+ * Gateway/activity props and paging remain owned by the observer; the shared
+ * live controller fetches permission-gated session approvals and reconciles
+ * websocket updates without replacing the scroll container.
  */
 import { LitElement, css, html, nothing } from 'lit';
 import type { PropertyValues } from 'lit';
@@ -28,6 +37,10 @@ import type {
   TranscriptStepGroupItem,
 } from '../utils/transcript';
 import { buildConversation } from '../utils/transcript';
+import { getApprovalRepository } from '../utils/approval-identity';
+import './repository-chip';
+import './browser-step-row';
+import { browserStepKey } from '../utils/session-artifacts';
 import { SESSION_EVENTS_PAGE_REQUESTED_EVENT } from '../utils/session-observer';
 
 const MESSAGE_PREVIEW_CHARS = 2000;
@@ -73,11 +86,83 @@ export const TALK_RETRY_EVENT = 'talk-retry';
 export class SessionChatView extends LitElement {
   // `attribute: false`: these are data-only properties set via property
   // bindings; an attribute path would (de)serialize large arrays as JSON.
+  @state() private approvalState: SessionApprovalState = {
+    requests: [],
+    canDecide: false,
+    author: '',
+    now: Date.now(),
+  };
+  private renderApproval(request: ApprovalRequest) {
+    return renderSessionApproval(this, this.approvalState, request);
+  }
+  @property({ type: Boolean }) liveEnabled = true;
+  @property({ type: Boolean }) ended = false;
+  private renderActivity() {
+    if (!this.liveEnabled) return nothing;
+    return renderSessionActivity(
+      this,
+      this.sessionId,
+      this.events,
+      this.activity,
+      this.ended,
+      this.approvalState,
+      (state) => {
+        this.approvalState = state;
+      }
+    );
+  }
+  private get displayItems(): Array<
+    | TranscriptItem
+    | { type: 'tool'; key: string; tool: SessionTool }
+    | { type: 'approval'; key: string; request: ApprovalRequest }
+  > {
+    const tools = sessionTools(this.events, this.activity);
+    const items: Array<
+      | TranscriptItem
+      | { type: 'tool'; key: string; tool: SessionTool }
+      | { type: 'approval'; key: string; request: ApprovalRequest }
+    > = this.conversation.items.flatMap<TranscriptItem>((item) => {
+      if (item.type !== 'steps') return [item];
+      const steps = item.steps.filter(
+        (step) =>
+          step.kind !== 'tool_call' &&
+          !(
+            step.kind === 'tool_result' &&
+            step.toolCallIds?.length &&
+            step.toolCallIds.every((id) =>
+              tools.some(
+                (tool) => tool.callId === id && tool.result !== undefined
+              )
+            )
+          )
+      );
+      return steps.length ? [{ ...item, steps }] : [];
+    });
+    for (const tool of tools) items.push({ type: 'tool', key: tool.id, tool });
+    for (const request of this.approvalState.requests)
+      items.push({ type: 'approval', key: `approval:${request.id}`, request });
+    const timestamp = (item: (typeof items)[number]): string | null =>
+      item.type === 'tool'
+        ? item.tool.timestamp
+        : item.type === 'approval'
+          ? item.request.requested_at
+          : item.type === 'steps'
+            ? item.steps[0]?.timestamp
+            : item.timestamp;
+    return items.sort(
+      (a, b) =>
+        sessionTimelineTime(timestamp(a)) - sessionTimelineTime(timestamp(b))
+    );
+  }
   @property({ attribute: false })
   events: FlowGatewayEvent[] = [];
 
   @property({ attribute: false })
   activity: RuntimeSessionActivityItem[] = [];
+
+  /** Session the activity belongs to; browser-step screenshots load from it. */
+  @property({ type: String })
+  sessionId = '';
 
   @property({ type: Boolean })
   loading = false;
@@ -392,6 +477,14 @@ export class SessionChatView extends LitElement {
       white-space: pre-wrap;
     }
 
+    .browser-step-item {
+      margin: 0.25rem 0;
+      border-radius: 8px;
+    }
+    .browser-step-item:focus {
+      outline: 2px solid var(--sl-color-primary-400, #60a5fa);
+      outline-offset: 2px;
+    }
     .divider {
       align-items: center;
       color: var(--sl-color-neutral-500);
@@ -427,6 +520,13 @@ export class SessionChatView extends LitElement {
   `;
 
   willUpdate(changed: PropertyValues<this>): void {
+    if (changed.has('sessionId'))
+      this.approvalState = {
+        requests: [],
+        canDecide: false,
+        author: '',
+        now: Date.now(),
+      };
     if (changed.has('events') || changed.has('activity')) {
       this.conversation = buildConversation(this.events, this.activity);
       // Screen readers get the agent's reply, not the whole thread: the last
@@ -495,7 +595,7 @@ export class SessionChatView extends LitElement {
 
   /** What the thread is showing right now, cheap enough to compare per update. */
   private contentSignature(): string {
-    const items = this.conversation.items;
+    const items = this.displayItems;
     const last = items[items.length - 1];
     return `${items.length}|${last ? last.key : ''}|${this.events.length}|${
       this.activity.length
@@ -793,6 +893,13 @@ export class SessionChatView extends LitElement {
       <div class="step step-kind-${step.kind}">
         <div class="step-header">
           <span class="step-label">${step.label}</span>
+          ${
+            getApprovalRepository(step.repositoryArgs)
+              ? html`<repository-chip
+                  .toolArgs=${step.repositoryArgs}
+                ></repository-chip>`
+              : nothing
+          }
           ${step.serverName ? html`<span>${step.serverName}</span>` : nothing}
           <span>${this.formatTime(step.timestamp)}</span>
           ${
@@ -840,13 +947,14 @@ export class SessionChatView extends LitElement {
         </div>
         ${
           displayText
-            ? html`
+            ? // prettier-ignore
+              html`
                 <pre class="step-text">
 ${
-  displayText.length > STEP_PREVIEW_CHARS && !expanded
-    ? `${displayText.slice(0, STEP_PREVIEW_CHARS)}…`
-    : displayText
-}</pre>
+                    displayText.length > STEP_PREVIEW_CHARS && !expanded
+                      ? `${displayText.slice(0, STEP_PREVIEW_CHARS)}…`
+                      : displayText
+                  }</pre>
               `
             : nothing
         }
@@ -867,9 +975,35 @@ ${
     `;
   }
 
-  private renderItem(item: TranscriptItem) {
+  /** Scroll the row of one browser step into view and focus it. */
+  scrollToBrowserStep(key: string): boolean {
+    const row = this.renderRoot.querySelector<HTMLElement>(
+      `[data-browser-step-key="${key}"]`
+    );
+    if (!row) return false;
+    row.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    row.focus({ preventScroll: true });
+    return true;
+  }
+
+  private renderItem(item: (typeof this.displayItems)[number]) {
+    if (item.type === 'tool')
+      return html`<session-tool-card .tool=${item.tool}></session-tool-card>`;
+    if (item.type === 'approval') return this.renderApproval(item.request);
     if (item.type === 'message') return this.renderMessage(item);
     if (item.type === 'steps') return this.renderStepGroup(item);
+    if (item.type === 'browser_step') {
+      return html`<div
+        class="browser-step-item"
+        tabindex="-1"
+        data-browser-step-key=${browserStepKey(item.activity)}
+      >
+        <browser-step-row
+          .item=${item.activity}
+          .sessionId=${this.sessionId}
+        ></browser-step-row>
+      </div>`;
+    }
     return html`
       <div class="divider">
         ${item.label}
@@ -951,6 +1085,10 @@ ${
   }
 
   render() {
+    return html`${this.renderActivity()}${this.renderContent()}`;
+  }
+
+  private renderContent() {
     if (this.loading && !this.events.length && !this.activity.length) {
       return html`
         <div class="loading">
@@ -960,7 +1098,8 @@ ${
       `;
     }
 
-    const { items, stats } = this.conversation;
+    const { stats } = this.conversation;
+    const items = this.displayItems;
     if (!items.length && !this.pending.length) {
       return html`${this.renderLiveRegion()}
         <div class="empty">${this.emptyText}</div>`;

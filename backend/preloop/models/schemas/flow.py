@@ -10,6 +10,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    RootModel,
     TypeAdapter,
     field_serializer,
     field_validator,
@@ -21,9 +22,17 @@ from preloop.models.schemas.verification import (
     ResolvedVerificationPolicy,
     VerificationPolicy,
 )
+from preloop.services.backport_branches import (
+    branch_component,
+    validate_branch_name,
+)
 from preloop.services.report_publication import (
     MAX_COMMIT_MESSAGE_LENGTH,
     MAX_PATH_LENGTH,
+)
+from preloop.services.stream_stall import (
+    STREAM_IDLE_TIMEOUT_CONFIG_KEY,
+    validate_stream_idle_timeout,
 )
 from preloop.utils.schedule_text import (
     WEEKDAYS,
@@ -58,6 +67,111 @@ class GitCloneRepository(BaseModel):
     def serialize_uuids(self, value: Optional[UUID]) -> Optional[str]:
         """Serialize UUID fields to strings."""
         return str(value) if value is not None else None
+
+
+_REPOSITORY_SEGMENT_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+
+
+class RepositoryBinding(BaseModel):
+    """A code-host repository that an issue-only tracker's flows work on.
+
+    A Jira project has no git repository of its own. A binding names the
+    repository on a code-host tracker the account already has (GitHub,
+    GitLab, or any tracker whose client sets ``hosts_repositories``). The
+    clone and push credential comes from that tracker, never from the
+    issue tracker's token.
+    """
+
+    tracker_id: UUID = Field(
+        description="Code-host tracker that hosts the repository and supplies "
+        "the clone and push credential"
+    )
+    repository: str = Field(
+        min_length=3,
+        max_length=255,
+        description="Repository path on the code host: owner/name, "
+        "group/subgroup/name, or workspace/repo",
+    )
+    base_branch: Optional[str] = Field(
+        default=None,
+        max_length=255,
+        description="Branch to check out and open the pull request against. "
+        "When unset, the flow's source_branch is used",
+    )
+    default: bool = Field(
+        default=False,
+        description="Use this entry when the binding lists several repositories",
+    )
+
+    @field_validator("repository")
+    @classmethod
+    def validate_repository(cls, value: str) -> str:
+        """Require a slash-separated path of plain segments."""
+        cleaned = value.strip().strip("/")
+        if cleaned.endswith(".git"):
+            cleaned = cleaned[: -len(".git")]
+        segments = cleaned.split("/")
+        if len(segments) < 2 or any(
+            not segment
+            or segment in {".", ".."}
+            or not _REPOSITORY_SEGMENT_RE.match(segment)
+            for segment in segments
+        ):
+            raise ValueError(
+                "repository must be a path such as owner/name or workspace/repo"
+            )
+        return cleaned
+
+    @field_validator("base_branch")
+    @classmethod
+    def validate_base_branch(cls, value: Optional[str]) -> Optional[str]:
+        """Reject branch names git would refuse or a shell could misread."""
+        if value is None:
+            return None
+        cleaned = value.strip()
+        if not cleaned:
+            return None
+        if (
+            cleaned.startswith(("-", "/"))
+            or cleaned.endswith(("/", ".lock"))
+            or ".." in cleaned
+            or any(ch.isspace() or ch in "~^:?*[\\" for ch in cleaned)
+        ):
+            raise ValueError(f"base_branch is not a valid branch name: {value!r}")
+        return cleaned
+
+    @field_serializer("tracker_id")
+    def serialize_tracker_id(self, value: UUID) -> str:
+        """Serialize the tracker id to a string."""
+        return str(value)
+
+
+def validate_repository_bindings(
+    bindings: List[RepositoryBinding],
+) -> List[RepositoryBinding]:
+    """Reject binding lists that cannot pick one repository.
+
+    Args:
+        bindings: Parsed binding entries.
+
+    Returns:
+        The same list.
+
+    Raises:
+        ValueError: More than one entry is marked default, or the same
+            repository is listed twice.
+    """
+    if sum(1 for binding in bindings if binding.default) > 1:
+        raise ValueError("repository_bindings may mark at most one entry as default")
+    seen: set[tuple[str, str]] = set()
+    for binding in bindings:
+        key = (str(binding.tracker_id), binding.repository.lower())
+        if key in seen:
+            raise ValueError(
+                f"repository_bindings lists {binding.repository} more than once"
+            )
+        seen.add(key)
+    return bindings
 
 
 class ReportPublication(BaseModel):
@@ -207,12 +321,130 @@ class FollowUpFiling(BaseModel):
         return cleaned
 
 
+MAX_BACKPORT_TARGETS = 10
+MAX_BACKPORT_REVIEWERS = 15
+
+
+class Backport(BaseModel):
+    """Cherry-pick a merged pull request onto later release branches.
+
+    Issue #961. When a pull request merges into ``source_branch``, the control
+    plane cherry-picks its merge commit onto a new branch cut from each entry
+    of ``target_branches``, in order, and opens one pull request per target.
+    No agent runs and nothing is ever merged. A conflict is reported with the
+    conflicting files and left for a person.
+
+    This block is separate from ``GitCloneConfig.source_branch``, which names
+    the branch an agent checkout starts from, a different meaning.
+
+    ``extra='forbid'``: a misspelled key here is a backport opened against the
+    wrong branch, or not at all.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = Field(
+        default=False,
+        description=(
+            "Whether merged pull requests are backported by the control plane "
+            "instead of running an agent"
+        ),
+    )
+    source_branch: str = Field(
+        description=(
+            "Release branch whose merged pull requests are backported. A merge "
+            "into any other branch does not start the flow"
+        ),
+    )
+    target_branches: List[str] = Field(
+        min_length=1,
+        max_length=MAX_BACKPORT_TARGETS,
+        description=(
+            "Branches the change is cherry-picked onto, in order, for example "
+            "the next release branch and then the default branch"
+        ),
+    )
+    reviewers: List[str] = Field(
+        default_factory=list,
+        max_length=MAX_BACKPORT_REVIEWERS,
+        description=(
+            "Usernames asked to review every backport pull request. A failed "
+            "review request is recorded and the pull request stays open"
+        ),
+    )
+    comment_on_original: bool = Field(
+        default=True,
+        description=(
+            "Post one summary comment with the status of every target on the "
+            "original pull request"
+        ),
+    )
+
+    @field_validator("source_branch")
+    @classmethod
+    def validate_source_branch(cls, value: str) -> str:
+        """The source branch is a plain branch name."""
+        return validate_branch_name(value)
+
+    @field_validator("target_branches")
+    @classmethod
+    def validate_target_branches(cls, value: List[str]) -> List[str]:
+        """Targets are plain, unique, and map to distinct backport branches."""
+        cleaned: List[str] = []
+        components: Dict[str, str] = {}
+        for raw in value:
+            name = validate_branch_name(raw)
+            if name in cleaned:
+                raise ValueError(f"backport.target_branches lists '{name}' twice")
+            component = branch_component(name)
+            if component in components:
+                raise ValueError(
+                    f"backport.target_branches '{components[component]}' and "
+                    f"'{name}' would use the same backport branch name"
+                )
+            components[component] = name
+            cleaned.append(name)
+        return cleaned
+
+    @field_validator("reviewers")
+    @classmethod
+    def validate_reviewers(cls, value: List[str]) -> List[str]:
+        """Reviewer usernames are short, non-empty and deduplicated."""
+        cleaned: List[str] = []
+        for reviewer in value:
+            text = (reviewer or "").strip().lstrip("@")
+            if not text:
+                raise ValueError("backport.reviewers may not contain empty names")
+            if len(text) > 100 or any(ch.isspace() for ch in text):
+                raise ValueError(f"backport.reviewers entry '{text[:40]}' is invalid")
+            if text not in cleaned:
+                cleaned.append(text)
+        return cleaned
+
+    @model_validator(mode="after")
+    def validate_source_not_a_target(self) -> "Backport":
+        """Backporting a branch onto itself would reopen the original change."""
+        if self.source_branch in self.target_branches:
+            raise ValueError(
+                "backport.target_branches may not include backport.source_branch"
+            )
+        return self
+
+
 class GitCloneConfig(BaseModel):
     """Configuration for git clone operations before agent execution."""
 
     enabled: bool = Field(default=False, description="Whether git clone is enabled")
     repositories: List[GitCloneRepository] = Field(
         default_factory=list, description="List of repositories to clone"
+    )
+    repository_bindings: List[RepositoryBinding] = Field(
+        default_factory=list,
+        description=(
+            "Code-host repositories for flows triggered by an issue-only "
+            "tracker (Jira). Used only when repositories is empty and the "
+            "trigger is Jira; overrides the Jira project's default binding"
+        ),
     )
     git_user_name: Optional[str] = Field(
         default="Preloop", description="Name to use for git commits"
@@ -295,6 +527,45 @@ class GitCloneConfig(BaseModel):
             "issues, after the agent has exited and without giving it write tools"
         ),
     )
+
+    backport: Optional[Backport] = Field(
+        default=None,
+        description=(
+            "Backport merged pull requests from a release branch onto later "
+            "branches. When enabled, the control plane runs the backport and "
+            "no agent runs"
+        ),
+    )
+
+    @field_validator("repository_bindings")
+    @classmethod
+    def validate_bindings(
+        cls, value: List[RepositoryBinding]
+    ) -> List[RepositoryBinding]:
+        """At most one default, no duplicate repositories."""
+        return validate_repository_bindings(value)
+
+    @model_validator(mode="after")
+    def validate_backport(self) -> "GitCloneConfig":
+        """A backport run publishes its own pull requests and nothing else.
+
+        The agent publication paths would open a second, unrelated pull
+        request from an agent checkout that never runs, so they are refused
+        next to an enabled backport block.
+        """
+        block = self.backport
+        if block is None or not block.enabled:
+            return self
+        if self.create_pull_request:
+            raise ValueError(
+                "backport cannot be combined with create_pull_request: the "
+                "backport opens one pull request per target branch itself"
+            )
+        if self.report_publication is not None and self.report_publication.enabled:
+            raise ValueError("backport cannot be combined with report_publication")
+        if self.follow_up_filing is not None and self.follow_up_filing.enabled:
+            raise ValueError("backport cannot be combined with follow_up_filing")
+        return self
 
     @model_validator(mode="after")
     def validate_report_publication(self) -> "GitCloneConfig":
@@ -885,8 +1156,21 @@ class FlowNotifications(BaseModel):
 class WebhookConfig(BaseModel):
     """Configuration for webhook triggers."""
 
-    webhook_secret: str = Field(
-        description="Secure token for authenticating webhook requests (auto-generated)"
+    webhook_secret: Optional[str] = Field(
+        default=None,
+        description=(
+            "Secure token for authenticating webhook requests (auto-generated "
+            "for webhook triggers; unset on flows triggered by tracker events)"
+        ),
+    )
+    supersede_on_update: bool = Field(
+        default=False,
+        description=(
+            "When a pull or merge request gets a new head, stop this flow's "
+            "executions still working on an older head of the same request "
+            "before starting the new one. Off by default; the Pull Request "
+            "Reviewer preset turns it on."
+        ),
     )
     dedupe_path: Optional[str] = Field(
         default=None,
@@ -965,6 +1249,75 @@ class ModelRoutingRule(BaseModel):
         return str(value)
 
 
+class ModelByLabelRule(BaseModel):
+    """One complexity label to one model and reasoning effort (#851).
+
+    The short form of a routing rule, for the common case an operator wants
+    from the console: "issues labelled complexity:high run on the big model,
+    thinking hard". It desugars into the same ordered rules engine as
+    ``model_routing``, so the two can never disagree about a label.
+
+    Deliberately model and effort only. Switching harness per label is what
+    ``model_routing`` is for, and a field the console cannot edit is a field
+    the next console save would quietly drop.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    label: str = Field(
+        min_length=1,
+        max_length=64,
+        description="Label that selects this rule, matched against the issue's current labels.",
+    )
+    ai_model_id: Optional[UUID] = Field(
+        default=None,
+        description="Model to run on. Omit to keep the flow's selected model.",
+    )
+    reasoning_effort: Optional[Literal["low", "medium", "high"]] = Field(
+        default=None,
+        description="Reasoning effort for this run. Omit to leave the model's own default.",
+    )
+
+    @field_validator("label")
+    @classmethod
+    def strip_label(cls, value: str) -> str:
+        """A label with surrounding spaces never matches; reject it early."""
+        label = value.strip()
+        if not label:
+            raise ValueError("label must be non-empty")
+        return label
+
+    @model_validator(mode="after")
+    def require_an_override(self) -> "ModelByLabelRule":
+        """A rule that changes nothing is a rule somebody mis-saved."""
+        if not self.ai_model_id and not self.reasoning_effort:
+            raise ValueError(
+                "each model_by_label rule must set ai_model_id and/or reasoning_effort"
+            )
+        return self
+
+    @field_serializer("ai_model_id")
+    def serialize_model_id(self, value: Optional[UUID]) -> Optional[str]:
+        """Store model ids as strings inside agent_config JSON."""
+        return str(value) if value is not None else None
+
+
+class ModelByLabelConfig(RootModel[List[ModelByLabelRule]]):
+    """``agent_config.model_by_label``: an ordered list, first match wins."""
+
+    root: List[ModelByLabelRule] = Field(default_factory=list, max_length=50)
+
+    @model_validator(mode="after")
+    def unique_labels(self) -> "ModelByLabelConfig":
+        """A label twice means one of the two never applies."""
+        seen: set[str] = set()
+        for rule in self.root:
+            if rule.label in seen:
+                raise ValueError(f"duplicate model_by_label label '{rule.label}'")
+            seen.add(rule.label)
+        return self
+
+
 class ModelRoutingConfig(BaseModel):
     """Optional per-flow ordered model/harness routing (agent_config.model_routing)."""
 
@@ -984,6 +1337,49 @@ class ModelRoutingConfig(BaseModel):
         return self
 
 
+class FlowExecutionLimits(BaseModel):
+    """Optional per-execution ceilings inside ``agent_config.limits`` (#840).
+
+    A flow bounds one run by wall clock (``timeout_seconds``); these bound
+    what that run may spend. All three are optional and independent; unset
+    means that ceiling does not apply. Values must be positive, and the
+    gateway refuses a request only once the run has *reached* a ceiling, so
+    the request that crosses it is allowed to complete.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    max_total_tokens: Optional[int] = Field(
+        default=None,
+        ge=1,
+        le=2_000_000_000,
+        description=(
+            "Hard ceiling on input+output tokens attributed to one execution. "
+            "The gateway sums the run's usage before each model request and "
+            "refuses once the total has reached it."
+        ),
+    )
+    max_usd: Optional[float] = Field(
+        default=None,
+        gt=0,
+        le=1_000_000,
+        description=(
+            "Hard ceiling in USD on the estimated cost attributed to one "
+            "execution. Unpriced runs are not compared (an unknown cost is "
+            "not an exceeded one)."
+        ),
+    )
+    max_turns: Optional[int] = Field(
+        default=None,
+        ge=1,
+        le=1_000_000,
+        description=(
+            "Hard ceiling on model requests (turns) attributed to one "
+            "execution. Counted at the gateway as one turn per request."
+        ),
+    )
+
+
 class FlowBase(BaseModel):
     name: Optional[str] = None
     description: Optional[str] = None
@@ -998,6 +1394,17 @@ class FlowBase(BaseModel):
     webhook_config: Optional[WebhookConfig] = None
     schedule_config: Optional[ScheduleConfig] = None
     prompt_template: Optional[str] = None
+    review_instructions: Optional[str] = Field(
+        default=None,
+        max_length=32768,
+        description=(
+            "Blocking review rules for the Pull Request Reviewer. Same "
+            "content as .preloop/review-policy.md, for a repository that "
+            "cannot commit that file. Injected as "
+            "{{flow.review_instructions}}. Empty means the repository file "
+            "is the only source."
+        ),
+    )
     ai_model_id: Optional[UUID] = None
     agent_type: Optional[str] = "openhands"
     agent_config: Optional[Dict[str, Any]] = None
@@ -1071,16 +1478,36 @@ class FlowBase(BaseModel):
         ),
     )
 
+    @field_validator("review_instructions")
+    @classmethod
+    def normalize_review_instructions(cls, value: Optional[str]) -> Optional[str]:
+        """Store blank instructions as NULL and reject an oversized paste."""
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            raise ValueError("review_instructions must be a string")
+        text = value.strip()
+        if not text:
+            return None
+        if len(text) > 32768:
+            raise ValueError("review_instructions must be at most 32768 characters")
+        return text
+
     @field_validator("agent_config")
     @classmethod
     def validate_model_routing_config(cls, v):
-        """Validate optional agent_config.model_routing shape before persistence."""
+        """Validate optional agent_config keys before persistence."""
         if not isinstance(v, dict):
             return v
         routing = v.get("model_routing")
-        if routing is None:
-            return v
-        ModelRoutingConfig.model_validate(routing)
+        if routing is not None:
+            ModelRoutingConfig.model_validate(routing)
+        limits = v.get("limits")
+        if limits is not None:
+            FlowExecutionLimits.model_validate(limits)
+        idle = v.get(STREAM_IDLE_TIMEOUT_CONFIG_KEY)
+        if idle is not None:
+            validate_stream_idle_timeout(idle)
         return v
 
     @field_validator("trigger_project_ids", mode="before")
@@ -1127,6 +1554,9 @@ class FlowResponse(FlowBase):
     # Catalog identity for built-in presets. Null for account flows and for
     # cloned presets, whose name is user-editable and is not identity.
     slug: Optional[str] = None
+    # Catalog marker copied from the preset YAML. Not a flow column: account
+    # copies inherit it from the global preset they were cloned from.
+    supports_persistent: bool = False
     # Template tracking - expose in response for UI to show update notifications
     source_preset_id: Optional[UUID] = None
     prompt_customized: bool = False

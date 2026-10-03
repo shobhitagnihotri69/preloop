@@ -1,5 +1,7 @@
 # search_sessions: the corpus as a tool
 
+Editions: OSS, Cloud, Enterprise. Unless stated otherwise, everything on this page ships in OSS.
+
 `search_sessions` is the built-in tool an agent uses to look up what past
 sessions did before repeating the work. It is the same ranked search the
 console runs, asked by the agent instead of by a human: did this migration
@@ -141,3 +143,11 @@ A search through the tool writes one audit row with the agent as the actor and
 tell an agent's grep over the transcripts from a person's. The query text is
 not stored unless the account opted in. See
 [docs/guide/session-search-audit.md](session-search-audit.md).
+
+## Files an agent stored
+
+Transcripts, documents, screenshots and other files an agent deposits on its
+session are [session artifacts](artifacts.md). They appear on the session
+timeline next to the turns that produced them. Artifacts are not searchable
+yet: neither their contents nor their name and labels are in this index.
+Indexing them is planned (#1082).

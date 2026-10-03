@@ -33,9 +33,7 @@
     "image": "registry.example.com/preloop-environment@sha256:REPLACE_WITH_PUBLISHED_DIGEST",
     "harness": "codex",
     "setup_commands": [
-      "python3 -m venv .venv",
-      ".venv/bin/pip install -e '.[dev]'",
-      ".venv/bin/python scripts/init_db.py --force"
+      "PYTHONPATH=backend python scripts/init_db.py --force"
     ],
     "services": [
       {
@@ -63,17 +61,15 @@
     },
     "test_commands": {
       "backend": [
-        ".venv/bin/pytest backend/tests"
+        "preloop-pytest -m \"not integration\" backend/tests"
       ]
     },
     "artifact_paths": [
       "test-results"
     ],
     "lockfiles": [
-      "pyproject.toml"
-    ],
-    "cache_paths": [
-      ".venv"
+      "pyproject.toml",
+      ".github/requirements/app-dev.txt"
     ]
   },
   "preloop-application": {
@@ -125,6 +121,33 @@
     "cache_paths": [
       ".venv",
       "frontend/node_modules"
+    ]
+  },
+  "preloop-browser": {
+    "version": 1,
+    "image": "registry.example.com/preloop-environment@sha256:REPLACE_WITH_PUBLISHED_DIGEST",
+    "harness": "codex",
+    "setup_timeout_seconds": 180,
+    "services": [
+      {
+        "name": "egress-proxy",
+        "image": "registry.example.com/preloop-egress-proxy@sha256:REPLACE_WITH_PUBLISHED_DIGEST",
+        "port": 3128,
+        "env": {
+          "EGRESS_ALLOWED_ORIGINS": "http://fixture-site:8080",
+          "EGRESS_ALLOW_PRIVATE_CIDRS": "172.20.0.0/16"
+        }
+      }
+    ],
+    "env": {
+      "PRELOOP_BROWSER_PROXY": "http://${service.egress-proxy}:3128",
+      "PRELOOP_HARNESS": "codex"
+    },
+    "setup_commands": [
+      "bash environments/preloop/browser/enable.sh"
+    ],
+    "artifact_paths": [
+      "result.json"
     ]
   }
 }

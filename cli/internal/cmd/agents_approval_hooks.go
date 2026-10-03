@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 
 	"github.com/preloop/preloop/cli/internal/api"
@@ -61,6 +62,8 @@ func permissionSourceForAgent(agent AgentConfig) string {
 		return permissionSourceCodexCLI
 	case strings.EqualFold(strings.TrimSpace(agent.Name), "Cursor"):
 		return permissionSourceCursor
+	case strings.EqualFold(strings.TrimSpace(agent.Name), "Copilot CLI"):
+		return permissionSourceCopilotCLI
 	case isOpenCodeAgent(agent):
 		return permissionSourceOpenCode
 	default:
@@ -112,6 +115,9 @@ func permissionHookCredentialPath(agent AgentConfig) (string, error) {
 // approvalHookConfigPath returns the agent-specific hook configuration file for
 // the given source.
 func approvalHookConfigPath(source string) (string, error) {
+	if source == permissionSourceCopilotCLI {
+		return copilotPreloopHooksPath()
+	}
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return "", err
@@ -311,6 +317,17 @@ func installApprovalHooks(agent AgentConfig, baseURL, token string, out io.Write
 		); err != nil {
 			return err
 		}
+	case permissionSourceCopilotCLI:
+		// One Preloop-owned file under ~/.copilot/hooks/; re-onboard replaces
+		// only our preToolUse entry and leaves any usage lifecycle entries.
+		// The invocation is per OS (PowerShell quoting on Windows).
+		if err := upsertCopilotHookEvent(
+			"preToolUse",
+			copilotApprovalHookCommand(),
+			hostTimeoutSeconds,
+		); err != nil {
+			return err
+		}
 	}
 
 	if out != nil {
@@ -449,6 +466,11 @@ func removeApprovalHooks(agent AgentConfig, out io.Writer) error {
 		if err := removeCursorUsageHooks(agent, out); err != nil {
 			return err
 		}
+	case permissionSourceCopilotCLI:
+		// Single Preloop-owned file: delete it entirely (approvals + usage).
+		if err := removeCopilotPreloopHooks(out); err != nil {
+			return err
+		}
 	}
 
 	if err := removePermissionHookCredential(agent); err != nil {
@@ -522,6 +544,149 @@ func removeCursorUsageHooks(agent AgentConfig, out io.Writer) error {
 	}
 	if out != nil {
 		fmt.Fprintln(out, "  Usage hooks: removed Cursor session and token-estimate hooks") //nolint:errcheck
+	}
+	return nil
+}
+
+// copilotPreloopHooksFileName is the single Preloop-owned Copilot CLI hook
+// file. Re-onboard replaces this file's entries; offboard deletes only it.
+const copilotPreloopHooksFileName = "preloop.json"
+
+// copilotUsageHookEvents are Copilot CLI lifecycle events wired to
+// `preloop usage hook --from copilot`. agentStop maps to ingest `response`.
+var copilotUsageHookEvents = []string{
+	"sessionStart",
+	"sessionEnd",
+	"subagentStart",
+	"subagentStop",
+	"agentStop",
+}
+
+// copilotHooksDir returns ~/.copilot/hooks, or $COPILOT_HOME/hooks when set.
+func copilotHooksDir() (string, error) {
+	if home := strings.TrimSpace(os.Getenv("COPILOT_HOME")); home != "" {
+		return filepath.Join(home, "hooks"), nil
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, ".copilot", "hooks"), nil
+}
+
+func copilotPreloopHooksPath() (string, error) {
+	dir, err := copilotHooksDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, copilotPreloopHooksFileName), nil
+}
+
+func copilotUsageHookCommand() string {
+	return copilotHookInvocationFor(runtime.GOOS, "usage hook --from copilot")
+}
+
+// copilotApprovalHookCommand is the Copilot CLI preToolUse entry. It carries
+// the same "agents permission-hook" marker approvalHookCommand uses, in the
+// per-OS invocation form Copilot hook entries need.
+func copilotApprovalHookCommand() string {
+	return copilotHookInvocationFor(
+		runtime.GOOS, "agents permission-hook --source "+permissionSourceCopilotCLI,
+	)
+}
+
+// copilotHookInvocationFor renders a preloop invocation for a Copilot hook
+// entry on one OS. The Windows entry runs under PowerShell, where a bare
+// path containing spaces (C:\Program Files\...) would not parse, so the
+// executable is single-quoted and invoked with the call operator.
+func copilotHookInvocationFor(goos, args string) string {
+	exe := preloopExecutableForHooks()
+	if goos == "windows" {
+		return fmt.Sprintf("& '%s' %s", strings.ReplaceAll(exe, "'", "''"), args)
+	}
+	return fmt.Sprintf("%s %s", exe, args)
+}
+
+// copilotCommandHookEntry builds one Copilot hooks-reference command object
+// for the OS this runner is on.
+func copilotCommandHookEntry(command string, timeoutSec int) map[string]interface{} {
+	return copilotCommandHookEntryFor(runtime.GOOS, command, timeoutSec)
+}
+
+// copilotCommandHookEntryFor builds one Copilot hooks-reference command
+// object. POSIX hosts keep the documented bash-shaped entry. Windows hosts
+// get a powershell entry, because Copilot never executes the bash key there
+// and the hooks would silently not run.
+func copilotCommandHookEntryFor(goos, command string, timeoutSec int) map[string]interface{} {
+	entry := map[string]interface{}{"type": "command"}
+	if goos == "windows" {
+		entry["powershell"] = command
+	} else {
+		entry["bash"] = command
+	}
+	if timeoutSec > 0 {
+		entry["timeoutSec"] = timeoutSec
+	}
+	return entry
+}
+
+// upsertCopilotHookEvent replaces the Preloop-owned list for one event key in
+// ~/.copilot/hooks/preloop.json, creating the file when missing. Other event
+// keys (and any sibling hook files) are left alone.
+func upsertCopilotHookEvent(eventKey, bash string, timeoutSec int) error {
+	path, err := copilotPreloopHooksPath()
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		return fmt.Errorf("failed to create Copilot hooks directory: %w", err)
+	}
+	doc, err := loadJSONDocumentOrEmpty(path)
+	if err != nil {
+		return err
+	}
+	doc["version"] = 1
+	hooks := ensureObjectChild(doc, "hooks")
+	hooks[eventKey] = []interface{}{copilotCommandHookEntry(bash, timeoutSec)}
+	return writeJSONDocument(path, doc)
+}
+
+// installCopilotUsageHooks wires `preloop usage hook --from copilot` into
+// Copilot CLI lifecycle events. Idempotent. Installed even when --approvals
+// is off (same split as Cursor). Non-Copilot agents are a no-op.
+func installCopilotUsageHooks(agent AgentConfig, out io.Writer) error {
+	if permissionSourceForAgent(agent) != permissionSourceCopilotCLI {
+		return nil
+	}
+	command := copilotUsageHookCommand()
+	for _, key := range copilotUsageHookEvents {
+		if err := upsertCopilotHookEvent(key, command, cursorUsageHookTimeoutSeconds); err != nil {
+			return err
+		}
+	}
+	if out != nil {
+		path, err := copilotPreloopHooksPath()
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(out, "  Usage hooks: installed Copilot CLI session hooks (%s)\n", path) //nolint:errcheck
+	}
+	return nil
+}
+
+// removeCopilotPreloopHooks deletes the Preloop-owned Copilot hook file only.
+func removeCopilotPreloopHooks(out io.Writer) error {
+	path, err := copilotPreloopHooksPath()
+	if err != nil {
+		return err
+	}
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("failed to remove Copilot hooks file %s: %w", path, err)
+	}
+	// Best-effort: drop an empty hooks directory we created.
+	_ = os.Remove(filepath.Dir(path))
+	if out != nil {
+		fmt.Fprintln(out, "  Hooks: removed Copilot CLI Preloop hooks file") //nolint:errcheck
 	}
 	return nil
 }

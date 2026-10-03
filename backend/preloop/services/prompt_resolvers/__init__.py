@@ -6,6 +6,8 @@ from .trigger_event import TriggerEventResolver
 from .project import ProjectResolver
 from .account import AccountResolver
 from .execution import ExecutionResolver
+from .flow import FlowResolver
+from .workspace import WorkspaceResolver
 
 __all__ = [
     "PromptResolver",
@@ -15,4 +17,6 @@ __all__ = [
     "ProjectResolver",
     "AccountResolver",
     "ExecutionResolver",
+    "FlowResolver",
+    "WorkspaceResolver",
 ]

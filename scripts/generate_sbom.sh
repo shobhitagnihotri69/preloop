@@ -84,6 +84,11 @@ generate_backend() {
     --require-hashes -r "${REPO_ROOT}/requirements/runtime.txt"
   "${WORK_DIR}/app/bin/pip" install --quiet --disable-pip-version-check \
     --no-deps "${REPO_ROOT}"
+  # pip, setuptools and wheel are installer tooling. The server does not
+  # import them, and leaving them in the scanned venv is what put the
+  # vulnerable base-image copies into the published SBOM.
+  "${WORK_DIR}/app/bin/python" -m pip uninstall -y pip setuptools wheel
+  "${WORK_DIR}/app/bin/python" -c "import preloop"
 
   ensure_tool_venv
 
@@ -151,8 +156,22 @@ for component in "${COMPONENTS[@]}"; do
 done
 
 ensure_tool_venv
-log "stamping supplier, manufacturer and authors, validating, measuring quality"
+log "stamping per-component suppliers and licenses, validating, measuring quality"
+STAMP_ARGS=()
+if [ -d "${WORK_DIR}/app" ]; then
+  STAMP_ARGS+=(--python-root "${WORK_DIR}/app")
+fi
+if [ -d "${REPO_ROOT}/frontend/node_modules" ]; then
+  STAMP_ARGS+=(--npm-root "${REPO_ROOT}/frontend/node_modules")
+fi
+if command -v go >/dev/null 2>&1; then
+  go_mod_cache="$(go env GOMODCACHE 2>/dev/null || true)"
+  if [ -n "${go_mod_cache}" ] && [ -d "${go_mod_cache}" ]; then
+    STAMP_ARGS+=(--go-mod-cache "${go_mod_cache}")
+  fi
+fi
 "${TOOL_VENV}/bin/python" "${REPO_ROOT}/scripts/sbom_metadata.py" --validate \
+  ${STAMP_ARGS[@]+"${STAMP_ARGS[@]}"} \
   "${OUT_DIR}"/*.cdx.json
 
 log "digests"

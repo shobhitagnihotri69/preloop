@@ -4,9 +4,9 @@
  * Pure functions only: no Lit, no fetch. The builder turns stored gateway
  * events (each carrying the full accumulated message history as a
  * conversation preview, plus the capped raw request body) and activity rows
- * into a chat-shaped item list where ONLY top-level user prompts and final
- * agent responses are expanded; tool calls, tool results, system/injected
- * segments and intermediate agent output are collapsed step groups.
+ * into chronological message and legacy step groups. Session views overlay
+ * normalized named tools and approval cards, replacing provably identical
+ * legacy tool steps while keeping uncorrelated historical content readable.
  *
  * Classification honesty rules (binding, see
  * factory/briefs/2026-08-06-transcript-redesign-spec.md section 2):
@@ -45,6 +45,9 @@ export interface TranscriptStep {
   toolName?: string | null;
   serverName?: string | null;
   status?: string | null;
+  /** Tool-call metadata, when it may carry `_preloop_repository`. */
+  repositoryArgs?: Record<string, unknown> | null;
+  toolCallIds?: string[];
   /** True when the classification came from exact structure, not a heuristic. */
   detectionExact: boolean;
 }
@@ -76,8 +79,23 @@ export interface TranscriptDividerItem {
   timestamp: string | null;
 }
 
+/**
+ * One `browser_step` activity, kept top level (never folded into a step
+ * group) so browser actions and their screenshots stay visible between the
+ * model and tool turns around them.
+ */
+export interface TranscriptBrowserStepItem {
+  type: 'browser_step';
+  key: string;
+  timestamp: string | null;
+  activity: RuntimeSessionActivityItem;
+}
+
 export type TranscriptItem =
-  TranscriptMessageItem | TranscriptStepGroupItem | TranscriptDividerItem;
+  | TranscriptMessageItem
+  | TranscriptStepGroupItem
+  | TranscriptDividerItem
+  | TranscriptBrowserStepItem;
 
 export interface TranscriptStats {
   promptCount: number;
@@ -301,7 +319,8 @@ function eventIsFailure(event: FlowGatewayEvent): boolean {
 type Atom =
   | { type: 'message'; item: TranscriptMessageItem; order: number }
   | { type: 'step'; step: TranscriptStep; order: number }
-  | { type: 'divider'; item: TranscriptDividerItem; order: number };
+  | { type: 'divider'; item: TranscriptDividerItem; order: number }
+  | { type: 'browser_step'; item: TranscriptBrowserStepItem; order: number };
 
 function atomTime(atom: Atom): number {
   const timestamp =
@@ -354,7 +373,12 @@ export function buildConversation(
   for (const event of gatewayEvents) {
     const scan = collectRawToolResultPrefixes(event);
     const toolResultPrefixes = scan.prefixes;
-    if (toolResultPrefixes === null) stats.eventsWithoutRawBody += 1;
+    if (
+      toolResultPrefixes === null &&
+      event.type !== 'model_gateway_request_started' &&
+      !Array.isArray(event.payload?.tools)
+    )
+      stats.eventsWithoutRawBody += 1;
     else if (scan.unusableToolResults > 0) {
       stats.eventsWithPartialToolResults += 1;
     }
@@ -386,6 +410,7 @@ export function buildConversation(
         timestamp: event.timestamp || null,
         redacted: Boolean(message.redacted),
         truncated: Boolean(message.truncated),
+        toolCallIds: message.tool_call_ids,
       };
 
       if (source === 'response') {
@@ -519,7 +544,21 @@ export function buildConversation(
           toolName: item.tool_name,
           serverName: item.server_name,
           status: item.status,
+          repositoryArgs: item.metadata ?? null,
           detectionExact: true,
+        },
+      });
+      continue;
+    }
+    if (activityType === 'browser_step') {
+      atoms.push({
+        type: 'browser_step',
+        order: order++,
+        item: {
+          type: 'browser_step',
+          key,
+          timestamp: item.timestamp || null,
+          activity: item,
         },
       });
       continue;
@@ -607,7 +646,7 @@ export function buildConversation(
       currentSteps.push(atom.step);
       return;
     }
-    if (atom.type === 'divider') {
+    if (atom.type === 'divider' || atom.type === 'browser_step') {
       closeSteps();
       items.push(atom.item);
       return;

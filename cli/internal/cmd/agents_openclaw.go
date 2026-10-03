@@ -315,6 +315,16 @@ type managedEnrollmentOptions struct {
 	// ``--model``. When set, the interactive model picker is skipped and this
 	// alias is used for gateway onboarding.
 	PreferredModel string
+	// PinModelFamilies keeps writing the stock Claude Code family env pins
+	// (ANTHROPIC_DEFAULT_OPUS_MODEL / _SONNET_MODEL / _HAIKU_MODEL). It is off
+	// by default so new Anthropic releases arrive with the next Claude Code
+	// update instead of a manual refresh; set it with --pin-model-families for
+	// gateways where the Claude family autoregister is disabled.
+	PinModelFamilies bool
+	// PinModelFamiliesSet reports whether --pin-model-families was passed
+	// explicitly. When false, onboarding preserves the persisted choice from a
+	// previous enrollment instead of resetting it to the default.
+	PinModelFamiliesSet bool
 	// AgentPrepared marks that the caller already ran
 	// prepareAgentForEnrollment on the agent (display name confirmed,
 	// runtime principal generated). executeManagedEnrollment must not run
@@ -481,6 +491,20 @@ type bedrockCredentialPayload struct {
 	AWSRegionName      string `json:"aws_region_name,omitempty"`
 }
 
+// resolveEnrollmentPinModelFamilies returns the effective Claude Code family
+// pinning choice for an enrollment: an explicit --pin-model-families wins,
+// otherwise the value persisted by a previous enrollment, otherwise the
+// unpinned default.
+func resolveEnrollmentPinModelFamilies(agent AgentConfig, opts managedEnrollmentOptions) bool {
+	if opts.PinModelFamiliesSet {
+		return opts.PinModelFamilies
+	}
+	if state, err := loadLocalEnrollmentState(agent); err == nil {
+		return state.PinModelFamilies
+	}
+	return opts.PinModelFamilies
+}
+
 func executeManagedEnrollment(agent AgentConfig, opts managedEnrollmentOptions) error {
 	client := opts.Client
 	var err error
@@ -514,6 +538,12 @@ func executeManagedEnrollment(agent AgentConfig, opts managedEnrollmentOptions) 
 			return err
 		}
 	}
+
+	// Resolve the Claude Code family-pinning choice: an explicit
+	// --pin-model-families wins; otherwise preserve the choice persisted by a
+	// previous enrollment so re-onboarding does not silently flip a pinned
+	// gateway back to unpinned (or vice versa).
+	pinModelFamilies := resolveEnrollmentPinModelFamilies(agent, opts)
 
 	// Pre-onboarding readiness: when the agent itself is not logged in,
 	// onboarding still proceeds (the MCP/model config is written), but say so
@@ -618,6 +648,7 @@ func executeManagedEnrollment(agent AgentConfig, opts managedEnrollmentOptions) 
 				"<token created at apply time>",
 				upstream.ManagedModelAlias,
 				previewClaudeSiblingFamilyAliases(upstream),
+				pinModelFamilies,
 			)
 			if err != nil {
 				return err
@@ -863,6 +894,7 @@ func executeManagedEnrollment(agent AgentConfig, opts managedEnrollmentOptions) 
 				credentialResp.Token,
 				upstream.ManagedModelAlias,
 				familyAliases,
+				pinModelFamilies,
 			)
 			if err != nil {
 				return err
@@ -908,6 +940,7 @@ func executeManagedEnrollment(agent AgentConfig, opts managedEnrollmentOptions) 
 	if err != nil {
 		return err
 	}
+	backupState.PinModelFamilies = pinModelFamilies
 	if err := writeAgentConfigDocument(agent, plan.ManagedDocument); err != nil {
 		return err
 	}
@@ -964,6 +997,13 @@ func executeManagedEnrollment(agent AgentConfig, opts managedEnrollmentOptions) 
 		// enrollment whose MCP and model configuration already applied.
 		if err := installCursorUsageHooks(agent, opts.StoreTranscript, output); err != nil {
 			fmt.Fprintf(output, "  Warning: Cursor usage hooks not installed: %v\n", err) //nolint:errcheck
+		}
+	}
+	if !opts.NoUsageHooks && permissionSourceForAgent(agent) == permissionSourceCopilotCLI {
+		// Same split as Cursor: usage/session hooks install even when
+		// --approvals is off. preToolUse is owned by installApprovalHooks.
+		if err := installCopilotUsageHooks(agent, output); err != nil {
+			fmt.Fprintf(output, "  Warning: Copilot CLI usage hooks not installed: %v\n", err) //nolint:errcheck
 		}
 	}
 	pluginInstallResult := installAgentControlRuntimePlugin(agent, output)
@@ -1509,6 +1549,14 @@ func buildCodexLiveValidationPayload(modelAlias, prompt string) map[string]inter
 	}
 }
 
+// codexProbeResponseID returns the Responses API id of the live validation
+// probe, or "" when the gateway answered without one (or not at all). The id
+// lets an operator find the probe in gateway and provider logs.
+func codexProbeResponseID(response map[string]interface{}) string {
+	id, _ := response["id"].(string)
+	return strings.TrimSpace(id)
+}
+
 func runCodexLiveValidation(
 	client *api.Client,
 	agent AgentConfig,
@@ -1595,7 +1643,6 @@ func runCodexLiveValidation(
 		requestPayload,
 		&gatewayResponse,
 	)
-	_ = gatewayResponse
 
 	apiKeyID := managedAPIKeyIDForToken(detail.Credentials, token)
 	var searchHit *gatewayUsageSearchItem
@@ -1624,6 +1671,9 @@ func runCodexLiveValidation(
 	})
 	if passed {
 		result["live_validation_status"] = "passed"
+	}
+	if responseID := codexProbeResponseID(gatewayResponse); responseID != "" {
+		result["live_validation_response_id"] = responseID
 	}
 	// Intentionally omit api key ids from the result map so they cannot
 	// flow into validation status logging (go/clear-text-logging).
@@ -2503,10 +2553,9 @@ func isClaudeCodeOAuthAccessToken(token string) bool {
 }
 
 // isOAuthCredentialType reports whether a managed-model credential type is a
-// provider OAuth bundle (e.g. "oauth_anthropic_claude_code",
-// "oauth_openai_codex"). These tokens rotate and expire, so re-onboarding
-// must always re-seed them rather than treating an existing same-type
-// credential as still valid.
+// provider OAuth bundle (for example "oauth_anthropic_claude_code" or
+// "oauth_openai_codex"). These tokens rotate. A live same-type secret stays
+// one lineage; a secret whose status is error can be refreshed in place.
 func isOAuthCredentialType(credentialType string) bool {
 	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(credentialType)), "oauth_")
 }
@@ -2569,7 +2618,103 @@ func serverHasReusableGatewayCredential(
 		return false
 	}
 	target := findReusableManagedGatewayAIModel(existing, upstream)
-	return target != nil && target.HasAPIKey
+	if target == nil || !target.HasAPIKey {
+		return false
+	}
+	// A Codex enrollment that already holds a live same-type secret must not
+	// upload another copy. A secret in error is not reusable: the sync path
+	// uploads the local bundle onto that same secret instead.
+	if isCodexCLIAgent(agent) && !codexServerSecretIsReusable(target, upstream) {
+		return false
+	}
+	return true
+}
+
+// oauthCredentialStatusIsError reports whether the credential secret behind a
+// model row is in the error state (refresh failed, grant rejected, and so on).
+func oauthCredentialStatusIsError(model *aiModelResponse) bool {
+	if model == nil {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(model.CredentialsStatus), "error")
+}
+
+// codexServerSecretIsReusable reports whether a stored Codex credential can
+// back gateway routing without a fresh upload. It must be a live secret, and
+// when the upstream names an OAuth type the stored type has to match.
+func codexServerSecretIsReusable(
+	target *aiModelResponse,
+	upstream *managedGatewayUpstream,
+) bool {
+	if target == nil || oauthCredentialStatusIsError(target) {
+		return false
+	}
+	if upstream == nil || !isOAuthCredentialType(upstream.CredentialType) {
+		return true
+	}
+	return strings.TrimSpace(target.CredentialType) == strings.TrimSpace(upstream.CredentialType)
+}
+
+// managedAgentKeepsLiveOAuthSecret reports whether this row already holds a
+// same-type OAuth secret that is not in error. A later onboard attaches that
+// lineage instead of uploading another copy of the laptop bundle.
+func managedAgentKeepsLiveOAuthSecret(
+	agent AgentConfig,
+	target *aiModelResponse,
+	upstream *managedGatewayUpstream,
+) bool {
+	if (!isCodexCLIAgent(agent) && !isClaudeCodeAgent(agent)) || target == nil || upstream == nil {
+		return false
+	}
+	if !target.HasAPIKey || strings.TrimSpace(target.CredentialsSecretID) == "" {
+		return false
+	}
+	wantType := strings.TrimSpace(upstream.CredentialType)
+	if !isOAuthCredentialType(wantType) ||
+		strings.TrimSpace(target.CredentialType) != wantType {
+		return false
+	}
+	return !oauthCredentialStatusIsError(target)
+}
+
+// repairCodexOAuthSecretInPlace uploads the local bundle onto an existing
+// Codex OAuth secret whose status is error. The PUT hits the row that already
+// owns the secret, so the backend updates that secret in place instead of
+// minting a second lineage.
+func repairCodexOAuthSecretInPlace(
+	client *api.Client,
+	agent AgentConfig,
+	owner *aiModelResponse,
+	upstream *managedGatewayUpstream,
+) error {
+	if client == nil || !isCodexCLIAgent(agent) || owner == nil || upstream == nil {
+		return nil
+	}
+	if !oauthCredentialStatusIsError(owner) {
+		return nil
+	}
+	if strings.TrimSpace(owner.ID) == "" ||
+		strings.TrimSpace(owner.CredentialsSecretID) == "" {
+		return nil
+	}
+	if len(upstream.CredentialPayload) == 0 ||
+		!isOAuthCredentialType(upstream.CredentialType) ||
+		oauthCredentialPayloadExpired(upstream.CredentialPayload) {
+		return nil
+	}
+	update := map[string]interface{}{
+		"credential_type":    upstream.CredentialType,
+		"credential_payload": upstream.CredentialPayload,
+	}
+	var updated aiModelResponse
+	if err := client.Put("/api/v1/ai-models/"+owner.ID, update, &updated); err != nil {
+		return fmt.Errorf(
+			"failed to refresh OAuth credential on AI model %q: %w",
+			owner.Name,
+			err,
+		)
+	}
+	return nil
 }
 
 // serverGatewayCredentialReuseNote is the onboarding note emitted when full
@@ -3171,10 +3316,24 @@ func (c *claudeOAuthCredential) Payload() map[string]interface{} {
 	if refresh := strings.TrimSpace(c.RefreshToken); refresh != "" {
 		payload["refresh"] = refresh
 	}
-	if c.ExpiresAtMS > 0 {
-		payload["expires"] = c.ExpiresAtMS
+	if expires := oauthPayloadEpochMillis(c.ExpiresAtMS); expires > 0 {
+		payload["expires"] = expires
 	}
 	return payload
+}
+
+// minOAuthPayloadEpochMillis is 2001-09-09 in epoch milliseconds. The server
+// rejects a smaller positive credential_payload "expires" as epoch seconds.
+const minOAuthPayloadEpochMillis int64 = 1_000_000_000_000
+
+// oauthPayloadEpochMillis returns an OAuth expiry in the epoch milliseconds
+// the server's credential_payload contract requires. Some credential blobs
+// record expires_at in seconds; those are scaled so the push is accepted.
+func oauthPayloadEpochMillis(value int64) int64 {
+	if value > 0 && value < minOAuthPayloadEpochMillis {
+		return value * 1000
+	}
+	return value
 }
 
 // printClaudeCodeOAuthOffboardNote warns when Claude Code's local Anthropic
@@ -3782,7 +3941,7 @@ func (c *codexOAuthCredential) Payload() map[string]interface{} {
 	payload := map[string]interface{}{
 		"access":  strings.TrimSpace(c.AccessToken),
 		"refresh": strings.TrimSpace(c.RefreshToken),
-		"expires": c.ExpiresAtMS,
+		"expires": oauthPayloadEpochMillis(c.ExpiresAtMS),
 	}
 	if accountID := strings.TrimSpace(c.AccountID); accountID != "" {
 		payload["account_id"] = accountID
@@ -3817,6 +3976,20 @@ func resolveCodexOAuthCredential() (*codexOAuthCredential, string) {
 }
 
 func readCodexKeychainOAuthCredential() (*codexOAuthCredential, string) {
+	credential, _ := readCodexKeychainOAuthBundle()
+	if credential == nil {
+		return nil, ""
+	}
+	account := computeCodexKeychainAccount(resolveCodexHomePath())
+	return credential, fmt.Sprintf(
+		"Resolved Codex ChatGPT OAuth credentials from OS Keychain (service: \"Codex Auth\", account: %s).",
+		account,
+	)
+}
+
+// readCodexKeychainOAuthBundle is the single macOS Keychain read for Codex
+// ChatGPT OAuth. The second result is the blob's last_refresh marker.
+func readCodexKeychainOAuthBundle() (*codexOAuthCredential, string) {
 	account := computeCodexKeychainAccount(resolveCodexHomePath())
 	secret, err := keyring.Get("Codex Auth", account)
 	if err != nil || strings.TrimSpace(secret) == "" {
@@ -3829,10 +4002,7 @@ func readCodexKeychainOAuthCredential() (*codexOAuthCredential, string) {
 	if credential == nil {
 		return nil, ""
 	}
-	return credential, fmt.Sprintf(
-		"Resolved Codex ChatGPT OAuth credentials from OS Keychain (service: \"Codex Auth\", account: %s).",
-		account,
-	)
+	return credential, codexOAuthLastRefreshFromJSON([]byte(secret))
 }
 
 func readCodexFileOAuthCredential() (*codexOAuthCredential, string) {
@@ -4058,7 +4228,7 @@ func buildOpenClawManagedMCPEnrollmentPlan(
 
 func supportsAgentControlChannel(agent AgentConfig) bool {
 	switch strings.ToLower(strings.TrimSpace(agent.Name)) {
-	case "openclaw", hermesSourceType, "claude code", "opencode", "pi", "deepseek harness", "deepseek", "dsh":
+	case "openclaw", hermesSourceType, "claude code", "codex cli", "opencode", "pi", "deepseek harness", "deepseek", "dsh":
 		return true
 	default:
 		return false
@@ -4164,6 +4334,15 @@ func applyManagedAgentControlConfig(
 			"Claude Code Agent Control config written to ~/.claude/preloop-control.json. Run `preloop claude` instead of `claude` for remote steer.",
 		)
 	}
+	if runtimeSessionSourceTypeForAgent(plan.Agent.Name) == "codex" {
+		if err := writePreloopControlFile(codexControlConfigPath(), control); err != nil {
+			return plan, err
+		}
+		plan.Notes = append(
+			plan.Notes,
+			"Codex CLI Agent Control config written to ~/.codex/preloop-control.json. Run `preloop codex sidecar enable` to keep the sidecar up.",
+		)
+	}
 	if isOpenCodeAgent(plan.Agent) {
 		// The plugin reads preloop.control from OpenCode's user config
 		// (opencode.json), not from the legacy config.json that carries the
@@ -4208,6 +4387,11 @@ func applyAgentControlConfigToDocument(
 	if runtimeSessionSourceTypeForAgent(agent.Name) == "claude_code" {
 		// Claude Code settings.json is reserved for Claude's own schema.
 		// Control lives in ~/.claude/preloop-control.json (written separately).
+		return
+	}
+	if runtimeSessionSourceTypeForAgent(agent.Name) == "codex" {
+		// Codex reserves ~/.codex/config.toml. Control lives in
+		// ~/.codex/preloop-control.json (written separately).
 		return
 	}
 	if isOpenCodeAgent(agent) {
@@ -4281,7 +4465,10 @@ func validRuntimeApprovalTimeout(value interface{}) bool {
 }
 
 func writeClaudePreloopControlFile(control map[string]interface{}) error {
-	path := claudeControlConfigPath()
+	return writePreloopControlFile(claudeControlConfigPath(), control)
+}
+
+func writePreloopControlFile(path string, control map[string]interface{}) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
@@ -4294,7 +4481,11 @@ func writeClaudePreloopControlFile(control map[string]interface{}) error {
 }
 
 func readClaudePreloopControlFile() (map[string]interface{}, bool) {
-	data, err := os.ReadFile(claudeControlConfigPath())
+	return readPreloopControlFile(claudeControlConfigPath())
+}
+
+func readPreloopControlFile(path string) (map[string]interface{}, bool) {
+	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, false
 	}
@@ -4479,6 +4670,9 @@ func agentControlConfigFromDocument(
 	if runtimeSessionSourceTypeForAgent(agent.Name) == "claude_code" {
 		return readClaudePreloopControlFile()
 	}
+	if runtimeSessionSourceTypeForAgent(agent.Name) == "codex" {
+		return readPreloopControlFile(codexControlConfigPath())
+	}
 	if isOpenCodeAgent(agent) {
 		return readOpenCodePreloopControl()
 	}
@@ -4501,6 +4695,8 @@ func agentControlPluginPackageName(agent AgentConfig) string {
 		return "@preloop-ai/openclaw-plugin"
 	case "claude_code":
 		return "@preloop-ai/claude-plugin"
+	case "codex":
+		return "@preloop-ai/codex-plugin"
 	case "opencode":
 		return openCodePluginPackageName
 	default:
@@ -4517,6 +4713,8 @@ func agentControlPluginVerifyCommand(agent AgentConfig) string {
 		return "preloop-openclaw-plugin"
 	case "claude_code":
 		return "preloop-claude-plugin"
+	case "codex":
+		return "preloop-codex-plugin"
 	case "opencode":
 		return openCodePluginVerifyCommand
 	default:
@@ -4530,7 +4728,7 @@ func agentControlPluginInstallerCommand(agent AgentConfig) string {
 		return "hermes"
 	case "openclaw":
 		return "openclaw"
-	case "claude_code":
+	case "claude_code", "codex":
 		return "npm"
 	default:
 		return ""
@@ -4543,8 +4741,8 @@ func resolveRuntimeExecutable(command string) (string, error) {
 		return path, nil
 	}
 	for _, candidate := range runtimeExecutableFallbackPaths(command) {
-		if info, statErr := os.Stat(candidate); statErr == nil && !info.IsDir() {
-			if info.Mode().Perm()&0111 != 0 {
+		if info, statErr := os.Stat(candidate); statErr == nil {
+			if isExecutableFileInfo(candidate, info) {
 				return candidate, nil
 			}
 		}
@@ -4560,11 +4758,11 @@ func runtimeExecutableFallbackPaths(command string) []string {
 	if err != nil {
 		return nil
 	}
-	candidates := []string{
-		filepath.Join(homeDir, ".local", "bin", command),
-		filepath.Join(homeDir, ".npm-global", "bin", command),
-		filepath.Join(homeDir, ".openclaw", "bin", command),
-		filepath.Join(homeDir, "Library", "pnpm", command),
+	candidates := runtimeExecutableFallbackPathsFor(
+		runtime.GOOS, homeDir, os.Getenv("APPDATA"), command,
+	)
+	if runtime.GOOS == "windows" {
+		return candidates
 	}
 	if nvmMatches, globErr := filepath.Glob(
 		filepath.Join(homeDir, ".nvm", "versions", "node", "*", "bin", command),
@@ -4600,6 +4798,8 @@ func agentControlPluginSourceDirName(agent AgentConfig) string {
 		return "openclaw-preloop"
 	case "claude_code":
 		return "claude-preloop"
+	case "codex":
+		return "codex-preloop"
 	case "opencode":
 		return "opencode-preloop"
 	default:
@@ -4642,21 +4842,32 @@ func installAgentControlRuntimePlugin(agent AgentConfig, writer io.Writer) map[s
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
+	if installer == "npm" && !installTargetIsLocalSource(installTarget) {
+		listed, detail := probeNpmPackageListed(agentControlPluginPackageName(agent))
+		if !listed {
+			reason := npmSidecarPackageMissingReason(agentControlPluginPackageName(agent), detail)
+			if writer != nil {
+				fmt.Fprintln(writer, "  Warning: "+reason) //nolint:errcheck
+			}
+			return npmSidecarUnavailableResult(installTarget, reason)
+		}
+	}
 	args := agentControlPluginInstallArgs(installer, installTarget)
 	if strings.EqualFold(agent.Name, "OpenClaw") {
 		// Onboarding already authorizes installing the official Preloop package.
 		args = append(args, "--force", "--accept-capabilities")
 	}
-	if runtimeSessionSourceTypeForAgent(agent.Name) == "claude_code" {
+	if installer == "npm" {
 		cancel()
 		ctx, cancel = context.WithTimeout(context.Background(), 120*time.Second)
 		defer cancel()
 		// npm install -g <source folder> symlinks the folder as-is: it does
 		// not install the folder's devDependencies, so the TypeScript build
 		// (prepare script) cannot run and npm silently skips creating the
-		// preloop-claude-plugin bin link because dist/index.js is missing.
-		// Build the source first so the global install links a working bin.
-		if buildErr := buildClaudePluginSourceIfNeeded(installerPath, installTarget, writer); buildErr != nil {
+		// bin link because dist/index.js is missing. Build the source first
+		// so the global install links a working bin.
+		label := npmSidecarBuildLabel(agent)
+		if buildErr := buildNpmSidecarSourceIfNeeded(installerPath, installTarget, label, writer); buildErr != nil {
 			result["control_plugin_install_status"] = "plugin_source_build_failed"
 			result["control_plugin_install_target"] = installTarget
 			result["control_plugin_install_error"] = buildErr.Error()
@@ -4898,6 +5109,21 @@ func agentControlPluginSourceCandidates(startPath, dirName string) []string {
 // that npm install -g links the preloop-claude-plugin bin against a real
 // entry point.
 func buildClaudePluginSourceIfNeeded(npmPath, installTarget string, writer io.Writer) error {
+	return buildNpmSidecarSourceIfNeeded(npmPath, installTarget, "Claude", writer)
+}
+
+func npmSidecarBuildLabel(agent AgentConfig) string {
+	switch runtimeSessionSourceTypeForAgent(agent.Name) {
+	case "claude_code":
+		return "Claude"
+	case "codex":
+		return "Codex"
+	default:
+		return "Agent Control"
+	}
+}
+
+func buildNpmSidecarSourceIfNeeded(npmPath, installTarget, label string, writer io.Writer) error {
 	info, err := os.Stat(installTarget)
 	if err != nil || !info.IsDir() {
 		// Registry package name, not a local source folder.
@@ -4908,7 +5134,7 @@ func buildClaudePluginSourceIfNeeded(npmPath, installTarget string, writer io.Wr
 		return nil
 	}
 	if writer != nil {
-		fmt.Fprintf(writer, "  Building Claude Agent Control plugin from source (%s)...\n", installTarget) //nolint:errcheck
+		fmt.Fprintf(writer, "  Building %s Agent Control plugin from source (%s)...\n", label, installTarget) //nolint:errcheck
 	}
 	steps := [][]string{
 		{"install", "--no-audit", "--no-fund"},
@@ -4985,6 +5211,9 @@ func verifyAgentControlRuntimePlugin(agent AgentConfig) map[string]interface{} {
 	configPath := agent.ConfigPath
 	if runtimeSessionSourceTypeForAgent(agent.Name) == "claude_code" {
 		configPath = claudeControlConfigPath()
+	}
+	if runtimeSessionSourceTypeForAgent(agent.Name) == "codex" {
+		configPath = codexControlConfigPath()
 	}
 	if isOpenCodeAgent(agent) {
 		configPath = openCodeUserConfigPath()
@@ -6089,16 +6318,16 @@ func parseOAuthSiblingTime(value interface{}) time.Time {
 	return time.Time{}
 }
 
-func applySharedClaudeCodeOAuthSecret(sibling *aiModelResponse) string {
+// applySharedOAuthSecret returns the sibling secret id to attach. It does
+// not copy token material onto that secret. An access token can still be
+// inside its window after the gateway has consumed the single-use refresh
+// token, and writing the cached laptop bundle back onto a live secret
+// bricks every sibling (invalid_grant). A secret whose status is error is
+// repaired by repairCodexOAuthSecretInPlace before this id is attached.
+func applySharedOAuthSecret(sibling *aiModelResponse) string {
 	if sibling == nil {
 		return ""
 	}
-	// Attach the sibling's live lineage. Never overwrite it from the local
-	// bundle: an access token can still be inside its window after the
-	// gateway has already consumed the single-use refresh token. Putting
-	// that cached bundle back onto the shared secret bricks every sibling
-	// (invalid_grant). Recovery of a dead lineage goes through the
-	// target-already-has-a-credential re-seed path, not this attach path.
 	return strings.TrimSpace(sibling.CredentialsSecretID)
 }
 
@@ -6165,42 +6394,17 @@ func syncManagedGatewayAIModel(
 			!isOAuthCredentialType(upstream.CredentialType) {
 			update["api_key"] = upstream.APIKey
 		}
-		// Re-seed the stored credential on re-onboard when the upstream
-		// carries a fresh payload AND either the target has no credential,
-		// the credential type changed, OR the credential is an OAuth bundle.
-		// OAuth subscription tokens (Anthropic/Codex) rotate and expire, so
-		// a re-onboard whose whole purpose is to recover a working token
-		// MUST overwrite the stale stored copy — otherwise the gateway keeps
-		// trying to refresh a dead/expired token and 401s with
-		// "Model credentials could not be refreshed".
+		// Keep a live same-type Claude/Codex secret instead of re-uploading
+		// the local bundle. An access token can still be unexpired after its
+		// single-use refresh token has been consumed by the gateway.
+		// A failed credential may be repaired with a fresh local login; the
+		// server rejects imports of refresh tokens it already consumed.
+		// Expired local bundles cannot replace an existing same-type secret.
 		//
-		// The one exception is a LOCAL bundle that is itself already past
-		// its recorded expiry. Provider refresh tokens are single-use: once
-		// the gateway refreshes the imported copy, the provider rotates the
-		// refresh token and the copy left in the agent's local credential
-		// store is dead. Overwriting the account's live, gateway-refreshed
-		// bundle with that stale local copy bricks the credential
-		// (``invalid_grant`` / "Refresh token not found or invalid") and
-		// downgrades every later onboarding to MCP-only. When the local
-		// bundle is expired and the account already holds a same-type OAuth
-		// credential, keep the account copy — the gateway can refresh it.
-		//
-		// A second exception: when a sibling already holds a same-type
-		// OAuth secret, attach that live lineage instead of minting a
-		// second one. This wins over re-seed even when the target already
-		// has a credential, so split family rows converge onto one secret.
-		// Sibling selection prefers last_verified / last_refresh /
-		// updated_at so a stale first-listed copy does not win.
-		//
-		// The target itself is excluded from the sibling pool, so compare
-		// liveness against it here: if this row already holds a newer
-		// secret than any sibling, keep it. Otherwise the first-synced
-		// live holder would be repointed onto a consumed copy.
-		//
-		// Only secret-derived liveness (credentials_last_verified_at or
-		// metadata timestamps on a same-type secret) participates: row-edit
-		// updated_at on a credentialless or wrong-type target must never
-		// block sibling attachment or re-seeding.
+		// Prefer a sibling's existing lineage to minting a second secret for
+		// another model family. Compare secret-derived liveness against the
+		// target so the first-synced live holder is not repointed onto a stale
+		// sibling. Row-edit timestamps cannot establish credential freshness.
 		sharedSibling := findManagedOAuthCredentialSibling(
 			existing,
 			managedAgent,
@@ -6214,7 +6418,7 @@ func syncManagedGatewayAIModel(
 			if !targetLiveness.IsZero() && targetLiveness.After(oauthSiblingLiveness(sharedSibling)) {
 				targetHoldsLiveLineage = true
 			} else {
-				sharedSecret = applySharedClaudeCodeOAuthSecret(sharedSibling)
+				sharedSecret = applySharedOAuthSecret(sharedSibling)
 			}
 		}
 		sameSecret := sharedSecret != "" &&
@@ -6223,8 +6427,17 @@ func syncManagedGatewayAIModel(
 			// Keep this row's own live secret. Do not attach a staler
 			// sibling and do not re-seed from a local bundle.
 		} else if sharedSecret != "" && !sameSecret {
+			if err := repairCodexOAuthSecretInPlace(
+				client,
+				agent,
+				sharedSibling,
+				upstream,
+			); err != nil {
+				return nil, nil, err
+			}
 			update["credentials_secret_id"] = sharedSecret
-		} else if len(upstream.CredentialPayload) > 0 &&
+		} else if !managedAgentKeepsLiveOAuthSecret(agent, target, upstream) &&
+			len(upstream.CredentialPayload) > 0 &&
 			(!target.HasAPIKey ||
 				strings.TrimSpace(target.CredentialType) != strings.TrimSpace(upstream.CredentialType) ||
 				(isOAuthCredentialType(upstream.CredentialType) &&
@@ -6302,8 +6515,16 @@ func syncManagedGatewayAIModel(
 		upstream.CredentialType,
 		"",
 	); sharedSibling != nil {
-		sharedSecret := applySharedClaudeCodeOAuthSecret(sharedSibling)
+		sharedSecret := applySharedOAuthSecret(sharedSibling)
 		if sharedSecret != "" {
+			if err := repairCodexOAuthSecretInPlace(
+				client,
+				agent,
+				sharedSibling,
+				upstream,
+			); err != nil {
+				return nil, nil, err
+			}
 			create.CredentialsSecretID = sharedSecret
 			create.APIKey = ""
 			create.CredentialType = ""
@@ -6815,7 +7036,10 @@ func removeManagedAgentRuntimeArtifacts(agent AgentConfig) error {
 	case "gemini cli":
 		return removeManagedAgentLauncher("gemini", "gemini-cli.env")
 	case "codex cli":
-		return removeManagedAgentLauncher("codex", "codex-cli.env")
+		if err := removeManagedAgentLauncher("codex", "codex-cli.env"); err != nil {
+			return err
+		}
+		return removeCodexAgentControlArtifacts()
 	default:
 		return nil
 	}

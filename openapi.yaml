@@ -120,9 +120,17 @@ paths:
       tags:
       - Auth
       summary: Forgot Password
-      description: "Send a password reset email.\n\nArgs:\n    reset_data: Password\
-        \ reset request with email.\n    background_tasks: Background tasks for sending\
-        \ emails.\n\nReturns:\n    Success message."
+      description: "Send a password reset email for every user row holding the address.\n\
+        \n``user.email`` is not unique: an address invited into a second account\n\
+        holds a second row there, with its own password. This never chooses one\n\
+        of them. Every row holding the address gets its own message, whose link\n\
+        is bound to that row and names its username, so the person resets the\naccount\
+        \ they mean by following that account's link. Each link goes to\nthe address\
+        \ its own row holds, the inbox that row already trusts for a\nreset, so no\
+        \ row is reachable from an inbox it does not name.\n\nArgs:\n    reset_data:\
+        \ Password reset request with email.\n    background_tasks: Background tasks\
+        \ for sending emails.\n\nReturns:\n    The same neutral message whether or\
+        \ not the address is registered."
       operationId: forgot_password_api_v1_auth_forgot_password_post
       requestBody:
         content:
@@ -280,7 +288,11 @@ paths:
 
         token (including this request''s) fails the generation check on the next
 
-        use. API keys and runner tokens are unchanged.'
+        use. Active ``cli_session`` rows are marked revoked in the same commit so
+
+        the CLI session list matches what is enforced. API keys and runner tokens
+
+        are unchanged.'
       operationId: revoke_all_sessions_api_v1_auth_sessions_revoke_all_post
       responses:
         '200':
@@ -295,6 +307,57 @@ paths:
                   Post
       security:
       - OAuth2PasswordBearer: []
+  /api/v1/auth/sessions/cli:
+    get:
+      tags:
+      - Auth
+      summary: List Cli Sessions
+      description: 'List the signed-in user''s active CLI login sessions.
+
+
+        Each ``preloop auth login`` creates one. Revoked sessions are omitted.'
+      operationId: list_cli_sessions_api_v1_auth_sessions_cli_get
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                items:
+                  $ref: '#/components/schemas/CliSessionResponse'
+                type: array
+                title: Response List Cli Sessions Api V1 Auth Sessions Cli Get
+      security:
+      - OAuth2PasswordBearer: []
+  /api/v1/auth/sessions/cli/{session_id}:
+    delete:
+      tags:
+      - Auth
+      summary: Revoke Cli Session
+      description: "Revoke one CLI login session of the signed-in user.\n\nIts access\
+        \ and refresh tokens are rejected on their next use. Other\nsessions are unaffected.\n\
+        \nRaises:\n    HTTPException: 404 when no active session with this id belongs\
+        \ to\n        the caller."
+      operationId: revoke_cli_session_api_v1_auth_sessions_cli__session_id__delete
+      security:
+      - OAuth2PasswordBearer: []
+      parameters:
+      - name: session_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+          title: Session Id
+      responses:
+        '204':
+          description: Successful Response
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
   /api/v1/auth/users/me:
     get:
       tags:
@@ -920,6 +983,22 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/HTTPValidationError'
+      security:
+      - bearerAuth: []
+  /api/v1/account/session-artifacts/usage:
+    get:
+      tags:
+      - Account
+      summary: Get Session Artifact Usage
+      description: Return session-artifact bytes used, the budget, and recent evictions.
+      operationId: get_session_artifact_usage_api_v1_account_session_artifacts_usage_get
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionArtifactUsageResponse'
       security:
       - bearerAuth: []
   /api/v1/account/gateway-usage/summary:
@@ -2054,6 +2133,66 @@ paths:
           minimum: 0
           default: 0
           title: Offset
+      - name: agent
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: string
+            minLength: 1
+            maxLength: 255
+          - type: 'null'
+          description: Managed agent id or display name; only that agent's sessions
+          title: Agent
+        description: Managed agent id or display name; only that agent's sessions
+      - name: agent_kind
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: string
+            minLength: 1
+            maxLength: 64
+          - type: 'null'
+          description: Agent kind (claude_code, codex, cursor, hermes, ...); sessions
+            of managed agents of that kind or recorded from that source
+          title: Agent Kind
+        description: Agent kind (claude_code, codex, cursor, hermes, ...); sessions
+          of managed agents of that kind or recorded from that source
+      - name: parent_session_id
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: string
+            format: uuid
+          - type: 'null'
+          description: Only sessions this session spawned
+          title: Parent Session Id
+        description: Only sessions this session spawned
+      - name: flow_execution_id
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: string
+            format: uuid
+          - type: 'null'
+          description: Only sessions linked to this flow execution
+          title: Flow Execution Id
+        description: Only sessions linked to this flow execution
+      - name: active_within_minutes
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: integer
+            maximum: 1440
+            minimum: 1
+          - type: 'null'
+          description: Only open sessions with activity in the last N minutes
+          title: Active Within Minutes
+        description: Only open sessions with activity in the last N minutes
       responses:
         '200':
           description: Successful Response
@@ -2244,6 +2383,48 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/RuntimeSessionActivityListResponse'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/v1/runtime-sessions/{runtime_session_id}/artifacts/{artifact_id}:
+    get:
+      tags:
+      - Account
+      summary: Get Account Session Artifact
+      description: 'Return one session artifact''s bytes, such as a browser-step screenshot.
+
+
+        The artifact must belong to this account and to the session in the path.
+
+        Unavailable bytes return 410 with the reason, so the console can keep
+
+        the step''s metadata and show why the image is gone.'
+      operationId: get_account_session_artifact_api_v1_runtime_sessions__runtime_session_id__artifacts__artifact_id__get
+      security:
+      - bearerAuth: []
+      parameters:
+      - name: runtime_session_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Runtime Session Id
+      - name: artifact_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Artifact Id
+      responses:
+        '200':
+          description: Artifact bytes in the stored media type
+        '404':
+          description: Session or artifact not found in this account
+        '410':
+          description: Artifact bytes were evicted or expired
         '422':
           description: Validation Error
           content:
@@ -3721,6 +3902,41 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/HTTPValidationError'
+  /api/v1/approval-workflows/{workflow_id}/webhook-secret/rotate:
+    post:
+      tags:
+      - Tools
+      summary: Rotate Approval Workflow Webhook Secret
+      description: "Replace the workflow's webhook signing secret and return it once.\n\
+        \nDeliveries are signed with the new secret from the next one on. Use this\n\
+        to obtain a secret for a workflow created by policy apply, or one whose\n\
+        secret was not kept.\n\nSync handler on purpose: FastAPI runs it in the threadpool,\
+        \ so the sync\nsession never blocks the event loop.\n\nRaises:\n    HTTPException:\
+        \ 404 if the workflow is not found, 400 if it has no\n        webhook configured."
+      operationId: rotate_approval_workflow_webhook_secret_api_v1_approval_workflows__workflow_id__webhook_secret_rotate_post
+      security:
+      - bearerAuth: []
+      parameters:
+      - name: workflow_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+          title: Workflow Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApprovalWorkflowResponse'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
   /api/v1/tool-configurations/{config_id}/approval-condition:
     get:
       tags:
@@ -4093,9 +4309,10 @@ paths:
       summary: List Approval Requests
       description: "List approval requests for the current account.\n\nArgs:\n   \
         \ status: Filter by status (pending, approved, declined, etc.)\n    execution_id:\
-        \ Filter by execution ID\n    limit: Maximum number of results\n    skip:\
-        \ Number of results to skip\n    current_user: Current authenticated user\n\
-        \nReturns:\n    List of approval requests"
+        \ Filter by execution ID\n    runtime_session_id: Filter by a validated runtime\
+        \ session ID\n    limit: Maximum number of results\n    skip: Number of results\
+        \ to skip\n    current_user: Current authenticated user\n\nReturns:\n    List\
+        \ of approval requests"
       operationId: list_approval_requests_api_v1_approval_requests_get
       security:
       - bearerAuth: []
@@ -4120,12 +4337,24 @@ paths:
           description: Filter by execution ID
           title: Execution Id
         description: Filter by execution ID
+      - name: runtime_session_id
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: string
+            format: uuid
+          - type: 'null'
+          description: Filter by runtime session ID
+          title: Runtime Session Id
+        description: Filter by runtime session ID
       - name: limit
         in: query
         required: false
         schema:
           type: integer
           maximum: 100
+          minimum: 1
           description: Maximum number of results
           default: 50
           title: Limit
@@ -4135,6 +4364,7 @@ paths:
         required: false
         schema:
           type: integer
+          minimum: 0
           description: Number of results to skip
           default: 0
           title: Skip
@@ -4178,11 +4408,13 @@ paths:
           format: uuid
           title: Request Id
       requestBody:
-        required: true
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/ApprovalDecision'
+              anyOf:
+              - $ref: '#/components/schemas/ApprovalDecision'
+              - type: 'null'
+              title: Decision
       responses:
         '200':
           description: Successful Response
@@ -4219,11 +4451,13 @@ paths:
           format: uuid
           title: Request Id
       requestBody:
-        required: true
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/ApprovalDecision'
+              anyOf:
+              - $ref: '#/components/schemas/ApprovalDecision'
+              - type: 'null'
+              title: Decision
       responses:
         '200':
           description: Successful Response
@@ -5119,6 +5353,16 @@ paths:
           - type: string
           - type: 'null'
           title: Resource Type
+      - name: resource_id
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          description: Only holds on this resource id
+          title: Resource Id
+        description: Only holds on this resource id
       - name: limit
         in: query
         required: false
@@ -5880,6 +6124,13 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ProjectResponse'
+        '400':
+          description: The identifier already exists in this organization
+        '404':
+          description: Organization not found in the caller's account
+        '409':
+          description: 'repository_already_registered: the repository is already a
+            project in another organization; move it with POST /api/v1/projects/{project_id}/transfer'
         '422':
           description: Validation Error
           content:
@@ -6135,13 +6386,77 @@ paths:
                 $ref: '#/components/schemas/HTTPValidationError'
       security:
       - bearerAuth: []
+  /api/v1/projects/{project_id}/transfer:
+    post:
+      tags:
+      - Projects
+      summary: Transfer Project
+      description: 'Rebind a repository project to the organization that now owns
+        it.
+
+
+        A GitHub repository keeps its repository ID when it is transferred to
+
+        another owner or renamed. This keeps the same project row (and so its ID,
+
+        issues, flow triggers, audit and review history) and moves it to the
+
+        destination organization, updating the owner/name that clone and review
+
+        publication use.
+
+
+        Preview by default; send ``dry_run: false`` to apply. Applying again is a
+
+        no-op that returns ``status: unchanged``.
+
+
+        The destination integration must already be able to see the repository
+
+        (checked live with its own credentials) and must include it in scope.
+
+        Repository-level grants on the source integration are not copied; the
+
+        receipt lists them under ``not_carried_over``.'
+      operationId: transfer_project_api_v1_projects__project_id__transfer_post
+      security:
+      - bearerAuth: []
+      parameters:
+      - name: project_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Project Id
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ProjectTransferRequest'
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProjectTransferReceipt'
+        '403':
+          description: Caller lacks manage_trackers
+        '404':
+          description: Project or destination organization not found
+        '409':
+          description: Transfer refused; detail.code says why
+        '422':
+          description: Repository type or host cannot be transferred
+        '502':
+          description: Destination integration could not be queried
   /api/v1/projects/{project_id}/pull-requests:
     get:
       tags:
       - Projects
       summary: List Project Pull Requests
-      description: List open pull requests (GitHub) or merge requests (GitLab) for
-        a project.
+      description: List open pull requests (GitHub, Bitbucket) or merge requests (GitLab).
       operationId: list_project_pull_requests_api_v1_projects__project_id__pull_requests_get
       security:
       - bearerAuth: []
@@ -8406,6 +8721,67 @@ paths:
                 $ref: '#/components/schemas/HTTPValidationError'
       security:
       - bearerAuth: []
+  /api/v1/ai-models/{model_id}/credentials/marker:
+    get:
+      tags:
+      - AI Models
+      - AI Models
+      summary: Read Subscription OAuth Rotation Marker
+      description: 'Return the rotation marker of a stored subscription-OAuth bundle.
+
+
+        Subscription OAuth grants (Claude Code, Codex) use single-use refresh
+
+        tokens. When both the operator''s laptop and Preloop hold a copy, the CLI
+
+        keeps them on one lineage: it pushes a newer local bundle, and pulls
+
+        Preloop''s bundle through ``POST /ai-models/{model_id}/credentials/export``
+
+        when Preloop''s copy is newer. This read tells the CLI which side is newer
+
+        without downloading tokens on every Codex permission-hook call.
+
+
+        The response carries no token material: ``expires`` is the stored
+
+        access-token expiry in epoch milliseconds and moves forward on every
+
+        rotation, ``last_refresh`` is when Preloop last wrote the bundle (import,
+
+        CLI push, or server-side refresh), ``credentials_status`` is ``error``
+
+        when the last server-side refresh failed, and ``account_id`` names the
+
+        provider account the bundle belongs to. This read never refreshes the
+
+        bundle, so it cannot rotate the grant by itself. API-key credentials are
+
+        refused with 400.'
+      operationId: read_ai_model_credential_marker_api_v1_ai_models__model_id__credentials_marker_get
+      security:
+      - bearerAuth: []
+      parameters:
+      - name: model_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+          title: Model Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AIModelCredentialMarkerResponse'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
   /api/v1/ai-models/{model_id}/credentials/export:
     post:
       tags:
@@ -8423,9 +8799,21 @@ paths:
 
         live lineage. The CLI calls this at offboard time to restore the agent''s
 
-        local login before the Preloop-held credential is removed. API-key
+        local login before the Preloop-held credential is removed, and from the
 
-        credentials are never exportable.'
+        Codex permission hook and ``preloop agents sync-credentials`` to pull
+
+        Preloop''s copy back into the local login when
+
+        ``GET /ai-models/{model_id}/credentials/marker`` shows it is newer. A
+
+        stored bundle that is about to expire is refreshed before it is returned.
+
+        ``last_refresh`` is when Preloop last wrote the bundle. Every export is
+
+        written to the audit log without token material. API-key credentials are
+
+        never exportable.'
       operationId: export_ai_model_credentials_api_v1_ai_models__model_id__credentials_export_post
       security:
       - bearerAuth: []
@@ -8796,6 +9184,79 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/HTTPValidationError'
+  /api/v1/attention/spend-outliers:
+    get:
+      tags:
+      - Attention
+      - Attention
+      summary: List Spend Outliers
+      description: 'Open spend outliers: the latest finding per rule and user (or
+        session).
+
+
+        The console applies ``/attention/dismissals`` to these like any other
+
+        attention item.'
+      operationId: list_spend_outliers_api_v1_attention_spend_outliers_get
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SpendOutlierListResponse'
+      security:
+      - bearerAuth: []
+  /api/v1/attention/spend-outliers/settings:
+    get:
+      tags:
+      - Attention
+      - Attention
+      summary: Get Spend Outlier Settings
+      description: The account's spend outlier thresholds (defaults when never set).
+      operationId: get_spend_outlier_settings_api_v1_attention_spend_outliers_settings_get
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SpendOutlierSettingsResponse'
+      security:
+      - bearerAuth: []
+    put:
+      tags:
+      - Attention
+      - Attention
+      summary: Update Spend Outlier Settings
+      description: 'Replace the account''s spend outlier thresholds.
+
+
+        Writing takes ``manage_budgets``, the same permission as budget limits.
+
+        Changing a threshold does not rewrite findings already recorded.'
+      operationId: update_spend_outlier_settings_api_v1_attention_spend_outliers_settings_put
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SpendOutlierSettingsPayload'
+        required: true
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SpendOutlierSettingsResponse'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+      security:
+      - bearerAuth: []
   /api/v1/cost/summary:
     get:
       tags:
@@ -9026,6 +9487,401 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/HTTPValidationError'
+      security:
+      - bearerAuth: []
+  /api/v1/cost/by-issue:
+    get:
+      tags:
+      - Cost Analytics
+      - Cost Analytics
+      summary: List Issue Costs
+      description: Issue-level cost and cycle time, with per-project and per-flow
+        sums.
+      operationId: list_issue_costs_api_v1_cost_by_issue_get
+      security:
+      - bearerAuth: []
+      parameters:
+      - name: start_date
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: string
+            format: date-time
+          - type: 'null'
+          description: Issues whose first event is at or after this time.
+          title: Start Date
+        description: Issues whose first event is at or after this time.
+      - name: end_date
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: string
+            format: date-time
+          - type: 'null'
+          description: Issues whose first event is before this time.
+          title: End Date
+        description: Issues whose first event is before this time.
+      - name: project_id
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: string
+            format: uuid
+          - type: 'null'
+          title: Project Id
+      - name: flow_id
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: string
+            format: uuid
+          - type: 'null'
+          title: Flow Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IssueCostReport'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/v1/cost/by-issue/export:
+    get:
+      tags:
+      - Cost Analytics
+      - Cost Analytics
+      summary: Export Issue Costs
+      description: 'Export the issue rows of the current filter as CSV or JSON.
+
+
+        CSV is the flat issue grain plus one unassigned row. JSON carries the
+
+        contributing execution ids per issue and for the unassigned bucket.'
+      operationId: export_issue_costs_api_v1_cost_by_issue_export_get
+      security:
+      - bearerAuth: []
+      parameters:
+      - name: format
+        in: query
+        required: false
+        schema:
+          enum:
+          - csv
+          - json
+          type: string
+          default: csv
+          title: Format
+      - name: start_date
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: string
+            format: date-time
+          - type: 'null'
+          title: Start Date
+      - name: end_date
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: string
+            format: date-time
+          - type: 'null'
+          title: End Date
+      - name: project_id
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: string
+            format: uuid
+          - type: 'null'
+          title: Project Id
+      - name: flow_id
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: string
+            format: uuid
+          - type: 'null'
+          title: Flow Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/v1/cost/by-issue/unassigned/executions:
+    get:
+      tags:
+      - Cost Analytics
+      - Cost Analytics
+      summary: List Unassigned Issue Cost Executions
+      description: Executions in the unassigned bucket, for the report's drill-down.
+      operationId: list_unassigned_issue_cost_executions_api_v1_cost_by_issue_unassigned_executions_get
+      security:
+      - bearerAuth: []
+      parameters:
+      - name: start_date
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: string
+            format: date-time
+          - type: 'null'
+          description: Executions that started at or after this time.
+          title: Start Date
+        description: Executions that started at or after this time.
+      - name: end_date
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: string
+            format: date-time
+          - type: 'null'
+          description: Executions that started before this time.
+          title: End Date
+        description: Executions that started before this time.
+      - name: project_id
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: string
+            format: uuid
+          - type: 'null'
+          title: Project Id
+      - name: flow_id
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: string
+            format: uuid
+          - type: 'null'
+          title: Flow Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/IssueCostExecutionRow'
+                title: Response List Unassigned Issue Cost Executions Api V1 Cost
+                  By Issue Unassigned Executions Get
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/v1/cost/by-issue/{rollup_id}/executions:
+    get:
+      tags:
+      - Cost Analytics
+      - Cost Analytics
+      summary: List Issue Cost Executions
+      description: Executions that contributed to one issue row.
+      operationId: list_issue_cost_executions_api_v1_cost_by_issue__rollup_id__executions_get
+      security:
+      - bearerAuth: []
+      parameters:
+      - name: rollup_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+          title: Rollup Id
+      - name: flow_id
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: string
+            format: uuid
+          - type: 'null'
+          title: Flow Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/IssueCostExecutionRow'
+                title: Response List Issue Cost Executions Api V1 Cost By Issue  Rollup
+                  Id  Executions Get
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/v1/cost/by-issue/rebuild:
+    post:
+      tags:
+      - Cost Analytics
+      - Cost Analytics
+      summary: Rebuild Issue Costs
+      description: 'Record finished executions of a window that have no issue fact
+        yet.
+
+
+        Bounded per call; repeat until ``limit_reached`` is false. Executions
+
+        that fail to record are skipped, counted in ``failed`` and examined again
+
+        on the next call.'
+      operationId: rebuild_issue_costs_api_v1_cost_by_issue_rebuild_post
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/IssueCostRebuildRequest'
+        required: true
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IssueCostRebuildResponse'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+      security:
+      - bearerAuth: []
+  /api/v1/cost/copilot:
+    get:
+      tags:
+      - Cost Analytics
+      - Cost Analytics
+      summary: Get Copilot Usage
+      description: Return imported Copilot seats, premium-request spend and model
+        mix.
+      operationId: get_copilot_usage_api_v1_cost_copilot_get
+      security:
+      - bearerAuth: []
+      parameters:
+      - name: start_date
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: string
+            format: date-time
+          - type: 'null'
+          title: Start Date
+      - name: end_date
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: string
+            format: date-time
+          - type: 'null'
+          title: End Date
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CopilotUsageSummaryResponse'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/v1/cost/copilot/connection:
+    put:
+      tags:
+      - Cost Analytics
+      - Cost Analytics
+      summary: Upsert Copilot Connection
+      description: Create or update the Copilot connection and its operator seat price.
+      operationId: upsert_copilot_connection_api_v1_cost_copilot_connection_put
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CopilotConnectionUpsert'
+        required: true
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CopilotConnectionResponse'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+      security:
+      - bearerAuth: []
+    delete:
+      tags:
+      - Cost Analytics
+      - Cost Analytics
+      summary: Delete Copilot Connection
+      description: Remove the connection and its tokens; imported history is kept.
+      operationId: delete_copilot_connection_api_v1_cost_copilot_connection_delete
+      responses:
+        '204':
+          description: Successful Response
+      security:
+      - bearerAuth: []
+  /api/v1/cost/copilot/connection/sync:
+    post:
+      tags:
+      - Cost Analytics
+      - Cost Analytics
+      summary: Sync Copilot Connection
+      description: 'Queue an import for this account now (idempotent for the same
+        day).
+
+
+        A plain ``def`` handler runs on the threadpool, so the database lookup
+
+        never blocks the event loop; only the publish hops back onto the loop.'
+      operationId: sync_copilot_connection_api_v1_cost_copilot_connection_sync_post
+      responses:
+        '202':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CopilotSyncResponse'
       security:
       - bearerAuth: []
   /api/v1/usage/import:
@@ -10121,6 +10977,79 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/HTTPValidationError'
+  /api/v1/flows/executions/{execution_id}/evidence/members:
+    get:
+      tags:
+      - Flows
+      summary: Get Flow Execution Evidence Members
+      description: 'List a pack''s manifest members, or return one member when ``path``
+        is set.
+
+
+        Auth, decryption, digest verification and legal hold follow
+
+        ``GET .../evidence``. Only a path that the manifest lists is readable.
+
+        Absolute paths and ``..`` are refused. A member larger than 8 MiB is
+
+        refused; download the pack for that file. Markdown, JSON and plain text
+
+        are served with those content types.
+
+
+        The full download is not audited. This read is not audited either.'
+      operationId: get_flow_execution_evidence_members_api_v1_flows_executions__execution_id__evidence_members_get
+      security:
+      - bearerAuth: []
+      parameters:
+      - name: execution_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+          title: Execution Id
+      - name: path
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Path
+      responses:
+        '200':
+          description: JSON member list, or one member's bytes when path is set.
+          content:
+            application/json:
+              schema:
+                type: object
+            text/markdown:
+              schema:
+                type: string
+            text/plain:
+              schema:
+                type: string
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+          headers:
+            X-Preloop-Evidence-Integrity:
+              schema:
+                type: string
+            X-Preloop-Evidence-SHA256:
+              schema:
+                type: string
+            X-Preloop-Evidence-Member:
+              schema:
+                type: string
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
   /api/v1/flows/executions/{execution_id}/workspace:
     get:
       tags:
@@ -10231,12 +11160,53 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/HTTPValidationError'
+  /api/v1/flows/executions/{execution_id}/host-sessions:
+    get:
+      tags:
+      - Flows
+      summary: Get Flow Execution Host Sessions
+      description: "Hook sessions and seat usage of a run on a host-exec profile.\n\
+        \nArgs:\n    execution_id: ID of the execution.\n\nReturns:\n    Sessions\
+        \ observed by the runner's usage hook, their event counts,\n    and the Copilot\
+        \ premium requests the CLI reported. None of it is\n    gateway traffic."
+      operationId: get_flow_execution_host_sessions_api_v1_flows_executions__execution_id__host_sessions_get
+      security:
+      - bearerAuth: []
+      parameters:
+      - name: execution_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+          title: Execution Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HostExecSessionsResponse'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
   /api/v1/flows/executions/{execution_id}/gateway-events:
     get:
       tags:
       - Flows
       summary: Get Flow Execution Gateway Events
-      description: Get normalized model gateway events for a flow execution.
+      description: "Get normalized model gateway events for a flow execution.\n\n\
+        Args:\n    execution_id: ID of the execution.\n    tail: Most recent rows\
+        \ to return (default 5000).\n    metadata_only: Drop the large payload fields\
+        \ (conversation preview,\n        tools, result, stream events).\n    model_calls_only:\
+        \ Return only ``model_gateway_call`` rows. Without it\n        every log row\
+        \ of the execution is returned, including the agent\n        log lines the\
+        \ logs endpoint already serves, and on a long run\n        those crowd the\
+        \ model calls out of ``tail``.\n\nReturns:\n    ``logs`` (newest first), ``source``,\
+        \ and ``has_more``: whether rows\n    older than the returned ``tail`` exist."
       operationId: get_flow_execution_gateway_events_api_v1_flows_executions__execution_id__gateway_events_get
       security:
       - bearerAuth: []
@@ -10254,6 +11224,7 @@ paths:
         schema:
           anyOf:
           - type: integer
+            minimum: 1
           - type: 'null'
           title: Tail
       - name: metadata_only
@@ -10263,6 +11234,13 @@ paths:
           type: boolean
           default: false
           title: Metadata Only
+      - name: model_calls_only
+        in: query
+        required: false
+        schema:
+          type: boolean
+          default: false
+          title: Model Calls Only
       responses:
         '200':
           description: Successful Response
@@ -10332,7 +11310,10 @@ paths:
         \ 0.0, which would misreport real\n      spend as free)\n    - has_pricing:\
         \ Whether any request could be priced\n    - cost_is_partial: Whether estimated_cost\
         \ excludes unpriced requests\n    - unpriced_requests: Requests that could\
-        \ not be priced\n    - unpriced_tokens: Token volume behind the unpriced requests"
+        \ not be priced\n    - unpriced_tokens: Token volume behind the unpriced requests\n\
+        \    - limits: Configured per-execution ceilings (only keys that are set)\n\
+        \    - limit_status: Current usage against those ceilings\n      (``total_tokens``,\
+        \ ``estimated_cost_usd``, ``turns``)"
       operationId: get_flow_execution_metrics_api_v1_flows_executions__execution_id__metrics_get
       security:
       - bearerAuth: []
@@ -10413,7 +11394,16 @@ paths:
       tags:
       - Flows
       summary: Send Execution Command
-      description: Send a command to a running flow execution.
+      description: 'Send a command to a running flow execution.
+
+
+        ``stop`` goes through ``preloop.services.flow_execution_stop``, the same
+
+        code path the automatic pull request stops use (#1032). It is idempotent:
+
+        stopping an execution that already ended changes nothing and answers with
+
+        the status it ended in.'
       operationId: send_execution_command_api_v1_flows_executions__execution_id__command_post
       security:
       - bearerAuth: []
@@ -10882,6 +11872,57 @@ paths:
               schema:
                 $ref: '#/components/schemas/HTTPValidationError'
   /api/v1/runners/{runner_id}:
+    delete:
+      tags:
+      - Runners
+      summary: Delete Runner
+      description: 'Delete a runner and reject its token from now on.
+
+
+        A runner that holds executions is refused with 409 unless ``force`` is
+
+        set. With ``force`` each held execution is stopped (the stop intent an
+
+        account halt writes, settled here because the runner can no longer
+
+        report back) and its runtime API keys are revoked. A live socket in this
+
+        process is told which executions to halt and then closed; one on another
+
+        replica ends on its next frame. Flows that route to the runner''s labels
+
+        see one runner fewer and fall back to their configured behaviour.'
+      operationId: delete_runner_api_v1_runners__runner_id__delete
+      security:
+      - bearerAuth: []
+      parameters:
+      - name: runner_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+          title: Runner Id
+      - name: force
+        in: query
+        required: false
+        schema:
+          type: boolean
+          default: false
+          title: Force
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RunnerDeleteResponse'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
     get:
       tags:
       - Runners
@@ -10904,6 +11945,43 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/RunnerResponse'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/v1/runners/{runner_id}/token:
+    post:
+      tags:
+      - Runners
+      summary: Rotate Runner Token
+      description: 'Mint a new runner token; the previous one is rejected immediately.
+
+
+        The new token is in this response and nowhere else. A socket
+
+        authenticated with the old token is closed: in this process now, on
+
+        another replica at its next frame.'
+      operationId: rotate_runner_token_api_v1_runners__runner_id__token_post
+      security:
+      - bearerAuth: []
+      parameters:
+      - name: runner_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+          title: Runner Id
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RunnerRegisterResponse'
         '422':
           description: Validation Error
           content:
@@ -11536,6 +12614,41 @@ paths:
                 $ref: '#/components/schemas/HTTPValidationError'
       security:
       - bearerAuth: []
+  /api/v1/policies/notices/summary:
+    get:
+      tags:
+      - Policies
+      summary: Summarize notify rule hits by rule
+      description: Return notify rule hits of the last ``days`` days, one row per
+        rule.
+      operationId: get_policy_notice_summary_api_v1_policies_notices_summary_get
+      security:
+      - bearerAuth: []
+      parameters:
+      - name: days
+        in: query
+        required: false
+        schema:
+          type: integer
+          maximum: 90
+          minimum: 1
+          description: Window length in days
+          default: 7
+          title: Days
+        description: Window length in days
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PolicyNoticeSummaryResponse'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
   /api/v1/security-screen/score:
     post:
       tags:
@@ -12101,6 +13214,274 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/HTTPValidationError'
+  /api/v1/runtime-sessions/{runtime_session_id}/browser-steps:
+    post:
+      tags:
+      - Runtime Sessions
+      summary: Ingest Runtime Session Browser Steps
+      description: "Store a batch of browser step observations on a runtime session.\n\
+        \nArgs:\n    runtime_session_id: Session the steps attach to.\n    batch:\
+        \ One to 200 steps.\n    db: Database session.\n    auth: Agent credential\
+        \ from the bearer token.\n\nReturns:\n    How many steps were stored, repeated,\
+        \ or refused.\n\nRaises:\n    HTTPException: 403 when the credential is pinned\
+        \ to another session,\n        404 when the session is not in the credential's\
+        \ account."
+      operationId: ingest_runtime_session_browser_steps_api_v1_runtime_sessions__runtime_session_id__browser_steps_post
+      parameters:
+      - name: runtime_session_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Runtime Session Id
+      - name: authorization
+        in: header
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Authorization
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BrowserStepBatchIn'
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BrowserStepBatchOut'
+        '401':
+          description: Missing or invalid bearer token
+        '403':
+          description: Credential is bound to a different runtime session
+        '404':
+          description: Runtime session not found
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+      security:
+      - bearerAuth: []
+  /api/v1/runtime-sessions/{runtime_session_id}/artifacts:
+    post:
+      tags:
+      - Runtime Sessions
+      summary: Deposit Runtime Session Artifact
+      description: 'Store one artifact on a runtime session and add it to the timeline.
+
+
+        JSON bodies carry one MCP ``ContentBlock`` in ``content``; multipart
+
+        bodies carry a ``file`` part and an optional JSON ``metadata`` part.
+
+        A repeated ``Idempotency-Key`` returns the stored artifact with
+
+        ``Idempotent-Replayed: true``.'
+      operationId: deposit_runtime_session_artifact_api_v1_runtime_sessions__runtime_session_id__artifacts_post
+      parameters:
+      - name: runtime_session_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Runtime Session Id
+      - name: Idempotency-Key
+        in: header
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Idempotency-Key
+      - name: authorization
+        in: header
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Authorization
+      responses:
+        '201':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RuntimeSessionArtifactOut'
+        '401':
+          description: Missing or invalid bearer token
+        '403':
+          description: Credential is bound to a different runtime session
+        '404':
+          description: Runtime session not found in this account
+        '409':
+          description: artifact_audio_storage_disabled
+        '413':
+          description: artifact_too_large
+        '415':
+          description: artifact_media_type_invalid or artifact_content_mismatch
+        '422':
+          description: artifact_labels_invalid and other request errors
+        '507':
+          description: storage_budget_exhausted
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              additionalProperties: false
+              description: 'JSON deposit: the metadata fields plus one MCP ``ContentBlock``.'
+              properties:
+                kind:
+                  anyOf:
+                  - type: string
+                  - type: 'null'
+                  description: Artifact kind. Inferred from the media type when omitted
+                    (image -> screenshot, text/vtt -> transcript, ...).
+                  title: Kind
+                name:
+                  maxLength: 255
+                  minLength: 1
+                  title: Name
+                  type: string
+                labels:
+                  anyOf:
+                  - additionalProperties: true
+                    type: object
+                  - type: 'null'
+                  description: 'Up to 16 keys matching ^[a-z][a-z0-9_.-]{0,62}$; string
+                    values up to 128 characters; `tags` is a list of strings. Documented
+                    keys: site, tenant_ref, consent_basis, retention_class, tags.'
+                  title: Labels
+                activity_id:
+                  anyOf:
+                  - type: string
+                  - type: 'null'
+                  description: Existing timeline row in this session the artifact
+                    illustrates.
+                  title: Activity Id
+                parent_artifact_id:
+                  anyOf:
+                  - type: string
+                  - type: 'null'
+                  description: Artifact in this account this one derives from.
+                  title: Parent Artifact Id
+                tool_name:
+                  anyOf:
+                  - maxLength: 255
+                    minLength: 1
+                    type: string
+                  - type: 'null'
+                  title: Tool Name
+                content:
+                  additionalProperties: true
+                  description: 'One MCP ContentBlock: text, image, audio, or resource
+                    (text or blob). A resource_link carries no bytes and is refused.'
+                  title: Content
+                  type: object
+              required:
+              - name
+              - content
+              title: ArtifactDepositIn
+              type: object
+          multipart/form-data:
+            schema:
+              type: object
+              required:
+              - file
+              properties:
+                file:
+                  type: string
+                  format: binary
+                metadata:
+                  type: string
+                  description: 'JSON object: kind, name, labels, activity_id, parent_artifact_id,
+                    tool_name'
+      security:
+      - bearerAuth: []
+    get:
+      tags:
+      - Runtime Sessions
+      summary: List Runtime Session Artifacts
+      description: 'List a session''s artifacts, newest first, with cursor pagination.
+
+
+        A key pinned to this session may list it. Any other credential needs a
+
+        user with ``view_runtime_sessions`` in the session''s account.'
+      operationId: list_runtime_session_artifacts_api_v1_runtime_sessions__runtime_session_id__artifacts_get
+      parameters:
+      - name: runtime_session_id
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Runtime Session Id
+      - name: kind
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Kind
+      - name: label
+        in: query
+        required: false
+        schema:
+          type: array
+          items:
+            type: string
+          description: Repeatable `key:value` label filter.
+          title: Label
+        description: Repeatable `key:value` label filter.
+      - name: limit
+        in: query
+        required: false
+        schema:
+          type: integer
+          default: 50
+          title: Limit
+      - name: cursor
+        in: query
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Cursor
+      - name: authorization
+        in: header
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Authorization
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RuntimeSessionArtifactListOut'
+        '401':
+          description: Missing or invalid bearer token
+        '403':
+          description: Credential is bound to a different runtime session
+        '404':
+          description: Runtime session not found in this account
+        '422':
+          description: Bad kind, label, limit or cursor
+      security:
+      - bearerAuth: []
   /api/v1/runtime-sessions/search/saved:
     post:
       tags:
@@ -12357,15 +13738,19 @@ paths:
     put:
       tags:
       - Runtime Sessions
-      summary: Set how much of a session this account embeds
-      description: 'Change the scope. Existing vectors are never touched by this call.
+      summary: Opt in to session embedding, or change its scope and cap
+      description: 'Change what this account embeds. Existing vectors are never touched.
 
 
         Narrowing to ``summaries_only`` stops new transcript chunks being
 
         embedded from the next worker pass; widening to ``full`` gives the
 
-        untouched backlog back to the worker, still under the daily cap.'
+        untouched backlog back to the worker, still under the daily cap.
+
+        Turning embedding off keeps the provider details, so turning it back on
+
+        needs only ``{"enabled": true}``.'
       operationId: update_session_embedding_setting_api_v1_runtime_sessions_settings_embedding_put
       requestBody:
         content:
@@ -12572,8 +13957,16 @@ components:
             type: object
           - type: 'null'
           title: Credential Payload
-          description: Optional inline credential payload for non-API-key auth, stored
-            encrypted when provided
+          description: 'Inline credential payload for non-API-key auth, stored encrypted.
+            Validated per credential_type at write time; an invalid payload returns
+            422 and nothing is stored. For ''oauth_openai_codex'' send {access, refresh,
+            account_id, expires}: access, refresh and account_id are non-empty strings
+            and expires is the access-token expiry as an integer in epoch milliseconds.
+            For ''oauth_anthropic_claude_code'' send {access} plus optional refresh
+            (non-empty string) and expires (epoch milliseconds). The key names from
+            the tools'' own auth files (access_token, refresh_token, expires_at) are
+            rejected. This is the same shape POST /ai-models/{model_id}/credentials/export
+            returns.'
         credentials_backend_type:
           anyOf:
           - type: string
@@ -12651,6 +14044,14 @@ components:
           - type: string
           - type: 'null'
           title: Account Id
+        last_refresh:
+          anyOf:
+          - type: string
+            format: date-time
+          - type: 'null'
+          title: Last Refresh
+          description: When Preloop last wrote this bundle (import, CLI push, or server-side
+            refresh), in UTC
       type: object
       required:
       - credential_type
@@ -12666,6 +14067,52 @@ components:
         single-use, so the Preloop-held copy is the only live lineage after a
 
         server-side refresh). Token material must never be logged.'
+    AIModelCredentialMarkerResponse:
+      properties:
+        credential_type:
+          type: string
+          title: Credential Type
+          description: Logical credential type stored for the model
+        expires:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Expires
+          description: Access-token expiry of the stored bundle in epoch milliseconds.
+            It moves forward every time the bundle is rotated.
+        last_refresh:
+          anyOf:
+          - type: string
+            format: date-time
+          - type: 'null'
+          title: Last Refresh
+          description: When Preloop last wrote this bundle (import, CLI push, or server-side
+            refresh), in UTC
+        credentials_status:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Credentials Status
+          description: Status of the model's credential secret
+        account_id:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Account Id
+          description: Provider account the bundle belongs to (the ChatGPT account
+            id for Codex), so the CLI never pulls another account's login
+      type: object
+      required:
+      - credential_type
+      title: AIModelCredentialMarkerResponse
+      description: 'Rotation marker for a stored subscription-OAuth bundle.
+
+
+        Carries no token material. The CLI reads it on the Codex permission hook
+
+        to decide whether Preloop''s copy is newer than the local login before it
+
+        downloads the bundle through the export endpoint.'
     AIModelGatewayUsageSummaryResponse:
       properties:
         ai_model_id:
@@ -13210,6 +14657,16 @@ components:
             type: object
           - type: 'null'
           title: Credential Payload
+          description: 'Inline credential payload for non-API-key auth, stored encrypted.
+            Validated per credential_type at write time; an invalid payload returns
+            422 and nothing is stored. For ''oauth_openai_codex'' send {access, refresh,
+            account_id, expires}: access, refresh and account_id are non-empty strings
+            and expires is the access-token expiry as an integer in epoch milliseconds.
+            For ''oauth_anthropic_claude_code'' send {access} plus optional refresh
+            (non-empty string) and expires (epoch milliseconds). The key names from
+            the tools'' own auth files (access_token, refresh_token, expires_at) are
+            rejected. This is the same shape POST /ai-models/{model_id}/credentials/export
+            returns.'
         credentials_backend_type:
           anyOf:
           - type: string
@@ -14071,6 +15528,10 @@ components:
           - high-mem
           title: Compute Size
           default: standard
+        desktop:
+          type: boolean
+          title: Desktop
+          default: false
       type: object
       required:
       - idempotency_key
@@ -14168,15 +15629,31 @@ components:
         session_id:
           anyOf:
           - type: string
+            maxLength: 255
           - type: 'null'
           title: Session Id
-          description: Agent session id
+          description: Originating agent session id
+        model:
+          anyOf:
+          - type: string
+            maxLength: 255
+          - type: 'null'
+          title: Model
+          description: Originating turn model observed by the hook
         cwd:
           anyOf:
           - type: string
           - type: 'null'
           title: Cwd
           description: Working directory
+        repository:
+          anyOf:
+          - $ref: '#/components/schemas/AgentPermissionRepository'
+          - type: 'null'
+          description: Trusted repository identity the hook observed from its cwd.
+            Stored as the '_preloop_repository' marker inside tool_args, next to '_preloop_source',
+            so approvals and the session timeline can label which repository the call
+            ran in.
         agent_reasoning:
           anyOf:
           - type: string
@@ -14243,6 +15720,57 @@ components:
       - decision
       title: AgentPermissionCheckResponse
       description: Allow/deny decision for the agent's native tool call.
+    AgentPermissionRepository:
+      properties:
+        remote:
+          type: string
+          maxLength: 512
+          title: Remote
+          description: Normalized 'host/owner/repo' with credentials stripped; empty
+            when the work tree has no origin remote.
+          default: ''
+        toplevel:
+          anyOf:
+          - type: string
+            maxLength: 512
+          - type: 'null'
+          title: Toplevel
+          description: Absolute work-tree root.
+        relative_path:
+          anyOf:
+          - type: string
+            maxLength: 512
+          - type: 'null'
+          title: Relative Path
+          description: cwd relative to the work-tree root.
+        source:
+          anyOf:
+          - type: string
+            maxLength: 512
+          - type: 'null'
+          title: Source
+          description: How the identity was observed, e.g. 'hook_cwd'.
+        no_remote:
+          type: boolean
+          title: No Remote
+          description: True when the work tree has no origin, or the origin is not
+            a host/owner/repo identity (a local path or file:// remote).
+          default: false
+      additionalProperties: false
+      type: object
+      title: AgentPermissionRepository
+      description: 'Trusted hook observation of the repository a native call ran in.
+
+
+        The hook resolves its own ``cwd`` against git and sends the result; the
+
+        caller-supplied tool arguments are never used, so an MCP tool cannot
+
+        spoof the repository. Extra keys are forbidden and every string is
+
+        bounded: the object travels into approval ``tool_args`` and onto the
+
+        session timeline, and this is untrusted network input.'
     ApiKeyCreate:
       properties:
         name:
@@ -14720,15 +16248,26 @@ components:
     ApprovalDecision:
       properties:
         approved:
-          type: boolean
+          anyOf:
+          - type: boolean
+          - type: 'null'
           title: Approved
-          description: Whether the request is approved or declined
+          description: Required on /decide. Optional on /approve and /decline, where
+            the path already names the decision; if sent there it must agree with
+            it.
         comment:
           anyOf:
           - type: string
           - type: 'null'
           title: Comment
           description: Comment from the approver
+        reason:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Reason
+          description: Deprecated alias for comment, used when comment is not set.
+          deprecated: true
         selected_option:
           anyOf:
           - type: string
@@ -14751,8 +16290,6 @@ components:
             JSON. Validated against that schema server-side; x-autofill fields (author,
             date) are stamped by the platform and anything sent for them is ignored.'
       type: object
-      required:
-      - approved
       title: ApprovalDecision
       description: Schema for an approval decision or a question answer.
     ApprovalDecisionRequest:
@@ -15472,6 +17009,19 @@ components:
           - type: string
           - type: 'null'
           title: Account Id
+        webhook_secret:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Webhook Secret
+          description: Webhook signing secret. Present only in the response that generated
+            it; store it, it is not shown again.
+        webhook_secret_hint:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Webhook Secret Hint
+          description: Last characters of the webhook signing secret
         created_at:
           type: string
           format: date-time
@@ -16079,6 +17629,70 @@ components:
       type: object
       title: AvatarResponse
       description: Response after avatar upload or deletion.
+    Backport:
+      properties:
+        enabled:
+          type: boolean
+          title: Enabled
+          description: Whether merged pull requests are backported by the control
+            plane instead of running an agent
+          default: false
+        source_branch:
+          type: string
+          title: Source Branch
+          description: Release branch whose merged pull requests are backported. A
+            merge into any other branch does not start the flow
+        target_branches:
+          items:
+            type: string
+          type: array
+          maxItems: 10
+          minItems: 1
+          title: Target Branches
+          description: Branches the change is cherry-picked onto, in order, for example
+            the next release branch and then the default branch
+        reviewers:
+          items:
+            type: string
+          type: array
+          maxItems: 15
+          title: Reviewers
+          description: Usernames asked to review every backport pull request. A failed
+            review request is recorded and the pull request stays open
+        comment_on_original:
+          type: boolean
+          title: Comment On Original
+          description: Post one summary comment with the status of every target on
+            the original pull request
+          default: true
+      additionalProperties: false
+      type: object
+      required:
+      - source_branch
+      - target_branches
+      title: Backport
+      description: 'Cherry-pick a merged pull request onto later release branches.
+
+
+        Issue #961. When a pull request merges into ``source_branch``, the control
+
+        plane cherry-picks its merge commit onto a new branch cut from each entry
+
+        of ``target_branches``, in order, and opens one pull request per target.
+
+        No agent runs and nothing is ever merged. A conflict is reported with the
+
+        conflicting files and left for a person.
+
+
+        This block is separate from ``GitCloneConfig.source_branch``, which names
+
+        the branch an agent checkout starts from, a different meaning.
+
+
+        ``extra=''forbid''``: a misspelled key here is a backport opened against the
+
+        wrong branch, or not at all.'
     BaselineAcceptRequest:
       properties:
         audit_execution_id:
@@ -16137,6 +17751,21 @@ components:
           description: Tokens this execution's gateway traffic consumed, split by
             direction and cache participation. Null when the run has no attributable
             gateway usage, which is not the same as zero.
+        resume_of:
+          anyOf:
+          - type: string
+            format: uuid
+          - type: 'null'
+          title: Resume Of
+          description: Publishing execution this repair resumes. Null when the row
+            is not a review/CI resumption. Distinct from parent_execution_id (delegation).
+        resume_totals:
+          anyOf:
+          - $ref: '#/components/schemas/ExecutionResumeTotals'
+          - type: 'null'
+          description: Summed total_tokens and estimated_cost for the publishing execution
+            and every repair that points at it. Null when the execution is not part
+            of a multi-turn resume chain.
         id:
           type: string
           format: uuid
@@ -16532,6 +18161,145 @@ components:
       required:
       - file
       title: Body_validate_policy_api_v1_policies_validate_post
+    BrowserScreenshotIn:
+      properties:
+        content_type:
+          type: string
+          enum:
+          - image/png
+          - image/jpeg
+          - image/webp
+          title: Content Type
+        data_base64:
+          type: string
+          title: Data Base64
+      type: object
+      required:
+      - content_type
+      - data_base64
+      title: BrowserScreenshotIn
+      description: 'An image the agent captured for one step, base64 encoded.
+
+
+        The bytes are decoded and checked in the ingest service so a bad image
+
+        rejects only its own row, not the whole batch.'
+    BrowserStepBatchIn:
+      properties:
+        steps:
+          items:
+            $ref: '#/components/schemas/BrowserStepIn'
+          type: array
+          maxItems: 200
+          minItems: 1
+          title: Steps
+      type: object
+      required:
+      - steps
+      title: BrowserStepBatchIn
+      description: A batch of browser steps from one agent flush.
+    BrowserStepBatchOut:
+      properties:
+        accepted:
+          type: integer
+          title: Accepted
+        duplicates:
+          type: integer
+          title: Duplicates
+        rejected:
+          items:
+            additionalProperties: true
+            type: object
+          type: array
+          title: Rejected
+      type: object
+      required:
+      - accepted
+      - duplicates
+      - rejected
+      title: BrowserStepBatchOut
+      description: How many steps in a batch were stored, repeated, or refused.
+    BrowserStepIn:
+      properties:
+        source:
+          type: string
+          enum:
+          - api
+          - browser_use
+          - skyvern
+          - playwright_mcp
+          title: Source
+          default: api
+        source_step_id:
+          type: string
+          maxLength: 200
+          minLength: 1
+          title: Source Step Id
+        step_index:
+          type: integer
+          minimum: 0.0
+          title: Step Index
+        action:
+          type: string
+          enum:
+          - navigate
+          - click
+          - type
+          - select
+          - scroll
+          - screenshot
+          - extract
+          - wait
+          - done
+          - other
+          title: Action
+        url:
+          anyOf:
+          - type: string
+            maxLength: 2048
+          - type: 'null'
+          title: Url
+        target:
+          anyOf:
+          - type: string
+            maxLength: 1024
+          - type: 'null'
+          title: Target
+        reasoning:
+          anyOf:
+          - type: string
+            maxLength: 8000
+          - type: 'null'
+          title: Reasoning
+        status:
+          type: string
+          enum:
+          - success
+          - failed
+          - unknown
+          title: Status
+          default: success
+        occurred_at:
+          anyOf:
+          - type: string
+            format: date-time
+          - type: 'null'
+          title: Occurred At
+        extra:
+          additionalProperties: true
+          type: object
+          title: Extra
+        screenshot:
+          anyOf:
+          - $ref: '#/components/schemas/BrowserScreenshotIn'
+          - type: 'null'
+      type: object
+      required:
+      - source_step_id
+      - step_index
+      - action
+      title: BrowserStepIn
+      description: One browser action observed by an agent.
     BudgetPeriod:
       type: string
       enum:
@@ -17083,6 +18851,44 @@ components:
       - checkpoints_verified
       title: ChainVerifyRead
       description: Verdict of a server side walk over a range of the chain.
+    CliSessionResponse:
+      properties:
+        id:
+          type: string
+          format: uuid
+          title: Id
+        created_at:
+          type: string
+          format: date-time
+          title: Created At
+        last_seen_at:
+          anyOf:
+          - type: string
+            format: date-time
+          - type: 'null'
+          title: Last Seen At
+        user_agent:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: User Agent
+        hostname:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Hostname
+        current:
+          type: boolean
+          title: Current
+          description: True for the session the request's own token belongs to
+          default: false
+      type: object
+      required:
+      - id
+      - created_at
+      title: CliSessionResponse
+      description: One CLI login session (``preloop auth login``) of the signed-in
+        user.
     CommentCreate:
       properties:
         body:
@@ -17205,6 +19011,7 @@ components:
       - require_approval
       - deny
       - allow
+      - notify
       title: ConditionAction
       description: Actions to take when a condition matches.
     ConditionTestRequest:
@@ -17402,6 +19209,386 @@ components:
       - allowed_recovery_modes
       - warnings
       title: ContinuationPreview
+    CopilotConnectionResponse:
+      properties:
+        id:
+          type: string
+          format: uuid
+          title: Id
+        organization:
+          type: string
+          title: Organization
+        enterprise:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Enterprise
+        has_enterprise_token:
+          type: boolean
+          title: Has Enterprise Token
+          default: false
+        seat_price_monthly:
+          anyOf:
+          - type: number
+          - type: 'null'
+          title: Seat Price Monthly
+        currency:
+          type: string
+          title: Currency
+          default: USD
+        is_active:
+          type: boolean
+          title: Is Active
+          default: true
+        last_synced_at:
+          anyOf:
+          - type: string
+            format: date-time
+          - type: 'null'
+          title: Last Synced At
+        last_synced_day:
+          anyOf:
+          - type: string
+            format: date
+          - type: 'null'
+          title: Last Synced Day
+        last_error:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Last Error
+        per_user_billing_status:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Per User Billing Status
+        per_user_billing_reason:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Per User Billing Reason
+        metrics_status:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Metrics Status
+        metrics_reason:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Metrics Reason
+        last_warning:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Last Warning
+      type: object
+      required:
+      - id
+      - organization
+      title: CopilotConnectionResponse
+      description: Connection state without any token material.
+    CopilotConnectionUpsert:
+      properties:
+        organization:
+          type: string
+          maxLength: 100
+          pattern: ^[A-Za-z0-9](?:[A-Za-z0-9-]{0,98}[A-Za-z0-9])?$
+          title: Organization
+        enterprise:
+          anyOf:
+          - type: string
+            maxLength: 100
+            pattern: ^[A-Za-z0-9](?:[A-Za-z0-9-]{0,98}[A-Za-z0-9])?$
+          - type: 'null'
+          title: Enterprise
+        token:
+          anyOf:
+          - type: string
+            maxLength: 512
+            minLength: 1
+          - type: 'null'
+          title: Token
+          description: Organization token (organization owner or administrator). Required
+            when creating the connection.
+        enterprise_token:
+          anyOf:
+          - type: string
+            maxLength: 512
+            minLength: 1
+          - type: 'null'
+          title: Enterprise Token
+          description: Optional enterprise billing reader token for the enterprise
+            premium-request route.
+        clear_enterprise_token:
+          type: boolean
+          title: Clear Enterprise Token
+          default: false
+        seat_price_monthly:
+          anyOf:
+          - type: number
+            minimum: 0.0
+          - type: 'null'
+          title: Seat Price Monthly
+          description: Operator-entered monthly price per seat; null clears it.
+        is_active:
+          anyOf:
+          - type: boolean
+          - type: 'null'
+          title: Is Active
+          description: Pause (false) or resume (true) scheduled imports; omitted keeps
+            the current value (new connections start active).
+      type: object
+      required:
+      - organization
+      title: CopilotConnectionUpsert
+      description: 'Create or update the account''s Copilot import connection.
+
+
+        Tokens are write-only: omit a token to keep the stored one. The seat
+
+        price is replaced on every call, so sending ``null`` clears it.'
+    CopilotDeveloperSpend:
+      properties:
+        login:
+          type: string
+          title: Login
+        net_amount:
+          type: number
+          title: Net Amount
+        net_quantity:
+          type: number
+          title: Net Quantity
+      type: object
+      required:
+      - login
+      - net_amount
+      - net_quantity
+      title: CopilotDeveloperSpend
+      description: Premium-request spend for one developer.
+    CopilotModelMix:
+      properties:
+        login:
+          type: string
+          title: Login
+        basis:
+          type: string
+          enum:
+          - net_amount
+          - requests
+          title: Basis
+        models:
+          items:
+            $ref: '#/components/schemas/CopilotModelShare'
+          type: array
+          title: Models
+      type: object
+      required:
+      - login
+      - basis
+      - models
+      title: CopilotModelMix
+      description: Model mix for one developer.
+    CopilotModelShare:
+      properties:
+        model:
+          type: string
+          title: Model
+        value:
+          type: number
+          title: Value
+        share:
+          type: number
+          title: Share
+      type: object
+      required:
+      - model
+      - value
+      - share
+      title: CopilotModelShare
+      description: One model's share of a developer's usage.
+    CopilotModelSpend:
+      properties:
+        model:
+          type: string
+          title: Model
+        net_amount:
+          type: number
+          title: Net Amount
+        net_quantity:
+          type: number
+          title: Net Quantity
+      type: object
+      required:
+      - model
+      - net_amount
+      - net_quantity
+      title: CopilotModelSpend
+      description: Premium-request spend for one model.
+    CopilotPremiumRequests:
+      properties:
+        total_net_amount:
+          anyOf:
+          - type: number
+          - type: 'null'
+          title: Total Net Amount
+        currency:
+          type: string
+          title: Currency
+          default: USD
+        per_user_status:
+          type: string
+          title: Per User Status
+          description: available, unavailable or no_data.
+        per_user_unavailable_reason:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Per User Unavailable Reason
+        org_aggregate_net_amount:
+          anyOf:
+          - type: number
+          - type: 'null'
+          title: Org Aggregate Net Amount
+          description: Spend stored only as an organization total.
+        unattributed_net_amount:
+          anyOf:
+          - type: number
+          - type: 'null'
+          title: Unattributed Net Amount
+          description: Spend on per-user days that no current seat holder explains,
+            for example a developer whose seat was removed.
+        aggregate_days:
+          type: integer
+          title: Aggregate Days
+          default: 0
+        by_developer:
+          items:
+            $ref: '#/components/schemas/CopilotDeveloperSpend'
+          type: array
+          title: By Developer
+        by_model:
+          items:
+            $ref: '#/components/schemas/CopilotModelSpend'
+          type: array
+          title: By Model
+      type: object
+      required:
+      - per_user_status
+      title: CopilotPremiumRequests
+      description: Premium-request spend (usage, not the seat fee) for the window.
+    CopilotSeat:
+      properties:
+        login:
+          type: string
+          title: Login
+        last_activity_at:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Last Activity At
+        last_activity_editor:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Last Activity Editor
+      type: object
+      required:
+      - login
+      title: CopilotSeat
+      description: One assigned seat and its last reported activity.
+    CopilotSeatSummary:
+      properties:
+        total_seats:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Total Seats
+        plan_type:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Plan Type
+        as_of:
+          anyOf:
+          - type: string
+            format: date-time
+          - type: 'null'
+          title: As Of
+        seat_price_monthly:
+          anyOf:
+          - type: number
+          - type: 'null'
+          title: Seat Price Monthly
+        currency:
+          type: string
+          title: Currency
+          default: USD
+        monthly_seat_estimate:
+          anyOf:
+          - type: number
+          - type: 'null'
+          title: Monthly Seat Estimate
+          description: seat_price_monthly x total_seats. Null when no seat price was
+            entered, never a zero.
+        assigned:
+          items:
+            $ref: '#/components/schemas/CopilotSeat'
+          type: array
+          title: Assigned
+      type: object
+      title: CopilotSeatSummary
+      description: Seat count and the operator-priced monthly seat estimate.
+    CopilotSyncResponse:
+      properties:
+        status:
+          type: string
+          const: queued
+          title: Status
+          default: queued
+      type: object
+      title: CopilotSyncResponse
+      description: Acknowledgement that a sync was queued.
+    CopilotUsageSummaryResponse:
+      properties:
+        metered_by_gateway:
+          type: boolean
+          const: false
+          title: Metered By Gateway
+          default: false
+        marker:
+          type: string
+          title: Marker
+        period_start:
+          type: string
+          format: date-time
+          title: Period Start
+        period_end:
+          type: string
+          format: date-time
+          title: Period End
+        connection:
+          anyOf:
+          - $ref: '#/components/schemas/CopilotConnectionResponse'
+          - type: 'null'
+        seats:
+          $ref: '#/components/schemas/CopilotSeatSummary'
+        premium_requests:
+          $ref: '#/components/schemas/CopilotPremiumRequests'
+        model_mix:
+          items:
+            $ref: '#/components/schemas/CopilotModelMix'
+          type: array
+          title: Model Mix
+      type: object
+      required:
+      - marker
+      - period_start
+      - period_end
+      - seats
+      - premium_requests
+      title: CopilotUsageSummaryResponse
+      description: The Copilot section of the Cost page.
     CostAnalyticsSummaryResponse:
       properties:
         period_start:
@@ -17891,6 +20078,21 @@ components:
         approvals are stored. A parked run holds no container and no runner: this
 
         is a governance object, not a spinner.'
+    ExecutionResumeTotals:
+      properties:
+        total_tokens:
+          type: integer
+          title: Total Tokens
+          description: Summed tokens across the resume chain
+          default: 0
+        estimated_cost:
+          type: number
+          title: Estimated Cost
+          description: Summed estimated cost across the resume chain
+          default: 0.0
+      type: object
+      title: ExecutionResumeTotals
+      description: Combined tokens and cost for a publishing execution and its repairs.
     ExecutionRunner:
       properties:
         kind:
@@ -17983,6 +20185,21 @@ components:
           description: Tokens this execution's gateway traffic consumed, split by
             direction and cache participation. Null when the run has no attributable
             gateway usage, which is not the same as zero.
+        resume_of:
+          anyOf:
+          - type: string
+            format: uuid
+          - type: 'null'
+          title: Resume Of
+          description: Publishing execution this repair resumes. Null when the row
+            is not a review/CI resumption. Distinct from parent_execution_id (delegation).
+        resume_totals:
+          anyOf:
+          - $ref: '#/components/schemas/ExecutionResumeTotals'
+          - type: 'null'
+          description: Summed total_tokens and estimated_cost for the publishing execution
+            and every repair that points at it. Null when the execution is not part
+            of a multi-turn resume chain.
         id:
           type: string
           format: uuid
@@ -18277,6 +20494,16 @@ components:
         prompt_template:
           type: string
           title: Prompt Template
+        review_instructions:
+          anyOf:
+          - type: string
+            maxLength: 32768
+          - type: 'null'
+          title: Review Instructions
+          description: Blocking review rules for the Pull Request Reviewer. Same content
+            as .preloop/review-policy.md, for a repository that cannot commit that
+            file. Injected as {{flow.review_instructions}}. Empty means the repository
+            file is the only source.
         ai_model_id:
           anyOf:
           - type: string
@@ -18468,6 +20695,21 @@ components:
           description: Tokens this execution's gateway traffic consumed, split by
             direction and cache participation. Null when the run has no attributable
             gateway usage, which is not the same as zero.
+        resume_of:
+          anyOf:
+          - type: string
+            format: uuid
+          - type: 'null'
+          title: Resume Of
+          description: Publishing execution this repair resumes. Null when the row
+            is not a review/CI resumption. Distinct from parent_execution_id (delegation).
+        resume_totals:
+          anyOf:
+          - $ref: '#/components/schemas/ExecutionResumeTotals'
+          - type: 'null'
+          description: Summed total_tokens and estimated_cost for the publishing execution
+            and every repair that points at it. Null when the execution is not part
+            of a multi-turn resume chain.
         id:
           type: string
           format: uuid
@@ -18645,6 +20887,21 @@ components:
           description: Tokens this execution's gateway traffic consumed, split by
             direction and cache participation. Null when the run has no attributable
             gateway usage, which is not the same as zero.
+        resume_of:
+          anyOf:
+          - type: string
+            format: uuid
+          - type: 'null'
+          title: Resume Of
+          description: Publishing execution this repair resumes. Null when the row
+            is not a review/CI resumption. Distinct from parent_execution_id (delegation).
+        resume_totals:
+          anyOf:
+          - $ref: '#/components/schemas/ExecutionResumeTotals'
+          - type: 'null'
+          description: Summed total_tokens and estimated_cost for the publishing execution
+            and every repair that points at it. Null when the execution is not part
+            of a multi-turn resume chain.
         flow_id:
           type: string
           format: uuid
@@ -18793,9 +21050,11 @@ components:
           description: 'Coarse machine-readable reason a terminal execution did not
             succeed: one of runner_conflict, runner_error, model_transient, model_auth,
             provider_billing, model_quota (legacy, superseded by provider_billing),
-            model_config, no_confirmation, agent_no_progress, setup_failed, tool_error,
-            agent_error, timeout, cancelled, unknown. Null for successful or still-running
-            executions, and for executions that predate this field.'
+            budget_exceeded, model_config, no_confirmation, agent_no_progress, setup_failed,
+            verification_failed, verification_blocked, tool_error, agent_error, model_stream_idle
+            (timed out while the model stream was silent), timeout, cancelled, unknown.
+            Null for successful or still-running executions, and for executions that
+            predate this field.'
         queued_reason:
           anyOf:
           - type: string
@@ -19066,6 +21325,16 @@ components:
           - type: string
           - type: 'null'
           title: Prompt Template
+        review_instructions:
+          anyOf:
+          - type: string
+            maxLength: 32768
+          - type: 'null'
+          title: Review Instructions
+          description: Blocking review rules for the Pull Request Reviewer. Same content
+            as .preloop/review-policy.md, for a repository that cannot commit that
+            file. Injected as {{flow.review_instructions}}. Empty means the repository
+            file is the only source.
         ai_model_id:
           anyOf:
           - type: string
@@ -19220,6 +21489,10 @@ components:
           - type: string
           - type: 'null'
           title: Slug
+        supports_persistent:
+          type: boolean
+          title: Supports Persistent
+          default: false
         execution_stats:
           anyOf:
           - additionalProperties: true
@@ -19333,6 +21606,16 @@ components:
           - type: string
           - type: 'null'
           title: Prompt Template
+        review_instructions:
+          anyOf:
+          - type: string
+            maxLength: 32768
+          - type: 'null'
+          title: Review Instructions
+          description: Blocking review rules for the Pull Request Reviewer. Same content
+            as .preloop/review-policy.md, for a repository that cannot commit that
+            file. Injected as {{flow.review_instructions}}. Empty means the repository
+            file is the only source.
         ai_model_id:
           anyOf:
           - type: string
@@ -20253,6 +22536,14 @@ components:
           type: array
           title: Repositories
           description: List of repositories to clone
+        repository_bindings:
+          items:
+            $ref: '#/components/schemas/RepositoryBinding-Input'
+          type: array
+          title: Repository Bindings
+          description: Code-host repositories for flows triggered by an issue-only
+            tracker (Jira). Used only when repositories is empty and the trigger is
+            Jira; overrides the Jira project's default binding
         git_user_name:
           anyOf:
           - type: string
@@ -20356,6 +22647,13 @@ components:
           - type: 'null'
           description: File the follow ups a human approved in this run as tracker
             issues, after the agent has exited and without giving it write tools
+        backport:
+          anyOf:
+          - $ref: '#/components/schemas/Backport'
+          - type: 'null'
+          description: Backport merged pull requests from a release branch onto later
+            branches. When enabled, the control plane runs the backport and no agent
+            runs
       type: object
       title: GitCloneConfig
       description: Configuration for git clone operations before agent execution.
@@ -20372,6 +22670,14 @@ components:
           type: array
           title: Repositories
           description: List of repositories to clone
+        repository_bindings:
+          items:
+            $ref: '#/components/schemas/RepositoryBinding-Output'
+          type: array
+          title: Repository Bindings
+          description: Code-host repositories for flows triggered by an issue-only
+            tracker (Jira). Used only when repositories is empty and the trigger is
+            Jira; overrides the Jira project's default binding
         git_user_name:
           anyOf:
           - type: string
@@ -20475,6 +22781,13 @@ components:
           - type: 'null'
           description: File the follow ups a human approved in this run as tracker
             issues, after the agent has exited and without giving it write tools
+        backport:
+          anyOf:
+          - $ref: '#/components/schemas/Backport'
+          - type: 'null'
+          description: Backport merged pull requests from a release branch onto later
+            branches. When enabled, the control plane runs the backport and no agent
+            runs
       type: object
       title: GitCloneConfig
       description: Configuration for git clone operations before agent execution.
@@ -20587,6 +22900,88 @@ components:
       - name
       title: HostExecProfileAdvertisement
       description: Name and capability flags a runner advertises. No executable path.
+    HostExecSession:
+      properties:
+        conversation_id:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Conversation Id
+          description: CLI session id reported by the hook.
+        source:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Source
+          description: Ingest source label, e.g. copilot_cli.
+        runtime_session_id:
+          anyOf:
+          - type: string
+            format: uuid
+          - type: 'null'
+          title: Runtime Session Id
+        event_count:
+          type: integer
+          title: Event Count
+          default: 0
+        event_types:
+          additionalProperties:
+            type: integer
+          type: object
+          title: Event Types
+        first_event_at:
+          anyOf:
+          - type: string
+            format: date-time
+          - type: 'null'
+          title: First Event At
+        last_event_at:
+          anyOf:
+          - type: string
+            format: date-time
+          - type: 'null'
+          title: Last Event At
+        models:
+          items:
+            type: string
+          type: array
+          title: Models
+      type: object
+      title: HostExecSession
+      description: One CLI session the usage hook observed during a host-exec run.
+    HostExecSessionsResponse:
+      properties:
+        execution_id:
+          type: string
+          format: uuid
+          title: Execution Id
+        sessions:
+          items:
+            $ref: '#/components/schemas/HostExecSession'
+          type: array
+          title: Sessions
+        event_count:
+          type: integer
+          title: Event Count
+          description: Hook events linked to the execution.
+          default: 0
+        premium_requests:
+          anyOf:
+          - type: number
+          - type: 'null'
+          title: Premium Requests
+          description: Copilot premium requests the CLI reported for the run. Billed
+            to the seat, not metered by the gateway.
+        gateway_metered:
+          type: boolean
+          title: Gateway Metered
+          description: 'Always false: these rows never pass the model gateway.'
+          default: false
+      type: object
+      required:
+      - execution_id
+      title: HostExecSessionsResponse
+      description: Hook sessions and subscription usage linked to one flow execution.
     ImportedUsageByConversation:
       properties:
         conversation_id:
@@ -20752,6 +23147,480 @@ components:
       - unit
       title: IntervalSchedule
       description: 'Friendly schedule form: run every N minutes/hours/days.'
+    IssueCostExecutionRow:
+      properties:
+        execution_id:
+          type: string
+          format: uuid
+          title: Execution Id
+        flow_id:
+          type: string
+          format: uuid
+          title: Flow Id
+        flow_name:
+          type: string
+          title: Flow Name
+        status:
+          type: string
+          title: Status
+        link:
+          type: string
+          title: Link
+          description: 'How the execution was attributed: lifecycle, resume, delegated,
+            retry, trigger_issue, pull_request, closing_reference, ambiguous or unassigned.'
+        pr_url:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Pr Url
+        estimated_cost:
+          anyOf:
+          - type: number
+          - type: 'null'
+          title: Estimated Cost
+        total_tokens:
+          type: integer
+          title: Total Tokens
+          default: 0
+        start_time:
+          type: string
+          format: date-time
+          title: Start Time
+        end_time:
+          anyOf:
+          - type: string
+            format: date-time
+          - type: 'null'
+          title: End Time
+      type: object
+      required:
+      - execution_id
+      - flow_id
+      - flow_name
+      - status
+      - link
+      - start_time
+      title: IssueCostExecutionRow
+      description: One execution that contributed to an issue (or to the unassigned
+        bucket).
+    IssueCostRebuildRequest:
+      properties:
+        start_date:
+          type: string
+          format: date-time
+          title: Start Date
+        end_date:
+          type: string
+          format: date-time
+          title: End Date
+      type: object
+      required:
+      - start_date
+      - end_date
+      title: IssueCostRebuildRequest
+      description: Window of finished executions to record.
+    IssueCostRebuildResponse:
+      properties:
+        recorded:
+          type: integer
+          title: Recorded
+        failed:
+          type: integer
+          title: Failed
+          description: Executions skipped because recording them failed.
+          default: 0
+        limit_reached:
+          type: boolean
+          title: Limit Reached
+      type: object
+      required:
+      - recorded
+      - limit_reached
+      title: IssueCostRebuildResponse
+      description: How many executions a rebuild recorded.
+    IssueCostReport:
+      properties:
+        start:
+          anyOf:
+          - type: string
+            format: date-time
+          - type: 'null'
+          title: Start
+        end:
+          anyOf:
+          - type: string
+            format: date-time
+          - type: 'null'
+          title: End
+        project_id:
+          anyOf:
+          - type: string
+            format: uuid
+          - type: 'null'
+          title: Project Id
+        flow_id:
+          anyOf:
+          - type: string
+            format: uuid
+          - type: 'null'
+          title: Flow Id
+        issues:
+          items:
+            $ref: '#/components/schemas/IssueCostRow'
+          type: array
+          title: Issues
+        by_project:
+          items:
+            $ref: '#/components/schemas/IssueCostSummary'
+          type: array
+          title: By Project
+        by_flow:
+          items:
+            $ref: '#/components/schemas/IssueCostSummary'
+          type: array
+          title: By Flow
+        unassigned:
+          $ref: '#/components/schemas/IssueCostUnassigned'
+        truncated:
+          type: boolean
+          title: Truncated
+          default: false
+      type: object
+      required:
+      - issues
+      - by_project
+      - by_flow
+      - unassigned
+      title: IssueCostReport
+      description: Issue rows, per-project and per-flow sums and the unassigned bucket.
+    IssueCostRow:
+      properties:
+        id:
+          type: string
+          format: uuid
+          title: Id
+        tracker_id:
+          type: string
+          format: uuid
+          title: Tracker Id
+        tracker_name:
+          type: string
+          title: Tracker Name
+        tracker_type:
+          type: string
+          title: Tracker Type
+        issue_key:
+          type: string
+          title: Issue Key
+        issue_id:
+          anyOf:
+          - type: string
+            format: uuid
+          - type: 'null'
+          title: Issue Id
+        title:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Title
+        issue_url:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Issue Url
+        pr_url:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Pr Url
+        project_id:
+          anyOf:
+          - type: string
+            format: uuid
+          - type: 'null'
+          title: Project Id
+        project_name:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Project Name
+        estimated_cost:
+          type: number
+          title: Estimated Cost
+          description: 'Sum of the contributing executions'' estimated_cost. This
+            is the known subtotal, not total spend: runs without a cost contribute
+            nothing to it. Read cost_coverage next to it.'
+        cost_coverage:
+          type: string
+          enum:
+          - complete
+          - partial
+          - unknown
+          title: Cost Coverage
+          description: 'Whether every contributing run had a cost estimate: complete,
+            partial or unknown. A bucket with no runs is unknown, and a known zero
+            counts as known. This describes execution-cost availability, never invoice
+            accuracy.'
+        known_cost_run_count:
+          type: integer
+          title: Known Cost Run Count
+          description: Contributing runs that carry a cost estimate, and so are summed
+            into estimated_cost. An explicit zero counts as known.
+        unknown_cost_run_count:
+          type: integer
+          title: Unknown Cost Run Count
+          description: Contributing runs with no cost estimate, for example subscription-backed
+            runs. They contribute nothing to estimated_cost, which is therefore the
+            subtotal of the known runs rather than total spend.
+        attributed_cost_usd:
+          anyOf:
+          - type: number
+          - type: 'null'
+          title: Attributed Cost Usd
+          description: The estimated_cost subtotal when cost_coverage is complete;
+            null otherwise, so a partial or unknown bucket is never read as a total.
+        total_tokens:
+          type: integer
+          title: Total Tokens
+        run_count:
+          type: integer
+          title: Run Count
+        failed_run_count:
+          type: integer
+          title: Failed Run Count
+        first_event_at:
+          anyOf:
+          - type: string
+            format: date-time
+          - type: 'null'
+          title: First Event At
+        pr_opened_at:
+          anyOf:
+          - type: string
+            format: date-time
+          - type: 'null'
+          title: Pr Opened At
+        approved_at:
+          anyOf:
+          - type: string
+            format: date-time
+          - type: 'null'
+          title: Approved At
+        merged_at:
+          anyOf:
+          - type: string
+            format: date-time
+          - type: 'null'
+          title: Merged At
+        first_event_to_pr_opened_hours:
+          anyOf:
+          - type: number
+          - type: 'null'
+          title: First Event To Pr Opened Hours
+          description: Blank when the pull request was not opened yet.
+        pr_opened_to_approved_hours:
+          anyOf:
+          - type: number
+          - type: 'null'
+          title: Pr Opened To Approved Hours
+          description: Blank when the pull request was not approved yet.
+        approved_to_merged_hours:
+          anyOf:
+          - type: number
+          - type: 'null'
+          title: Approved To Merged Hours
+          description: Blank when the pull request was not merged yet.
+        pr_opened_at_source:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Pr Opened At Source
+          description: 'Where pr_opened_at came from: forge (the pull request''s own
+            created_at), bind (when Preloop bound it to a run) or run_end (the publishing
+            run''s end).'
+        estimate_hours:
+          anyOf:
+          - type: number
+          - type: 'null'
+          title: Estimate Hours
+          description: Human estimate in hours as the tracker states it. Blank when
+            the tracker has none; never derived.
+        estimate_hours_source:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Estimate Hours Source
+          description: Where estimate_hours was read, for example jira:timeoriginalestimate,
+            gitlab:time_estimate or label:estimate:.
+        estimate_points:
+          anyOf:
+          - type: number
+          - type: 'null'
+          title: Estimate Points
+          description: Human estimate in points as the tracker states it. Blank when
+            the tracker has none; never derived.
+        estimate_points_source:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Estimate Points Source
+          description: Where estimate_points was read, for example jira:customfield_10016,
+            gitlab:weight or label:points:.
+        execution_ids:
+          anyOf:
+          - items:
+              type: string
+              format: uuid
+            type: array
+          - type: 'null'
+          title: Execution Ids
+          description: Contributing execution ids (JSON export only).
+      type: object
+      required:
+      - id
+      - tracker_id
+      - tracker_name
+      - tracker_type
+      - issue_key
+      - estimated_cost
+      - cost_coverage
+      - known_cost_run_count
+      - unknown_cost_run_count
+      - total_tokens
+      - run_count
+      - failed_run_count
+      title: IssueCostRow
+      description: One tracker issue with its summed cost and cycle-time milestones.
+    IssueCostSummary:
+      properties:
+        id:
+          anyOf:
+          - type: string
+            format: uuid
+          - type: 'null'
+          title: Id
+        name:
+          type: string
+          title: Name
+        issue_count:
+          type: integer
+          title: Issue Count
+        estimated_cost:
+          type: number
+          title: Estimated Cost
+          description: 'Sum of the contributing executions'' estimated_cost: the known
+            subtotal of the bucket, not total spend.'
+        cost_coverage:
+          type: string
+          enum:
+          - complete
+          - partial
+          - unknown
+          title: Cost Coverage
+          description: 'Whether every contributing run had a cost estimate: complete,
+            partial or unknown. A bucket with no runs is unknown, and a known zero
+            counts as known. This describes execution-cost availability, never invoice
+            accuracy.'
+        known_cost_run_count:
+          type: integer
+          title: Known Cost Run Count
+          description: Contributing runs that carry a cost estimate, and so are summed
+            into estimated_cost. An explicit zero counts as known.
+        unknown_cost_run_count:
+          type: integer
+          title: Unknown Cost Run Count
+          description: Contributing runs with no cost estimate, for example subscription-backed
+            runs. They contribute nothing to estimated_cost, which is therefore the
+            subtotal of the known runs rather than total spend.
+        attributed_cost_usd:
+          anyOf:
+          - type: number
+          - type: 'null'
+          title: Attributed Cost Usd
+          description: The estimated_cost subtotal when cost_coverage is complete;
+            null otherwise, so a partial or unknown bucket is never read as a total.
+        total_tokens:
+          type: integer
+          title: Total Tokens
+        run_count:
+          type: integer
+          title: Run Count
+        failed_run_count:
+          type: integer
+          title: Failed Run Count
+      type: object
+      required:
+      - name
+      - issue_count
+      - estimated_cost
+      - cost_coverage
+      - known_cost_run_count
+      - unknown_cost_run_count
+      - total_tokens
+      - run_count
+      - failed_run_count
+      title: IssueCostSummary
+      description: Sum of issue rows for one project or one flow.
+    IssueCostUnassigned:
+      properties:
+        estimated_cost:
+          type: number
+          title: Estimated Cost
+          description: 'Sum of the unassigned executions'' estimated_cost: the known
+            subtotal, not total spend.'
+          default: 0.0
+        cost_coverage:
+          type: string
+          enum:
+          - complete
+          - partial
+          - unknown
+          title: Cost Coverage
+          description: 'Whether every contributing run had a cost estimate: complete,
+            partial or unknown. A bucket with no runs is unknown, and a known zero
+            counts as known. This describes execution-cost availability, never invoice
+            accuracy.'
+          default: unknown
+        known_cost_run_count:
+          type: integer
+          title: Known Cost Run Count
+          description: Contributing runs that carry a cost estimate, and so are summed
+            into estimated_cost. An explicit zero counts as known.
+          default: 0
+        unknown_cost_run_count:
+          type: integer
+          title: Unknown Cost Run Count
+          description: Contributing runs with no cost estimate, for example subscription-backed
+            runs. They contribute nothing to estimated_cost, which is therefore the
+            subtotal of the known runs rather than total spend.
+          default: 0
+        attributed_cost_usd:
+          anyOf:
+          - type: number
+          - type: 'null'
+          title: Attributed Cost Usd
+          description: The estimated_cost subtotal when cost_coverage is complete;
+            null otherwise, so a partial or unknown bucket is never read as a total.
+        total_tokens:
+          type: integer
+          title: Total Tokens
+          default: 0
+        run_count:
+          type: integer
+          title: Run Count
+          default: 0
+        failed_run_count:
+          type: integer
+          title: Failed Run Count
+          default: 0
+        executions:
+          items:
+            $ref: '#/components/schemas/IssueCostExecutionRow'
+          type: array
+          title: Executions
+      type: object
+      title: IssueCostUnassigned
+      description: Executions that could not be tied to exactly one issue.
     IssueCreate:
       properties:
         title:
@@ -21446,7 +24315,9 @@ components:
             type: object
           - type: 'null'
           title: Auth Config
-          description: JSON configuration for authentication
+          description: 'JSON configuration for authentication. Secret values are write-only:
+            responses return them as ''***REDACTED***''. Sending that marker (or {"redacted":
+            true}) keeps the stored value.'
         status:
           anyOf:
           - type: string
@@ -21499,7 +24370,9 @@ components:
             type: object
           - type: 'null'
           title: Auth Config
-          description: JSON configuration for authentication
+          description: 'JSON configuration for authentication. Secret values are write-only:
+            responses return them as ''***REDACTED***''. Sending that marker (or {"redacted":
+            true}) keeps the stored value.'
         status:
           anyOf:
           - type: string
@@ -21573,7 +24446,9 @@ components:
             type: object
           - type: 'null'
           title: Auth Config
-          description: JSON configuration for authentication
+          description: 'JSON configuration for authentication. Secret values are write-only:
+            responses return them as ''***REDACTED***''. Sending that marker (or {"redacted":
+            true}) keeps the stored value.'
         status:
           anyOf:
           - type: string
@@ -22483,6 +25358,19 @@ components:
           type: boolean
           title: Supports Interrupt
           default: false
+        desktop:
+          type: string
+          enum:
+          - vnc
+          - rdp
+          - none
+          title: Desktop
+          default: none
+        desktop_display:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Desktop Display
         control_session_mode:
           type: string
           title: Control Session Mode
@@ -22627,6 +25515,37 @@ components:
       title: ManagedAgentUsageAggregate
       description: Historical usage aggregate across all sessions for one managed
         agent.
+    McpResourceLink:
+      properties:
+        type:
+          type: string
+          const: resource_link
+          title: Type
+          default: resource_link
+        uri:
+          type: string
+          title: Uri
+        name:
+          type: string
+          title: Name
+        mimeType:
+          type: string
+          title: Mimetype
+        size:
+          type: integer
+          title: Size
+        _meta:
+          additionalProperties: true
+          type: object
+          title: Meta
+      type: object
+      required:
+      - uri
+      - name
+      - mimeType
+      - size
+      title: McpResourceLink
+      description: MCP ``ResourceLink`` pointing at the artifact's byte route.
     MobileDeviceRegistration:
       properties:
         platform:
@@ -23557,6 +26476,81 @@ components:
       - policy_name
       title: PolicyImportResult
       description: Result of importing a policy.
+    PolicyNoticeRuleSummaryResponse:
+      properties:
+        rule_id:
+          type: string
+          title: Rule Id
+          description: Model I/O rule id
+        rule_description:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Rule Description
+          description: Rule description
+        target:
+          type: string
+          title: Target
+          description: model.request or model.response
+        count:
+          type: integer
+          title: Count
+          description: Hits in the window
+        last_hit_id:
+          type: string
+          format: uuid
+          title: Last Hit Id
+          description: Newest hit id (card fingerprint)
+        last_hit_at:
+          type: string
+          format: date-time
+          title: Last Hit At
+          description: Newest hit time (UTC)
+        last_excerpt:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Last Excerpt
+          description: Newest redacted excerpt (at most 280 characters)
+        last_user_id:
+          anyOf:
+          - type: string
+            format: uuid
+          - type: 'null'
+          title: Last User Id
+          description: Newest hit's user
+        last_username:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Last Username
+          description: Newest hit's username
+      type: object
+      required:
+      - rule_id
+      - target
+      - count
+      - last_hit_id
+      - last_hit_at
+      title: PolicyNoticeRuleSummaryResponse
+      description: Hits of one notify rule inside the window.
+    PolicyNoticeSummaryResponse:
+      properties:
+        days:
+          type: integer
+          title: Days
+          description: Window length in days
+        rules:
+          items:
+            $ref: '#/components/schemas/PolicyNoticeRuleSummaryResponse'
+          type: array
+          title: Rules
+      type: object
+      required:
+      - days
+      - rules
+      title: PolicyNoticeSummaryResponse
+      description: Notify rule hits grouped by rule, newest first.
     PolicyValidationError:
       properties:
         path:
@@ -23889,6 +26883,13 @@ components:
           type: string
           title: Type
           default: project
+        group:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Group
+          description: Grouping label inside the organization, for example the Bitbucket
+            project a repository belongs to.
       type: object
       required:
       - id
@@ -23941,6 +26942,13 @@ components:
           type: string
           title: Updated At
           description: Last update timestamp
+        group:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Group
+          description: Grouping label inside the organization, for example the Bitbucket
+            project a repository belongs to.
       type: object
       required:
       - name
@@ -23951,6 +26959,67 @@ components:
       - updated_at
       title: ProjectResponse
       description: Response model for project data.
+    ProjectTransferReceipt:
+      properties:
+        project_id:
+          type: string
+          title: Project Id
+        repository_id:
+          type: string
+          title: Repository Id
+        status:
+          type: string
+          title: Status
+          description: '''preview'', ''transferred'' (moved organization), ''updated''
+            (same organization, owner/name refreshed) or ''unchanged'' (already bound)'
+        source:
+          $ref: '#/components/schemas/RepositoryLocation'
+        destination:
+          $ref: '#/components/schemas/RepositoryLocation'
+        changes:
+          items:
+            type: string
+          type: array
+          title: Changes
+        not_carried_over:
+          items:
+            type: string
+          type: array
+          title: Not Carried Over
+          description: Grants and settings that stay with the source and must be re-established
+            deliberately in the destination, if wanted.
+        manual_actions:
+          items:
+            type: string
+          type: array
+          title: Manual Actions
+      type: object
+      required:
+      - project_id
+      - repository_id
+      - status
+      - source
+      - destination
+      title: ProjectTransferReceipt
+      description: Result of a repository project transfer or its preview.
+    ProjectTransferRequest:
+      properties:
+        organization_id:
+          type: string
+          title: Organization Id
+          description: Destination organization ID
+        dry_run:
+          type: boolean
+          title: Dry Run
+          description: Preview only (default). Set to false to apply the move. The
+            preview runs every check the apply runs, including the live destination
+            access check.
+          default: true
+      type: object
+      required:
+      - organization_id
+      title: ProjectTransferRequest
+      description: Move a repository project to the organization that now owns it.
     ProjectUpdate:
       properties:
         name:
@@ -24481,6 +27550,120 @@ components:
         ``extra=''forbid''``: a misspelled key here is a document that silently
 
         lands somewhere else, or not at all.'
+    RepositoryBinding-Input:
+      properties:
+        tracker_id:
+          type: string
+          format: uuid
+          title: Tracker Id
+          description: Code-host tracker that hosts the repository and supplies the
+            clone and push credential
+        repository:
+          type: string
+          maxLength: 255
+          minLength: 3
+          title: Repository
+          description: 'Repository path on the code host: owner/name, group/subgroup/name,
+            or workspace/repo'
+        base_branch:
+          anyOf:
+          - type: string
+            maxLength: 255
+          - type: 'null'
+          title: Base Branch
+          description: Branch to check out and open the pull request against. When
+            unset, the flow's source_branch is used
+        default:
+          type: boolean
+          title: Default
+          description: Use this entry when the binding lists several repositories
+          default: false
+      type: object
+      required:
+      - tracker_id
+      - repository
+      title: RepositoryBinding
+      description: 'A code-host repository that an issue-only tracker''s flows work
+        on.
+
+
+        A Jira project has no git repository of its own. A binding names the
+
+        repository on a code-host tracker the account already has (GitHub,
+
+        GitLab, or any tracker whose client sets ``hosts_repositories``). The
+
+        clone and push credential comes from that tracker, never from the
+
+        issue tracker''s token.'
+    RepositoryBinding-Output:
+      properties:
+        tracker_id:
+          type: string
+          title: Tracker Id
+          description: Code-host tracker that hosts the repository and supplies the
+            clone and push credential
+        repository:
+          type: string
+          maxLength: 255
+          minLength: 3
+          title: Repository
+          description: 'Repository path on the code host: owner/name, group/subgroup/name,
+            or workspace/repo'
+        base_branch:
+          anyOf:
+          - type: string
+            maxLength: 255
+          - type: 'null'
+          title: Base Branch
+          description: Branch to check out and open the pull request against. When
+            unset, the flow's source_branch is used
+        default:
+          type: boolean
+          title: Default
+          description: Use this entry when the binding lists several repositories
+          default: false
+      type: object
+      required:
+      - tracker_id
+      - repository
+      title: RepositoryBinding
+      description: 'A code-host repository that an issue-only tracker''s flows work
+        on.
+
+
+        A Jira project has no git repository of its own. A binding names the
+
+        repository on a code-host tracker the account already has (GitHub,
+
+        GitLab, or any tracker whose client sets ``hosts_repositories``). The
+
+        clone and push credential comes from that tracker, never from the
+
+        issue tracker''s token.'
+    RepositoryLocation:
+      properties:
+        organization_id:
+          type: string
+          title: Organization Id
+        organization_name:
+          type: string
+          title: Organization Name
+        tracker_id:
+          type: string
+          title: Tracker Id
+        full_name:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Full Name
+      type: object
+      required:
+      - organization_id
+      - organization_name
+      - tracker_id
+      title: RepositoryLocation
+      description: Where a repository project is bound.
     RepriceRequest:
       properties:
         start_date:
@@ -24927,6 +28110,27 @@ components:
       - concurrency
       title: RunnerConcurrencyUpdate
       description: Edit one runner's slot ceiling from the console.
+    RunnerDeleteResponse:
+      properties:
+        id:
+          type: string
+          format: uuid
+          title: Id
+        deleted:
+          type: boolean
+          title: Deleted
+          default: true
+        halted_execution_ids:
+          items:
+            type: string
+            format: uuid
+          type: array
+          title: Halted Execution Ids
+      type: object
+      required:
+      - id
+      title: RunnerDeleteResponse
+      description: Outcome of deleting a runner; its token is rejected from now on.
     RunnerFleetSummary:
       properties:
         runner_count:
@@ -25242,6 +28446,11 @@ components:
       title: RunnerResponse
     RuntimeSessionActivityItem:
       properties:
+        activity_id:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Activity Id
         activity_type:
           type: string
           title: Activity Type
@@ -25342,6 +28551,109 @@ components:
       type: object
       title: RuntimeSessionActivityListResponse
       description: List of activity items for a runtime session.
+    RuntimeSessionArtifactListOut:
+      properties:
+        items:
+          items:
+            $ref: '#/components/schemas/RuntimeSessionArtifactOut'
+          type: array
+          title: Items
+        next_cursor:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Next Cursor
+          description: Pass as `cursor` for the next page; null on the last page.
+      type: object
+      required:
+      - items
+      title: RuntimeSessionArtifactListOut
+      description: One page of a session's artifacts, newest first.
+    RuntimeSessionArtifactOut:
+      properties:
+        id:
+          type: string
+          title: Id
+        runtime_session_id:
+          type: string
+          title: Runtime Session Id
+        activity_id:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Activity Id
+        kind:
+          type: string
+          title: Kind
+        name:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Name
+        content_type:
+          type: string
+          title: Content Type
+        size_bytes:
+          type: integer
+          title: Size Bytes
+        sha256:
+          type: string
+          title: Sha256
+        labels:
+          additionalProperties: true
+          type: object
+          title: Labels
+        producer:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Producer
+        agent_id:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Agent Id
+        tool_name:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Tool Name
+        parent_artifact_id:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Parent Artifact Id
+        text_status:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Text Status
+        availability:
+          type: string
+          title: Availability
+        legal_hold:
+          type: boolean
+          title: Legal Hold
+        created_at:
+          type: string
+          format: date-time
+          title: Created At
+        content_block:
+          $ref: '#/components/schemas/McpResourceLink'
+      type: object
+      required:
+      - id
+      - runtime_session_id
+      - kind
+      - content_type
+      - size_bytes
+      - sha256
+      - availability
+      - legal_hold
+      - created_at
+      - content_block
+      title: RuntimeSessionArtifactOut
+      description: Descriptor of one stored session artifact.
     RuntimeSessionCacheModelGroup:
       properties:
         model_alias:
@@ -26085,6 +29397,11 @@ components:
           - type: string
           - type: 'null'
           title: Endpoint
+        auth_subject_type:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Auth Subject Type
         tools:
           items:
             $ref: '#/components/schemas/RuntimeSessionRequestTool'
@@ -26329,6 +29646,43 @@ components:
           description: 'True while a legal hold freezes this session: the retention
             purge leaves it and its activity alone until the hold is released'
           default: false
+        managed_agent_id:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Managed Agent Id
+          description: Managed agent whose runtime principal owns this session
+        managed_agent_name:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Managed Agent Name
+          description: Display name of that managed agent
+        agent_kind:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Agent Kind
+          description: Agent kind of that managed agent (claude_code, codex, hermes,
+            ...), or null when the session has no managed agent
+        cwd:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Cwd
+          description: Working directory the agent's hook last reported for this session;
+            an observation used for labelling, not a trusted path
+        tool_call_count:
+          type: integer
+          title: Tool Call Count
+          description: Tool calls recorded for this session, or the count its usage
+            hook reported when no tool call was recorded server side
+          default: 0
+        pending_approval_count:
+          type: integer
+          title: Pending Approval Count
+          description: Approval requests for this session still awaiting a decision
+          default: 0
       type: object
       required:
       - id
@@ -26746,6 +30100,96 @@ components:
         \    threshold: Finite threshold in [0, 1] this deployment screens at.\n \
         \   primary_outcome: Optional lowercase label naming the dominant rule\n \
         \       category; omitted for benign content."
+    SessionArtifactUsageByKind:
+      properties:
+        screenshot:
+          type: integer
+          title: Screenshot
+          default: 0
+        recording:
+          type: integer
+          title: Recording
+          default: 0
+        screencast:
+          type: integer
+          title: Screencast
+          default: 0
+        audio:
+          type: integer
+          title: Audio
+          default: 0
+        transcript:
+          type: integer
+          title: Transcript
+          default: 0
+        document:
+          type: integer
+          title: Document
+          default: 0
+        generated_file:
+          type: integer
+          title: Generated File
+          default: 0
+        trace:
+          type: integer
+          title: Trace
+          default: 0
+      type: object
+      title: SessionArtifactUsageByKind
+      description: Available plaintext bytes by artifact kind (zero when unused).
+    SessionArtifactUsageResponse:
+      properties:
+        used_bytes:
+          type: integer
+          title: Used Bytes
+        budget_bytes:
+          type: integer
+          title: Budget Bytes
+        by_kind:
+          $ref: '#/components/schemas/SessionArtifactUsageByKind'
+        evicted_count_30d:
+          type: integer
+          title: Evicted Count 30D
+      type: object
+      required:
+      - used_bytes
+      - budget_bytes
+      - by_kind
+      - evicted_count_30d
+      title: SessionArtifactUsageResponse
+      description: Account session-artifact usage against the storage budget.
+    SessionEmbeddingCorpus:
+      properties:
+        vectors:
+          type: integer
+          title: Vectors
+          description: Chunks carrying a vector of any model.
+          default: 0
+        model_vectors:
+          type: integer
+          title: Model Vectors
+          description: Chunks embedded with the model configured now.
+          default: 0
+        pending:
+          type: integer
+          title: Pending
+          description: Chunks inside the current scope still waiting for one.
+          default: 0
+        embedded_through:
+          anyOf:
+          - type: string
+            format: date-time
+          - type: 'null'
+          title: Embedded Through
+          description: Newest chunk embedded with the configured model.
+      type: object
+      title: SessionEmbeddingCorpus
+      description: 'How much of this account''s corpus semantic search can read.
+
+
+        The same counts search uses to explain a thin semantic answer, published
+
+        so a user who opted in yesterday can see the backlog rather than guess.'
     SessionEmbeddingSettingResponse:
       properties:
         enabled:
@@ -26793,6 +30237,15 @@ components:
           - type: 'null'
           title: Daily Cap Usd
           description: Account cap in USD; null falls back to the deployment.
+        deployment_daily_cap_usd:
+          type: number
+          title: Deployment Daily Cap Usd
+          description: The deployment default cap a null account cap uses.
+        deployment_embedding_enabled:
+          type: boolean
+          title: Deployment Embedding Enabled
+          description: False when the deployment kill switch has turned embedding
+            off for every account, whatever this setting says.
         degraded_reason:
           anyOf:
           - type: string
@@ -26806,29 +30259,82 @@ components:
           - type: 'null'
           title: Degraded At
           description: When that degraded state was recorded.
+        corpus:
+          $ref: '#/components/schemas/SessionEmbeddingCorpus'
+          description: How far embedding has got through this account's corpus.
       type: object
       required:
       - enabled
       - scope
       - provider
       - dimensions
+      - deployment_daily_cap_usd
+      - deployment_embedding_enabled
       title: SessionEmbeddingSettingResponse
       description: What one account's embedding setting says right now.
     SessionEmbeddingSettingUpdate:
       properties:
+        enabled:
+          anyOf:
+          - type: boolean
+          - type: 'null'
+          title: Enabled
+          description: Turn embedding on or off. Turning it on needs a model, either
+            in this body or already on the setting from an earlier opt in.
         scope:
-          type: string
-          enum:
-          - summaries_only
-          - full
+          anyOf:
+          - type: string
+            enum:
+            - summaries_only
+            - full
+          - type: 'null'
           title: Scope
           description: summaries_only (default) or full.
+        daily_cap_usd:
+          anyOf:
+          - type: number
+            minimum: 0.0
+          - type: 'null'
+          title: Daily Cap Usd
+          description: Account cap in USD. An explicit null clears it back to the
+            deployment default; leaving the field out keeps the current cap.
+        provider:
+          anyOf:
+          - type: string
+            enum:
+            - openai_compatible
+            - local
+          - type: 'null'
+          title: Provider
+          description: Provider family; only accepted when enabling.
+        model_identifier:
+          anyOf:
+          - type: string
+            maxLength: 255
+          - type: 'null'
+          title: Model Identifier
+          description: Model name as the provider knows it; only when enabling.
+        base_url:
+          anyOf:
+          - type: string
+            maxLength: 500
+          - type: 'null'
+          title: Base Url
+          description: https endpoint for openai_compatible; only when enabling.
       additionalProperties: false
       type: object
-      required:
-      - scope
       title: SessionEmbeddingSettingUpdate
-      description: The one thing this endpoint lets an account change.
+      description: 'What the console''s opt in card saves. Absent fields are left
+        alone.
+
+
+        An explicit ``null`` is read as absent for every field except
+
+        ``daily_cap_usd``, where it is the documented way to clear the account
+
+        cap. A client that round trips nullable values must not turn embedding
+
+        off, or be refused for naming a provider, by sending ``null``.'
     SessionSavedSearchCreate:
       properties:
         name:
@@ -27153,6 +30659,61 @@ components:
         are all "this saved question changed", and splitting them into three
 
         routes would say nothing extra.'
+    SessionSearchArtifactRef:
+      properties:
+        artifact_id:
+          type: string
+          title: Artifact Id
+        activity_id:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Activity Id
+        kind:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Kind
+        name:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Name
+        content_type:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Content Type
+        tool_name:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Tool Name
+        labels:
+          additionalProperties: true
+          type: object
+          title: Labels
+        cue_start:
+          anyOf:
+          - type: number
+          - type: 'null'
+          title: Cue Start
+        text_truncated:
+          type: boolean
+          title: Text Truncated
+          default: false
+      type: object
+      required:
+      - artifact_id
+      title: SessionSearchArtifactRef
+      description: 'The artifact an ``artifact`` chunk came from, enough to open it.
+
+
+        ``activity_id`` is the timeline row the deposit wrote, so a console can
+
+        land on that row; ``cue_start`` is the start in seconds of the transcript
+
+        cue the chunk begins in, when the transcript was timed.'
     SessionSearchDegraded:
       properties:
         keyword:
@@ -27253,7 +30814,27 @@ components:
           - type: 'null'
           title: Source Kind
           description: 'One corpus source kind: gateway_interaction, transcript_message,
-            tool_call, operator_note, session_summary, flow_log.'
+            tool_call, browser_step, operator_note, session_summary, flow_log, artifact.'
+        kind:
+          anyOf:
+          - type: string
+            maxLength: 32
+            minLength: 1
+          - type: 'null'
+          title: Kind
+          description: Artifact kind, for example transcript or document. Restricts
+            the search to artifact chunks.
+        label:
+          anyOf:
+          - items:
+              type: string
+            type: array
+            maxItems: 16
+          - type: 'null'
+          title: Label
+          description: Artifact label filters as key:value, for example site:nord.
+            Repeatable; every one must match (AND). tags:x matches an artifact whose
+            tags include x. Restricts the search to artifact chunks.
       additionalProperties: false
       type: object
       title: SessionSearchFilters
@@ -27614,6 +31195,12 @@ components:
           description: Cosine similarity between the query vector and this chunk.
             Null for a chunk the vector half never scored, because a keyword match
             has no similarity to report.
+        artifact:
+          anyOf:
+          - $ref: '#/components/schemas/SessionSearchArtifactRef'
+          - type: 'null'
+          description: 'Set when source_kind is artifact: the artifact id, its timeline
+            activity id, kind, name, labels and the transcript cue start.'
       type: object
       required:
       - document_id
@@ -28015,6 +31602,177 @@ components:
       - model_identifier
       title: SpeechToTextResponse
       description: Transcript returned from a resolved STT model.
+    SpendOutlierFindingResponse:
+      properties:
+        id:
+          type: string
+          title: Id
+        item_id:
+          type: string
+          title: Item Id
+          description: Attention item id for dismissals
+        fingerprint:
+          type: string
+          title: Fingerprint
+          description: Rule, user, and UTC day (or session id). A new day that still
+            matches is a new fingerprint, so a dismissed card comes back.
+        rule:
+          type: string
+          enum:
+          - daily_spend
+          - model_mix
+          - session_cost
+          title: Rule
+        rule_label:
+          type: string
+          title: Rule Label
+        user_id:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: User Id
+        user_name:
+          type: string
+          title: User Name
+        runtime_session_id:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Runtime Session Id
+        session_title:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Session Title
+        day:
+          type: string
+          title: Day
+          description: UTC day the finding is about
+        detected_at:
+          type: string
+          title: Detected At
+        details:
+          additionalProperties: true
+          type: object
+          title: Details
+          description: 'The numbers: spend_usd, median_usd, multiple (daily_spend);
+            model, share, previous_share (model_mix); spend_usd, threshold_usd (session_cost).
+            imported_usd is spend the gateway did not meter.'
+        summary:
+          type: string
+          title: Summary
+      type: object
+      required:
+      - id
+      - item_id
+      - fingerprint
+      - rule
+      - rule_label
+      - user_name
+      - day
+      - detected_at
+      - summary
+      title: SpendOutlierFindingResponse
+      description: One open spend outlier, as the Attention page shows it.
+    SpendOutlierListResponse:
+      properties:
+        items:
+          items:
+            $ref: '#/components/schemas/SpendOutlierFindingResponse'
+          type: array
+          title: Items
+        total:
+          type: integer
+          title: Total
+          default: 0
+      type: object
+      title: SpendOutlierListResponse
+      description: Open spend outliers for the account.
+    SpendOutlierSettingsPayload:
+      properties:
+        daily_multiple:
+          type: number
+          maximum: 100.0
+          minimum: 1.0
+          title: Daily Multiple
+          description: Fire when yesterday is at least this multiple of the median
+          default: 3.0
+        min_history_days:
+          type: integer
+          maximum: 28.0
+          minimum: 1.0
+          title: Min History Days
+          description: Days with spend in the trailing 28 before the rule runs
+          default: 7
+        top_tier_model_prefixes:
+          items:
+            type: string
+          type: array
+          maxItems: 50
+          title: Top Tier Model Prefixes
+          description: Model name prefixes to treat as top-tier (case-insensitive)
+        top_tier_share:
+          type: number
+          exclusiveMaximum: 1.0
+          exclusiveMinimum: 0.0
+          title: Top Tier Share
+          description: Share of a user's daily spend, as a fraction (0.5 = 50%)
+          default: 0.5
+        session_cost_threshold_usd:
+          anyOf:
+          - type: number
+            exclusiveMinimum: 0.0
+          - type: 'null'
+          title: Session Cost Threshold Usd
+          description: Per-session cost threshold in USD; null turns the rule off
+      type: object
+      title: SpendOutlierSettingsPayload
+      description: Body of ``PUT /attention/spend-outliers/settings``.
+    SpendOutlierSettingsResponse:
+      properties:
+        daily_multiple:
+          type: number
+          maximum: 100.0
+          minimum: 1.0
+          title: Daily Multiple
+          description: Fire when yesterday is at least this multiple of the median
+          default: 3.0
+        min_history_days:
+          type: integer
+          maximum: 28.0
+          minimum: 1.0
+          title: Min History Days
+          description: Days with spend in the trailing 28 before the rule runs
+          default: 7
+        top_tier_model_prefixes:
+          items:
+            type: string
+          type: array
+          maxItems: 50
+          title: Top Tier Model Prefixes
+          description: Model name prefixes to treat as top-tier (case-insensitive)
+        top_tier_share:
+          type: number
+          exclusiveMaximum: 1.0
+          exclusiveMinimum: 0.0
+          title: Top Tier Share
+          description: Share of a user's daily spend, as a fraction (0.5 = 50%)
+          default: 0.5
+        session_cost_threshold_usd:
+          anyOf:
+          - type: number
+            exclusiveMinimum: 0.0
+          - type: 'null'
+          title: Session Cost Threshold Usd
+          description: Per-session cost threshold in USD; null turns the rule off
+        configured:
+          type: boolean
+          title: Configured
+          description: False while the account uses every default
+          default: false
+      type: object
+      title: SpendOutlierSettingsResponse
+      description: The account's thresholds; defaults when never configured.
     SubjectGovernanceConfig:
       properties:
         allowed_models:
@@ -28954,7 +32712,8 @@ components:
             format: uri
           - type: 'null'
           title: Url
-          description: URL of the tracker instance (required for Jira)
+          description: URL of the tracker instance (required for Jira and Bitbucket
+            Data Center)
         is_active:
           type: boolean
           title: Is Active
@@ -28966,7 +32725,10 @@ components:
             type: object
           - type: 'null'
           title: Connection Details
-          description: Tracker-specific connection details
+          description: Tracker-specific connection details. bitbucket_dc uses instance_url,
+            version (10.2), project_key, repository_id (numeric, stable across rename),
+            repository_slug, and optional reviewer username. Credentials and deployment
+            trust settings must not be stored here.
         meta_data:
           anyOf:
           - additionalProperties: true
@@ -29072,6 +32834,27 @@ components:
 
             fix the scope instead of the sync retrying forever.'
           readOnly: true
+        token_expires_at:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Token Expires At
+          description: 'When the stored token expires, if the user recorded it.
+
+
+            Bitbucket API tokens and repository access tokens carry an expiry
+
+            date chosen at creation. The API does not report it, so the tracker
+
+            form stores it in ``connection_details["token_expires_at"]``.'
+          readOnly: true
+        token_expiry_status:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Token Expiry Status
+          description: '``expired``, ``expiring`` (within 14 days), ``ok`` or None.'
+          readOnly: true
       type: object
       required:
       - name
@@ -29081,6 +32864,8 @@ components:
       - created
       - last_updated
       - degraded_projects
+      - token_expires_at
+      - token_expiry_status
       title: TrackerResponse
       description: Response model for tracker data (excluding sensitive info like
         api_key).
@@ -29154,13 +32939,24 @@ components:
             type: object
           - type: 'null'
           title: Connection Details
-          description: Tracker-specific connection details
+          description: Tracker-specific connection details. bitbucket_dc uses instance_url,
+            version (10.2), project_key, repository_id (numeric, stable across rename),
+            repository_slug, and optional reviewer username. Credentials and deployment
+            trust settings must not be stored here.
         organization_identifier:
           anyOf:
           - type: string
           - type: 'null'
           title: Organization Identifier
           description: Identifier for the organization to fetch projects from
+        auth_type:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Auth Type
+          description: 'Authentication mode for trackers that support several (Bitbucket
+            Cloud: ''api_token'' or ''oauth_token''; Data Center: ''api_token'' user
+            PAT only). Ignored when tracker_id is set: the stored mode is used.'
       type: object
       required:
       - tracker_type
@@ -29197,6 +32993,8 @@ components:
       - github
       - gitlab
       - jira
+      - bitbucket
+      - bitbucket_dc
       title: TrackerType
       description: Enum for tracker types.
     TrackerUpdate:
@@ -29231,7 +33029,9 @@ components:
             type: object
           - type: 'null'
           title: Connection Details
-          description: Updated connection details
+          description: Updated connection details. The legacy key 'config' is still
+            accepted. A null connection_details is treated as absent and falls back
+            to config. When both are objects, connection_details wins.
         meta_data:
           anyOf:
           - additionalProperties: true
@@ -29516,6 +33316,16 @@ components:
           type: string
           format: date-time
           title: Timestamp
+        flow_execution_id:
+          anyOf:
+          - type: string
+            format: uuid
+          - type: 'null'
+          title: Flow Execution Id
+          description: Flow execution a host-exec runner started this session for.
+            The runner exports it to the CLI and the usage hook forwards it. It is
+            honoured only for executions of this account whose flow runs on a host
+            profile; otherwise the record is stored unlinked.
         event_type:
           type: string
           enum:
@@ -29941,9 +33751,20 @@ components:
     WebhookConfig:
       properties:
         webhook_secret:
-          type: string
+          anyOf:
+          - type: string
+          - type: 'null'
           title: Webhook Secret
-          description: Secure token for authenticating webhook requests (auto-generated)
+          description: Secure token for authenticating webhook requests (auto-generated
+            for webhook triggers; unset on flows triggered by tracker events)
+        supersede_on_update:
+          type: boolean
+          title: Supersede On Update
+          description: When a pull or merge request gets a new head, stop this flow's
+            executions still working on an older head of the same request before starting
+            the new one. Off by default; the Pull Request Reviewer preset turns it
+            on.
+          default: false
         dedupe_path:
           anyOf:
           - type: string
@@ -29953,8 +33774,6 @@ components:
             key (e.g. 'data.issue.id'). When unset, defaults to 'attachments.0.title_link'
             then 'data.issue.id'.
       type: object
-      required:
-      - webhook_secret
       title: WebhookConfig
       description: Configuration for webhook triggers.
     WebhookDeliveryRead:

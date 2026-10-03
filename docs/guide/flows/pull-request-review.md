@@ -1,11 +1,16 @@
 # Pull Request Reviewer preset
 
+Editions: OSS, Cloud, Enterprise. Unless stated otherwise, everything on this page ships in OSS.
+
 Reviews a GitHub pull request or a GitLab merge request: security, quality,
 performance, tests, documentation impact, and (since this slice) whether the
 PR actually does what the issue it references asked for.
 
 The preset ships as `backend/presets/002-pull-request-reviewer.yaml`
 (slug `pull-request-reviewer`).
+
+Operators set blocking review policy on the flow form's Review instructions
+field when the repository cannot hold `.preloop/review-policy.md`.
 
 The review is **stateful**. One summary comment carries HTML markers
 (`<!-- preloop-review:flow-id:pr-reviewer -->`,
@@ -148,6 +153,146 @@ re-checked; the rest keep their checkbox untouched.
 ```
 
 `issue_coverage` is `[]` when the PR references no issue.
+
+## Stale reviews stop on their own
+
+When a pull request (GitHub, Bitbucket) or merge request (GitLab) is merged
+or closed, Preloop stops every execution still bound to it, in any flow of
+the account, unless that flow itself triggers on the merge or close. The
+execution shows the reason, for example "Stopped because pull request
+example/repo#12 was merged". Nothing happens if no run is bound.
+
+With `webhook_config.supersede_on_update: true`, a new head commit also
+stops the older run of the same flow on the same pull request before the
+new head is reviewed. The preset sets it; flows created from the preset
+before this change keep the old behaviour (the new head waits for the older
+run) until the flag is set on them. It applies only when the flow triggers
+on `pull_request_updated` (`merge_request_updated` on GitLab).
+
+## Repository review policy
+
+Agent instruction files (`AGENTS.md`, `CLAUDE.md`, `.cursorrules`,
+`.clinerules`) are project context. The reviewer reads them in full,
+including on the fast path. They are not, by themselves, a blocking
+compatibility contract: a sentence in `AGENTS.md` is guidance, and
+`CONTRIBUTING.md` is only the first 150 lines (and is skipped on the fast
+path). To make "this tree must keep running on runtime X" a blocking
+finding, commit a policy file or set the flow field below.
+
+### Where to put the rules
+
+| Source | When to use it | Force |
+| --- | --- | --- |
+| `.preloop/review-policy.md` at the repository root | The repository can carry a file. Read in full on every review, including the fast path. | Blocking. A violation is HIGH, category Compatibility, and the review requests changes. |
+| Flow `review_instructions` | The repository cannot commit that file. Same markdown. Injected as `{{flow.review_instructions}}` (16 KiB cap). Set it on the flow in the console (Review instructions) or the API. It is not part of the prompt template, so a later preset update does not wipe it. | Same as the file. |
+
+An empty field and a missing file are normal. The reviewer does not invent
+a policy. In clone-less mode the file is visible only when the diff includes
+it; the review says so instead of assuming there is no policy.
+
+### File shape
+
+Markdown. The first fenced `yaml` block is the compatibility config. Prose
+around it is also blocking when the diff breaks a rule it states. Versions
+are quoted strings: an unquoted `5.10` is the number 5.1 in YAML.
+
+```yaml
+compatibility:
+  - language: perl
+    minimum_version: "5.10"
+    paths:
+      - "daemons/**"
+    extensions:
+      - ".pl"
+      - ".pm"
+      - ".t"
+    version_linter: "perlver --blame"
+    allowed:
+      - "say"
+      - "state"
+      - "defined-or (//)"
+    forbidden:
+      - "postfix dereference (->@*, ->%*, ->$*)"
+      - "subroutine signatures"
+      - "__SUB__"
+      - "fc"
+```
+
+`paths` defaults to every file. `**/` matches zero or more directories,
+so `src/**/*.pl` covers `src/x.pl` and `**/*.pl` covers a file at the
+repository root. `*` does not cross `/`. `extensions` defaults from the
+language. Perl's default is `.pl`, `.pm`, and `.t`. `allowed` is syntax the minimum
+already includes, and must not be flagged. `forbidden` is a violation even
+when a linter is silent. Other languages use the same keys and name their
+own `version_linter`. There is no default command except Perl's.
+
+A `version_linter` value is a program name (a basename, not a path) plus
+plain arguments. The reviewer appends each matching path as one argument.
+Shell operators and `:` are not run, so a URL cannot be an argument. A
+basename that already exists in the sandbox can still run: the command is
+taken from the policy already on the target branch, and that author can
+already change CI. If the pull request edits the policy file, the reviewer
+uses the target branch copy and does not execute a command the pull request
+introduced. A policy file the pull request itself adds has no force on that
+review. The reviewer says the policy is newly proposed and applies it only
+after it merges.
+
+### Version linters
+
+When a compatibility entry matches changed files and names `version_linter`,
+the reviewer runs that command and quotes the output. For Perl, omitting
+the command means `perlver --blame <file>` (from `Perl::MinimumVersion`).
+If that script is missing, the reviewer tries:
+
+```text
+perl -MPerl::MinimumVersion -e 'my $pmv = Perl::MinimumVersion->new(shift); print $pmv->minimum_version, "\n"' <file>
+```
+
+A reported version newer than `minimum_version` is a HIGH finding. An equal
+version is not. Dotted numbers compare numerically: 5.10 is newer than 5.9
+and older than 5.16.
+
+The default reviewer sandbox is `ghcr.io/openai/codex-universal` (see
+`backend/preloop/agents/images.py`). That image is not built from this
+repository and does not guarantee Perl. When `perl` or
+`Perl::MinimumVersion` is absent, the review says "version linter
+unavailable in this sandbox" and judges the diff from the policy. That is
+not a pass.
+
+The environment image built from `environments/preloop/Dockerfile` ships
+`perlver`. A private runner gets it with `cpanm Perl::MinimumVersion`.
+
+### Perl 5.10 example
+
+A tree of daemons that must stay on Perl 5.10 commits the yaml above plus
+one line of prose: "Perl under daemons/ must run on Perl 5.10." `say`,
+`state`, and defined-or (`//`) are part of 5.10 and are listed under
+`allowed`, so a review must not flag them. Postfix dereference (`->@*`),
+subroutine signatures, `__SUB__`, and `fc` need a newer Perl. They are
+forbidden, and a pull request that adds one is a blocking finding.
+
+The same markdown can be pasted into the flow's Review instructions when
+the repository cannot carry `.preloop/review-policy.md`.
+
+## Running tests
+
+Reading the tests is the main check; a run confirms it. Step 2.4 runs
+tests only on the PR branch from this repository, never on a fork's code,
+and never installs packages to do it. When nothing could run, the summary
+says "tests not run in this sandbox" and names the CI jobs to confirm.
+
+In the environment image built from `environments/preloop/Dockerfile`
+(see [Execution environments](environments-and-recovery.md#backend-and-frontend-tests-in-the-image)),
+the reviewer runs the backend test files the diff touches with
+`preloop-pytest -q -m "not integration" <files>`: the backend lock is
+preinstalled and the runner starts its own disposable database, with no
+network. For frontend test files it runs `preloop-frontend-deps`, then
+`cd frontend && npx --no-install web-test-runner <files>` (`--no-install`
+so a missing tree fails instead of fetching a package). It never runs the
+whole suite (CI shards it) and keeps runs under about 5 minutes. A failing
+test on the reviewed head is a finding. The default `codex-universal` image has
+neither runner, so there the reviewer only uses a test command whose
+dependencies are already installed.
 
 ## Not in this slice
 

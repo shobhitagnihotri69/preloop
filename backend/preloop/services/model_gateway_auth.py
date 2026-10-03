@@ -6,7 +6,7 @@ from dataclasses import dataclass
 import json
 import logging
 import time
-from typing import Optional, Sequence
+from typing import Any, Optional, Sequence
 
 from sqlalchemy.orm import Session
 
@@ -48,6 +48,45 @@ class ModelGatewayAuthContext:
     api_key: models.ApiKey | GatewayApiKeySnapshot | None = None
     oauth_access_token: models.OAuthMCPAccessToken | GatewayOAuthSnapshot | None = None
 
+    @property
+    def account_id(self) -> Any:
+        """Account the credential belongs to.
+
+        An API key is bound to one account for life, so a key-authenticated
+        request is attributed to the key's account. User sessions (JWT) and
+        OAuth MCP tokens carry no key and fall back to the user's account.
+        """
+        if self.api_key is not None:
+            return self.api_key.account_id
+        return self.user.account_id
+
+    @property
+    def api_key_id(self) -> Any | None:
+        """API key id when the bearer is a key, otherwise ``None``."""
+        if self.api_key is None:
+            return None
+        return self.api_key.id
+
+    @property
+    def runtime_session_id(self) -> str | None:
+        """Session pinned on the key, when the credential names one.
+
+        The dataclass stores the key, not a session column. A runtime key
+        may put ``runtime_session_id`` in ``context_data``; a user token
+        and an unpinned key leave this unset, and the caller may name any
+        session in the account.
+        """
+        api_key = self.api_key
+        if api_key is None:
+            return None
+        context = getattr(api_key, "context_data", None)
+        if not isinstance(context, dict):
+            return None
+        value = context.get("runtime_session_id")
+        if value is None or value == "":
+            return None
+        return str(value)
+
     def snapshot(self) -> ModelGatewayAuthContext:
         """Copy the authenticated identity before its owning worker closes DB."""
         if isinstance(self.user, GatewayUserSnapshot):
@@ -73,7 +112,11 @@ class ModelGatewayAuthContext:
 
 
 async def authenticate_bearer_token(
-    token: str, db: Session, *, owns_db_session: bool = False
+    token: str,
+    db: Session,
+    *,
+    owns_db_session: bool = False,
+    allow_ended_runtime_session: bool = False,
 ) -> Optional[ModelGatewayAuthContext]:
     """Resolve bearer state in one worker, releasing HTTP-owned auth reads.
 
@@ -88,12 +131,21 @@ async def authenticate_bearer_token(
     from preloop.api.loop_safety import run_db_off_loop
 
     def authenticate_in_session(session: Session) -> Optional[ModelGatewayAuthContext]:
-        user = get_user_from_token_if_valid_sync(token, session)
+        user = get_user_from_token_if_valid_sync(
+            token,
+            session,
+            allow_ended_runtime_session=allow_ended_runtime_session,
+        )
         if user is not None:
             # A last-use commit may expire the user. Hydrate while this worker
             # still owns the session rather than issuing ORM I/O on the loop.
             _ = user.id, user.account_id, user.username, user.email, user.is_active
-        context = _resolve_bearer_context(token, session, user)
+        context = _resolve_bearer_context(
+            token,
+            session,
+            user,
+            allow_ended_runtime_session=allow_ended_runtime_session,
+        )
         return (
             context.snapshot() if owns_db_session and context is not None else context
         )
@@ -112,14 +164,60 @@ async def authenticate_bearer_token(
     return await run_db_off_loop(authenticate)
 
 
+def _key_matches_user_account(api_key: Any, user: Any) -> bool:
+    """Return whether a key is bound to its owner's account, logging if not.
+
+    ``_authenticate_with_api_key`` enforces the same rule for bearer tokens.
+    Context builders that resolve the key row themselves repeat it so no
+    gateway path attributes a key's traffic to a foreign account.
+    """
+    if str(api_key.account_id) == str(user.account_id):
+        return True
+    logger.warning(
+        "Model gateway rejected API key: key account does not match its user's account",
+        extra={
+            "event": "api_key_account_mismatch",
+            "api_key_id": str(api_key.id),
+            "user_id": str(user.id),
+            "key_account_id": str(api_key.account_id),
+            "user_account_id": str(user.account_id),
+        },
+    )
+    return False
+
+
+def _key_owner_account_differs(db: Session, api_key: Any) -> bool:
+    """Return whether a rejected key's owner now sits in another account.
+
+    Used only to name the rejection reason in the gateway diagnostic log.
+    """
+    owner = crud_user.get(db, id=str(api_key.user_id))
+    return owner is not None and str(owner.account_id) != str(api_key.account_id)
+
+
 def _resolve_bearer_context(
-    token: str, db: Session, user: Optional[models.User]
+    token: str,
+    db: Session,
+    user: Optional[models.User],
+    *,
+    allow_ended_runtime_session: bool = False,
 ) -> Optional[ModelGatewayAuthContext]:
-    """Resolve remaining gateway credentials on the session's worker thread."""
+    """Resolve remaining gateway credentials on the session's worker thread.
+
+    Args:
+        token: Presented bearer token.
+        db: Database session.
+        user: User already resolved from the token, if any.
+        allow_ended_runtime_session: When false, a key pinned to an ended
+            session is rejected. Browser step ingestion passes true so an
+            adapter can flush after the run.
+    """
     if user:
         api_key = crud_api_key.get_by_key(db, key=token)
         if api_key is not None:
             if not api_key.is_active or api_key.is_expired:
+                return None
+            if not _key_matches_user_account(api_key, user):
                 return None
             context_data = (
                 api_key.context_data if isinstance(api_key.context_data, dict) else {}
@@ -132,7 +230,12 @@ def _resolve_bearer_context(
                     account_id=str(api_key.account_id),
                     runtime_session_id=str(runtime_session_id),
                 )
-                if runtime_session is None or runtime_session.ended_at is not None:
+                session_ended = (
+                    runtime_session is not None and runtime_session.ended_at is not None
+                )
+                if runtime_session is None or (
+                    session_ended and not allow_ended_runtime_session
+                ):
                     return None
             managed_agent = _managed_agent_for_api_key(
                 db, api_key, runtime_session=runtime_session
@@ -153,6 +256,8 @@ def _resolve_bearer_context(
             reason = "key is deactivated (agent deleted/suspended or offboarded)"
         elif rejected_key.is_expired:
             reason = "key is expired"
+        elif _key_owner_account_differs(db, rejected_key):
+            reason = "key account does not match its owner's account"
         else:
             reason = "key binding is invalid (managed agent missing or inactive)"
         logger.warning(
@@ -212,6 +317,8 @@ def build_runtime_key_auth_context(
     user = crud_user.get(db, id=str(api_key.user_id))
     if user is None or not user.is_active:
         return None
+    if not _key_matches_user_account(api_key, user):
+        return None
 
     return ModelGatewayAuthContext(token=token, user=user, api_key=api_key)
 
@@ -248,7 +355,7 @@ def resolve_managed_agent_id_for_context(
 
     managed_agent = crud_managed_agent.get_by_source(
         db,
-        account_id=str(auth_context.user.account_id),
+        account_id=str(auth_context.account_id),
         session_source_type=session_source_type,
         session_source_id=session_source_id,
     )
@@ -261,6 +368,50 @@ def compute_authorized_model_ids(
     account_models: Sequence[models.AIModel],
 ) -> frozenset[str]:
     """Compute the ids of ``account_models`` this gateway principal may use.
+
+    The principal-binding rules below decide first. A registered authorizer
+    (account hook H4) is then asked about each remaining model with the
+    ``model:invoke`` action and can only remove models. With no authorizer
+    this is exactly the principal-binding result.
+
+    Args:
+        db: Active database session.
+        auth_context: Authenticated model gateway request context.
+        account_models: Full account model inventory to authorize against.
+
+    Returns:
+        Frozen set of authorized ``AIModel`` id strings.
+    """
+    from preloop.plugins.account_hooks import (
+        ACTION_MODEL_INVOKE,
+        AuthorizationContext,
+        authorize,
+        get_authorizer,
+    )
+
+    authorized = _principal_authorized_model_ids(db, auth_context, account_models)
+    if get_authorizer() is None or not authorized:
+        return authorized
+    ctx = AuthorizationContext(
+        account_id=auth_context.account_id,
+        db=db,
+        user=auth_context.user,
+        principal=auth_context,
+    )
+    return frozenset(
+        str(ai_model.id)
+        for ai_model in account_models
+        if str(ai_model.id) in authorized
+        and authorize(ctx, ACTION_MODEL_INVOKE, ai_model).allowed
+    )
+
+
+def _principal_authorized_model_ids(
+    db: Session,
+    auth_context: ModelGatewayAuthContext,
+    account_models: Sequence[models.AIModel],
+) -> frozenset[str]:
+    """Ids of ``account_models`` the principal-binding rules allow.
 
     Authorization rules, in order:
 
@@ -306,7 +457,7 @@ def compute_authorized_model_ids(
 
     bindings = crud_managed_agent_ai_model_binding.list_for_agent(
         db,
-        account_id=str(auth_context.user.account_id),
+        account_id=str(auth_context.account_id),
         agent_id=managed_agent_id,
     )
     for binding in bindings:

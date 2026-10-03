@@ -37,11 +37,12 @@ from typing import (
 )
 from urllib import error as urllib_error
 from urllib import request as urllib_request
+from urllib.parse import quote as urllib_quote
 
 import httpx
 import litellm
 from sqlalchemy import inspect, text
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from preloop.config import settings
@@ -60,6 +61,11 @@ from preloop.models.crud.runtime_session import IDLE_GENERATION_INFIX
 from preloop.models.db.gateway_session import (
     has_runtime_session_summary_columns,
     release_gateway_session,
+)
+from preloop.services.codex_crosschat import (
+    crosschat_chat_message,
+    is_unsolicited_crosschat_output,
+    rewrite_crosschat_responses_input,
 )
 from preloop.services.codex_tool_compat import (
     unwrap_freeform_arguments,
@@ -85,7 +91,10 @@ from preloop.services.account_realtime import (
     emit_account_event,
 )
 from preloop.services.account_governance_cache import get_cached_account_meta_data
-from preloop.services.agent_session_headers import normalize_session_id
+from preloop.services.agent_session_headers import (
+    normalize_session_id,
+    runtime_principal_type,
+)
 from preloop.services import alibaba_pricing
 from preloop.services import kill_switch as kill_switch_service
 from preloop.services.context_optimization import (
@@ -160,7 +169,9 @@ from preloop.services.model_pricing import (
     _iter_litellm_model_candidates,
     estimate_ai_model_usage_cost_detailed,
 )
+from preloop.services.azure_openai import azure_request_kwargs
 from preloop.services.litellm_routing import (
+    BEDROCK_PROVIDERS,
     apply_preloop_client_headers,
     is_openrouter_model,
     model_api_base,
@@ -179,7 +190,10 @@ from preloop.services.openai_responses_passthrough import (
     should_use_responses_passthrough,
 )
 from preloop.services.tls_verify import ssl_verify_setting
-from preloop.services.pricing_overrides import resolve_pricing_override
+from preloop.services.pricing_overrides import (
+    pricing_account_id,
+    resolve_pricing_override,
+)
 from preloop.services.model_runtime_resolver import (
     is_agent_managed_model,
     resolve_ai_model_runtime,
@@ -346,6 +360,89 @@ atexit.register(_close_anthropic_passthrough_http_client)
 atexit.register(_close_openai_passthrough_http_client)
 
 
+# Claude family autoregister upstream verification (issue #950). Lazy
+# registration must not turn a typo, a guessed snapshot date or a probe into a
+# permanent catalog row. Before minting a sibling, ask Anthropic whether it
+# actually serves the identifier, authenticated with the template model's
+# subscription-OAuth token. The result is cached in process so the extra call
+# is paid once per TTL per (credential, identifier): a positive answer for a
+# day, a negative (404) answer for ten minutes, and an inconclusive answer not
+# at all so an Anthropic outage is retried on the next request.
+_ANTHROPIC_MODEL_VERIFY_TIMEOUT_SECONDS = 10.0
+_CLAUDE_FAMILY_VERIFY_POSITIVE_TTL_SECONDS = 24 * 60 * 60
+_CLAUDE_FAMILY_VERIFY_NEGATIVE_TTL_SECONDS = 10 * 60
+_CLAUDE_FAMILY_VERIFY_CACHE_MAX_ENTRIES = 512
+_CLAUDE_FAMILY_VERIFY_CACHE: Dict[Tuple[str, str], Tuple[str, float]] = {}
+_CLAUDE_FAMILY_VERIFY_CACHE_LOCK = threading.Lock()
+
+
+def _claude_family_verification_cache_get(key: Tuple[str, str]) -> Optional[str]:
+    """Return a live cached outcome for ``key``, evicting an expired entry."""
+    now = time.monotonic()
+    with _CLAUDE_FAMILY_VERIFY_CACHE_LOCK:
+        entry = _CLAUDE_FAMILY_VERIFY_CACHE.get(key)
+        if entry is None:
+            return None
+        outcome, expires_at = entry
+        if expires_at <= now:
+            _CLAUDE_FAMILY_VERIFY_CACHE.pop(key, None)
+            return None
+        return outcome
+
+
+def _claude_family_verification_cache_put(key: Tuple[str, str], outcome: str) -> None:
+    """Remember a verification outcome, evicting the oldest key when full."""
+    ttl = (
+        _CLAUDE_FAMILY_VERIFY_POSITIVE_TTL_SECONDS
+        if outcome == "verified"
+        else _CLAUDE_FAMILY_VERIFY_NEGATIVE_TTL_SECONDS
+    )
+    expires_at = time.monotonic() + ttl
+    with _CLAUDE_FAMILY_VERIFY_CACHE_LOCK:
+        _CLAUDE_FAMILY_VERIFY_CACHE[key] = (outcome, expires_at)
+        while (
+            len(_CLAUDE_FAMILY_VERIFY_CACHE) > _CLAUDE_FAMILY_VERIFY_CACHE_MAX_ENTRIES
+        ):
+            oldest = next(iter(_CLAUDE_FAMILY_VERIFY_CACHE))
+            if oldest == key:
+                break
+            _CLAUDE_FAMILY_VERIFY_CACHE.pop(oldest, None)
+
+
+def _probe_anthropic_model_identifier(*, identifier: str, access_token: str) -> str:
+    """Ask Anthropic whether a subscription serves ``identifier``.
+
+    Sends only the OAuth credential and the identifier in the URL: no client
+    request body, and the token is never logged.
+
+    Returns:
+        ``"verified"`` when the models endpoint answers 200, ``"rejected"``
+        when it answers 404, and ``"unknown"`` for any other status or a
+        transport error. Never raises.
+    """
+    url = (
+        f"{ANTHROPIC_OAUTH_PASSTHROUGH_BASE_URL}/v1/models/"
+        f"{urllib_quote(identifier, safe='')}"
+    )
+    try:
+        response = httpx.get(
+            url,
+            headers={
+                "Authorization": f"Bearer {access_token}",
+                "anthropic-version": ANTHROPIC_DEFAULT_API_VERSION,
+                "anthropic-beta": ANTHROPIC_OAUTH_BETA_FLAG,
+            },
+            timeout=_ANTHROPIC_MODEL_VERIFY_TIMEOUT_SECONDS,
+        )
+    except httpx.HTTPError:
+        return "unknown"
+    if response.status_code == 200:
+        return "verified"
+    if response.status_code == 404:
+        return "rejected"
+    return "unknown"
+
+
 def _emit_account_event_nonblocking(event: Dict[str, Any]) -> None:
     """Publish an account realtime event without blocking TTFB on NATS.
 
@@ -386,8 +483,14 @@ def _submit_gateway_started_emit(event: Dict[str, Any]) -> None:
 
 
 def _supports_ambient_provider_credentials(ai_model: GatewayModel) -> bool:
+    """Whether the model's provider can authenticate from the AWS chain.
+
+    Uses the same provider set as routing (``BEDROCK_PROVIDERS``): a model
+    routed to Bedrock must also get its stored AWS JSON credential unpacked
+    into ``aws_*`` kwargs, or the blob would be sent as an ``api_key``.
+    """
     provider = (ai_model.provider_name or "").strip().lower()
-    return provider in {"bedrock", "amazon-bedrock"}
+    return provider in BEDROCK_PROVIDERS
 
 
 def _openrouter_usage_accounting_enabled() -> bool:
@@ -799,6 +902,7 @@ def gateway_database_scope(operation: Callable[..., Any]) -> Callable[..., Any]:
 
     @wraps(operation)
     def scoped(self: OpenAIGatewayService, *args: Any, **kwargs: Any) -> Any:
+        self._live_request_id = None
         try:
             result = operation(self, *args, **kwargs)
             self.release_db_for_wait()
@@ -815,6 +919,8 @@ class OpenAIGatewayService:
     # __new__ construction (tests, factories) skips __init__. Default keeps
     # release_db_for_wait from crashing on a missing attribute.
     _owns_db_session: bool = False
+    # Service instances are scoped to one HTTP request, including its stream.
+    _live_request_id: Optional[str] = None
 
     def __init__(
         self,
@@ -827,6 +933,7 @@ class OpenAIGatewayService:
         owns_db_session: bool = False,
         client_identity_headers: Optional[Mapping[str, str]] = None,
         client_parent_session_id: Optional[str] = None,
+        client_session_id_is_explicit: Optional[bool] = None,
     ) -> None:
         self._owns_db_session = owns_db_session
         # The request dependency supplies a binding only. Every owned Session
@@ -843,6 +950,21 @@ class OpenAIGatewayService:
         # an agent-native equivalent such as X-Claude-Code-Session-Id).
         # Validated/normalized once; invalid values fall back to source keying.
         self._client_session_id = _normalize_client_session_id(client_session_id)
+        # Whether the request opted in explicitly with X-Preloop-Session-Id. The
+        # HTTP ingress passes this flag separately, because the Anthropic
+        # ingress reads Claude Code's vendor header without a principal-type
+        # gate: only the operator header may opt a plain API key into a runtime
+        # session. Body-level ids (prompt_cache_key / metadata.user_id) are
+        # adopted later through _adopt_* and never touch this flag. Direct
+        # construction (tests, factories) that does not separate the two keeps
+        # the historical reading and treats a bound id as the explicit opt-in.
+        if client_session_id_is_explicit is None:
+            self._client_session_id_is_explicit = self._client_session_id is not None
+        else:
+            self._client_session_id_is_explicit = (
+                bool(client_session_id_is_explicit)
+                and self._client_session_id is not None
+            )
         # Session that spawned this one, when the harness said so (OpenCode's
         # X-Parent-Session-Id, Claude Code's agent id). Same validation as the
         # session id, so a hostile value simply leaves the lineage unknown. It
@@ -920,6 +1042,10 @@ class OpenAIGatewayService:
         # (``GatewayStreamingResponse.on_complete``). None when the generator
         # is still mid-stream or recording already ran.
         self._deferred_stream_record: Optional[Callable[[], None]] = None
+        # Id of the usage row written for the current request. Non-streaming
+        # endpoints return it as ``X-Preloop-Usage-Id`` so an operator smoke
+        # check can point at the exact row the Cost page counts.
+        self.last_usage_id: Optional[str] = None
 
     @property
     def db(self) -> Session:
@@ -986,6 +1112,7 @@ class OpenAIGatewayService:
         """
         self._last_upstream_retry_count = 0
         self._last_alibaba_cache_mode = None
+        self.last_usage_id = None
 
     def _adopt_native_session_id(self, payload: Optional[Dict[str, Any]]) -> None:
         """Adopt the agent's own session id from an Anthropic request payload.
@@ -999,11 +1126,16 @@ class OpenAIGatewayService:
         An explicit ``X-Preloop-Session-Id`` always wins, and this is a no-op
         once the runtime session has been resolved for the request, so the
         session identity of an in-flight request can never change mid-call.
+        Body ids stay gated on a runtime principal. Model content policy reads
+        the same client session id, so a plain key's vendor id is not copied
+        into the policy context.
 
         Args:
             payload: The Anthropic Messages request payload.
         """
         if self._client_session_id or self._resolved_runtime_session_attempted:
+            return
+        if not self._credential_has_runtime_principal():
             return
         native_session_id = _session_id_from_anthropic_metadata(payload)
         if native_session_id:
@@ -1032,9 +1164,20 @@ class OpenAIGatewayService:
         """
         if self._client_session_id or self._resolved_runtime_session_attempted:
             return
+        if not self._credential_has_runtime_principal():
+            return
         native_session_id = _session_id_from_openai_payload(payload)
         if native_session_id:
             self._client_session_id = native_session_id
+
+    def _credential_has_runtime_principal(self) -> bool:
+        """Return whether this credential carries a runtime principal block.
+
+        Plain console keys have empty or missing ``context_data``. Body-level
+        session ids are only adopted for principal-bearing credentials, so
+        they cannot opt a plain key into a runtime session.
+        """
+        return runtime_principal_type(self.auth_context) is not None
 
     def _runtime_session_idle_cutoff(self) -> Optional[datetime]:
         """Return the timestamp before which an idle session is considered over.
@@ -1143,14 +1286,14 @@ class OpenAIGatewayService:
         try:
             parent = crud_runtime_session.get_by_source(
                 self.db,
-                account_id=str(self.auth_context.user.account_id),
+                account_id=str(self.auth_context.account_id),
                 session_source_type=session_source_type,
                 session_source_id=parent_source_id,
             )
             if parent is None:
                 parent = crud_runtime_session.upsert_by_source(
                     self.db,
-                    account_id=str(self.auth_context.user.account_id),
+                    account_id=str(self.auth_context.account_id),
                     session_source_type=session_source_type,
                     session_source_id=parent_source_id,
                     runtime_principal_type=session_source_type,
@@ -1215,7 +1358,7 @@ class OpenAIGatewayService:
                 try:
                     latest_run = crud_runtime_session.get_latest_by_principal(
                         self.db,
-                        account_id=str(self.auth_context.user.account_id),
+                        account_id=str(self.auth_context.account_id),
                         principal_type=session_source_type,
                         principal_id=session_source_id,
                     )
@@ -1240,7 +1383,7 @@ class OpenAIGatewayService:
                         # its own id and correctly reattaches to its own row.
                         rs = crud_runtime_session.get_by_source(
                             self.db,
-                            account_id=str(self.auth_context.user.account_id),
+                            account_id=str(self.auth_context.account_id),
                             session_source_type=session_source_type,
                             session_source_id=session_source_id,
                         )
@@ -1248,7 +1391,7 @@ class OpenAIGatewayService:
                         # Signal-less: only the clock can bound this session.
                         rs = crud_runtime_session.get_latest_idle_generation(
                             self.db,
-                            account_id=str(self.auth_context.user.account_id),
+                            account_id=str(self.auth_context.account_id),
                             session_source_type=session_source_type,
                             session_source_id=session_source_id,
                         )
@@ -1268,7 +1411,7 @@ class OpenAIGatewayService:
                         observed_at = datetime.now(timezone.utc)
                         rs = crud_runtime_session.upsert_by_source(
                             self.db,
-                            account_id=str(self.auth_context.user.account_id),
+                            account_id=str(self.auth_context.account_id),
                             session_source_type=session_source_type,
                             session_source_id=session_source_id,
                             runtime_principal_type=session_source_type,
@@ -1301,7 +1444,7 @@ class OpenAIGatewayService:
                         if parent_session_id is not None:
                             rs = crud_runtime_session.upsert_by_source(
                                 self.db,
-                                account_id=str(self.auth_context.user.account_id),
+                                account_id=str(self.auth_context.account_id),
                                 session_source_type=session_source_type,
                                 session_source_id=session_source_id,
                                 parent_session_id=parent_session_id,
@@ -1318,6 +1461,89 @@ class OpenAIGatewayService:
                         f"Failed to auto-upsert runtime session for gateway request: {e}",
                         exc_info=True,
                     )
+
+        if (
+            not runtime_session_id
+            and not runtime_principal
+            and self.auth_context.api_key is not None
+            and self._client_session_id_is_explicit
+            and self._client_session_id
+        ):
+            # A plain console-created key has no runtime principal, so without
+            # this branch its traffic records priced usage with
+            # ``runtime_session_id`` NULL and session drill-down, Optimize and
+            # replay have nothing to attach to. Opt in per request and only on
+            # an explicit X-Preloop-Session-Id (normalized into
+            # ``self._client_session_id`` at construction): the account and key
+            # id are part of the source key, so a caller-supplied id can never
+            # adopt another key's or account's session. Vendor session headers
+            # and body-level ids never set the explicit flag, and there is no
+            # idle bucketing here -- an explicit id is authoritative.
+            api_key_id = self.auth_context.api_key.id
+            session_source_id = f"{api_key_id}:{self._client_session_id}"
+            raw_name = getattr(self.auth_context.api_key, "name", None)
+            principal_name = (
+                raw_name if isinstance(raw_name, str) and raw_name.strip() else None
+            )
+            observed_at = datetime.now(timezone.utc)
+            try:
+                rs = crud_runtime_session.get_by_source(
+                    self.db,
+                    account_id=str(self.auth_context.account_id),
+                    session_source_type="api_key",
+                    session_source_id=session_source_id,
+                )
+                if rs is None or rs.ended_at is not None:
+                    rs = crud_runtime_session.upsert_by_source(
+                        self.db,
+                        account_id=str(self.auth_context.account_id),
+                        session_source_type="api_key",
+                        session_source_id=session_source_id,
+                        runtime_principal_type="api_key",
+                        runtime_principal_id=str(api_key_id),
+                        runtime_principal_name=principal_name,
+                        started_at=observed_at,
+                        last_activity_at=observed_at,
+                        reopen_if_ended=True,
+                    )
+                runtime_session_id = str(rs.id)
+            except IntegrityError:
+                # A losing racer still attaches to the winner. The re-read is
+                # its own try: an exception here is not caught by the sibling
+                # handlers below, and callers assume resolution degrades.
+                self.db.rollback()
+                try:
+                    rs = crud_runtime_session.get_by_source(
+                        self.db,
+                        account_id=str(self.auth_context.account_id),
+                        session_source_type="api_key",
+                        session_source_id=session_source_id,
+                    )
+                except SQLAlchemyError:
+                    self.db.rollback()
+                    logger.warning(
+                        "Failed to resolve runtime session for plain gateway key",
+                        exc_info=True,
+                    )
+                else:
+                    if rs is not None and rs.ended_at is None:
+                        runtime_session_id = str(rs.id)
+                    else:
+                        logger.warning(
+                            "Failed to resolve runtime session for plain gateway key",
+                            exc_info=True,
+                        )
+            except SQLAlchemyError:
+                self.db.rollback()
+                logger.warning(
+                    "Failed to resolve runtime session for plain gateway key",
+                    exc_info=True,
+                )
+            except Exception:
+                logger.debug(
+                    "Failed to auto-upsert runtime session for plain gateway key",
+                    exc_info=True,
+                )
 
         self._resolved_runtime_session_id = runtime_session_id
         return runtime_session_id
@@ -1344,7 +1570,7 @@ class OpenAIGatewayService:
         """
         operator_notes.deliver_gateway_notes(
             self.db,
-            account_id=str(self.auth_context.user.account_id),
+            account_id=str(self.auth_context.account_id),
             managed_agent_id=self._resolve_managed_agent_id(),
             runtime_session_id=self._resolve_runtime_session(),
             protocol=protocol,
@@ -1363,15 +1589,17 @@ class OpenAIGatewayService:
         from preloop.services.model_gateway_events import build_account_event
         from preloop.services.account_realtime import ACCOUNT_TOPIC_GATEWAY_ACTIVITY
 
+        self._live_request_id = str(uuid4())
         runtime_session_id = self._resolve_runtime_session()
         managed_agent_id = self._resolve_managed_agent_id()
 
         _emit_account_event_nonblocking(
             build_account_event(
-                account_id=str(self.auth_context.user.account_id),
+                account_id=str(self.auth_context.account_id),
                 topic=ACCOUNT_TOPIC_GATEWAY_ACTIVITY,
                 event_type="model_gateway_request_started",
                 payload={
+                    "request_id": self._live_request_id,
                     "status_code": 202,  # accepted, waiting
                     "outcome": "pending",
                     "duration": 0,
@@ -1383,7 +1611,6 @@ class OpenAIGatewayService:
                         "endpoint_kind": endpoint_kind,
                         "requested_model": requested_model,
                     },
-                    "request": request_payload,
                     "timestamp": datetime.now(timezone.utc).isoformat(),
                 },
                 runtime_session_id=runtime_session_id,
@@ -1425,7 +1652,7 @@ class OpenAIGatewayService:
 
             emit_list_models(
                 account_id=(
-                    str(self.auth_context.user.account_id)
+                    str(self.auth_context.account_id)
                     if self.auth_context.user
                     else None
                 )
@@ -3018,7 +3245,7 @@ class OpenAIGatewayService:
             output_items: List[Dict[str, Any]] = []
             tool_call_states: Dict[int, Dict[str, Any]] = {}
             reasoning_bridge = DeepSeekResponsesReasoning.for_model(
-                model, self.auth_context.user.account_id
+                model, self.auth_context.account_id
             )
             reasoning_buffer = StringIO()
             reasoning_bytes = 0
@@ -3477,7 +3704,7 @@ class OpenAIGatewayService:
         )
 
     def _get_account_models(self) -> List[models.AIModel]:
-        account_id = self.auth_context.user.account_id
+        account_id = self.auth_context.account_id
         from preloop.models.crud.ai_model import ai_model as crud_ai_model
 
         return crud_ai_model.get_all_for_account(self.db, account_id=account_id)
@@ -3599,7 +3826,7 @@ class OpenAIGatewayService:
                 logger.warning(
                     "gateway_alias_collision account=%s requested=%r "
                     "chosen=%s chosen_name=%r shadowed=%s",
-                    self.auth_context.user.account_id,
+                    self.auth_context.account_id,
                     requested_model,
                     chosen.id,
                     chosen.name,
@@ -3690,7 +3917,12 @@ class OpenAIGatewayService:
 
         Only the registry check is relaxed. Budget preflight, subject-scoped
         ``allowed_models``, attribution, and usage accounting run unchanged on
-        the returned model.
+        the returned model. Before the row is written, the identifier is
+        optionally verified against Anthropic's models endpoint with the
+        template's OAuth token
+        (``model_gateway_claude_family_autoregister_verify_upstream``); a 404
+        blocks registration so a typo or a guessed snapshot date cannot become
+        a permanent catalog row.
 
         Args:
             requested_model: The client's requested model string.
@@ -3701,8 +3933,9 @@ class OpenAIGatewayService:
         Returns:
             The newly registered model, or ``None`` when preconditions fail
             (feature disabled, non-Anthropic protocol, non-claude identifier,
-            or no subscription-OAuth template model to share credentials
-            with) — the caller then raises its usual 404.
+            no subscription-OAuth template model to share credentials with,
+            or Anthropic rejects the identifier) — the caller then raises its
+            usual 404.
         """
         if not settings.model_gateway_claude_family_autoregister_enabled:
             return None
@@ -3733,6 +3966,21 @@ class OpenAIGatewayService:
         if template is None:
             return None
 
+        verification_outcome: Optional[str] = None
+        if settings.model_gateway_claude_family_autoregister_verify_upstream:
+            verification = self._verify_claude_family_model_upstream(
+                identifier=base_requested,
+                template=template,
+            )
+            if verification == "rejected":
+                # Anthropic answers 404 for this id: never mint a permanent
+                # catalog row. The caller raises its usual 404, and the
+                # negative answer is cached so a retry does not re-probe.
+                return None
+            verification_outcome = (
+                "verified" if verification == "verified" else "unverified"
+            )
+
         return self._autoregister_subscription_oauth_sibling(
             identifier=base_requested,
             alias=f"anthropic/{base_requested}",
@@ -3746,7 +3994,77 @@ class OpenAIGatewayService:
                 "Code subscription-OAuth request."
             ),
             log_label="Claude family",
+            verification_outcome=verification_outcome,
         )
+
+    def _verify_claude_family_model_upstream(
+        self, *, identifier: str, template: models.AIModel
+    ) -> str:
+        """Classify an unknown ``claude-*`` id against Anthropic's models API.
+
+        The template model's credential secret is the same secret the new
+        sibling will share, so probing with it authenticates exactly as the
+        request would. The result is cached in process: a positive answer for
+        a day, a rejection for ten minutes, and an inconclusive answer not at
+        all.
+
+        Args:
+            identifier: The bare (unprefixed) ``claude-*`` identifier.
+            template: An authorized subscription-OAuth model whose credential
+                secret the new sibling will share.
+
+        Returns:
+            ``"verified"`` (upstream 200), ``"rejected"`` (upstream 404), or
+            ``"unknown"`` (any other status, transport error, or unusable
+            credential). Only ``"rejected"`` blocks registration; the other
+            two preserve the pre-verification behaviour.
+        """
+        secret_id = template.credentials_secret_id
+        cache_key = (
+            str(secret_id) if secret_id is not None else "",
+            identifier,
+        )
+        cached = _claude_family_verification_cache_get(cache_key)
+        if cached is not None:
+            return cached
+        try:
+            resolved = get_secret_service().resolve_ai_model_credentials(
+                template,
+                db=self.db,
+                allow_refresh=True,
+            )
+        except Exception:  # noqa: BLE001 - a probe must never fail the request
+            logger.warning(
+                "Claude family upstream verification could not resolve "
+                "credentials for %s; registering without verification",
+                identifier,
+                exc_info=True,
+            )
+            return "unknown"
+        if (
+            resolved is None
+            or resolved.credential_type != ANTHROPIC_CLAUDE_CODE_OAUTH_CREDENTIAL_TYPE
+            or not resolved.value
+        ):
+            logger.warning(
+                "Claude family upstream verification has no usable OAuth "
+                "credential for %s; registering without verification",
+                identifier,
+            )
+            return "unknown"
+        outcome = _probe_anthropic_model_identifier(
+            identifier=identifier,
+            access_token=str(resolved.value),
+        )
+        if outcome in {"verified", "rejected"}:
+            _claude_family_verification_cache_put(cache_key, outcome)
+        else:
+            logger.warning(
+                "Claude family upstream verification was inconclusive for %s; "
+                "registering without verification",
+                identifier,
+            )
+        return outcome
 
     @staticmethod
     def _codex_autoregister_identifier(model_ref: str) -> Optional[str]:
@@ -3875,6 +4193,7 @@ class OpenAIGatewayService:
         name_prefix: str,
         description: str,
         log_label: str,
+        verification_outcome: Optional[str] = None,
     ) -> Optional[models.AIModel]:
         """Create a sibling models.AIModel + agent binding under a savepoint.
 
@@ -3884,6 +4203,12 @@ class OpenAIGatewayService:
         nested transaction (commit=False keeps the CRUD layer from committing
         the outer transaction mid-savepoint) and the final commit happens
         only after the savepoint released cleanly.
+
+        ``verification_outcome`` records whether Anthropic was asked about the
+        identifier and what it answered (``"verified"`` or ``"unverified"``
+        for an inconclusive probe); ``None`` means verification was disabled.
+        The value is written to ``meta_data.upstream_verification`` so an
+        operator can tell a verified row from a fallback later.
         """
         managed_agent_id = resolve_managed_agent_id_for_context(
             self.db, self.auth_context
@@ -3894,7 +4219,7 @@ class OpenAIGatewayService:
             # unauthorized for this credential on the very next request.
             return None
 
-        account_id = self.auth_context.user.account_id
+        account_id = self.auth_context.account_id
         for model in crud_ai_model.get_by_account(self.db, account_id=account_id):
             if (
                 (model.model_identifier or "").strip() == identifier
@@ -3942,6 +4267,23 @@ class OpenAIGatewayService:
             if isinstance(template_meta.get("gateway"), dict)
             else {}
         )
+        created_meta: Dict[str, Any] = {
+            "gateway": {
+                "enabled": True,
+                "url": template_gateway.get("url"),
+                "provider_adapter": template_gateway.get("provider_adapter", "preloop"),
+                "model_alias": alias,
+            },
+            "managed_by": managed_by,
+            "source_agent": source_agent,
+            "managed_agent_id": managed_agent_id,
+            "autoregistered_from_ai_model_id": str(template.id),
+        }
+        if verification_outcome is not None:
+            # Audit/catalog marker: "verified" means Anthropic answered 200 for
+            # this id; "unverified" means the probe was inconclusive (other
+            # status or transport error) and the row was registered as before.
+            created_meta["upstream_verification"] = verification_outcome
         try:
             with self.db.begin_nested():
                 created = crud_ai_model.create_with_account(
@@ -3953,20 +4295,7 @@ class OpenAIGatewayService:
                         "model_identifier": identifier,
                         "api_endpoint": template.api_endpoint,
                         "credentials_secret_id": template.credentials_secret_id,
-                        "meta_data": {
-                            "gateway": {
-                                "enabled": True,
-                                "url": template_gateway.get("url"),
-                                "provider_adapter": template_gateway.get(
-                                    "provider_adapter", "preloop"
-                                ),
-                                "model_alias": alias,
-                            },
-                            "managed_by": managed_by,
-                            "source_agent": source_agent,
-                            "managed_agent_id": managed_agent_id,
-                            "autoregistered_from_ai_model_id": str(template.id),
-                        },
+                        "meta_data": created_meta,
                     },
                     account_id=account_id,
                     commit=False,
@@ -4037,11 +4366,7 @@ class OpenAIGatewayService:
             raise ModelGatewayAPIError(
                 provider="openai",
                 status_code=status_code,
-                message=(
-                    "OpenAI Codex OAuth credentials could not be refreshed. "
-                    "Run `codex login` on the agent host and rerun onboarding "
-                    "to reconnect the model gateway."
-                ),
+                message=exc.recovery_message(),
                 code=exc.code,
             ) from exc
         if (
@@ -4141,8 +4466,11 @@ class OpenAIGatewayService:
     def _build_openai_codex_payload(
         self, ai_model: GatewayModel, payload: Dict[str, Any], *, stream: bool = False
     ) -> Dict[str, Any]:
+        # The ChatGPT Codex backend receives the client's raw ``input``, so
+        # call_id-less cross-chat deliveries need the same rewrite as the
+        # native passthrough (#1113).
         upstream_payload = self._sanitize_openai_codex_payload(
-            json.loads(json.dumps(payload))
+            json.loads(json.dumps(rewrite_crosschat_responses_input(payload)))
         )
         upstream_payload["model"] = ai_model.model_identifier
         if stream:
@@ -5234,7 +5562,7 @@ class OpenAIGatewayService:
     ) -> Dict[str, Any]:
         output_items = self._build_response_output_items(response_dict)
         reasoning_bridge = DeepSeekResponsesReasoning.for_model(
-            ai_model, self.auth_context.user.account_id
+            ai_model, self.auth_context.account_id
         )
         choices = response_dict.get("choices") or []
         message = (choices[0].get("message") or {}) if choices else {}
@@ -5336,10 +5664,7 @@ class OpenAIGatewayService:
             raise ModelGatewayAPIError(
                 provider="anthropic",
                 status_code=status_code,
-                message=(
-                    "Model credentials could not be refreshed. "
-                    "Reconnect this managed agent or update the model credentials."
-                ),
+                message=exc.recovery_message(),
                 code=exc.code,
             ) from exc
         if (
@@ -5378,7 +5703,7 @@ class OpenAIGatewayService:
             if not isinstance(raw_tools, list) or not raw_tools:
                 return payload
             meta_data = get_cached_account_meta_data(
-                self.db, str(self.auth_context.user.account_id)
+                self.db, str(self.auth_context.account_id)
             )
             if meta_data is None:
                 return payload
@@ -5990,10 +6315,7 @@ class OpenAIGatewayService:
             raise ModelGatewayAPIError(
                 provider="openai",
                 status_code=status_code,
-                message=(
-                    "Model credentials could not be refreshed. "
-                    "Reconnect this managed agent or update the model credentials."
-                ),
+                message=exc.recovery_message(),
                 code=exc.code,
             ) from exc
         if (
@@ -6039,7 +6361,7 @@ class OpenAIGatewayService:
             if not isinstance(raw_tools, list) or not raw_tools:
                 return payload
             meta_data = get_cached_account_meta_data(
-                self.db, str(self.auth_context.user.account_id)
+                self.db, str(self.auth_context.account_id)
             )
             if meta_data is None:
                 return payload
@@ -6105,6 +6427,9 @@ class OpenAIGatewayService:
         # Attribution is computed from the tools the CLIENT sent, before the
         # strip, so a stripped tool is still reported (with stripped=True).
         self._capture_tools_meta(payload.get("tools"))
+        # Codex cross-chat deliveries carry no call_id; native upstreams
+        # reject them, so send them as labelled user context instead (#1113).
+        governed_payload = rewrite_crosschat_responses_input(governed_payload)
         body = build_passthrough_body(ai_model, governed_payload, stream=stream)
         headers = {
             "Authorization": f"Bearer {api_key}",
@@ -6239,7 +6564,7 @@ class OpenAIGatewayService:
             call = (
                 meter.prepare_native(
                     self.db,
-                    account_id=self.auth_context.user.account_id,
+                    account_id=self.auth_context.account_id,
                     model=ai_model,
                     body=body,
                     url=url,
@@ -6329,7 +6654,7 @@ class OpenAIGatewayService:
             call = (
                 meter.prepare_native(
                     self.db,
-                    account_id=self.auth_context.user.account_id,
+                    account_id=self.auth_context.account_id,
                     model=ai_model,
                     body=body,
                     url=url,
@@ -6598,10 +6923,7 @@ class OpenAIGatewayService:
             raise ModelGatewayAPIError(
                 provider=provider,
                 status_code=status_code,
-                message=(
-                    "Model credentials could not be refreshed. "
-                    "Reconnect this managed agent or update the model credentials."
-                ),
+                message=exc.recovery_message(),
                 code=exc.code,
             ) from exc
         supports_ambient = _supports_ambient_provider_credentials(ai_model)
@@ -6671,6 +6993,9 @@ class OpenAIGatewayService:
             }
         if api_base := model_api_base(ai_model):
             kwargs["api_base"] = api_base
+        # Azure needs the resource root (not the pasted deployment URL) and
+        # an api-version; both come from the stored model.
+        kwargs.update(azure_request_kwargs(ai_model))
         if alibaba_pricing.is_alibaba(ai_model):
             cache_markers = 0
             for message in messages:
@@ -6952,7 +7277,7 @@ class OpenAIGatewayService:
             reservation = (
                 meter.prepare(
                     self.db,
-                    account_id=self.auth_context.user.account_id,
+                    account_id=self.auth_context.account_id,
                     model=ai_model,
                     kwargs=kwargs,
                     owns_session=self._owns_db_session,
@@ -7021,10 +7346,7 @@ class OpenAIGatewayService:
             raise ModelGatewayAPIError(
                 provider="openai",
                 status_code=status_code,
-                message=(
-                    "Model credentials could not be refreshed. "
-                    "Reconnect this managed agent or update the model credentials."
-                ),
+                message=exc.recovery_message(),
                 code=exc.code,
             ) from exc
         supports_ambient = _supports_ambient_provider_credentials(ai_model)
@@ -7062,6 +7384,9 @@ class OpenAIGatewayService:
             kwargs.setdefault("aws_region_name", region)
         if api_base := model_api_base(ai_model):
             kwargs["api_base"] = api_base
+        # Azure needs the resource root (not the pasted deployment URL) and
+        # an api-version; both come from the stored model.
+        kwargs.update(azure_request_kwargs(ai_model))
         for field in ("dimensions", "encoding_format", "user"):
             if payload.get(field) is not None:
                 kwargs[field] = payload[field]
@@ -7093,7 +7418,7 @@ class OpenAIGatewayService:
             reservation = (
                 meter.prepare(
                     self.db,
-                    account_id=self.auth_context.user.account_id,
+                    account_id=self.auth_context.account_id,
                     model=ai_model,
                     kwargs=kwargs,
                     owns_session=self._owns_db_session,
@@ -7491,7 +7816,7 @@ class OpenAIGatewayService:
             return messages, payload
         try:
             meta_data = get_cached_account_meta_data(
-                self.db, str(self.auth_context.user.account_id)
+                self.db, str(self.auth_context.account_id)
             )
             if meta_data is None:
                 return messages, payload
@@ -7548,9 +7873,7 @@ class OpenAIGatewayService:
     ) -> List[Dict[str, Any]]:
         messages: List[Dict[str, Any]] = []
         reasoning_bridge = (
-            DeepSeekResponsesReasoning.for_model(
-                ai_model, self.auth_context.user.account_id
-            )
+            DeepSeekResponsesReasoning.for_model(ai_model, self.auth_context.account_id)
             if ai_model is not None
             else None
         )
@@ -7660,6 +7983,16 @@ class OpenAIGatewayService:
                     }
                 )
                 pending_tool_call_ids.discard(call_id)
+                continue
+
+            if is_unsolicited_crosschat_output(item):
+                # Codex cross-chat delivery (#1113): call_id-less context, not
+                # a tool result. Contract in preloop.services.codex_crosschat.
+                # It must not satisfy (or slip between) a pending tool call.
+                if staged_tool_calls or pending_tool_call_ids:
+                    flush_staged_tool_calls()
+                    raise tool_response_error()
+                messages.append(crosschat_chat_message(item))
                 continue
 
             if item_type == "function_call_output":
@@ -8568,7 +8901,7 @@ class OpenAIGatewayService:
         """Resolve account-scoped pricing metadata for a gateway usage row."""
         return resolve_pricing_override(
             self.db,
-            account_id=self.auth_context.user.account_id,
+            account_id=pricing_account_id(self.auth_context.account_id, ai_model),
             ai_model=ai_model,
             requested_alias=model_alias,
         )
@@ -9063,7 +9396,7 @@ class OpenAIGatewayService:
         )
         attempt_summary = crud_api_usage.get_gateway_attempt_summary(
             self.db,
-            account_id=str(self.auth_context.user.account_id),
+            account_id=str(self.auth_context.account_id),
             runtime_session_id=runtime_session_id,
             request_fingerprint=request_fingerprint,
         )
@@ -9132,7 +9465,7 @@ class OpenAIGatewayService:
             status_code=status_code,
             duration=duration,
             user_id=str(self.auth_context.user.id),
-            account_id=str(self.auth_context.user.account_id),
+            account_id=str(self.auth_context.account_id),
             api_key_id=(
                 str(self.auth_context.api_key.id) if self.auth_context.api_key else None
             ),
@@ -9169,6 +9502,7 @@ class OpenAIGatewayService:
             runtime_principal_name=runtime_principal.get("name"),
             rate_limit_retry_after_ms=rate_limit_retry_after_ms,
             meta_data={
+                "request_id": getattr(self, "_live_request_id", None),
                 "endpoint_kind": endpoint_kind,
                 "requested_model": requested_model,
                 "gateway_provider": runtime.model_gateway_provider,
@@ -9211,6 +9545,7 @@ class OpenAIGatewayService:
                 ),
             },
         )
+        self.last_usage_id = str(usage_row.id)
         observed_at = usage_row.timestamp
 
         if cost_source == "unpriced" and (prompt_tokens or completion_tokens):
@@ -9241,7 +9576,7 @@ class OpenAIGatewayService:
                 try:
                     notify_unpriced_model(
                         self.db,
-                        account_id=str(self.auth_context.user.account_id),
+                        account_id=str(self.auth_context.account_id),
                         model_alias=model_alias,
                         provider_name=ai_model.provider_name,
                         total_tokens=int(total_tokens or 0),
@@ -9255,7 +9590,7 @@ class OpenAIGatewayService:
 
         log_model_gateway_request(
             self.db,
-            account_id=self.auth_context.user.account_id,
+            account_id=self.auth_context.account_id,
             user_id=self.auth_context.user.id,
             api_usage_id=str(usage_row.id),
             endpoint=endpoint,
@@ -9368,7 +9703,7 @@ class OpenAIGatewayService:
             if usage_row.runtime_session_id:
                 runtime_session = crud_runtime_session.touch_activity(
                     self.db,
-                    account_id=self.auth_context.user.account_id,
+                    account_id=self.auth_context.account_id,
                     runtime_session_id=usage_row.runtime_session_id,
                     observed_at=observed_at,
                     min_update_interval=_RUNTIME_SESSION_ACTIVITY_TOUCH_MIN_INTERVAL,
@@ -9384,7 +9719,7 @@ class OpenAIGatewayService:
                     )
                     emit_account_event(
                         build_account_event(
-                            account_id=str(self.auth_context.user.account_id),
+                            account_id=str(self.auth_context.account_id),
                             topic=ACCOUNT_TOPIC_RUNTIME_SESSIONS,
                             event_type="runtime_session_updated",
                             payload={
@@ -9417,7 +9752,7 @@ class OpenAIGatewayService:
             if usage_row.runtime_principal_type and usage_row.runtime_principal_id:
                 managed_agent = crud_managed_agent.touch_last_seen_for_principal(
                     self.db,
-                    account_id=self.auth_context.user.account_id,
+                    account_id=self.auth_context.account_id,
                     session_source_type=usage_row.runtime_principal_type,
                     session_source_id=usage_row.runtime_principal_id,
                     runtime_session_id=usage_row.runtime_session_id,
@@ -9427,7 +9762,7 @@ class OpenAIGatewayService:
                 if managed_agent is not None:
                     emit_account_event(
                         build_account_event(
-                            account_id=str(self.auth_context.user.account_id),
+                            account_id=str(self.auth_context.account_id),
                             topic=ACCOUNT_TOPIC_MANAGED_AGENTS,
                             event_type="managed_agent_updated",
                             payload={
@@ -9488,7 +9823,7 @@ class OpenAIGatewayService:
         existing_summary = summary_state.get("summary")
         request_count = crud_api_usage.count_successful_gateway_calls_for_session(
             self.db,
-            account_id=self.auth_context.user.account_id,
+            account_id=self.auth_context.account_id,
             runtime_session_id=runtime_session.id,
         )
         if not isinstance(request_count, int) or request_count < 1:
@@ -9501,7 +9836,7 @@ class OpenAIGatewayService:
 
         default_model = crud_ai_model.get_default_active_model(
             self.db,
-            account_id=self.auth_context.user.account_id,
+            account_id=self.auth_context.account_id,
         )
         if default_model is None:
             return
@@ -9517,7 +9852,7 @@ class OpenAIGatewayService:
                 response_payload=response_payload,
                 recent_interactions=crud_runtime_session_activity.list_recent_model_gateway_call_payloads_for_session(
                     self.db,
-                    account_id=self.auth_context.user.account_id,
+                    account_id=self.auth_context.account_id,
                     runtime_session_id=runtime_session.id,
                     limit=_RUNTIME_SESSION_SUMMARY_REFRESH_EVERY_REQUESTS,
                 ),
@@ -9565,7 +9900,7 @@ class OpenAIGatewayService:
         try:
             index_session_summary(
                 self.db,
-                account_id=self.auth_context.user.account_id,
+                account_id=self.auth_context.account_id,
                 runtime_session_id=runtime_session.id,
                 title=getattr(runtime_session, "title", None),
                 summary=stored_summary,
@@ -9763,7 +10098,7 @@ class OpenAIGatewayService:
         blocked request stays attributable to the halt, then raised as a 403
         carrying the distinct ``preloop_account_halted`` error code.
         """
-        account_id = self.auth_context.user.account_id
+        account_id = self.auth_context.account_id
         if not kill_switch_service.gateway_halted(self.db, account_id):
             return
         reason = kill_switch_service.halt_reason(self.db, account_id, "gateway")
@@ -9793,6 +10128,68 @@ class OpenAIGatewayService:
         )
         raise error
 
+    def _check_per_execution_limits(
+        self,
+        ai_model: GatewayModel,
+        payload: Dict[str, Any],
+        *,
+        gateway_provider: GatewayProvider = "openai",
+    ) -> None:
+        """Refuse a request from a run that is already over its own ceiling.
+
+        The execution id rides on the runtime API key's context
+        (``flow_execution_id``), minted for one flow run. When that run has
+        ``agent_config.limits`` and its attributed usage has reached a
+        ceiling, the request is refused with the shared
+        ``execution_budget_exceeded`` code and the execution is marked FAILED
+        with the ``budget_exceeded`` category naming the ceiling. The crossing
+        request itself was allowed, so the agent can finish its last response
+        and emit a verdict; this method only refuses the request *after* the
+        ceiling is known to be spent.
+
+        Credentials with no execution context return immediately. When an
+        execution id is present, the execution and its flow are loaded so a
+        ceiling set mid-run is visible; the usage aggregate is skipped only
+        when that flow has no ceilings configured.
+        """
+        if not self.auth_context.api_key:
+            return
+        context_data = self.auth_context.api_key.context_data or {}
+        execution_id = context_data.get("flow_execution_id")
+        if not execution_id:
+            return
+
+        from preloop.services.flow_execution_limits import (
+            ExecutionBudgetExceededError,
+            enforce_execution_limits_for_id,
+        )
+
+        try:
+            enforce_execution_limits_for_id(self.db, execution_id=execution_id)
+        except ExecutionBudgetExceededError as exc:
+            logger.warning(
+                "Gateway request refused by per-execution ceiling: "
+                "execution=%s kind=%s limit=%s observed=%s",
+                execution_id,
+                exc.violation.kind,
+                exc.violation.limit,
+                exc.violation.observed,
+            )
+            # enforce_* already marked the execution FAILED on this session.
+            # Commit that mark before raising: with owns_db_session the
+            # gateway_database_scope finally closes without commit and would
+            # otherwise roll the failure back, leaving the run RUNNING.
+            # Do not _record_gateway_request here — a usage row would count as
+            # another turn toward max_turns (turns == api_requests).
+            if self._owns_db_session:
+                self.release_db_for_wait()
+            raise ModelGatewayAPIError(
+                provider=gateway_provider,
+                status_code=403,
+                message=exc.message,
+                code="execution_budget_exceeded",
+            ) from exc
+
     def _check_budget(
         self,
         ai_model: GatewayModel,
@@ -9801,6 +10198,13 @@ class OpenAIGatewayService:
         gateway_provider: GatewayProvider = "openai",
     ) -> Optional[BudgetCheckResult]:
         """Check configured gateway budgets before the upstream call."""
+        # The run's own per-execution ceiling is independent of the account
+        # budget policies below: it applies even when no BudgetPolicy exists,
+        # and it is refused before an extension enforcer can short-circuit.
+        self._check_per_execution_limits(
+            ai_model, payload, gateway_provider=gateway_provider
+        )
+
         # Execute plugin budget enforcement (HTTP 403 on limit exceeded)
         if hasattr(self.budget_enforcer, "enforce_or_raise"):
             try:
@@ -9815,9 +10219,26 @@ class OpenAIGatewayService:
                     exc, gateway_provider=gateway_provider
                 ) from exc
 
-        return ModelGatewayBudgetService(self.db, self.auth_context).preflight_check(
+        result = ModelGatewayBudgetService(self.db, self.auth_context).preflight_check(
             ai_model, payload
         )
+        if (
+            result is not None
+            and result.hard_limit_exceeded
+            and result.enforcement_reason == "pricing_required_for_budget_enforcement"
+        ):
+            # The denial is recorded with zero tokens, and the on-miss lookup
+            # only fires for unpriced rows that carry tokens. Without this a
+            # model denied for lacking a price is never looked up, so every
+            # retry is denied the same way (issue #801). Throttled by the
+            # lookup's own dedupe and negative cache.
+            try:
+                schedule_price_lookup(ai_model_id=getattr(ai_model, "id", None))
+            except Exception:  # noqa: BLE001 - never turn a 403 into a 500
+                logger.debug(
+                    "Scheduling price lookup after denial failed", exc_info=True
+                )
+        return result
 
     @staticmethod
     def _normalize_budget_gateway_error(

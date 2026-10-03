@@ -60,6 +60,7 @@ class GitLabTracker(BaseTracker):
     """GitLab tracker implementation using python-gitlab."""
 
     tracker_type: str = "gitlab"
+    hosts_repositories: bool = True
 
     def __init__(
         self,
@@ -1580,6 +1581,7 @@ class GitLabTracker(BaseTracker):
         state: str = "open",
         limit: int = 20,
         page: int = 1,
+        source_branch: Optional[str] = None,
     ) -> Dict[str, Any]:
         """List merge requests for the connected GitLab project.
 
@@ -1587,6 +1589,7 @@ class GitLabTracker(BaseTracker):
             state: Normalized state (open maps to GitLab opened).
             limit: Page size (per_page).
             page: 1-based page number.
+            source_branch: Only MRs from this source branch.
 
         Returns:
             Dict with normalized ``items`` and ``has_more``. ``has_more`` is
@@ -1597,6 +1600,9 @@ class GitLabTracker(BaseTracker):
         project_id = self._get_project_id()
         gitlab_state = "opened" if state == "open" else state
         project = await self._make_request(self.gl.projects.get, project_id)
+        filters: Dict[str, Any] = {}
+        if source_branch:
+            filters["source_branch"] = source_branch
         mrs = await self._make_request(
             project.mergerequests.list,
             state=gitlab_state,
@@ -1604,6 +1610,7 @@ class GitLabTracker(BaseTracker):
             sort="desc",
             per_page=limit,
             page=page,
+            **filters,
         )
         rows = list(mrs or [])
         has_more = False
@@ -1615,10 +1622,41 @@ class GitLabTracker(BaseTracker):
                 sort="desc",
                 per_page=1,
                 page=page + 1,
+                **filters,
             )
             has_more = bool(list(nxt or []))
         items = [self._normalize_listed_merge_request(mr) for mr in rows]
         return {"items": items, "has_more": has_more}
+
+    async def list_open_pull_requests_by_source_branch(
+        self, branch: str
+    ) -> Dict[str, Any]:
+        """Open merge requests from ``branch``, in the shared PR list shape."""
+        return await self.list_merge_requests(
+            state="open", limit=5, page=1, source_branch=branch
+        )
+
+    async def branch_exists(self, branch: str) -> bool:
+        """Whether ``branch`` exists on the connected project.
+
+        Raises on anything other than a clean found / not-found answer so a
+        caller can tell "absent" from "could not check".
+        """
+        project_id = self._get_project_id()
+        project = await self._make_request(self.gl.projects.get, project_id)
+
+        def _exists() -> bool:
+            # GitlabGetError is not a GitlabHttpError, so the request wrapper
+            # would drop its status code; resolve the 404 here.
+            try:
+                project.branches.get(branch)
+            except gitlab.exceptions.GitlabGetError as error:
+                if error.response_code == HTTP_STATUS_NOT_FOUND:
+                    return False
+                raise
+            return True
+
+        return await self._make_request_no_retry(_exists)
 
     def _normalize_listed_merge_request(self, mr: Any) -> Dict[str, Any]:
         """Map a python-gitlab MR object (or dict) to the shared PR list shape."""
@@ -1664,6 +1702,53 @@ class GitLabTracker(BaseTracker):
             "created_at": data.get("created_at"),
             "updated_at": data.get("updated_at"),
         }
+
+    async def find_merge_requests_by_branch(
+        self, source_branch: str, target_branch: str
+    ) -> List[Dict[str, Any]]:
+        """Merge requests in any state from ``source_branch`` into ``target_branch``.
+
+        Only merge requests whose source branch lives in the connected project
+        are returned, so a fork with the same branch name never matches.
+
+        Args:
+            source_branch: Source branch name.
+            target_branch: Target branch name.
+
+        Returns:
+            Normalized merge requests (see ``list_merge_requests``), newest
+            first. ``state`` is ``open``, ``closed``, ``merged`` or ``locked``.
+        """
+        project_id = self._get_project_id()
+        project = await self._make_request(self.gl.projects.get, project_id)
+        mrs = await self._make_request(
+            project.mergerequests.list,
+            source_branch=source_branch,
+            target_branch=target_branch,
+            state="all",
+            order_by="created_at",
+            sort="desc",
+            per_page=20,
+        )
+        matches: List[Dict[str, Any]] = []
+        for mr in list(mrs or []):
+            data = mr if isinstance(mr, dict) else getattr(mr, "attributes", {})
+            source_project = data.get("source_project_id")
+            target_project = data.get("target_project_id")
+            if (
+                source_project is not None
+                and target_project is not None
+                and source_project != target_project
+            ):
+                continue
+            item = self._normalize_listed_merge_request(mr)
+            if (
+                item["source_branch"] != source_branch
+                or item["target_branch"] != target_branch
+            ):
+                continue
+            matches.append(item)
+        return matches
 
     async def update_merge_request(
         self,
@@ -2402,6 +2487,7 @@ class GitLabTracker(BaseTracker):
         context: str = "preloop",
         description: Optional[str] = None,
         target_url: Optional[str] = None,
+        refname: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Create a commit status (pipeline status) on a specific commit.
 
@@ -2415,10 +2501,13 @@ class GitLabTracker(BaseTracker):
                      this status from others. Default is "preloop".
             description: A short description of the status.
             target_url: URL to link to for more details.
+            refname: Merge request source branch. Unused: GitLab shows a
+                status on every merge request whose head is ``sha``.
 
         Returns:
             Dictionary with status details.
         """
+        del refname
         project_id = self._get_project_id()
 
         # Map common state names to GitLab's expected values

@@ -62,6 +62,7 @@ from .managed_agent_credential import ManagedAgentCredential
 from .managed_agent_enrollment import ManagedAgentEnrollment
 from .model_price_override import ModelPriceOverride
 from .provider_billing import ProviderBillingConnection, ProviderBillingSnapshot
+from .copilot_import import CopilotImportConnection
 from .tool_configuration import ToolConfiguration, ApprovalWorkflow
 from .mcp_server import MCPServer
 from .mcp_tool import MCPTool
@@ -82,13 +83,21 @@ from .notification_preferences import NotificationPreferences
 from .registration_token import RegistrationToken
 from .team import Team, TeamMembership
 from .user import User, UserSource
+from .person import Person
+from .account_access_grant import AccountAccessGrant, account_access_grant_target
+from .access_rule import AccessRule
+from .resource_share import ResourceShare, ResourceShareRecipient
+from .resource_tag import ResourceTag, TagKeyPolicy
+from . import hierarchy  # noqa: F401  (registers the before_flush defaults)
 from .permission import Permission, Role, RolePermission, UserRole, TeamRole
 from .user_invitation import UserInvitation, UserInvitationStatus
 from .event import Event
 from .visitor import Visitor
 from .identity_link import IdentityLink
+from .policy_notice_hit import PolicyNoticeHit
 from .account_milestone import AccountMilestone
 from .attention_dismissal import AttentionDismissal
+from .spend_outlier import SpendOutlierFinding, SpendOutlierSettings
 from .instance import Instance
 from .cli_client import CliClient
 from .github_app_installation import OAuthAppInstallation, GitHubAppInstallation
@@ -98,6 +107,7 @@ from .repricing_job import RepricingJob
 from .policy_snapshot import PolicySnapshot
 from .runtime_session import RuntimeSession
 from .runtime_session_activity import RuntimeSessionActivity
+from .runtime_session_artifact import RuntimeSessionArtifact
 from .runtime_session_optimization_action import RuntimeSessionOptimizationAction
 from .runtime_session_optimization_result import RuntimeSessionOptimizationResult
 from .runtime_session_replay_run import RuntimeSessionReplayRun
@@ -109,6 +119,7 @@ from .session_search_document import SessionSearchDocument
 from .tool_cost_flag import ToolCostFlag
 from .tool_output_filter import ToolOutputFilter
 from .oauth_mcp_client import OAuthMCPClient
+from .cli_session import CliSession
 from .oauth_mcp_token import (
     OAuthMCPAuthorizationCode,
     OAuthMCPAccessToken,
@@ -118,6 +129,7 @@ from .budget import BudgetPolicy, BudgetSpendActivity, BudgetPeriod
 from .billing_operation import BillingOperation
 from .hosted_spend import HostedSpendAccount, HostedSpendMonth, HostedSpendReservation
 
+from .issue_cost import IssueCostExecution, IssueCostPullRequest, IssueCostRollup
 from .issue_lifecycle import IssueLifecycle
 from .security_maintenance import (
     SecurityMaintenanceBaseline,
@@ -134,6 +146,9 @@ __all__ = [
     "HostedSpendReservation",
     "FlowFeedback",
     "FlowThread",
+    "IssueCostExecution",
+    "IssueCostPullRequest",
+    "IssueCostRollup",
     "IssueLifecycle",
     "SecurityMaintenanceRelease",
     "SecurityMaintenanceItem",
@@ -199,6 +214,7 @@ __all__ = [
     "ModelPriceOverride",
     "ProviderBillingConnection",
     "ProviderBillingSnapshot",
+    "CopilotImportConnection",
     "ToolConfiguration",
     "ApprovalWorkflow",
     "MCPServer",
@@ -217,6 +233,14 @@ __all__ = [
     "Team",
     "TeamMembership",
     "User",
+    "Person",
+    "AccountAccessGrant",
+    "account_access_grant_target",
+    "AccessRule",
+    "ResourceShare",
+    "ResourceShareRecipient",
+    "ResourceTag",
+    "TagKeyPolicy",
     "UserSource",
     "Permission",
     "Role",
@@ -228,8 +252,11 @@ __all__ = [
     "Event",
     "Visitor",
     "IdentityLink",
+    "PolicyNoticeHit",
     "AccountMilestone",
     "AttentionDismissal",
+    "SpendOutlierFinding",
+    "SpendOutlierSettings",
     "Instance",
     "CliClient",
     "OAuthAppInstallation",
@@ -241,6 +268,7 @@ __all__ = [
     "PolicySnapshot",
     "RuntimeSession",
     "RuntimeSessionActivity",
+    "RuntimeSessionArtifact",
     "RuntimeSessionOptimizationAction",
     "RuntimeSessionReplayRun",
     "RuntimeSessionOptimizationResult",
@@ -255,6 +283,7 @@ __all__ = [
     "BudgetSpendActivity",
     "BudgetPeriod",
     "OAuthMCPClient",
+    "CliSession",
     "OAuthMCPAuthorizationCode",
     "OAuthMCPAccessToken",
     "OAuthMCPRefreshToken",

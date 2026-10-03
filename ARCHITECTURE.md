@@ -1,8 +1,16 @@
 # Preloop Architecture
 
-Preloop is an open-source, responsible AI automation platform. It can proxy tools from MCP servers, optionally adding a human approval layer with configurable policies. It provides event-driven agentic flows to intelligently automate common tasks using the agent harnesses registered in `preloop.agents.factory`: OpenHands, Aider, Codex CLI, Gemini CLI, OpenCode, Pi and DeepSeek Harness. It integrates with issue & code tracking systems like Jira, GitHub, GitLab, both for listening to events and for ingesting issues, comments, documentation and code. By leveraging vector-based similarity search, Preloop detects duplicate and overlapping issues, detects unmapped dependencies, evaluates compliance metrics, and offers intelligent suggestions to streamline workflows. The architecture now also includes Preloop-owned model-gateway surfaces so managed runtimes can route model traffic through a central enforcement point for telemetry, budgets, session observability, and secret custody. The architecture emphasizes flexibility, performance, and ease of integration, providing access via a REST API, a web UI, and an MCP server for various clients.
+Preloop is an open-source, responsible AI automation platform. It can proxy tools from MCP servers, optionally adding a human approval layer with configurable policies. It provides event-driven agentic flows to intelligently automate common tasks using the agent harnesses registered in `preloop.agents.factory`: OpenHands, Aider, Codex CLI, Gemini CLI, OpenCode, Pi and DeepSeek Harness. It integrates with issue & code tracking systems like Jira, GitHub, GitLab, Bitbucket Cloud, both for listening to events and for ingesting issues, comments, documentation and code. By leveraging vector-based similarity search, Preloop detects duplicate and overlapping issues, detects unmapped dependencies, evaluates compliance metrics, and offers intelligent suggestions to streamline workflows. The architecture now also includes Preloop-owned model-gateway surfaces so managed runtimes can route model traffic through a central enforcement point for telemetry, budgets, session observability, and secret custody. The architecture emphasizes flexibility, performance, and ease of integration, providing access via a REST API, a web UI, and an MCP server for various clients.
 
 ARCHITECTURE.md is the map. Read one chapter under `docs/architecture/` for the subsystem you are changing. Do not load every chapter for context.
+
+Live session supervision uses shared Lit state and tool/approval cards across
+Talk, Conversation and Transcript. Gateway starts and accounting completions
+share a per-request identity; captured OpenAI, Responses and Anthropic tool
+metadata has a 64 KiB aggregate bound and follows capture/redaction policy.
+Approval REST queries combine account and runtime-session scope, and websocket
+approval payloads pass the same permission boundary before delivery. See
+[Runtime sessions](docs/guide/concepts/runtime-sessions.md#following-live-work-and-decisions).
 
 Implementation PRs can use [durable feedback subscriptions](docs/guide/flows/durable-implementation-feedback.md): PostgreSQL threads and inbox leases coordinate new execution turns, while native conversation artifacts remain isolated from workspace checkpoints. Repository events and bounded reconciliation advance CI/review gates without idle agent containers. Feedback opt-in applies to future executions; a preview-and-adopt API binds one older publication explicitly. Live policy changes are checked again at atomic repair reservation. Missing native checkpoints fail closed unless the operator explicitly selected a source-only published-branch handoff. Unreadable repository requirements prevent readiness while fully verified feedback can still authorize bounded repairs.
 
@@ -14,6 +22,11 @@ HTTP model gateways use immutable execution values and fresh worker-owned databa
 units for authentication, preparation and accounting. Provider waits and stream
 pulls retain no Session. See [Gateway database ownership](docs/architecture/gateway.md#gateway-database-ownership)
 for protocol boundaries, cancellation and the serialized OAuth rotation exception.
+
+Claude/Codex subscription recovery preserves agent enrollment through
+`preloop agents reconnect`. Credential imports serialize with rotation and reject
+recently consumed refresh tokens; provider-declared invalid grants require fresh
+authorization. See [OAuth credential recovery](docs/architecture/gateway.md#gateway-database-ownership).
 
 The [account kill switch](docs/guide/account-kill-switch.md) serializes halt transitions and runtime admission on the account row. Audit records and durable execution stop intent share the transition transaction. Monitors and recovery workers distinguish a stop request from confirmed runtime termination; approval deadlines recover once by their actual frozen interval.
 
@@ -45,6 +58,20 @@ Cloud analytics history is resolved through a billing plugin service at reportin
 The Cost console loads totals independently of settings and tab breakdowns.
 Selective reporting queries and per-section loading states are described in
 [Progressive reporting](docs/architecture/cost.md#progressive-reporting).
+Cost and cycle time per tracker issue are rolled up across flows into their own
+tables. Each issue row, summary and unassigned bucket also states `cost_coverage`
+(`complete`, `partial`, `unknown`) and how many of its runs carry a cost, so an
+unpriced subscription-backed run is never read as a free ticket; see
+[Cost per issue](docs/architecture/cost.md#cost-and-cycle-time-per-tracker-issue).
+
+Bitbucket Data Center uses the separate `bitbucket_dc` adapter, gated off by
+default. Its REST transport enforces administrator-approved HTTPS instances,
+context paths, connection-time destination validation and verified TLS; user PATs
+use tracker SecretReference encryption through CRUD. Repository numeric IDs
+remain stable when slugs change. DC repository/review support targets the 10.2
+LTS contract with synthetic fixtures; Jira remains the issue host. OAuth,
+webhooks and execution/publication routing are separate integrations. See the
+[deployment and validation guide](docs/guide/bitbucket-data-center.md).
 
 ## High-Level Architecture
 
@@ -54,7 +81,7 @@ graph LR
     subgraph "External Systems"
         direction TB
         MCP_Clients["MCP Clients (e.g., Claude Code)"]
-        Issue_Trackers["Issue Trackers (Jira, GitHub, GitLab)"]
+        Issue_Trackers["Issue Trackers (Jira, GitHub, GitLab, Bitbucket Cloud)"]
         Browser["Browser"]
     end
     subgraph "Preloop Platform"
@@ -113,6 +140,22 @@ graph LR
 
 Execution environment profiles and hosted checkpoint recovery are documented in
 [Environments and recovery](docs/guide/flows/environments-and-recovery.md).
+Workspace checkpoint capture streams individual files and enforces its
+compressed size cap during packing. Dependency directories and caches are
+excluded; oversized captures leave the last complete checkpoint available.
+Hosted legacy GitHub App publication refreshes repository-scoped credentials on
+the controller immediately before push or PR creation. A signed runner capability
+binds the execution, account, tracker and startup repository; issuance requires an
+active execution. App signing keys remain on the controller. The runtime replaces
+stale git credentials and uses the fresh token for PR REST calls as well.
+The sandboxed-browser allowlist sidecar lives in
+[`environments/egress-proxy`](environments/egress-proxy/README.md).
+
+A flow with an enabled `git_clone_config.backport` block runs in a
+control-plane mode: the orchestrator cherry-picks the merge commit onto each
+target branch in a scratch repository and opens one pull request per target,
+with no agent container. See
+[Release backport](docs/guide/flows/release-backport.md).
 
 ### Flow delegation and execution trees
 
@@ -266,3 +309,12 @@ on failure. Before returning success, the API checks the account's registered
 agent and selected model binding through CRUD. Credentials stay in request
 memory; audit events contain deployment identifiers and outcomes. See
 [operator configuration](docs/operations/agent-deployment.md).
+
+Cost digest consumers use full-window CRUD aggregates for model and agent
+request rankings. SQL window totals preserve unknown activity and remaining
+known groups while returning at most three named entries plus a bucket row.
+Agent attribution prefers the account-owned direct managed principal, then
+an account-owned session's managed agent, then a named principal. Account
+constraints and scalar session association prevent cross-account labels and
+join fan-out. Console exact-period links preserve UTC microseconds and use
+normal authenticated account scoping; URL account context grants no access.

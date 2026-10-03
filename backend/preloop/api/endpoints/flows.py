@@ -1,7 +1,7 @@
 import asyncio
-import uuid
 import secrets
-from datetime import datetime
+import uuid
+from datetime import datetime, timedelta
 from typing import Annotated, Any, Dict, List, NoReturn, Optional, cast
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
@@ -21,8 +21,14 @@ from preloop.models.crud.flow_execution import CRUDFlowExecution
 from preloop.models.db.session import get_db_session as get_db
 from preloop.api.auth import get_current_active_user
 from preloop.models.models.user import User
+from preloop.plugins.account_hooks import VISIBLE_FLOW, filter_viewable
 from preloop.schemas.gateway_usage import FlowGatewayUsageSummaryResponse
-from preloop.services.execution_metrics import project_execution_totals
+from preloop.schemas.host_exec_usage import HostExecSessionsResponse
+from preloop.services.host_exec_usage import summarize_host_exec_usage
+from preloop.services.execution_metrics import (
+    project_execution_totals,
+    project_resume_lineage,
+)
 from preloop.services.kill_switch import FlowHaltActiveError
 from preloop.services.issue_triage_controller import TriageControllerError
 from preloop.services.model_gateway_usage import ModelGatewayUsageService
@@ -47,7 +53,6 @@ from preloop.services.flow_delegation import (
     CallableFlowsError,
     validate_callable_flows,
 )
-from preloop.services import flow_tree_stop
 from preloop.services.model_routing import (
     ModelRoutingError,
     model_usable_for_agent as _model_usable_for_agent,
@@ -73,6 +78,11 @@ from preloop.services.flow_continuation_adoption import (
     ContinuationAdoptionError,
     preview_continuation,
     adopt_continuation,
+)
+from preloop.cra.evidence_pack import (
+    EvidenceMemberError,
+    list_evidence_members,
+    read_evidence_member,
 )
 from preloop.services.flow_artifacts import (
     EvidenceUnavailableError,
@@ -112,6 +122,17 @@ def _reject_host_exec_flow(
         )
         if blocked:
             raise HTTPException(status_code=400, detail=blocked)
+
+
+def _reject_unsupported_persistent_preset(agent_config: Any, preset: Any) -> None:
+    """Reject a persistent execution path for a catalog preset that opts out."""
+    if preset is None:
+        return
+    from preloop.services.persistent_workspace import persistent_preset_rejection
+
+    reason = persistent_preset_rejection(agent_config, getattr(preset, "name", None))
+    if reason:
+        raise HTTPException(status_code=422, detail=reason)
 
 
 @router.post("/flows", response_model=schemas.FlowResponse)
@@ -170,7 +191,11 @@ def create_flow(
     ):
         # Generate a secure 32-byte URL-safe token
         webhook_secret = secrets.token_urlsafe(32)
-        flow_in.webhook_config = schemas.WebhookConfig(webhook_secret=webhook_secret)
+        # Keep the other settings the caller sent (dedupe_path,
+        # supersede_on_update); only the secret is server-generated.
+        flow_in.webhook_config = (
+            flow_in.webhook_config or schemas.WebhookConfig()
+        ).model_copy(update={"webhook_secret": webhook_secret})
         flow_in.trigger_event_source = "webhook"
         flow_in.trigger_event_types = ["webhook"]
 
@@ -199,6 +224,7 @@ def create_flow(
                 detail=f"Source flow {flow_in.source_preset_id} is not a preset. "
                 "Only preset flows can be used as a source.",
             )
+        _reject_unsupported_persistent_preset(flow_in.agent_config, preset)
 
         # Security: Preset must be global (account_id is None) or belong to the user's account
         if (
@@ -269,12 +295,23 @@ def read_flows(
     current_user: User = Depends(get_current_active_user),
 ):
     """Retrieve flows for the account."""
-    flows = crud_flow.get_multi(
-        db, account_id=current_user.account_id, skip=skip, limit=limit
+    flows = filter_viewable(
+        db,
+        current_user,
+        VISIBLE_FLOW,
+        crud_flow.get_multi(
+            db,
+            account_id=current_user.account_id,
+            skip=skip,
+            limit=limit,
+            include_shared=True,
+        ),
     )
 
     if flows:
-        flow_ids = [f.id for f in flows]
+        # Execution stats cover own flows only: the runs of a flow another
+        # account shares here (account hook H3) belong to that account.
+        flow_ids = [f.id for f in flows if f.account_id == current_user.account_id]
         stats = crud_flow_execution.get_execution_stats_for_flows(
             db, flow_ids, start_date=stats_since
         )
@@ -364,14 +401,29 @@ def read_presets(
     ``POST /flows/run-preset`` takes, so scripted callers do not have to
     match on a display name that can be renamed.
     """
-    from preloop.flow_presets import PRESET_SLUGS_BY_NAME
+    from preloop.flow_presets import PRESET_SLUGS_BY_NAME, supports_persistent_for_slug
 
     presets = crud_flow.get_presets_for_account(db, account_id=current_user.account_id)
+    by_id = {}
+    for preset in presets:
+        preset_id = getattr(preset, "id", None)
+        if preset_id is not None:
+            by_id[preset_id] = preset
     for preset in presets:
         # Account-specific rows are copies: their name is user-editable and
-        # is not catalog identity, so they stay unslugged.
+        # is not catalog identity, so they stay unslugged. Persistent support
+        # still follows the catalog preset they were cloned from.
+        slug = None
         if getattr(preset, "account_id", None) is None:
-            preset.slug = PRESET_SLUGS_BY_NAME.get(getattr(preset, "name", None) or "")
+            slug = PRESET_SLUGS_BY_NAME.get(getattr(preset, "name", None) or "")
+            preset.slug = slug
+        else:
+            source = by_id.get(getattr(preset, "source_preset_id", None))
+            if source is not None and getattr(source, "account_id", None) is None:
+                slug = PRESET_SLUGS_BY_NAME.get(getattr(source, "name", None) or "")
+            else:
+                slug = PRESET_SLUGS_BY_NAME.get(getattr(preset, "name", None) or "")
+        preset.supports_persistent = supports_persistent_for_slug(slug)
     return presets
 
 
@@ -573,6 +625,7 @@ def read_flow_executions(
     # Tool calls and cost from the same aggregation the execution page shows,
     # so a row and the page it opens never state different numbers.
     project_execution_totals(db, executions)
+    project_resume_lineage(db, executions, account_id=current_user.account_id)
 
     return executions
 
@@ -896,24 +949,63 @@ def read_flow_execution(
     if not execution:
         raise HTTPException(status_code=404, detail="Flow execution not found")
 
-    if not execution.mcp_usage_logs:
-        rows = crud_runtime_session_activity.list_tool_calls_for_flow_execution(
-            db,
-            account_id=current_user.account_id,
-            flow_execution_id=execution.id,
+    # The gateway's recorded activity is authoritative for the outcome of a
+    # governed call (succeeded/refused/failed and the refusal string), so it is
+    # preferred over the parsed "detected" markers. Parsed rows whose tool was
+    # not recorded by the gateway (for example an ungoverned MCP server) are
+    # kept so the timeline does not lose calls. Matching is one recorded row
+    # to one parsed marker (correlation_id, else timestamp proximity) so a
+    # single recorded call does not drop the tool's whole parse history.
+    activity_rows = crud_runtime_session_activity.list_tool_calls_for_flow_execution(
+        db,
+        account_id=current_user.account_id,
+        flow_execution_id=execution.id,
+    )
+    if activity_rows:
+
+        def _activity_log(row: Any) -> Dict[str, Any]:
+            # Present the outcome with the same keys the parsed rows use, so
+            # the console shows a refusal string where it already shows an
+            # error, and never leaks the raw argument payload.
+            succeeded = str(row.status or "").startswith("succ")
+            entry: Dict[str, Any] = {
+                "timestamp": row.timestamp.isoformat() if row.timestamp else None,
+                "tool_name": row.tool_name,
+                "server_name": row.server_name,
+                "status": row.status,
+                "summary": row.summary,
+                "result_summary": row.summary if succeeded else None,
+                "error": None if succeeded else row.summary,
+                "correlation_id": (row.metadata_ or {}).get("correlation_id"),
+                "arguments_summary": (row.metadata_ or {}).get("arguments_summary"),
+            }
+            started_at = (row.metadata_ or {}).get("started_at")
+            if started_at:
+                entry["started_at"] = started_at
+            return entry
+
+        activity_logs = [_activity_log(row) for row in activity_rows]
+        existing_logs: List[Any] = (
+            execution.mcp_usage_logs
+            if isinstance(execution.mcp_usage_logs, list)
+            else []
         )
-        if rows:
-            execution.mcp_usage_logs = [
-                {
-                    "timestamp": row.timestamp.isoformat() if row.timestamp else None,
-                    "tool_name": row.tool_name,
-                    "server_name": row.server_name,
-                    "status": row.status,
-                    "summary": row.summary,
-                    **(row.metadata_ or {}),
-                }
-                for row in rows
-            ]
+        parsed_logs = [log for log in existing_logs if isinstance(log, dict)]
+        used_parsed: set[int] = set()
+        for activity in activity_logs:
+            match_index = _match_parsed_mcp_marker(activity, parsed_logs, used_parsed)
+            if match_index is not None:
+                used_parsed.add(match_index)
+        leftover_parsed = [
+            log for index, log in enumerate(parsed_logs) if index not in used_parsed
+        ]
+        leftover_other = [log for log in existing_logs if not isinstance(log, dict)]
+        execution.mcp_usage_logs = sorted(
+            activity_logs + leftover_parsed + leftover_other,
+            key=lambda log: (
+                (log.get("timestamp") if isinstance(log, dict) else "") or ""
+            ),
+        )
 
     # The model that ran this execution, from the same gateway usage the list
     # projects, so the detail page and the table never disagree.
@@ -922,9 +1014,99 @@ def read_flow_execution(
     # Same for tool calls and cost: the page hydrates its strip from this row
     # before /metrics answers, and the number must not change under the user.
     project_execution_totals(db, [execution])
+    project_resume_lineage(db, [execution], account_id=current_user.account_id)
     _project_execution_park(db, execution)
+    # The page paints its title from this row before the flow itself loads.
+    execution.flow_name = execution.flow.name if execution.flow else None
 
     return execution
+
+
+def _parse_mcp_log_timestamp(value: Any) -> Optional[datetime]:
+    """Parse a timeline timestamp from an ISO string or datetime."""
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, str):
+        try:
+            return datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    return None
+
+
+# Slack around a call's [started_at, timestamp] interval. Parsed markers
+# are stamped at call start and gateway rows at call end, so a fixed window
+# around the row timestamp misses any call longer than the window.
+_MCP_USAGE_MATCH_WINDOW_SECONDS = 5.0
+
+
+def _match_parsed_mcp_marker(
+    activity: Dict[str, Any],
+    parsed_logs: List[Dict[str, Any]],
+    used: set[int],
+) -> Optional[int]:
+    """Return the index of one parsed marker matching a recorded activity.
+
+    Prefers correlation_id when both sides carry it; otherwise matches the
+    same client-visible tool_name when the marker falls inside
+    ``[started_at - slack, timestamp + slack]``. Rows without ``started_at``
+    use the row timestamp for both ends. Nearest marker wins, one to one.
+
+    Args:
+        activity: Recorded gateway usage row projected for the timeline.
+        parsed_logs: Parsed "detected" markers from the agent log.
+        used: Indices already matched to another recorded row.
+
+    Returns:
+        Index into ``parsed_logs`` to retire, or None if no marker matches.
+    """
+    corr = activity.get("correlation_id")
+    if corr:
+        for index, parsed in enumerate(parsed_logs):
+            if index in used:
+                continue
+            if parsed.get("correlation_id") == corr:
+                return index
+
+    act_tool = activity.get("tool_name")
+    if not act_tool:
+        return None
+    act_end = _parse_mcp_log_timestamp(activity.get("timestamp"))
+    act_start = _parse_mcp_log_timestamp(activity.get("started_at")) or act_end
+    if act_end is None:
+        act_end = act_start
+    best_index: Optional[int] = None
+    best_delta: Optional[float] = None
+    for index, parsed in enumerate(parsed_logs):
+        if index in used:
+            continue
+        if parsed.get("tool_name") != act_tool:
+            continue
+        parsed_ts = _parse_mcp_log_timestamp(parsed.get("timestamp"))
+        if act_end is None or parsed_ts is None:
+            # Same tool name without usable timestamps: retire the first
+            # unmatched marker so one recorded call still maps to one parse.
+            if best_index is None:
+                return index
+            continue
+        if act_start is not None and act_end is not None and act_start > act_end:
+            act_start, act_end = act_end, act_start
+        window_start = act_start - timedelta(seconds=_MCP_USAGE_MATCH_WINDOW_SECONDS)
+        window_end = act_end + timedelta(seconds=_MCP_USAGE_MATCH_WINDOW_SECONDS)
+        if parsed_ts < window_start or parsed_ts > window_end:
+            continue
+        if parsed_ts < act_start:
+            delta = (act_start - parsed_ts).total_seconds()
+        elif parsed_ts > act_end:
+            delta = (parsed_ts - act_end).total_seconds()
+        else:
+            delta = 0.0
+        if best_delta is None or delta < best_delta:
+            best_index = index
+            best_delta = delta
+    return best_index
 
 
 def _project_execution_park(db: Session, execution: Any) -> None:
@@ -1109,26 +1291,40 @@ def get_flow_execution_evidence(
     )
     if not execution:
         raise HTTPException(status_code=404, detail="Flow execution not found")
-    try:
-        archive, receipt = load_evidence(
-            db, account_id=current_user.account_id, execution=execution
-        )
-    except EvidenceUnavailableError as exc:
-        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
-    receipt = attach_evidence_signature(
-        db, account_id=current_user.account_id, receipt=receipt
+    archive, receipt = _load_verified_evidence(
+        db, execution=execution, account_id=current_user.account_id
     )
+    return Response(
+        content=archive,
+        media_type="application/gzip",
+        headers=_evidence_download_headers(
+            execution,
+            receipt,
+            filename=f"evidence-{execution.id}.tar.gz",
+        ),
+    )
+
+
+def _evidence_download_headers(
+    execution: Any,
+    receipt: dict[str, Any],
+    *,
+    filename: str,
+    member_path: str | None = None,
+) -> dict[str, str]:
+    """Integrity and signature headers shared by the pack and member reads.
+
+    The full download is not written to the audit log. A member read uses the
+    same headers and the same omission, so the two reads leave the same trail.
+    """
     digest = receipt.get("sha256") or receipt.get("digest") or ""
     signature = receipt.get("signature") or {}
+    safe_name = filename.replace('"', "").replace("\r", "").replace("\n", "")
     headers = {
-        "Content-Disposition": (
-            f'attachment; filename="evidence-{execution.id}.tar.gz"'
-        ),
+        "Content-Disposition": f'attachment; filename="{safe_name}"',
         "Cache-Control": "no-store",
         "X-Preloop-Evidence-Status": str(receipt.get("status") or "available"),
         "X-Preloop-Evidence-Kind": "evidence",
-        # The same three-state word the status endpoint reports, so the
-        # header and the poll cannot describe one pack differently.
         "X-Preloop-Evidence-Integrity": (
             "verified" if receipt.get("integrity_verified") else "unverified"
         ),
@@ -1142,17 +1338,105 @@ def get_flow_execution_evidence(
     }
     if digest:
         headers["X-Preloop-Evidence-SHA256"] = str(digest)
+    if member_path:
+        headers["X-Preloop-Evidence-Member"] = member_path
     if signature:
-        # The signature covers a small payload the caller can rebuild from
-        # the bytes it just downloaded, so these headers are checkable
-        # without trusting the response that carried them (#558).
         headers["X-Preloop-Signature"] = str(signature.get("signature") or "")
         headers["X-Preloop-Signing-Key-Id"] = str(signature.get("key_id") or "")
         headers["X-Preloop-Signed-At"] = str(signature.get("signed_at") or "")
+    return headers
+
+
+def _load_verified_evidence(
+    db: Session, *, execution: Any, account_id: Any
+) -> tuple[bytes, dict[str, Any]]:
+    """Decrypt and verify a pack, or raise the same HTTP errors as download."""
+    try:
+        archive, receipt = load_evidence(db, account_id=account_id, execution=execution)
+    except EvidenceUnavailableError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+    return archive, attach_evidence_signature(
+        db, account_id=account_id, receipt=receipt
+    )
+
+
+@router.get(
+    "/flows/executions/{execution_id}/evidence/members",
+    response_model=None,
+    responses={
+        200: {
+            "description": (
+                "JSON member list, or one member's bytes when path is set."
+            ),
+            "content": {
+                "application/json": {"schema": {"type": "object"}},
+                "text/markdown": {"schema": {"type": "string"}},
+                "text/plain": {"schema": {"type": "string"}},
+                "application/octet-stream": {
+                    "schema": {"type": "string", "format": "binary"}
+                },
+            },
+            "headers": {
+                "X-Preloop-Evidence-Integrity": {"schema": {"type": "string"}},
+                "X-Preloop-Evidence-SHA256": {"schema": {"type": "string"}},
+                "X-Preloop-Evidence-Member": {"schema": {"type": "string"}},
+            },
+        }
+    },
+)
+@require_permission("view_flows")
+def get_flow_execution_evidence_members(
+    *,
+    db: Session = Depends(get_db),
+    execution_id: uuid.UUID,
+    current_user: User = Depends(get_current_active_user),
+    path: str | None = None,
+) -> Dict[str, Any] | Response:
+    """List a pack's manifest members, or return one member when ``path`` is set.
+
+    Auth, decryption, digest verification and legal hold follow
+    ``GET .../evidence``. Only a path that the manifest lists is readable.
+    Absolute paths and ``..`` are refused. A member larger than 8 MiB is
+    refused; download the pack for that file. Markdown, JSON and plain text
+    are served with those content types.
+
+    The full download is not audited. This read is not audited either.
+    """
+    execution = crud_flow_execution.get(
+        db=db, id=execution_id, account_id=current_user.account_id
+    )
+    if not execution:
+        raise HTTPException(status_code=404, detail="Flow execution not found")
+    archive, receipt = _load_verified_evidence(
+        db, execution=execution, account_id=current_user.account_id
+    )
+    try:
+        if path is None:
+            members = list_evidence_members(archive)
+        else:
+            body, meta = read_evidence_member(archive, path)
+    except EvidenceMemberError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+    if path is None:
+        return {
+            "execution_id": str(execution.id),
+            "status": receipt.get("status") or "available",
+            "sha256": receipt.get("sha256") or receipt.get("digest"),
+            "integrity": receipt.get("integrity"),
+            "integrity_note": receipt.get("integrity_note"),
+            "legal_hold": bool(receipt.get("legal_hold")),
+            "members": members,
+        }
+    leaf = meta["path"].rsplit("/", 1)[-1]
     return Response(
-        content=archive,
-        media_type="application/gzip",
-        headers=headers,
+        content=body,
+        media_type=meta["content_type"],
+        headers=_evidence_download_headers(
+            execution,
+            receipt,
+            filename=leaf or "member",
+            member_path=meta["path"],
+        ),
     )
 
 
@@ -1371,6 +1655,43 @@ async def get_flow_execution_logs(
         return {"logs": [], "source": "database", "has_more": False}
 
 
+# The row type the gateway writes for each model request of an execution.
+MODEL_GATEWAY_CALL_LOG_TYPE = "model_gateway_call"
+
+
+@router.get(
+    "/flows/executions/{execution_id}/host-sessions",
+    response_model=HostExecSessionsResponse,
+)
+@require_permission("view_flows")
+def get_flow_execution_host_sessions(
+    *,
+    db: Session = Depends(get_db),
+    execution_id: uuid.UUID,
+    current_user: User = Depends(get_current_active_user),
+) -> HostExecSessionsResponse:
+    """Hook sessions and seat usage of a run on a host-exec profile.
+
+    Args:
+        execution_id: ID of the execution.
+
+    Returns:
+        Sessions observed by the runner's usage hook, their event counts,
+        and the Copilot premium requests the CLI reported. None of it is
+        gateway traffic.
+    """
+    execution = crud_flow_execution.get(
+        db=db, id=execution_id, account_id=current_user.account_id
+    )
+    if not execution:
+        raise HTTPException(status_code=404, detail="Flow execution not found")
+    return HostExecSessionsResponse.model_validate(
+        summarize_host_exec_usage(
+            db, account_id=current_user.account_id, execution_id=execution.id
+        )
+    )
+
+
 @router.get("/flows/executions/{execution_id}/gateway-events")
 @require_permission("view_flows")
 def get_flow_execution_gateway_events(
@@ -1378,10 +1699,26 @@ def get_flow_execution_gateway_events(
     db: Session = Depends(get_db),
     execution_id: uuid.UUID,
     current_user: User = Depends(get_current_active_user),
-    tail: int | None = None,
+    tail: Annotated[int | None, Query(ge=1)] = None,
     metadata_only: bool = False,
+    model_calls_only: bool = False,
 ) -> Dict[str, Any]:
-    """Get normalized model gateway events for a flow execution."""
+    """Get normalized model gateway events for a flow execution.
+
+    Args:
+        execution_id: ID of the execution.
+        tail: Most recent rows to return (default 5000).
+        metadata_only: Drop the large payload fields (conversation preview,
+            tools, result, stream events).
+        model_calls_only: Return only ``model_gateway_call`` rows. Without it
+            every log row of the execution is returned, including the agent
+            log lines the logs endpoint already serves, and on a long run
+            those crowd the model calls out of ``tail``.
+
+    Returns:
+        ``logs`` (newest first), ``source``, and ``has_more``: whether rows
+        older than the returned ``tail`` exist.
+    """
     execution = crud_flow_execution.get(
         db=db, id=execution_id, account_id=current_user.account_id
     )
@@ -1389,9 +1726,18 @@ def get_flow_execution_gateway_events(
         raise HTTPException(status_code=404, detail="Flow execution not found")
 
     actual_tail = tail if tail is not None else 5000
+    # One extra row answers has_more without a count query.
     rows = crud_flow_execution_log.get_by_execution_id(
-        db, execution_id, tail=actual_tail, desc=True
+        db,
+        execution_id,
+        tail=actual_tail + 1,
+        desc=True,
+        log_types=[MODEL_GATEWAY_CALL_LOG_TYPE] if model_calls_only else None,
     )
+    has_more = len(rows) > actual_tail
+    if has_more:
+        # Rows come back oldest first, so the extra row is the first one.
+        rows = rows[1:]
 
     events = []
     # Reverse rows so chronological order is maintained (oldest to newest)
@@ -1417,7 +1763,7 @@ def get_flow_execution_gateway_events(
                 "payload": payload,
             }
         )
-    return {"logs": events, "source": "database"}
+    return {"logs": events, "source": "database", "has_more": has_more}
 
 
 @router.get("/flows/executions/{execution_id}/gateway-events/{event_id}")
@@ -1472,6 +1818,9 @@ def get_flow_execution_metrics(
         - cost_is_partial: Whether estimated_cost excludes unpriced requests
         - unpriced_requests: Requests that could not be priced
         - unpriced_tokens: Token volume behind the unpriced requests
+        - limits: Configured per-execution ceilings (only keys that are set)
+        - limit_status: Current usage against those ceilings
+          (``total_tokens``, ``estimated_cost_usd``, ``turns``)
     """
     from preloop.services.execution_metrics import ExecutionMetricsService
 
@@ -1486,6 +1835,20 @@ def get_flow_execution_metrics(
     metrics_service = ExecutionMetricsService(db)
     try:
         metrics = metrics_service.get_execution_metrics(str(execution_id))
+        # Per-execution ceilings and how the run measures against them, so the
+        # page can render "used / allowed" without re-reading the flow. Empty
+        # limits and zero usage for flows that configure none.
+        from preloop.services.flow_execution_limits import (
+            describe_execution_limits,
+        )
+
+        limits, usage = describe_execution_limits(db, execution)
+        metrics["limits"] = limits.as_dict()
+        metrics["limit_status"] = {
+            "total_tokens": usage.total_tokens,
+            "estimated_cost_usd": usage.cost_usd,
+            "turns": usage.turns,
+        }
         return metrics
     except Exception as e:
         # Log error but return zero metrics instead of failing
@@ -1504,6 +1867,12 @@ def get_flow_execution_metrics(
             "cost_is_partial": False,
             "unpriced_requests": 0,
             "unpriced_tokens": 0,
+            "limits": {},
+            "limit_status": {
+                "total_tokens": 0,
+                "estimated_cost_usd": None,
+                "turns": 0,
+            },
         }
 
 
@@ -1546,13 +1915,16 @@ async def send_execution_command(
     command_data: schemas.FlowExecutionCommand,
     current_user: User = Depends(get_current_active_user),
 ):
-    """Send a command to a running flow execution."""
+    """Send a command to a running flow execution.
+
+    ``stop`` goes through ``preloop.services.flow_execution_stop``, the same
+    code path the automatic pull request stops use (#1032). It is idempotent:
+    stopping an execution that already ended changes nothing and answers with
+    the status it ended in.
+    """
     import logging
-    from datetime import datetime, timezone
-    from preloop.agents.container import ContainerAgentExecutor
-    from preloop.agents.codex import CodexAgent
+    from preloop.services.flow_execution_stop import stop_execution
     from preloop.sync.services.event_bus import get_nats_client
-    import os
 
     logger = logging.getLogger(__name__)
 
@@ -1570,155 +1942,19 @@ async def send_execution_command(
     if not execution:
         raise HTTPException(status_code=404, detail="Flow execution not found")
 
-    # Handle stop command - stop container directly
     if command_data.command == "stop":
-        # A parent parked on the flows it started leaves the park here, before
-        # any I/O, and terminally (#689). From this write on, a child reaching
-        # a terminal state claims nothing and the sweep lists nothing, so the
-        # stop cannot race a resume into existence while the container teardown
-        # below takes its seconds. The tree itself is stopped after the status
-        # update, once this execution is unambiguously terminal.
-        stops_a_tree = flow_tree_stop.parked_on_children(execution)
-        if stops_a_tree:
-            flow_tree_stop.close_children_park(db, parent=execution)
-
-        session_reference = execution.agent_session_reference
-        stoppable = execution.status in [
-            "RUNNING",
-            "STARTING",
-            "INITIALIZING",
-            "PENDING",
-        ]
-        runner_id = runner_id_from_session_reference(session_reference)
-        queued_pool = pool_from_session_reference(session_reference)
-        if runner_id is not None and stoppable:
-            # Runner-backed execution: the lease reference is not a container
-            # or Job name, so a container executor cannot see or stop the
-            # runner's process (and only builds an invalid Kubernetes
-            # selector trying). Flag the halt so the runner stops the job
-            # itself; its output already streams into flow_execution_log.
-            # Halt is per assignment: this runner may be running other jobs
-            # that nobody asked to stop.
-            if crud_flow_runner.request_halt(
-                db, runner_id=runner_id, execution_id=execution_id
-            ):
-                logger.info(
-                    f"Requested halt on runner {runner_id} for execution {execution_id}"
-                )
-        elif queued_pool is not None and stoppable:
-            # Queued for a private pool: nothing runs yet, so there is no
-            # container, Job, or runner to stop. The status update below is
-            # all that is needed.
-            pass
-        # Stop the container if it's running
-        elif session_reference and stoppable:
-            try:
-                # Get the flow to determine agent type
-                flow = crud_flow.get(
-                    db=db, id=execution.flow_id, account_id=current_user.account_id
-                )
-                if flow:
-                    use_kubernetes = (
-                        os.getenv("USE_KUBERNETES_FOR_AGENTS", "false").lower()
-                        == "true"
-                    )
-
-                    # Create agent executor to fetch logs and stop the container
-                    # CodexAgent auto-detects Kubernetes environment, no need to pass use_kubernetes
-                    if flow.agent_type == "codex":
-                        agent = CodexAgent(config={})
-                    else:
-                        agent = ContainerAgentExecutor(
-                            agent_type=flow.agent_type,
-                            config={},
-                            image="dummy-image",
-                            use_kubernetes=use_kubernetes,
-                        )
-
-                    # Fetch final logs before stopping the container
-                    try:
-                        container_logs = await agent.get_logs(
-                            execution.agent_session_reference, tail=5000
-                        )
-
-                        # Persist final logs to normalized flow_execution_log table
-                        if container_logs:
-                            for log_line in container_logs:
-                                crud_flow_execution.append_log(
-                                    db,
-                                    execution_id=str(execution_id),
-                                    log_data={
-                                        "type": "agent_log_line",
-                                        "payload": {"line": log_line},
-                                    },
-                                    commit=False,
-                                )
-                            db.commit()
-                            logger.info(
-                                f"Persisted {len(container_logs)} log lines to database for execution {execution_id}"
-                            )
-                    except Exception as log_error:
-                        logger.error(
-                            f"Failed to fetch and persist logs before stopping: {log_error}"
-                        )
-                        # Continue with stop even if log fetching fails
-
-                    # Stop the container
-                    await agent.stop(execution.agent_session_reference)
-                    logger.info(
-                        f"Stopped container {execution.agent_session_reference} for execution {execution_id}"
-                    )
-            except Exception as e:
-                logger.error(
-                    f"Failed to stop container for execution {execution_id}: {e}"
-                )
-                # Continue with status update even if container stop fails
-
-        # Update execution status
-        update_data = schemas.FlowExecutionUpdate(
-            status="STOPPED",
-            error_message="Manually stopped by user",
-            end_time=datetime.now(timezone.utc),
+        outcome = await stop_execution(
+            db,
+            execution,
+            account_id=current_user.account_id,
+            nats_client=nats_client,
+            command_payload=command_data.payload,
         )
-        crud_flow_execution.update(db=db, db_obj=execution, obj_in=update_data)
-        db.commit()
-
-        # Stopping a parent stops the flows it was waiting for (#689): the
-        # decision, why it is the one taken, and what the operator sees are in
-        # preloop/services/flow_tree_stop.py. Never fails the stop: this
-        # execution is already terminal and every write below is retried by
-        # nothing, so a failure here must be visible in the log rather than as
-        # a 500 on a stop that did happen.
-        if stops_a_tree:
-            try:
-                await flow_tree_stop.stop_tree_for_stopped_parent(
-                    db,
-                    parent=execution,
-                    account_id=current_user.account_id,
-                    nats_client=nats_client,
-                )
-            except Exception:
-                logger.exception(
-                    "Failed to stop the tree of execution %s", execution_id
-                )
-
-        # Try to send stop command via NATS (best effort - don't fail if this doesn't work)
-        try:
-            from preloop.services.flow_orchestrator import (
-                FlowExecutionOrchestrator,
-            )
-
-            await FlowExecutionOrchestrator.send_command(
-                execution_id=str(execution_id),
-                command=command_data.command,
-                payload=command_data.payload,
-                nats_client=nats_client,
-            )
-        except Exception as e:
-            logger.warning(f"Failed to send stop command via NATS: {e}")
-            # Not a critical error - container is already stopped
-
-        return {"status": "stopped"}
+        if outcome.stopped or outcome.status.upper() == "STOPPED":
+            return {"status": "stopped"}
+        # Already ended some other way (succeeded, failed, timed out): the
+        # stop is a no-op, and the caller learns how the run ended.
+        return {"status": "not_running", "execution_status": outcome.status}
 
     # For other commands, try to send via NATS
     try:
@@ -2143,6 +2379,15 @@ def update_flow(
     # We forcibly preserve the existing source_preset_id to prevent any modification,
     # including unlinking by setting to None.
     flow_in.source_preset_id = flow.source_preset_id
+    source_id = getattr(flow, "source_preset_id", None)
+    if isinstance(source_id, uuid.UUID):
+        source_preset = crud_flow.get(db=db, id=source_id)
+        agent_config = (
+            flow_in.agent_config
+            if flow_in.agent_config is not None
+            else flow.agent_config
+        )
+        _reject_unsupported_persistent_preset(agent_config, source_preset)
 
     # Check for name uniqueness if name is being changed
     # Note: We intentionally allow flows to have the same name as global presets
@@ -2197,14 +2442,23 @@ def update_flow(
     # later (e.g. cloned presets, which start with no trigger) ended up
     # with webhook_config=None: the console never shows a webhook URL and
     # the flow is untriggerable. Mirror the create-path behavior here.
+    existing_secret = (flow.webhook_config or {}).get("webhook_secret")
+    if flow_in.webhook_config is not None and not flow_in.webhook_config.webhook_secret:
+        # A client updating another webhook_config key (for example
+        # supersede_on_update) does not resend the secret: keep it.
+        if existing_secret:
+            flow_in.webhook_config = flow_in.webhook_config.model_copy(
+                update={"webhook_secret": existing_secret}
+            )
     if (
         effective_source == "webhook"
-        and not flow.webhook_config
-        and not flow_in.webhook_config
+        and not existing_secret
+        and not (flow_in.webhook_config and flow_in.webhook_config.webhook_secret)
     ):
-        flow_in.webhook_config = schemas.WebhookConfig(
-            webhook_secret=secrets.token_urlsafe(32)
-        )
+        flow_in.webhook_config = (
+            flow_in.webhook_config
+            or schemas.WebhookConfig(**(flow.webhook_config or {}))
+        ).model_copy(update={"webhook_secret": secrets.token_urlsafe(32)})
 
     # Detect customization for template-tracked flows
     # If the user modifies the prompt or tools, mark them as customized

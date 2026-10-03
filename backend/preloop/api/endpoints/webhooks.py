@@ -20,9 +20,18 @@ from preloop.models.crud import (
     crud_tracker,
 )
 from preloop.models.db.session import get_db_session, _safe_close_db_session
+from preloop.models.crud.project import find_repository_projects, repository_host
 from preloop.sync.scanner.core import TrackerClient
 
 from preloop.sync.services.event_bus import EventBus, get_task_publisher
+
+from preloop.utils.bitbucket import (
+    BITBUCKET_DELIVERY_HEADER,
+    BITBUCKET_EVENT_HEADER,
+    BITBUCKET_SIGNATURE_HEADER,
+    BITBUCKET_WEBHOOK_EVENTS,
+    verify_signature as verify_bitbucket_signature,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +63,7 @@ DEFAULT_GITLAB_SUBSCRIBED_EVENTS = [
     "Deployment Hook",
     "Release Hook",
 ]
+DEFAULT_BITBUCKET_SUBSCRIBED_EVENTS = list(BITBUCKET_WEBHOOK_EVENTS)
 DEFAULT_JIRA_SUBSCRIBED_EVENTS = [
     "jira:issue_created",
     "jira:issue_updated",
@@ -169,6 +179,41 @@ async def receive_webhook(
     return result
 
 
+def _resolve_webhook_project(
+    db: Session,
+    *,
+    identifier: str,
+    organization_id: Any,
+    tracker: Any,
+) -> Optional[models.Project]:
+    """Find the project a webhook names, within the delivering tracker's reach.
+
+    Prefer the organization the webhook was delivered for. Otherwise fall back
+    to the same repository on the same tracker type and host elsewhere in the
+    tracker's account, so a repository that moved owners keeps routing to its
+    project until it is transferred (#1159). Never look outside the account,
+    and never match an identifier from another tracker type or host: the same
+    number names unrelated repositories there.
+    """
+    if organization_id is not None:
+        project = crud_project.get_by_identifier(
+            db,
+            identifier=identifier,
+            organization_id=str(organization_id),
+            account_id=str(tracker.account_id),
+        )
+        if project is not None:
+            return project
+    matches = find_repository_projects(
+        db,
+        identifier=identifier,
+        account_id=tracker.account_id,
+        tracker_type=tracker.tracker_type,
+        host=repository_host(tracker),
+    )
+    return matches[0] if matches else None
+
+
 def _prepare_webhook(
     tracker_type: str,
     organization_id: str,
@@ -198,6 +243,9 @@ def _prepare_webhook(
         event_type_header_key = "X-Gitlab-Event"
     elif tracker_type.lower() == "jira":
         default_event_list_for_type = DEFAULT_JIRA_SUBSCRIBED_EVENTS
+    elif tracker_type.lower() == "bitbucket":
+        default_event_list_for_type = DEFAULT_BITBUCKET_SUBSCRIBED_EVENTS
+        event_type_header_key = BITBUCKET_EVENT_HEADER
     else:
         logger.error(f"Unsupported tracker_type for webhook: {tracker_type}")
         raise HTTPException(
@@ -438,6 +486,43 @@ def _prepare_webhook(
                     detail="Jira signature verification failed",
                 )
 
+    elif tracker_type.lower() == "bitbucket":
+        # Bitbucket Cloud signs the raw body with HMAC-SHA256 and sends
+        # 'X-Hub-Signature: sha256=<hex>'. Hooks are always created with a
+        # secret, so a missing header is rejected like a mismatch.
+        signature_header = headers.get(BITBUCKET_SIGNATURE_HEADER)
+        if not signature_header:
+            logger.warning(
+                f"Missing X-Hub-Signature header for Bitbucket webhook, tracker ID {resolved_tracker.id}"
+            )
+            plan.queue_task(
+                "notify_admins",
+                subject="Missing X-Hub-Signature header for Bitbucket webhook",
+                message=f"Missing X-Hub-Signature header for Bitbucket webhook, tracker ID {resolved_tracker.id}",
+            )
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Missing Bitbucket signature",
+            )
+        if not verify_bitbucket_signature(
+            webhook_secret_to_use, raw_body, signature_header
+        ):
+            logger.warning(
+                f"Bitbucket webhook signature mismatch for tracker ID {resolved_tracker.id}"
+            )
+            plan.queue_task(
+                "notify_admins",
+                subject="Bitbucket webhook signature mismatch",
+                message=f"Bitbucket webhook signature mismatch for tracker ID {resolved_tracker.id}",
+            )
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Invalid Bitbucket signature",
+            )
+        logger.info(
+            f"Bitbucket webhook signature verified successfully for tracker ID {resolved_tracker.id}"
+        )
+
     # --- 4. Parse Payload & Determine Event Type ---
     actual_event_type: Optional[str] = None
     parsed_payload: Dict[str, Any]
@@ -458,7 +543,7 @@ def _prepare_webhook(
             status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid JSON payload"
         )
 
-    if tracker_type.lower() in ["github", "gitlab"]:
+    if tracker_type.lower() in ["github", "gitlab", "bitbucket"]:
         if not event_type_header_key:  # Should be set during tracker resolution
             logger.error(
                 f"Internal error: event_type_header_key not set for {tracker_type}"
@@ -583,7 +668,12 @@ def _prepare_webhook(
                     detail="Could not determine project identifier from payload",
                 )
 
-            project = crud_project.get_by_identifier(db, identifier=project_identifier)
+            project = _resolve_webhook_project(
+                db,
+                identifier=project_identifier,
+                organization_id=plan.organization_id,
+                tracker=resolved_tracker,
+            )
             if not project:
                 # The webhook names a project we never imported. Usually the
                 # repo is outside the integration's scope (GitHub App installed
@@ -743,7 +833,12 @@ def _prepare_webhook(
                     detail="Could not determine project identifier from payload",
                 )
 
-            project = crud_project.get_by_identifier(db, identifier=project_identifier)
+            project = _resolve_webhook_project(
+                db,
+                identifier=project_identifier,
+                organization_id=plan.organization_id,
+                tracker=resolved_tracker,
+            )
             if not project:
                 raise HTTPException(
                     status_code=404,
@@ -843,7 +938,8 @@ def _prepare_webhook(
         tracker_type=tracker_type.lower(),
         event_type=actual_event_type,
         delivery_id=headers.get("X-GitHub-Delivery")
-        or headers.get("X-Gitlab-Event-UUID"),
+        or headers.get("X-Gitlab-Event-UUID")
+        or headers.get(BITBUCKET_DELIVERY_HEADER),
         payload=parsed_payload,
         tracker_id=str(plan.tracker_id),
         organization_id=str(plan.organization_id),

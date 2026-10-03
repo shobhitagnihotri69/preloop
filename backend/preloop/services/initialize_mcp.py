@@ -11,6 +11,7 @@ from uuid import UUID
 
 from fastmcp import Context
 from fastmcp.tools import FunctionTool
+from fastmcp.tools.tool import ToolResult
 
 from preloop.services.approval_helper import require_approval
 from preloop.services.dynamic_fastmcp import (
@@ -22,6 +23,7 @@ from preloop.services.dynamic_fastmcp import (
 )
 from preloop.tools.builtin_defs import (
     ASK_USER_TOOL,
+    DEPOSIT_ARTIFACT_TOOL,
     GET_EXECUTION_TOOL,
     GET_ISSUE_DESCRIPTION,
     GET_ISSUE_SCHEMA,
@@ -1331,6 +1333,90 @@ def initialize_mcp_with_tools() -> DynamicFastMCP:
     search_sessions_tool.parameters = deepcopy(SEARCH_SESSIONS_TOOL["schema"])
     mcp.add_tool(search_sessions_tool)
 
+    # Register Tool 7h: deposit_artifact (shared metadata:
+    # tools.builtin_defs.DEPOSIT_ARTIFACT_TOOL). An agent stores a file, image
+    # or text on its own runtime session (#1081). The session comes from the
+    # session-bound credential; storage, the timeline row and every error
+    # code are the #1080 deposit service, via services.artifact_mcp_tools.
+    async def deposit_artifact(
+        content: dict,
+        name: str,
+        kind: str | None = None,
+        labels: dict | None = None,
+        parent_artifact_id: str | None = None,
+        activity_id: str | None = None,
+        ctx: Optional[Context] = None,
+    ) -> ToolResult:
+        """Store one MCP content block as an artifact on the caller's session.
+
+        Returns:
+            A CallToolResult with a resource_link to the artifact and the
+            artifact descriptor as structuredContent, or a tool error whose
+            text starts with the stable error code.
+        """
+        from mcp.types import ResourceLink, TextContent
+
+        from preloop.models.db import session as db_session_module
+        from preloop.services import artifact_mcp_tools
+        from preloop.services.dynamic_fastmcp_http import get_current_user_context
+        from anyio import to_thread
+
+        user_context = get_current_user_context()
+        if not user_context:
+            outcome = artifact_mcp_tools.error(artifact_mcp_tools.ERROR_NO_SESSION)
+        else:
+            arguments = {
+                "content": content,
+                "name": name,
+                "kind": kind,
+                "labels": labels,
+                "parent_artifact_id": parent_artifact_id,
+                "activity_id": activity_id,
+            }
+            approved, denial = await require_approval(
+                tool_name=DEPOSIT_ARTIFACT_TOOL["name"],
+                tool_source="builtin",
+                account_id=user_context.account_id,
+                arguments={k: v for k, v in arguments.items() if k != "content"},
+                ctx=ctx,
+                workflow_id=_rule_workflow_id_var.get(None),
+                correlation_id=_correlation_id_var.get(None),
+                justification=_justification_var.get(None),
+            )
+            if not approved:
+                return ToolResult(
+                    content=[TextContent(type="text", text=str(denial))],
+                    is_error=True,
+                )
+
+            def _run():
+                db = next(db_session_module.get_db_session())
+                try:
+                    return artifact_mcp_tools.deposit_from_mcp(
+                        db, user_context=user_context, arguments=arguments
+                    )
+                finally:
+                    db.close()
+
+            outcome = await to_thread.run_sync(_run)
+
+        blocks: list = [TextContent(type="text", text=outcome.text)]
+        if outcome.content_block is not None:
+            blocks = [ResourceLink.model_validate(outcome.content_block)]
+        return ToolResult(
+            content=blocks,
+            structured_content=outcome.structured,
+            is_error=outcome.is_error,
+        )
+
+    deposit_artifact_tool = FunctionTool.from_function(
+        deposit_artifact,
+        description=DEPOSIT_ARTIFACT_TOOL["description"],
+        output_schema=None,
+    )
+    deposit_artifact_tool.parameters = deepcopy(DEPOSIT_ARTIFACT_TOOL["schema"])
+    mcp.add_tool(deposit_artifact_tool)
+
     # Register Tool 8: add_comment
     @mcp.tool()
     async def add_comment(
@@ -1496,7 +1582,7 @@ def initialize_mcp_with_tools() -> DynamicFastMCP:
         remove_reaction: str | None = None,
         ctx: Optional[Context] = None,
     ) -> str:
-        """Update a pull request's metadata, submit a review, and/or manage reactions. To update PR properties: provide title, description, labels, state (open/closed), etc. To submit a review: provide review_action (approve/request_changes/comment) with optional review_body and review_comments for inline feedback. To add/remove reactions: use add_reaction or remove_reaction with emoji names (GitHub: +1, -1, laugh, confused, heart, hooray, rocket, eyes; GitLab: thumbsup, thumbsdown, smile, eyes, rocket, etc.)."""
+        """Update a pull request's metadata, submit a review, and/or manage reactions. To update PR properties: provide title, description, labels, state (open/closed), etc. To submit a review: provide review_action (approve/request_changes/comment) with optional review_body and review_comments for inline feedback. On Bitbucket, unapprove and remove_request_changes withdraw a verdict, and a review comment with task: true also opens a task. To add/remove reactions: use add_reaction or remove_reaction with emoji names (GitHub: +1, -1, laugh, confused, heart, hooray, rocket, eyes; GitLab: thumbsup, thumbsdown, smile, eyes, rocket, etc.)."""
         # Get user context for approval checking
         from preloop.services.dynamic_fastmcp_http import get_current_user_context
 
@@ -1567,7 +1653,7 @@ def initialize_mcp_with_tools() -> DynamicFastMCP:
         extra_options: dict | None = None,
         ctx: Optional[Context] = None,
     ) -> str:
-        """Create a pull request (GitHub) or merge request (GitLab). Auto-detects platform from project. Provide project as slug (owner/repo), full path, or URL. Use extra_options for GitLab-specific options like squash, remove_source_branch, assignee_ids, reviewer_ids, milestone_id."""
+        """Create a pull request (GitHub, Bitbucket) or merge request (GitLab). Auto-detects platform from project. Provide project as slug (owner/repo), full path, or URL. Use extra_options for GitLab-specific options like squash, remove_source_branch, assignee_ids, reviewer_ids, milestone_id. On Bitbucket, extra_options.close_source_branch deletes the source branch on merge; assignees, labels and milestone are ignored."""
         # Get user context for approval checking
         from preloop.services.dynamic_fastmcp_http import get_current_user_context
 
@@ -1791,6 +1877,7 @@ def initialize_mcp_with_tools() -> DynamicFastMCP:
                                 _approved_comment_var,
                                 _approved_id_var,
                                 _bypass_approval_var,
+                                post_approval_exec_outcome,
                             )
 
                             _bypass_approval_var.set(True)
@@ -1826,6 +1913,11 @@ def initialize_mcp_with_tools() -> DynamicFastMCP:
                                 _approved_comment_var.set(None)
                                 _approved_answer_var.set(None)
                                 _approved_id_var.set(None)
+
+                            # An upstream isError result is not "executed".
+                            exec_status, exec_error = post_approval_exec_outcome(
+                                tool_result
+                            )
 
                             # Normalise the result to a JSON-safe dict
                             if hasattr(tool_result, "model_dump"):

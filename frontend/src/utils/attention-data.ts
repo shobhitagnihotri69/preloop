@@ -24,7 +24,12 @@ import type {
   AttentionInputs,
   AttentionPriceOverride,
 } from './attention';
+import { loadPolicyNotices } from './attention-policy';
 import { parseUTCDate } from './date';
+import {
+  getSpendOutliers,
+  type SpendOutlierFinding,
+} from '../spend-outliers-api';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -126,6 +131,8 @@ export async function loadAttentionInputs(
     now.getTime() - ATTENTION_QUERY.usageWindowDays * DAY_MS
   ).toISOString();
   const prefetched = options.prefetched || {};
+  // Started alongside the others; never rejects (see loadPolicyNotices).
+  const policyNotices = loadPolicyNotices();
 
   const [
     approvals,
@@ -137,6 +144,7 @@ export async function loadAttentionInputs(
     summary,
     dismissals,
     priceOverrides,
+    spendOutliers,
   ] = await Promise.allSettled([
     prefetched.approvals
       ? Promise.resolve(prefetched.approvals)
@@ -189,6 +197,9 @@ export async function loadAttentionInputs(
     // 402, which used to open the upgrade dialog on the first screen a new
     // Free account ever sees.
     getModelPriceOverrides({ activeOnly: true, passive: true }),
+    // Findings the server already evaluated (#960). A 403 for an operator
+    // without cost access drops the section like any other input.
+    getSpendOutliers(),
   ]);
 
   const dismissalList =
@@ -235,6 +246,11 @@ export async function loadAttentionInputs(
       Array.isArray(priceOverrides.value)
         ? (priceOverrides.value as AttentionPriceOverride[])
         : [],
+    spendOutliers:
+      spendOutliers.status === 'fulfilled' && Array.isArray(spendOutliers.value)
+        ? (spendOutliers.value as SpendOutlierFinding[])
+        : [],
+    policyNotices: await policyNotices,
     dismissals: dismissalList,
     dismissalsSupported:
       dismissals.status === 'fulfilled' &&

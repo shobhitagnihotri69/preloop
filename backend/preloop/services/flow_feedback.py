@@ -16,12 +16,14 @@ from sqlalchemy.orm import Session
 from preloop.config import settings
 from preloop.models import models
 from preloop.models.crud import crud_flow, crud_flow_execution, crud_flow_feedback
+from preloop.models.crud.flow_feedback import SESSIONLESS_RETRY_STATUSES
 from preloop.services.flow_feedback_provider import (
     FeedbackProvider,
     FeedbackState,
     bounded_text,
     classify_failure,
 )
+from preloop.utils.bitbucket import repository_identity
 
 logger = logging.getLogger(__name__)
 FEEDBACK_TYPES = frozenset(
@@ -42,8 +44,25 @@ FEEDBACK_TYPES = frozenset(
         "merge_request_updated",
         "merge_request_closed",
         "merge_request_merged",
+        # Bitbucket review verdicts are participant flips, not reviews.
+        "pull_request_approved",
+        "pull_request_unapproved",
+        "pull_request_changes_requested",
+        "pull_request_changes_request_removed",
     }
 )
+
+
+def _repository_identity(provider: Any, repository: dict[str, Any]) -> Any:
+    """The stable per-provider repository key threads are found by.
+
+    GitHub and GitLab have numeric repository ids. Bitbucket has none, so its
+    identity is ``workspace_slug/repo_uuid``, which both webhook payloads and
+    manual-run payloads can produce.
+    """
+    if provider == "bitbucket":
+        return repository_identity(repository)
+    return repository.get("id")
 
 
 def feedback_policy(flow: Any) -> dict[str, Any] | None:
@@ -78,9 +97,9 @@ def register_thread(
         return None
     payload = details.get("payload") or {}
     repository = payload.get("repository") or payload.get("project") or {}
-    repository_id = repository.get("id")
     tracker_id = details.get("tracker_id") or flow.trigger_event_source
     provider = details.get("source")
+    repository_id = _repository_identity(provider, repository)
     parsed = urlparse(pr_url)
     parts = parsed.path.rstrip("/").split("/")
     try:
@@ -96,7 +115,7 @@ def register_thread(
     if (
         not repository_id
         or tracker_uuid is None
-        or provider not in {"github", "gitlab"}
+        or provider not in {"github", "gitlab", "bitbucket"}
         or not parts[-1].isdigit()
     ):
         logger.warning("Cannot bind feedback: missing provider repository identity")
@@ -149,6 +168,35 @@ def register_thread(
     )
 
 
+# A launch that dies before the agent runs. STOPPED, CANCELLED, and ABORTED
+# stop the thread on purpose and are not retried here. The revival scan uses
+# the same ``SESSIONLESS_RETRY_STATUSES`` constant.
+_SESSIONLESS_RETRY_STATUSES = SESSIONLESS_RETRY_STATUSES
+
+
+def native_session(execution: models.FlowExecution) -> dict[str, Any]:
+    """Return the stored session dict, or an empty dict when none was stored."""
+    session = execution.cli_session
+    return session if isinstance(session, dict) else {}
+
+
+def execution_has_native_session(execution: models.FlowExecution) -> bool:
+    """True when the execution stored a session id or a checkpoint artifact.
+
+    An artifact without a session id still counts. That is a broken identity,
+    not permission to start a fresh conversation.
+    """
+    session = native_session(execution)
+    return bool(session.get("session_id") or session.get("artifact_reference"))
+
+
+def sessionless_retry(execution: models.FlowExecution) -> bool:
+    """True when this execution died before it stored a conversation to resume."""
+    return execution.status in _SESSIONLESS_RETRY_STATUSES and (
+        not execution_has_native_session(execution)
+    )
+
+
 def resolve_native_checkpoint(
     db: Session,
     *,
@@ -181,50 +229,60 @@ def resolve_native_checkpoint(
     )
     if prior is None or prior.flow_id != flow_id:
         raise ValueError("resume_failed: checkpoint execution mismatch")
-    if not settings.flow_artifact_direct_upload:
-        raise ValueError("resume_failed: checkpoint uploads disabled")
-    if source_cold_handoff(thread, prior.id):
+
+    def published_branch() -> dict[str, Any]:
         if (
             resume.get("pr_url") != thread.pr_url
             or resume.get("source_branch") != thread.branch
         ):
             raise ValueError("resume_failed: published branch binding mismatch")
         return {"cold_handoff_authorized": True}
-    session = prior.cli_session
-    if not isinstance(session, dict):
-        raise ValueError("resume_failed: native checkpoint missing")
+
+    # Explicit adoption, a publisher/repair that never stored a recoverable
+    # checkpoint, or Cloud with uploads off: review continues on the published
+    # branch. A session id alone is not recoverable without an uploaded
+    # native_session artifact. Fail closed only when an artifact was stored
+    # but is expired, mismatched, or bound to the wrong execution.
+    session = native_session(prior)
+    reference = session.get("artifact_reference") or {}
+    has_artifact_ref = bool(reference.get("artifact_id"))
+    if (
+        source_cold_handoff(thread, prior.id)
+        or sessionless_retry(prior)
+        or not has_artifact_ref
+        or not settings.flow_artifact_direct_upload
+    ):
+        return published_branch()
     from preloop.agents.cli_session import valid_session_id
 
     if not valid_session_id(
         session.get("agent_type", ""), session.get("session_id", "")
     ):
         raise ValueError("resume_failed: invalid native session identity")
-    if settings.flow_artifact_direct_upload:
-        from preloop.models.crud import flow_artifact
-        from preloop.services.flow_artifacts import artifact_reference
+    from preloop.models.crud import flow_artifact
+    from preloop.services.flow_artifacts import artifact_reference
 
-        reference = session.get("artifact_reference") or {}
-        try:
-            artifact = flow_artifact.get(
-                db,
-                artifact_id=uuid.UUID(str(reference.get("artifact_id"))),
-                account_id=account_id,
-                flow_id=flow_id,
-                thread_id=str(thread.id),
-            )
-        except (ValueError, TypeError):
-            artifact = None
-        if (
-            artifact is None
-            or artifact.kind != "native_session"
-            or artifact.execution_id != prior.id
-            or artifact.ciphertext is None
-            or artifact.expires_at.replace(tzinfo=UTC) <= datetime.now(UTC)
-            or str(reference.get("execution_id")) != str(prior.id)
-            or reference.get("manifest_sha256")
-            != artifact_reference(artifact).manifest_sha256
-        ):
-            raise ValueError("resume_failed: native checkpoint unavailable")
+    try:
+        artifact = flow_artifact.get(
+            db,
+            artifact_id=uuid.UUID(str(reference.get("artifact_id"))),
+            account_id=account_id,
+            flow_id=flow_id,
+            thread_id=str(thread.id),
+        )
+    except (ValueError, TypeError):
+        artifact = None
+    if (
+        artifact is None
+        or artifact.kind != "native_session"
+        or artifact.execution_id != prior.id
+        or artifact.ciphertext is None
+        or artifact.expires_at.replace(tzinfo=UTC) <= datetime.now(UTC)
+        or str(reference.get("execution_id")) != str(prior.id)
+        or reference.get("manifest_sha256")
+        != artifact_reference(artifact).manifest_sha256
+    ):
+        raise ValueError("resume_failed: native checkpoint unavailable")
     if session.get("thread_id") and session["thread_id"] != str(thread.id):
         raise ValueError("resume_failed: native session thread mismatch")
     return dict(session)
@@ -244,15 +302,21 @@ def ingest_feedback(db: Session, event: dict[str, Any]) -> bool:
         return False
     payload = event.get("payload") or {}
     repo = payload.get("repository") or payload.get("project") or {}
-    if not repo.get("id") or not event.get("account_id") or not event.get("tracker_id"):
+    provider = str(event.get("source") or "").lower()
+    repo_id = _repository_identity(provider, repo)
+    if not repo_id or not event.get("account_id") or not event.get("tracker_id"):
         return False
     pr = (
         payload.get("pull_request")
         or payload.get("merge_request")
+        or payload.get("pullrequest")
         or payload.get("issue")
         or {}
     )
     number = pr.get("number") or pr.get("iid")
+    if not number and provider == "bitbucket":
+        # Bitbucket pull request payloads carry the number as ``id``.
+        number = pr.get("id")
     if not number:
         # Commit-level check_run/status payloads omit a PR. Finding without a
         # number would wake every thread on the repository.
@@ -261,7 +325,7 @@ def ingest_feedback(db: Session, event: dict[str, Any]) -> bool:
         db,
         account_id=uuid.UUID(str(event["account_id"])),
         tracker_id=uuid.UUID(str(event["tracker_id"])),
-        repository_id=str(repo["id"]),
+        repository_id=str(repo_id),
         pr_number=str(number),
     )
     now = datetime.now(UTC).replace(tzinfo=None)
@@ -368,6 +432,8 @@ async def run_feedback_tick(db: Session, *, now: datetime | None = None) -> int:
                 "Feedback registration failed for execution %s",
                 getattr(publication, "id", None),
             )
+    for thread in crud_flow_feedback.stopped_for_no_progress(db):
+        crud_flow_feedback.revive(db, thread.id, now=now)
     claims = crud_flow_feedback.claim_due(db, now=now)
     for thread_id, token in claims:
         try:
@@ -451,9 +517,19 @@ async def _reconcile(
         crud_flow_feedback.update(db, thread_id, token, changes={}, now=now)
         return
     if completed_repair:
-        thread.no_progress = (
-            thread.no_progress + 1 if thread.head_sha == state.head_sha else 0
-        )
+        finished = crud_flow_execution.get(db, id=thread.latest_execution_id)
+        # The agent never ran, so an unchanged head is not a failed repair.
+        if finished is None or not sessionless_retry(finished):
+            thread.no_progress = (
+                thread.no_progress + 1 if thread.head_sha == state.head_sha else 0
+            )
+    # A launch that died before the agent ran already consumed its reviews.
+    # Ingest will not reopen a receipt, so put those reviews back. The next
+    # reservation continues from the published branch.
+    if thread.active_execution_id is None:
+        failed = crud_flow_execution.get(db, id=thread.latest_execution_id)
+        if failed is not None and sessionless_retry(failed):
+            crud_flow_feedback.release_consumed(db, thread.id, failed.id)
     if completed_execution:
         prior_execution = crud_flow_execution.get(db, id=thread.latest_execution_id)
         # Explicit adoption authorizes continuing this historical publication,
@@ -579,9 +655,9 @@ async def _reconcile(
         "_resume": resume,
         "payload": {
             "object_attributes": thread.context.get("original_issue", {}),
-            "repository"
-            if thread.provider == "github"
-            else "project": thread.context.get(
+            "project"
+            if thread.provider == "gitlab"
+            else "repository": thread.context.get(
                 "repository", {"id": thread.repository_id}
             ),
             "issue": {

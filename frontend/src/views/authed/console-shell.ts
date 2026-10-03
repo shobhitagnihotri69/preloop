@@ -20,6 +20,8 @@ import '../../components/console-header';
 import '../../components/approval-bypass-banner';
 import '../../components/kill-switch-banner';
 import '../../components/usage-nudge-banner';
+import '../../components/capability-extension';
+import { hasCapability } from '../../capabilities';
 import consoleStyles from '../../styles/console-styles.css?inline';
 import {
   getFeatures,
@@ -56,6 +58,9 @@ const NAV_PERMISSIONS: Record<string, string[]> = {
   '/console/settings/invitations': ['invite_users', 'view_users'],
   '/console/settings/account': ['manage_account', 'view_billing'],
   '/console/settings/plan': ['manage_account', 'view_billing'],
+  // Audit integrity and exports use view_audit_logs. Retention and holds
+  // use view_policies. Either permission is enough to open the page.
+  '/console/settings/records': ['view_audit_logs', 'view_policies'],
   // Halting an account is the kill switch permission, not the billing one.
   // The controls used to sit on the account page, where a reader who could
   // not use them still saw them.
@@ -944,6 +949,14 @@ export class ConsoleShell extends LitElement {
                             : ''
                         }
                         ${
+                          this._permissionsLoaded
+                            ? this._renderNavLink(
+                                '/console/settings/records',
+                                html`<sl-menu-item>Records</sl-menu-item>`
+                              )
+                            : ''
+                        }
+                        ${
                           this.features.user_management
                             ? this._renderNavLink(
                                 '/console/settings/users',
@@ -967,6 +980,19 @@ export class ConsoleShell extends LitElement {
                                 html`<sl-menu-item>Invitations</sl-menu-item>`
                               )
                             : ''
+                        }
+                        ${
+                          // Served by an extension plugin; the capability in
+                          // /features is the only switch.
+                          hasCapability(this.features, 'account_hierarchy')
+                            ? html`${this._renderNavLink(
+                                '/console/settings/subaccounts',
+                                html`<sl-menu-item>Subaccounts</sl-menu-item>`
+                              )}${this._renderNavLink(
+                                '/console/settings/access-grants',
+                                html`<sl-menu-item>Access grants</sl-menu-item>`
+                              )}`
+                            : nothing
                         }
                         ${this._renderNavLink(
                           '/console/settings/api-keys',
@@ -1026,6 +1052,14 @@ export class ConsoleShell extends LitElement {
                       label="Open menu"
                       @click=${this._handleSidebarToggle}
                     ></sl-icon-button>
+                    ${
+                      hasCapability(this.features, 'multi_account')
+                        ? html`<capability-extension
+                            slot="account-switcher"
+                            name="account-switcher"
+                          ></capability-extension>`
+                        : nothing
+                    }
                   </console-header>
                   <!-- Sits directly under the header so a relaxed governance
                        state is visible on every console page, not just the

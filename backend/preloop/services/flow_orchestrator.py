@@ -5,7 +5,7 @@ import asyncio
 import shlex
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Mapping, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Tuple
 import re
 
 from sqlalchemy.orm import Session
@@ -54,8 +54,14 @@ from preloop.agents.verification import (
 )
 from preloop.services.flow_failure_category import (
     FAILURE_CATEGORY_AGENT_NO_PROGRESS,
+    FAILURE_CATEGORY_MODEL_STREAM_IDLE,
+    FAILURE_CATEGORY_TIMEOUT,
     FAILURE_CATEGORY_UNKNOWN,
     derive_failure_category,
+)
+from preloop.services.stream_stall import (
+    STREAM_STALL_RESULT_KEY,
+    detect_stream_stall,
 )
 from preloop.services.no_progress_guard import (
     NO_COMMITS_MARKER,
@@ -88,6 +94,7 @@ from preloop.services.prompt_resolvers import (
     ProjectResolver,
     AccountResolver,
     ExecutionResolver,
+    FlowResolver,
 )
 from preloop.services.prompt_resolvers.execution import resume_rebase_conflict_hint
 from preloop.services.flow_execution_logger import FlowExecutionLogger
@@ -119,8 +126,17 @@ from preloop.services.report_publication import (
     closed_vocabulary_member,
     parse_report_publication_marker,
 )
-from preloop.services.tracker_git_token import resolve_tracker_git_token
+from preloop.utils.bitbucket import (
+    payload_commit_hash as bitbucket_payload_commit_hash,
+    pr_source_branch as bitbucket_pr_source_branch,
+    pr_target_branch as bitbucket_pr_target_branch,
+)
+from preloop.services.tracker_git_token import (
+    resolve_tracker_git_token,
+    resolve_tracker_git_username,
+)
 from preloop.sync.event_normalizer import attach_trigger_subject
+from preloop.sync.trackers.base import BaseTracker
 from preloop.services.model_runtime_resolver import resolve_ai_model_runtime
 from preloop.utils.git_credentials import (
     GitCredential,
@@ -143,7 +159,19 @@ from preloop.services.account_realtime import (
     emit_account_event,
 )
 
+if TYPE_CHECKING:
+    from preloop.services.backport import BackportPlan
+
 logger = logging.getLogger(__name__)
+
+# Log lines the post-execution block prints once it has started publishing.
+# ``PRELOOP_EVIDENCE committed`` is deliberately absent: the evidence upload
+# runs from an EXIT trap, so it also prints on a pre-push transient failure.
+_PUBLICATION_SIDE_EFFECT_PATTERNS = (
+    ("commits being pushed", re.compile(r"Found \d+ commits on \S+, pushing")),
+    ("a pull request create response", re.compile(r"\b(?:PR|MR) create HTTP 2\d\d\b")),
+    ("the pull request marker", re.compile(re.escape(PR_OPENED_MARKER) + r"\s+\{")),
+)
 
 # Statuses after which no agent of this execution can still be running, so its
 # runtime credentials can be retired. Anything else means the agent may still
@@ -159,6 +187,14 @@ TERMINAL_EXECUTION_STATUSES = frozenset({"SUCCEEDED", "FAILED", "STOPPED", "CANC
 WAITING_FOR_HUMAN_STATUS = "WAITING_FOR_HUMAN"
 WAITING_FOR_CHILDREN_STATUS = "WAITING_FOR_CHILDREN"
 PARKED_STATUSES = frozenset({WAITING_FOR_HUMAN_STATUS, WAITING_FOR_CHILDREN_STATUS})
+
+# Terminal outcomes that leave a pending approval with nowhere to land.
+# SUCCEEDED ran the tool after a decision. STOPPED is an operator halt and
+# is left to the stop path. TIMEOUT is the spelling some monitors write;
+# the agent monitor itself reports a timeout as FAILED.
+_APPROVAL_CANCEL_ON_TERMINAL = frozenset(
+    {"FAILED", "CANCELLED", "CANCELED", "TIMEOUT", "TIMED_OUT"}
+)
 
 # Sentinel string that agents print when completing successfully.
 FLOW_SUCCESS_SENTINEL = "FLOW_EXECUTION_SUCCESS"
@@ -495,27 +531,38 @@ class TimeoutBudget:
     #: the approval took.
     consumed_seconds: int = 0
 
+    def label(self) -> str:
+        """Which budget this is, for a sentence about it expiring."""
+        if self.consumed_seconds:
+            return "the remainder of this flow's timeout budget"
+        if self.source == "flow":
+            return "this flow's timeout budget"
+        return "the default timeout budget"
+
     def timeout_message(self) -> str:
-        """Operator-facing failure message naming the budget that expired."""
+        """Operator-facing failure message naming the budget that expired.
+
+        The budget is named by ``label()``, the same words the stream stall
+        message uses, so the two cannot describe one budget differently.
+        """
+        label = self.label()
         if self.consumed_seconds:
             return (
-                f"Execution timed out after {self.seconds} seconds, the "
-                f"remainder of this flow's timeout budget after "
-                f"{self.consumed_seconds} seconds already spent before it was "
-                "parked for a human decision (waiting for the human did not "
-                "count). Raise timeout_seconds on the flow if the work "
-                "genuinely needs longer."
+                f"Execution timed out after {self.seconds} seconds, {label} "
+                f"after {self.consumed_seconds} seconds already spent before "
+                "it was parked for a human decision (waiting for the human "
+                "did not count). Raise timeout_seconds on the flow if the "
+                "work genuinely needs longer."
             )
         if self.source == "flow":
             return (
-                f"Execution timed out after {self.seconds} seconds "
-                f"(this flow's timeout budget). Raise timeout_seconds on the "
-                "flow if the work genuinely needs longer."
+                f"Execution timed out after {self.seconds} seconds ({label}). "
+                "Raise timeout_seconds on the flow if the work genuinely "
+                "needs longer."
             )
         return (
-            f"Execution timed out after {self.seconds} seconds (the default "
-            "timeout budget). Set timeout_seconds on the flow to give it a "
-            "budget of its own."
+            f"Execution timed out after {self.seconds} seconds ({label}). "
+            "Set timeout_seconds on the flow to give it a budget of its own."
         )
 
 
@@ -535,6 +582,200 @@ def _make_json_serializable(obj: Any) -> Any:
 def _exception_message(exc: BaseException) -> str:
     """Return a useful message for exceptions whose str() is empty."""
     return str(exc) or exc.__class__.__name__
+
+
+def repository_path_from_git_url(url: str) -> Optional[str]:
+    """Return the ``group/repo`` path from a clone or web URL.
+
+    Args:
+        url: A git or browser URL, with or without a trailing ``.git``.
+
+    Returns:
+        The repository path, or None when the URL has no path.
+    """
+    raw = url.strip()
+    if not raw:
+        return None
+    if raw.endswith(".git"):
+        raw = raw[: -len(".git")]
+    if "://" in raw:
+        rest = raw.split("://", 1)[1]
+        path = rest.split("/", 1)[1] if "/" in rest else ""
+    elif raw.startswith("git@") and ":" in raw:
+        path = raw.split(":", 1)[1]
+    else:
+        return None
+    path = path.strip("/")
+    return path or None
+
+
+def _normalize_repository_path(path: str) -> str:
+    """Compare repository paths without case or a trailing ``.git``."""
+    value = path.strip().strip("/")
+    if value.lower().endswith(".git"):
+        value = value[: -len(".git")]
+    return value.lower()
+
+
+def payload_repository_identity(event: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+    """Read the repository a trigger payload names.
+
+    A GitLab merge request carries ``project.path_with_namespace`` and the
+    numeric project id. A GitHub or Bitbucket event carries ``repository``.
+    CI triggers send the same shapes and often omit ``tracker_id``.
+
+    Args:
+        event: Trigger event, with the provider body under ``payload``.
+
+    Returns:
+        ``source``, ``path``, ``external_id`` and ``clone_url`` when the
+        payload names a repository, otherwise None.
+    """
+    if not isinstance(event, Mapping):
+        return None
+    source = str(event.get("source") or "").lower()
+    payload = event.get("payload")
+    body = payload if isinstance(payload, dict) else event
+    if not isinstance(body, dict):
+        return None
+    project = body.get("project") if isinstance(body.get("project"), dict) else {}
+    repository = (
+        body.get("repository") if isinstance(body.get("repository"), dict) else {}
+    )
+
+    path: Optional[str] = None
+    external_id: Optional[str] = None
+    clone_url: Optional[str] = None
+    if source == "bitbucket" or (source not in {"gitlab", "github"} and repository):
+        path = repository.get("full_name") or repository.get("name")
+        from preloop.utils.bitbucket import normalize_uuid as normalize_bitbucket_uuid
+
+        external_id = normalize_bitbucket_uuid(repository.get("uuid")) or None
+        if external_id is None and repository.get("id") is not None:
+            external_id = str(repository.get("id"))
+        clone_url = repository.get("clone_url") or _link_href(repository)
+    if source == "github" or (source != "gitlab" and repository.get("full_name")):
+        path = repository.get("full_name") or repository.get("name") or path
+        if repository.get("id") is not None and source != "bitbucket":
+            external_id = str(repository.get("id"))
+        clone_url = (
+            repository.get("clone_url")
+            or repository.get("git_url")
+            or repository.get("ssh_url")
+            or clone_url
+        )
+    if source == "gitlab" or project.get("path_with_namespace") or project.get("id"):
+        path = project.get("path_with_namespace") or project.get("path") or path
+        if project.get("id") is not None:
+            external_id = str(project.get("id"))
+        clone_url = (
+            project.get("git_http_url")
+            or project.get("http_url_to_repo")
+            or project.get("ssh_url")
+            or clone_url
+        )
+    if path is not None:
+        path = str(path).strip() or None
+    if not path and clone_url:
+        path = repository_path_from_git_url(str(clone_url))
+    if not path and not external_id:
+        return None
+    return {
+        "source": source,
+        "path": path,
+        "external_id": external_id,
+        "clone_url": str(clone_url) if clone_url else None,
+    }
+
+
+def _project_identity_rank(
+    project: Any, tracker_type: str, identity: Mapping[str, Any]
+) -> int:
+    """Rank how well a project matches a payload repository.
+
+    A tracker of a different host cannot match: GitLab project 21 and GitHub
+    repository 21 are not the same repository. Slug equality outranks a
+    numeric identifier, which can collide across hosts when the tracker type
+    is unknown.
+
+    Args:
+        project: Project row with ``slug`` and ``identifier``.
+        tracker_type: Owning tracker type, or empty when unknown.
+        identity: Parsed payload repository.
+
+    Returns:
+        3 for a path match, 2 for an identifier match, 0 for no match.
+    """
+    source = str(identity.get("source") or "")
+    if source in {"github", "gitlab", "bitbucket"} and tracker_type:
+        if tracker_type != source:
+            return 0
+    slug = _normalize_repository_path(str(project.slug or ""))
+    identifier = str(project.identifier or "")
+    path = identity.get("path")
+    normalized_path = _normalize_repository_path(str(path)) if path else ""
+    if normalized_path and slug and slug == normalized_path:
+        return 3
+    external_id = identity.get("external_id")
+    if external_id and identifier == str(external_id):
+        return 2
+    if normalized_path and _normalize_repository_path(identifier) == normalized_path:
+        return 2
+    return 0
+
+
+def _repository_entry_matches(
+    repo: Mapping[str, Any],
+    identity: Mapping[str, Any],
+    project_id: Optional[str],
+) -> bool:
+    """Whether a clone entry is the repository the payload named."""
+    if project_id and str(repo.get("project_id") or "") == project_id:
+        return True
+    raw_url = repo.get("repository_url")
+    if not raw_url:
+        return False
+    entry_path = repository_path_from_git_url(str(raw_url))
+    payload_path = identity.get("path")
+    if (
+        entry_path
+        and payload_path
+        and _normalize_repository_path(entry_path)
+        == _normalize_repository_path(str(payload_path))
+    ):
+        return True
+    clone_url = identity.get("clone_url")
+    if clone_url and str(raw_url).rstrip("/") == str(clone_url).rstrip("/"):
+        return True
+    return False
+
+
+def _link_href(repository: Mapping[str, Any]) -> Optional[str]:
+    """Return a Bitbucket repository's HTML link, when that is all it has."""
+    links = repository.get("links")
+    if not isinstance(links, dict):
+        return None
+    html = links.get("html")
+    if isinstance(html, dict) and html.get("href"):
+        return str(html["href"])
+    return None
+
+
+_UNSET = object()
+
+
+class _NamedTriggerProject:
+    """Payload project resolution before the first-project fallback.
+
+    Attributes:
+        project_id: Matched project, or None.
+        forbid_fallback: The payload named a repository the flow did not
+            select, so ``trigger_project_ids[0]`` must not be used.
+    """
+
+    def __init__(self, project_id: Optional[str], forbid_fallback: bool) -> None:
+        self.project_id = project_id
+        self.forbid_fallback = forbid_fallback
 
 
 RUNNER_LOG_PAGE_SIZE = 500
@@ -577,6 +818,15 @@ class FlowExecutionOrchestrator:
         # True after this orchestrator has already persisted ``_opened_pr``.
         # Live log frames bind immediately; terminal rescan must not bind twice.
         self._opened_pr_bound = False
+        # Repository binding applied to a Jira-triggered execution (see
+        # preloop.services.repository_binding); None when the flow clones
+        # its own repositories or no binding applies.
+        self._repository_binding: Optional[Any] = None
+        # True when ``_opened_pr`` came from the tracker lookup by head
+        # branch rather than from the wrapper's marker line.
+        self._opened_pr_by_lookup = False
+        # Set by the retry boundary: this run's fresh branch is on the remote.
+        self._remote_branch_published = False
         # Native CLI agent session (opencode/codex) reported by the container
         # via the PRELOOP_AGENT_SESSION marker, persisted on the execution so
         # a correlated PR-comment resume can invoke the CLI resume flag.
@@ -706,6 +956,12 @@ class FlowExecutionOrchestrator:
                         f"Found commit SHA in pull_request.head.sha: {sha[:8]}"
                     )
                     return sha
+
+        # Bitbucket Cloud PR (pullrequest.source.commit.hash) or repo:push
+        sha = bitbucket_payload_commit_hash(payload)
+        if sha:
+            logger.debug(f"Found Bitbucket commit SHA: {sha[:8]}")
+            return sha
 
         # Direct commit reference
         if "commit" in payload:
@@ -1050,6 +1306,9 @@ class FlowExecutionOrchestrator:
                 context=self._status_context,
                 description=description,
                 target_url=target_url,
+                # Bitbucket attaches a build status to a pull request only
+                # when refname names its source branch.
+                refname=self._extract_pr_branch_from_trigger(),
             )
 
             logger.info(
@@ -1233,12 +1492,14 @@ class FlowExecutionOrchestrator:
         routing_record = (self.trigger_event_data or {}).get(ROUTING_RECORD_KEY) or {}
         if routing_record:
             logger.info(
-                "Model routing for execution: source=%s rule_id=%s "
-                "agent_type=%s ai_model_id=%s",
+                "Model routing for execution: source=%s rule_id=%s label=%s "
+                "agent_type=%s ai_model_id=%s reasoning_effort=%s",
                 routing_record.get("source"),
                 routing_record.get("rule_id"),
+                routing_record.get("matched_label"),
                 routing_record.get("agent_type"),
                 routing_record.get("ai_model_id"),
+                routing_record.get("reasoning_effort"),
             )
 
         logger.info(f"Found flow: {self.flow.name} (agent_type: {self.agent_type})")
@@ -1289,6 +1550,55 @@ class FlowExecutionOrchestrator:
 
         return resolve_ai_model_runtime(self.ai_model, allow_gateway=True)
 
+    def _apply_routed_reasoning_effort(
+        self, execution_context: Dict[str, Any]
+    ) -> Optional[str]:
+        """Carry the routed label choice into the run (#851).
+
+        A label rule may ask for more thinking rather than a different model,
+        so the effort is layered over the model row's own parameters for this
+        run only. The effort comes from the controller-written routing
+        record, never from the event body. The milestone says which label
+        decided, so the execution page can show why this run is on this model
+        while the flow default says something else.
+
+        Args:
+            execution_context: Context being assembled for the agent.
+
+        Returns:
+            The effort applied, or None when the record asked for none.
+        """
+        record = (self.trigger_event_data or {}).get(ROUTING_RECORD_KEY) or {}
+        raw_effort = record.get("reasoning_effort")
+        effort = (
+            raw_effort.strip().lower()
+            if isinstance(raw_effort, str) and raw_effort.strip()
+            else None
+        )
+        if effort:
+            parameters = dict(execution_context.get("model_parameters") or {})
+            parameters["reasoning_effort"] = effort
+            execution_context["model_parameters"] = parameters
+        if record.get("source") == "label":
+            self.execution_logger.log_milestone(
+                "model_by_label",
+                {
+                    "label": record.get("matched_label"),
+                    "rule_id": record.get("rule_id"),
+                    "ai_model_id": record.get("ai_model_id"),
+                    "agent_type": record.get("agent_type"),
+                    "reasoning_effort": effort,
+                },
+            )
+        if effort:
+            logger.info(
+                "Reasoning effort %s applied by routing (%s, label %s)",
+                effort,
+                record.get("source"),
+                record.get("matched_label") or "none",
+            )
+        return effort
+
     async def _resolve_prompt(self) -> str:
         """
         Resolve dynamic placeholders in the prompt template using registered resolvers.
@@ -1314,11 +1624,18 @@ class FlowExecutionOrchestrator:
         resolved_prompt = prompt_template
 
         # Create resolver context
+        from preloop.services.persistent_workspace import workspace_mode
+
         resolver_context = ResolverContext(
             db=self.db,
             trigger_event_data=self.trigger_event_data,
             flow_id=str(self.flow_id),
             execution_id=str(self.execution_log.id) if self.execution_log else "",
+            workspace_mode=workspace_mode(
+                agent_config=getattr(self.flow, "agent_config", None),
+                git_clone_config=getattr(self.flow, "git_clone_config", None),
+                trigger_event_data=self.trigger_event_data,
+            ),
         )
 
         # Extract all {{placeholder}} patterns, filters included. Dedup on
@@ -1424,6 +1741,12 @@ class FlowExecutionOrchestrator:
             resolver_registry.register(AccountResolver())
         if not resolver_registry.get("execution"):
             resolver_registry.register(ExecutionResolver())
+        if not resolver_registry.get("flow"):
+            resolver_registry.register(FlowResolver())
+        if not resolver_registry.get("workspace"):
+            from preloop.services.prompt_resolvers.workspace import WorkspaceResolver
+
+            resolver_registry.register(WorkspaceResolver())
 
     def _sync_runtime_session(
         self,
@@ -1879,6 +2202,11 @@ class FlowExecutionOrchestrator:
                 logger.debug(f"Extracted MR target branch: {branch}")
                 return branch
 
+            branch = bitbucket_pr_target_branch(payload)
+            if branch:
+                logger.debug(f"Extracted Bitbucket PR destination branch: {branch}")
+                return branch
+
             project = payload.get("project")
             if isinstance(project, dict) and project.get("default_branch"):
                 return project["default_branch"]
@@ -1915,40 +2243,92 @@ class FlowExecutionOrchestrator:
                 logger.debug(f"Extracted MR source branch: {branch}")
                 return branch
 
+            branch = bitbucket_pr_source_branch(payload)
+            if branch:
+                logger.debug(f"Extracted Bitbucket PR source branch: {branch}")
+                return branch
+
             return None
         except Exception as e:
             logger.debug(f"Error extracting PR branch: {e}")
             return None
+
+    def _effective_git_clone_config(self) -> Any:
+        """Clone config this execution runs with.
+
+        The flow's stored ``git_clone_config``, or, when a repository binding
+        was applied, the copy the binding filled with the bound repository.
+        The flow row itself is never modified.
+        """
+        binding = getattr(self, "_repository_binding", None)
+        if binding is not None:
+            return binding.git_clone_config
+        flow = getattr(self, "flow", None)
+        return getattr(flow, "git_clone_config", None) if flow is not None else None
+
+    def _apply_repository_binding(self) -> None:
+        """Resolve the repository binding for this execution, if any.
+
+        Sets ``self._repository_binding`` (None when no binding applies).
+
+        Raises:
+            RepositoryBindingError: A binding exists but cannot be applied.
+        """
+        from preloop.services.repository_binding import resolve_repository_binding
+
+        trigger = self.trigger_event_data or {}
+        self._repository_binding = resolve_repository_binding(
+            self.db,
+            account_id=str(self.flow.account_id) if self.flow.account_id else None,
+            git_clone_config=self.flow.git_clone_config,
+            trigger_tracker_id=trigger.get("tracker_id"),
+            trigger_source=trigger.get("source"),
+            trigger_project_id=self._resolve_trigger_project_id(),
+        )
 
     def _resolve_trigger_project_id(
         self, *, allow_first_project_fallback: bool = True
     ) -> Optional[str]:
         """Resolve the project that triggered this execution.
 
-        Prefer the repository from the webhook payload (e.g. the MR's project)
-        over the first entry in flow.trigger_project_ids, which may be a
-        different repo when the flow watches multiple projects.
+        The payload repository is used when it is one of the flow's selected
+        projects or clone repositories. A flow that selects none is not
+        limited, so the payload is matched against the account's projects.
+        The first selected project is only a fallback when the payload does
+        not name a repository. A CI trigger often has no ``tracker_id``, and
+        taking ``trigger_project_ids[0]`` then clones a different repo than
+        the merge request.
 
         Args:
             allow_first_project_fallback: When False, return None instead of
                 falling back to ``flow.trigger_project_ids[0]``. Callers that
                 address a specific repository (commit statuses) need this,
                 because a wrong repo is worse than no repo.
+
+        Returns:
+            The internal project id, or None when the payload names a
+            repository this flow is not allowed to use.
         """
-        project_id = self.trigger_event_data.get("project_id")
-        if project_id:
-            return str(project_id)
-
-        from preloop.services.flow_trigger_service import FlowTriggerService
-
-        resolved = FlowTriggerService(self.db)._extract_project_id(
-            self.trigger_event_data
+        # The preset runner calls this on a stand-in that only has
+        # trigger_event_data and flow.trigger_project_ids. Do not call
+        # another method before that case has returned.
+        event = getattr(self, "trigger_event_data", None) or {}
+        explicit = event.get("project_id") if isinstance(event, dict) else None
+        flow = getattr(self, "flow", None)
+        selected = getattr(flow, "trigger_project_ids", None) or []
+        git_config = (
+            getattr(flow, "git_clone_config", None) if flow is not None else None
         )
-        if resolved:
-            logger.info(f"Resolved trigger project from event payload: {resolved}")
-            return resolved
-
-        if not allow_first_project_fallback:
+        repositories = (
+            git_config.get("repositories") if isinstance(git_config, dict) else None
+        )
+        has_repositories = isinstance(repositories, list) and bool(repositories)
+        if explicit and not selected and not has_repositories:
+            return str(explicit)
+        named = self._named_trigger_project()
+        if named.project_id is not None:
+            return named.project_id
+        if named.forbid_fallback or not allow_first_project_fallback:
             return None
 
         if self.flow.trigger_project_ids:
@@ -1961,20 +2341,294 @@ class FlowExecutionOrchestrator:
 
         return None
 
-    def _resolve_repository_url_from_trigger(self) -> Optional[str]:
-        """Extract repository URL from trigger event data."""
-        try:
-            # GitHub structure
-            if "repository" in self.trigger_event_data:
-                repo = self.trigger_event_data["repository"]
-                if isinstance(repo, dict):
-                    return repo.get("clone_url") or repo.get("html_url")
+    def _cached_payload_identity(self) -> Optional[Dict[str, Any]]:
+        """Parse the payload repository once per orchestrator."""
+        cached = getattr(self, "_payload_identity_cached", _UNSET)
+        if cached is _UNSET:
+            cached = payload_repository_identity(self.trigger_event_data or {})
+            self._payload_identity_cached = cached
+        return cached
 
-            # GitLab structure
-            if "project" in self.trigger_event_data:
-                project = self.trigger_event_data["project"]
+    def _named_trigger_project(self) -> "_NamedTriggerProject":
+        """Resolve the payload's project once, without the first-project fallback.
+
+        ``_prepare_execution_context`` asks for this from repository binding,
+        clone narrowing, and the execution context. The payload cannot change
+        after construction, so the identity parse and the project query run once.
+        """
+        cached = getattr(self, "_named_trigger_project_cached", None)
+        if cached is not None:
+            return cached
+
+        identity = self._cached_payload_identity()
+        project_id = (self.trigger_event_data or {}).get("project_id")
+        resolved_id: Optional[str] = None
+        if project_id and self._project_is_selected(str(project_id)):
+            resolved_id = str(project_id)
+        else:
+            from preloop.services.flow_trigger_service import FlowTriggerService
+
+            extracted = FlowTriggerService(self.db)._extract_project_id(
+                self.trigger_event_data or {}
+            )
+            if extracted and self._project_is_selected(str(extracted)):
+                logger.info(
+                    "Resolved trigger project from event payload: %s", extracted
+                )
+                resolved_id = str(extracted)
+            elif identity:
+                matched = self._match_payload_project(identity)
+                if matched:
+                    logger.info(
+                        "Matched trigger payload repository %s to project %s",
+                        identity.get("path") or identity.get("external_id"),
+                        matched,
+                    )
+                    resolved_id = matched
+
+        forbid_fallback = bool(
+            identity and resolved_id is None and self._flow_limits_repositories()
+        )
+        if forbid_fallback and identity is not None:
+            logger.info(
+                "Trigger repository %s is not one of this flow's selected repositories",
+                identity.get("path") or identity.get("external_id"),
+            )
+        cached = _NamedTriggerProject(resolved_id, forbid_fallback)
+        self._named_trigger_project_cached = cached
+        return cached
+
+    def _flow_limits_repositories(self) -> bool:
+        """Whether this flow names the repositories it is allowed to use."""
+        if self.flow.trigger_project_ids:
+            return True
+        config = self._effective_git_clone_config()
+        if not isinstance(config, dict):
+            return False
+        repositories = config.get("repositories")
+        return isinstance(repositories, list) and bool(repositories)
+
+    def _selected_project_ids(self) -> set[str]:
+        """Project ids the flow has selected, from triggers and clone entries."""
+        selected: set[str] = set()
+        for raw in self.flow.trigger_project_ids or []:
+            if raw:
+                selected.add(str(raw))
+        config = self._effective_git_clone_config()
+        repositories = config.get("repositories") if isinstance(config, dict) else None
+        if isinstance(repositories, list):
+            for repo in repositories:
+                if isinstance(repo, dict) and repo.get("project_id"):
+                    selected.add(str(repo["project_id"]))
+        return selected
+
+    def _project_is_selected(self, project_id: str) -> bool:
+        """Return whether ``project_id`` is allowed for this flow.
+
+        A flow that does not select repositories or projects allows any
+        project that belongs to its account.
+        """
+        if not self._flow_limits_repositories():
+            return True
+        return project_id in self._selected_project_ids()
+
+    def _match_payload_project(self, identity: Mapping[str, Any]) -> Optional[str]:
+        """Find the selected project the payload repository refers to.
+
+        Args:
+            identity: Result of ``payload_repository_identity``.
+
+        Returns:
+            One matching project id. None when nothing matches, or when more
+            than one selected project matches equally well.
+        """
+        limited = self._flow_limits_repositories()
+        selected = self._selected_project_ids() if limited else None
+        if limited and not selected:
+            return None
+        projects = self._projects_matching_identity(identity, selected)
+        ranked: List[tuple[int, str]] = []
+        for project, tracker_type in projects:
+            rank = _project_identity_rank(project, tracker_type, identity)
+            if rank:
+                ranked.append((rank, str(project.id)))
+        if not ranked:
+            return None
+        best = max(rank for rank, _project_id in ranked)
+        winners = [project_id for rank, project_id in ranked if rank == best]
+        if len(set(winners)) != 1:
+            logger.info(
+                "Trigger repository %s matches %s projects; not guessing",
+                identity.get("path") or identity.get("external_id"),
+                len(set(winners)),
+            )
+            return None
+        return winners[0]
+
+    def _projects_matching_identity(
+        self,
+        identity: Mapping[str, Any],
+        selected_ids: Optional[set[str]],
+    ) -> List[tuple[Any, str]]:
+        """Load account projects that could be the payload repository.
+
+        Args:
+            identity: Parsed payload repository.
+            selected_ids: When set, only these project ids are eligible.
+                None means the flow did not limit repositories.
+
+        Returns:
+            ``(project, tracker_type)`` pairs. Tracker type is empty when
+            the project has no tracker.
+        """
+        from sqlalchemy import func, or_
+        from sqlalchemy.orm import joinedload
+
+        from preloop.models.models.organization import Organization
+        from preloop.models.models.project import Project
+        from preloop.models.models.tracker import Tracker
+
+        clauses = []
+        path = identity.get("path")
+        external_id = identity.get("external_id")
+        if path:
+            lowered = _normalize_repository_path(str(path))
+            clauses.append(func.lower(Project.slug) == lowered)
+            clauses.append(func.lower(Project.identifier) == lowered)
+        if external_id:
+            clauses.append(Project.identifier == str(external_id))
+        if not clauses:
+            return []
+
+        query = (
+            self.db.query(Project)
+            .options(joinedload(Project.organization).joinedload(Organization.tracker))
+            .join(Organization)
+            .join(Tracker)
+            .filter(Tracker.account_id == self.flow.account_id)
+            .filter(Project.is_active.is_(True))
+            .filter(or_(*clauses))
+        )
+        if selected_ids is not None:
+            parsed_ids = []
+            for raw in selected_ids:
+                try:
+                    parsed_ids.append(uuid.UUID(str(raw)))
+                except ValueError:
+                    continue
+            if not parsed_ids:
+                return []
+            query = query.filter(Project.id.in_(parsed_ids))
+
+        found: List[tuple[Any, str]] = []
+        for project in query.all():
+            organization = project.organization
+            tracker = organization.tracker if organization is not None else None
+            tracker_type = str(tracker.tracker_type or "").lower() if tracker else ""
+            found.append((project, tracker_type))
+        return found
+
+    def _git_clone_config_for_trigger(self) -> Any:
+        """Clone config reduced to the repository the payload named.
+
+        The stored config is not modified. Clone entries are a hard selection:
+        the payload repository is cloned only when it is one of them (or one
+        of the flow's projects). A payload that names something else clears
+        the list, so a fixed clone of a different repository is not checked
+        out under the payload's commit. That empty checkout is logged.
+        """
+        config = self._effective_git_clone_config()
+        if not isinstance(config, dict):
+            return config
+        identity = self._cached_payload_identity()
+        if not identity:
+            return config
+
+        project_id = self._resolve_trigger_project_id(
+            allow_first_project_fallback=False
+        )
+        repositories = [
+            repo
+            for repo in (config.get("repositories") or [])
+            if isinstance(repo, dict)
+        ]
+        matching = [
+            repo
+            for repo in repositories
+            if _repository_entry_matches(repo, identity, project_id)
+        ]
+        if len(matching) > 1:
+            logger.info(
+                "Trigger repository %s matches %s clone entries; using the first",
+                identity.get("path") or identity.get("external_id"),
+                len(matching),
+            )
+        if matching:
+            chosen = dict(matching[0])
+            if project_id and not chosen.get("project_id"):
+                chosen["project_id"] = project_id
+            if identity.get("clone_url") and not chosen.get("repository_url"):
+                chosen["repository_url"] = identity["clone_url"]
+            narrowed = dict(config)
+            narrowed["repositories"] = [chosen]
+            return narrowed
+
+        if project_id:
+            entry: Dict[str, Any] = {
+                "project_id": project_id,
+                "clone_path": "/workspace",
+            }
+            if identity.get("clone_url"):
+                entry["repository_url"] = identity["clone_url"]
+            narrowed = dict(config)
+            narrowed["repositories"] = [entry]
+            return narrowed
+
+        if self._flow_limits_repositories() and repositories:
+            logger.warning(
+                "Trigger repository %s matches no clone entry; "
+                "no repository will be cloned",
+                identity.get("path") or identity.get("external_id"),
+            )
+            narrowed = dict(config)
+            narrowed["repositories"] = []
+            return narrowed
+        return config
+
+    def _resolve_repository_url_from_trigger(self) -> Optional[str]:
+        """Extract repository URL from trigger event data.
+
+        Trigger events nest the provider payload under ``payload`` (see
+        ``FlowTriggerService.process_event``), so the repository is looked up
+        there first. The top level is still checked for callers that pass a
+        bare provider payload.
+        """
+        try:
+            payload = self.trigger_event_data.get("payload")
+            candidates = [payload, self.trigger_event_data]
+            for data in candidates:
+                if not isinstance(data, dict):
+                    continue
+
+                # GitHub and Bitbucket structure
+                repo = data.get("repository")
+                if isinstance(repo, dict):
+                    url = repo.get("clone_url") or repo.get("git_http_url")
+                    if not url:
+                        # Bitbucket webhooks carry only the HTML link.
+                        html = repo.get("html_url") or (
+                            (repo.get("links") or {}).get("html") or {}
+                        ).get("href")
+                        url = html
+                    if url:
+                        return url
+
+                # GitLab structure
+                project = data.get("project")
                 if isinstance(project, dict):
-                    return project.get("http_url_to_repo") or project.get("web_url")
+                    url = project.get("http_url_to_repo") or project.get("web_url")
+                    if url:
+                        return url
 
             return None
         except Exception as e:
@@ -2021,11 +2675,30 @@ class FlowExecutionOrchestrator:
                     tracker.auth_type,
                 )
 
-            return {
+            credentials = {
                 "tracker_id": str(tracker_id),
                 "token": token or "",
                 "tracker_type": tracker.tracker_type,
+                "auth_type": tracker.auth_type,
             }
+            username = resolve_tracker_git_username(tracker)
+            if username:
+                credentials["username"] = username
+            if str(tracker.tracker_type or "").lower() == "bitbucket":
+                # The container's post-execution REST calls send Bearer and
+                # retry HTTP Basic <email>:<token> on a 401, exactly like the
+                # tracker client. Only a personal API token has that fallback;
+                # access and OAuth tokens are Bearer-only. The email is not a
+                # secret.
+                details = tracker.connection_details or {}
+                email = details.get("email")
+                auth_type = str(
+                    details.get("auth_type") or tracker.auth_type or "api_token"
+                ).lower()
+                token_kind = str(details.get("token_kind") or "api_token").lower()
+                if email and auth_type == "api_token" and token_kind == "api_token":
+                    credentials["email"] = str(email)
+            return credentials
 
         except Exception as e:
             logger.error(
@@ -2068,11 +2741,10 @@ class FlowExecutionOrchestrator:
         Minting an App installation token is async and must happen here, in
         the orchestrator, not in the synchronous container code path.
 
-        GitHub App installation tokens expire within an hour. They are minted
-        at execution start and delivered in the container environment; the
-        post-execution ``git push`` is the same container script, so a run
-        longer than that window can still fail the push with an expired
-        token. The recovery bundle is written before the push.
+        GitHub App installation tokens expire within an hour. The launch
+        token authenticates clone; hosted publication obtains fresh scoped
+        credentials from the controller after verification, before push/PR.
+        The recovery bundle is written before the push.
         """
 
         tracker_id = self._resolve_project_tracker_id(
@@ -2118,7 +2790,11 @@ class FlowExecutionOrchestrator:
                 return None
 
             host_kind = tracker_host_kind(repo_url)
-            if host_kind is None and tracker_type not in {"github", "gitlab"}:
+            if host_kind is None and tracker_type not in {
+                "github",
+                "gitlab",
+                "bitbucket",
+            }:
                 logger.warning(
                     "Could not determine tracker type for %s; "
                     "using the generic credential username",
@@ -2127,7 +2803,8 @@ class FlowExecutionOrchestrator:
 
             return GitCredential(
                 repo_url=strip_url_credentials(repo_url),
-                username=credential_username(host_kind, tracker_type),
+                username=credentials.get("username")
+                or credential_username(host_kind, tracker_type),
                 token=token,
             )
 
@@ -2217,6 +2894,98 @@ class FlowExecutionOrchestrator:
             logger.error(f"Error executing custom commands: {e}", exc_info=True)
             return False
 
+    async def _attach_git_credentials(self, execution_context: Dict[str, Any]) -> None:
+        """Resolve clone credentials for the flow's repositories.
+
+        Adds ``git_credentials_map`` (keyed by tracker id) for the effective
+        clone config's repositories (the bound repository when a repository
+        binding applies), then the triggering project's tracker credentials
+        unless a binding applies.
+
+        Args:
+            execution_context: Context to extend in place.
+        """
+        repositories = (self._effective_git_clone_config() or {}).get(
+            "repositories", []
+        )
+        if repositories:
+            logger.info(
+                f"Preparing git credentials for {len(repositories)} configured repositories"
+            )
+            # Get unique tracker IDs from repositories
+            tracker_ids = set(
+                repo.get("tracker_id")
+                for repo in repositories
+                if repo.get("tracker_id")
+            )
+
+            # Fetch credentials for each tracker
+            credentials_map = {}
+            for tracker_id in tracker_ids:
+                creds = await self._get_tracker_credentials_by_id(tracker_id)
+                if creds:
+                    credentials_map[tracker_id] = creds
+
+            if credentials_map:
+                execution_context["git_credentials_map"] = credentials_map
+                logger.info(
+                    f"Prepared git credentials for {len(credentials_map)} tracker(s)"
+                )
+            else:
+                logger.warning(
+                    "Git clone enabled but could not get tracker credentials"
+                )
+
+        # Repositories declared without a tracker_id (and the trigger-project
+        # fallback used when none are declared at all) resolved their token
+        # inside the agent container, which reads the stored key only and
+        # therefore finds nothing for a GitHub App tracker. Resolve it here,
+        # where minting an installation token is possible, and hand it over
+        # with the rest of the credentials. A bound execution skips this: the
+        # triggering tracker is the issue tracker, and its token must never
+        # reach the code host.
+        if getattr(self, "_repository_binding", None) is None:
+            await self._attach_trigger_tracker_credentials(execution_context)
+
+    async def prepare_host_exec_checkout_context(self) -> Optional[Dict[str, Any]]:
+        """Build the clone inputs a host-exec runner needs, with credentials.
+
+        Host profiles never receive the full execution context. This returns
+        only what the checkout resolvers read, so the delivery path can turn
+        it into a validated, per-repository checkout plan.
+
+        A repository binding applies here exactly as on container runs: a
+        Jira-triggered flow clones the bound code-host repository with that
+        tracker's credential only.
+
+        Returns:
+            The checkout context, or None when the flow does not clone.
+
+        Raises:
+            RepositoryBindingError: A binding exists but cannot be applied.
+        """
+        stored = self.flow.git_clone_config
+        if not isinstance(stored, dict) or not stored.get("enabled"):
+            return None
+        self._apply_repository_binding()
+        clone = self._effective_git_clone_config()
+        context: Dict[str, Any] = {
+            "flow_id": str(self.flow_id),
+            "flow_name": self.flow.name,
+            "execution_id": str(self.execution_log.id),
+            "account_id": self.flow.account_id,
+            "git_clone_config": self._git_clone_config_for_trigger(),
+            "trigger_event_data": self.trigger_event_data,
+            "trigger_project_id": self._resolve_trigger_project_id(),
+        }
+        binding = getattr(self, "_repository_binding", None)
+        if binding is not None:
+            # Read by the shared clone resolvers: the git credential must come
+            # from the bound code-host tracker only, never the issue tracker.
+            context["repository_binding"] = binding.summary()
+        await self._attach_git_credentials(context)
+        return context
+
     async def _prepare_execution_context(
         self, *, resolved_prompt: Optional[str] = None
     ) -> Dict[str, Any]:
@@ -2244,23 +3013,33 @@ class FlowExecutionOrchestrator:
                 [seed.path for seed in workspace_files],
             )
 
-        # Native profiles use only the operator's local Cursor login/config.
-        # Do not mint model/MCP tokens or resolve cloud provider secrets here.
+        # Native profiles use only the operator's local Cursor or Copilot
+        # login/config. Do not mint model/MCP tokens or resolve cloud provider
+        # secrets here.
         from preloop.services.host_exec import (
-            host_exec_profile_name,
+            HOST_EXEC_AGENT_TYPE,
             host_exec_flow_error,
+            host_exec_model_identifier,
+            host_exec_profile_name,
             host_exec_unavailable_reason,
+            is_host_exec_agent_type,
         )
 
         profile = host_exec_profile_name(self.flow.agent_config)
-        if effective_agent_type == "cursor" or profile:
+        if is_host_exec_agent_type(effective_agent_type) or profile:
+            clone_config = self.flow.git_clone_config
+            if isinstance(clone_config, dict):
+                publication_mode = clone_config.get("publication_mode")
+            else:
+                publication_mode = getattr(clone_config, "publication_mode", None)
             error = host_exec_flow_error(
                 agent_type=effective_agent_type,
                 agent_config=self.flow.agent_config,
                 runner_pool=self.flow.runner_pool,
             ) or host_exec_unavailable_reason(
-                git_clone_config=self.flow.git_clone_config,
+                git_clone_config=clone_config,
                 custom_commands=self.flow.custom_commands,
+                publication_mode=publication_mode,
             )
             if error:
                 raise ValueError(error)
@@ -2268,20 +3047,35 @@ class FlowExecutionOrchestrator:
                 raise ValueError(
                     "Host profiles do not support remote workspace seeds or native resume"
                 )
+            host_agent_type = (
+                effective_agent_type.strip().lower()
+                if isinstance(effective_agent_type, str)
+                else HOST_EXEC_AGENT_TYPE
+            ) or HOST_EXEC_AGENT_TYPE
+            host_model = host_exec_model_identifier(
+                host_agent_type, self.flow.agent_config
+            )
             return {
                 "flow_id": str(self.flow_id),
                 "flow_name": self.flow.name,
                 "execution_id": str(self.execution_log.id),
                 "prompt": resolved_prompt,
-                "agent_type": "cursor",
+                "agent_type": host_agent_type,
                 "agent_config": {"host_exec_profile": profile},
                 "account_id": self.flow.account_id,
-                # A request for the local profile's explicit model map. This is
-                # never a claim about the model Cursor actually reported.
-                "model_identifier": self.ai_model.model_identifier
-                if self.ai_model
-                else None,
+                # cursor_model / copilot_model is a local model alias. A
+                # catalog model remains the fallback for a saved flow. Neither
+                # value is the model the CLI reports, and an empty value leaves
+                # --model unset (the CLI's own default).
+                "model_identifier": host_model
+                or (self.ai_model.model_identifier if self.ai_model else None),
             }
+
+        # A Jira-triggered flow has no repository of its own: the binding
+        # names the code-host repository. Raises RepositoryBindingError (a
+        # ValueError) when a binding exists but cannot be applied, so run()
+        # fails the execution with that message instead of guessing.
+        self._apply_repository_binding()
 
         # Create short-lived API token for this flow execution
         account_api_token = None
@@ -2302,11 +3096,14 @@ class FlowExecutionOrchestrator:
             "prompt": resolved_prompt,
             "agent_type": effective_agent_type,
             "agent_config": self.flow.agent_config,
+            # The wall clock this run may spend. Harnesses keep their own
+            # waits (the Codex stream idle timeout) inside it.
+            "flow_timeout_seconds": self._execution_timeout_budget().seconds,
             "allowed_mcp_servers": self.flow.allowed_mcp_servers,
             "allowed_mcp_tools": self.flow.allowed_mcp_tools,
             "account_id": self.flow.account_id,
             "account_api_token": account_api_token,
-            "git_clone_config": self.flow.git_clone_config,
+            "git_clone_config": self._git_clone_config_for_trigger(),
             "custom_commands": self.flow.custom_commands,
             "trigger_event_data": self.trigger_event_data,
             "trigger_project_ids": [str(pid) for pid in self.flow.trigger_project_ids]
@@ -2315,6 +3112,11 @@ class FlowExecutionOrchestrator:
             # Singular form used by container.py for git clone and credential lookup
             "trigger_project_id": self._resolve_trigger_project_id(),
         }
+        binding = getattr(self, "_repository_binding", None)
+        if binding is not None:
+            # Read by container.py: the git credential must come from the
+            # bound code-host tracker only, never the issue tracker.
+            execution_context["repository_binding"] = binding.summary()
 
         # Resolve a previous run's stored result into this run's workspace
         # when the payload names one. Account-scoped, size-capped, and
@@ -2394,7 +3196,7 @@ class FlowExecutionOrchestrator:
         self._isolated_publication_policy = None
         self._publication_verification = None
         self._publication_runtime_stopped = False
-        if isolated_publication_enabled(self.flow.git_clone_config):
+        if isolated_publication_enabled(self._effective_git_clone_config()):
             self._isolated_publication_policy = await prepare_isolated_publication(
                 self.db, self.flow, execution_context
             )
@@ -2410,43 +3212,9 @@ class FlowExecutionOrchestrator:
         self._verify_product_provenance_record()
 
         # Isolated mode never resolves the existing broad tracker token.
-        if self.flow.git_clone_config and self._isolated_publication_policy is None:
-            repositories = self.flow.git_clone_config.get("repositories", [])
-            if repositories:
-                logger.info(
-                    f"Preparing git credentials for {len(repositories)} configured repositories"
-                )
-                # Get unique tracker IDs from repositories
-                tracker_ids = set(
-                    repo.get("tracker_id")
-                    for repo in repositories
-                    if repo.get("tracker_id")
-                )
-
-                # Fetch credentials for each tracker
-                credentials_map = {}
-                for tracker_id in tracker_ids:
-                    creds = await self._get_tracker_credentials_by_id(tracker_id)
-                    if creds:
-                        credentials_map[tracker_id] = creds
-
-                if credentials_map:
-                    execution_context["git_credentials_map"] = credentials_map
-                    logger.info(
-                        f"Prepared git credentials for {len(credentials_map)} tracker(s)"
-                    )
-                else:
-                    logger.warning(
-                        "Git clone enabled but could not get tracker credentials"
-                    )
-
-            # Repositories declared without a tracker_id (and the
-            # trigger-project fallback used when none are declared at all)
-            # resolved their token inside the agent container, which reads the
-            # stored key only and therefore finds nothing for a GitHub App
-            # tracker. Resolve it here, where minting an installation token is
-            # possible, and hand it over with the rest of the credentials.
-            await self._attach_trigger_tracker_credentials(execution_context)
+        effective_git_config = self._effective_git_clone_config()
+        if effective_git_config and self._isolated_publication_policy is None:
+            await self._attach_git_credentials(execution_context)
 
         # Add AI model details if available
         if self.ai_model:
@@ -2463,6 +3231,7 @@ class FlowExecutionOrchestrator:
                     else None
                 )
             )
+            self._apply_routed_reasoning_effort(execution_context)
 
             # Populate the authorized gateway model list so agent config
             # generators (e.g. OpenCode) can include every model the
@@ -2825,13 +3594,25 @@ class FlowExecutionOrchestrator:
         timestamps: list[datetime] = []
         for activity in reversed(activities):
             metadata = activity.metadata_ or {}
+            signature_payload: Dict[str, Any] = {
+                "server_name": activity.server_name,
+                "tool_name": activity.tool_name,
+                # Key names and sizes only; the payload is never
+                # persisted on the activity row (issue #793).
+                "arguments_summary": metadata.get("arguments_summary"),
+            }
+            # Prefer arguments_hash so same-shape/different-value calls
+            # (get_pr(123) vs get_pr(124)) do not share a signature.
+            # Legacy rows without a hash fall back to the redacted arguments
+            # value so they do not all collapse onto one summary-only key.
+            arguments_hash = metadata.get("arguments_hash")
+            if arguments_hash is not None:
+                signature_payload["arguments_hash"] = arguments_hash
+            elif "arguments" in metadata:
+                signature_payload["arguments"] = metadata.get("arguments")
             signatures.append(
                 json.dumps(
-                    {
-                        "server_name": activity.server_name,
-                        "tool_name": activity.tool_name,
-                        "arguments": metadata.get("arguments"),
-                    },
+                    signature_payload,
                     sort_keys=True,
                     default=str,
                 )
@@ -4203,6 +4984,246 @@ class FlowExecutionOrchestrator:
         )
         self._opened_pr_bound = True
 
+    def _publication_context(self) -> Dict[str, Any]:
+        ctx = getattr(self, "_execution_context", None)
+        return ctx if isinstance(ctx, dict) else {}
+
+    def _publication_target_branch(self) -> Optional[str]:
+        """The branch the post-execution block pushes, when this run has one."""
+        branch = self._publication_context().get("_git_target_branch")
+        if isinstance(branch, str) and branch.strip():
+            return branch.strip()
+        return None
+
+    def _publication_is_resume(self) -> bool:
+        """A resume pushes onto a PR branch that existed before this run."""
+        ctx = self._publication_context()
+        source = ctx.get("_git_source_branch")
+        target = ctx.get("_git_target_branch")
+        if source and target and source == target:
+            return True
+        trigger = ctx.get("trigger_event_data")
+        return isinstance(trigger, dict) and bool(trigger.get("_resume"))
+
+    def _publication_lookup_enabled(self) -> bool:
+        """Whether this run's post-execution block creates a PR/MR."""
+        if getattr(self, "_isolated_publication_policy", None) is not None:
+            # Only the trusted publisher can bind an isolated execution.
+            return False
+        if self.execution_log is None or self._publication_target_branch() is None:
+            return False
+        git_config = self._publication_context().get("git_clone_config")
+        if not isinstance(git_config, dict):
+            git_config = getattr(self.flow, "git_clone_config", None) or {}
+        return isinstance(git_config, dict) and bool(
+            git_config.get("create_pull_request")
+        )
+
+    async def _publication_tracker_clients(self) -> List[Any]:
+        """Tracker clients for the repositories the post-exec block pushes to.
+
+        Repositories that name a ``project_id`` resolve their own client.
+        Otherwise the trigger project is the push target, as in the
+        container's clone fallback (``_resolve_git_clone_repositories``).
+        """
+        from preloop.api.common import get_tracker_client
+        from preloop.models.crud import crud_project
+
+        git_config = self._publication_context().get("git_clone_config")
+        if not isinstance(git_config, dict):
+            git_config = {}
+        project_ids = []
+        for repo in git_config.get("repositories") or []:
+            if isinstance(repo, dict) and repo.get("project_id"):
+                if repo["project_id"] not in project_ids:
+                    project_ids.append(repo["project_id"])
+        if not project_ids:
+            trigger_project_id = self._publication_context().get("trigger_project_id")
+            if trigger_project_id:
+                project_ids.append(trigger_project_id)
+        if not project_ids:
+            return []
+        clients: List[Any] = []
+        users = crud_user.get_by_account(
+            self.db, account_id=self.flow.account_id, limit=1
+        )
+        if not users:
+            return []
+        for project_id in project_ids:
+            try:
+                project = crud_project.get(self.db, id=project_id)
+                if not project or not getattr(project, "organization_id", None):
+                    continue
+                client = await get_tracker_client(
+                    organization_id=project.organization_id,
+                    project_id=project.id,
+                    db=self.db,
+                    current_user=users[0],
+                )
+            except Exception as error:
+                logger.warning(
+                    "PR lookup: no tracker client for project %s: %s",
+                    project_id,
+                    _exception_message(error),
+                )
+                continue
+            if client is not None:
+                clients.append(client)
+        return clients
+
+    @staticmethod
+    def _tracker_kind(client: Any) -> Optional[str]:
+        """The git host kind of a tracker client, or None for issue trackers."""
+        kind = str(getattr(client, "tracker_type", "") or "").lower()
+        return kind if kind in {"github", "gitlab", "bitbucket"} else None
+
+    async def _lookup_published_pr(
+        self, client: Any, branch: str
+    ) -> Optional[Dict[str, str]]:
+        """The open PR/MR whose head is ``branch`` on ``client``'s repo.
+
+        The forge's ``created_at`` is carried along, so "PR opened" is the
+        forge's time, not the bind time.
+        """
+        kind = self._tracker_kind(client)
+        lookup = getattr(client, "list_open_pull_requests_by_source_branch", None)
+        if kind is None or lookup is None:
+            return None
+        # The provider filter is authoritative; the guard skips anything a
+        # tracker returned for another branch or without a URL.
+        item = BaseTracker._first_listed_for_branch(await lookup(branch), branch)
+        if item is None:
+            return None
+        found = {"url": str(item["url"]), "branch": branch, "provider": kind}
+        created_at = item.get("created_at")
+        if created_at:
+            found["created_at"] = str(created_at)
+        return found
+
+    def _execution_already_bound(self) -> bool:
+        """True when another path (MCP create_pull_request) bound a PR."""
+        try:
+            self.db.refresh(self.execution_log)
+        except Exception:
+            logger.debug("Could not refresh execution before PR lookup", exc_info=True)
+        result = getattr(self.execution_log, "result", None)
+        return isinstance(result, dict) and bool(result.get("pr_url"))
+
+    async def _bind_published_pr_by_branch(self) -> Optional[Dict[str, str]]:
+        """Bind the PR/MR the post-execution block opened, found by branch.
+
+        The ``PRELOOP_PR_OPENED`` log line is the fast path. The PR itself is
+        created by deterministic code, so when the line is missing (the
+        script died after the create call, the stream dropped a frame) the
+        tracker is the source of truth: look the PR up by head branch and
+        bind it through ``record_opened_pr`` like the marker would.
+        """
+        if self._opened_pr is not None:
+            return self._opened_pr
+        if not self._publication_lookup_enabled():
+            return None
+        if self._execution_already_bound():
+            return None
+        branch = self._publication_target_branch()
+        try:
+            clients = await self._publication_tracker_clients()
+        except Exception as error:
+            logger.warning("PR lookup by branch skipped: %s", _exception_message(error))
+            return None
+        for client in clients:
+            try:
+                found = await self._lookup_published_pr(client, branch)
+            except Exception as error:
+                logger.warning(
+                    "PR lookup by branch %s failed: %s",
+                    branch,
+                    _exception_message(error),
+                )
+                continue
+            if found is None:
+                continue
+            self._opened_pr = found
+            self._opened_pr_by_lookup = True
+            record_opened_pr(
+                self.db,
+                self.execution_log.id,
+                found["url"],
+                source_branch=found["branch"],
+                opened_at=found.get("created_at"),
+            )
+            self._opened_pr_bound = True
+            logger.info("Bound the published pull request by head branch lookup")
+            self.execution_logger.log_milestone(
+                "pull_request_opened",
+                {
+                    "pr_url": found["url"],
+                    "branch": found["branch"],
+                    "provider": found["provider"],
+                    "source": "branch_lookup",
+                },
+            )
+            return found
+        return None
+
+    async def _probe_remote_branch_published(self) -> None:
+        """Record whether this run's fresh target branch now exists remotely.
+
+        Only meaningful for a new branch: a resume pushes onto a PR branch
+        that already existed, so its presence proves nothing about this run.
+        """
+        self._remote_branch_published = False
+        if self._publication_is_resume() or not self._publication_lookup_enabled():
+            return
+        branch = self._publication_target_branch()
+        try:
+            clients = await self._publication_tracker_clients()
+        except Exception:
+            return
+        for client in clients:
+            if self._tracker_kind(client) is None:
+                continue
+            try:
+                if await client.branch_exists(branch):
+                    self._remote_branch_published = True
+                    return
+            except Exception as error:
+                logger.warning(
+                    "Remote branch probe for %s failed: %s",
+                    branch,
+                    _exception_message(error),
+                )
+
+    def _publication_side_effect_evidence(
+        self, agent_result: Dict[str, Any]
+    ) -> Optional[str]:
+        """Why this failed attempt already published, or ``None``.
+
+        The post-exec block can fail after it pushed and opened a PR (the
+        2026-09-25 ``unbound variable`` abort one line after
+        ``PR create HTTP 201``). A non-zero exit then does not mean "no side
+        effects", and relaunching from a fresh clone would redo the work
+        against a branch and PR that already exist.
+        """
+        opened = self._opened_pr
+        if opened is not None and not (
+            getattr(self, "_opened_pr_by_lookup", False)
+            and self._publication_is_resume()
+        ):
+            return f"a pull request is bound ({opened.get('url')})"
+        if getattr(self, "_remote_branch_published", False):
+            return (
+                f"branch {self._publication_target_branch()} now exists on the remote"
+            )
+        lines = [
+            str(line) for line in self.execution_logger.get_agent_output_lines()[-400:]
+        ]
+        lines.extend(str(agent_result.get("error_message") or "").splitlines())
+        for line in lines:
+            for label, pattern in _PUBLICATION_SIDE_EFFECT_PATTERNS:
+                if pattern.search(line):
+                    return f"the log shows {label}"
+        return None
+
     async def _start_queued_followup(self) -> None:
         """Start the single follow-up resume queued while this run was going.
 
@@ -4981,6 +6002,36 @@ class FlowExecutionOrchestrator:
             )
         return self._budget_after_park(TimeoutBudget(seconds=clamped, source="flow"))
 
+    def _name_stream_stall(
+        self, timeout_result: Dict[str, Any], budget: TimeoutBudget
+    ) -> None:
+        """Say so when a timed-out run was waiting on a silent model stream.
+
+        Without this, a run that spent its budget on a stream that sent
+        nothing reads exactly like a run that needed more time (issue #872).
+        When the log shows the stall was still on at the deadline, the
+        message names it, ``failure_category`` is ``model_stream_idle``, and
+        ``result.stream_stall`` carries the evidence. Otherwise the result is
+        left as the plain timeout it is.
+
+        Args:
+            timeout_result: The monitor's timeout result, updated in place.
+            budget: The budget that expired.
+        """
+        stall = detect_stream_stall(self.execution_logger.get_agent_output_lines())
+        if stall is None:
+            return
+        evidence = stall.as_result()
+        timeout_result["error_message"] = stall.timeout_message(
+            budget.seconds, budget.label()
+        )
+        timeout_result["failure_category"] = FAILURE_CATEGORY_MODEL_STREAM_IDLE
+        result = timeout_result.get("result")
+        result = dict(result) if isinstance(result, dict) else {}
+        result[STREAM_STALL_RESULT_KEY] = evidence
+        timeout_result["result"] = result
+        self.execution_logger.log_milestone("agent_stream_stalled", evidence)
+
     def _chain_consumed_seconds(self) -> int:
         """Agent wall clock already spent by the park chain this run continues."""
         from preloop.services.approval_park import consumed_seconds_from_details
@@ -5686,17 +6737,19 @@ class FlowExecutionOrchestrator:
             )
             await agent_executor.stop(session_reference)
 
-            return {
+            # A timed-out eval run may still have written result.json; the
+            # stopped container is kept, so the artifact is reachable.
+            timeout_result = {
                 "status": "FAILED",
                 "error_message": timeout_budget.timeout_message(),
                 "actions_taken": self.execution_logger.get_actions_taken(),
                 "mcp_usage_logs": self.execution_logger.get_mcp_usage_logs(),
-                # A timed-out eval run may still have written result.json;
-                # the stopped container is kept, so the artifact is reachable.
                 "result": await self._capture_result_artifact(
                     agent_executor, session_reference
                 ),
             }
+            self._name_stream_stall(timeout_result, timeout_budget)
+            return timeout_result
 
         except Exception as e:
             error_message = _exception_message(e)
@@ -5839,6 +6892,12 @@ class FlowExecutionOrchestrator:
         self.db.refresh(updated_log)
         self.execution_log = updated_log
 
+        # A run that has finished cannot deliver an answer. Cancel questions
+        # it still holds so the console does not offer one. Parked runs omit
+        # status here; their approval stays pending until the human decides.
+        if status in _APPROVAL_CANCEL_ON_TERMINAL:
+            self._cancel_pending_approvals(status)
+
         # Debug: Verify the values were actually set
         if "tool_calls_count" in kwargs or "total_tokens" in kwargs:
             logger.info(
@@ -5861,6 +6920,40 @@ class FlowExecutionOrchestrator:
         await self._publish_update("status_update", status_payload)
 
         logger.debug(f"Execution log updated: status={status}")
+
+    def _cancel_pending_approvals(self, status: str) -> None:
+        """Cancel pending approvals this execution can no longer deliver.
+
+        Never raises: losing the cancel must not rewrite the terminal status
+        that was just committed. The reason is stored on the request so the
+        console can say why the question disappeared.
+        """
+        if self.execution_log is None:
+            return
+        try:
+            from preloop.models.crud import crud_approval_request
+
+            cancelled = crud_approval_request.cancel_pending_for_execution(
+                self.db,
+                execution_id=str(self.execution_log.id),
+                reason=(
+                    f"{crud_approval_request.EXECUTION_ENDED_CANCEL_REASON} "
+                    f"Execution status: {status}."
+                ),
+            )
+        except Exception:
+            logger.exception(
+                "Could not cancel pending approvals for terminal execution %s",
+                getattr(self.execution_log, "id", "unknown"),
+            )
+            return
+        if cancelled:
+            logger.info(
+                "Cancelled %s pending approval(s) on terminal execution %s (%s)",
+                cancelled,
+                self.execution_log.id,
+                status,
+            )
 
     def _emit_execution_finished_webhook(
         self, status: str, failure_category: Optional[str]
@@ -5959,6 +7052,71 @@ class FlowExecutionOrchestrator:
             park.get("compute_seconds"),
         )
 
+    async def _write_pull_request_back_to_jira(
+        self, result: Optional[Dict[str, Any]] = None
+    ) -> bool:
+        """Comment and link the opened pull request on the triggering Jira issue.
+
+        Runs only when the trigger was a Jira issue event and the execution
+        recorded a pull request URL. Never raises.
+
+        Args:
+            result: Terminal result, when the caller has it.
+
+        Returns:
+            True when the comment was posted, so the generic "PR opened"
+            notification does not comment the same URL a second time.
+        """
+        try:
+            from preloop.services.flow_execution_notifications import (
+                extract_opened_pr_url,
+            )
+            from preloop.services.jira_pr_writeback import (
+                jira_issue_key,
+                write_pull_request_to_jira,
+            )
+
+            snapshot = getattr(self.execution_log, "trigger_event_details", None)
+            issue_key = jira_issue_key(snapshot) or jira_issue_key(
+                self.trigger_event_data
+            )
+            if not issue_key:
+                return False
+            payload = (
+                result
+                if isinstance(result, dict)
+                else getattr(self.execution_log, "result", None)
+            )
+            payload = payload if isinstance(payload, dict) else {}
+            opened = self._opened_pr or {}
+            pr_url = extract_opened_pr_url(payload) or opened.get("url")
+            if not pr_url:
+                return False
+            branch = payload.get("pr_source_branch") or opened.get("branch")
+            client = await self._get_tracker_client_for_status()
+            outcome = await write_pull_request_to_jira(
+                jira_client=client,
+                issue_key=issue_key,
+                pr_url=pr_url,
+                branch=branch,
+                execution_id=str(self.execution_log.id),
+            )
+            logger.info(
+                "Jira write-back for %s: comment=%s remote_link=%s skipped=%s",
+                issue_key,
+                outcome.comment_posted,
+                outcome.remote_link_written,
+                outcome.skipped_reason,
+            )
+            return outcome.comment_posted
+        except Exception:
+            logger.warning(
+                "Jira pull request write-back failed for execution %s",
+                getattr(self.execution_log, "id", "unknown"),
+                exc_info=True,
+            )
+            return False
+
     async def _notify_terminal(
         self,
         status: str,
@@ -5995,6 +7153,14 @@ class FlowExecutionOrchestrator:
             except Exception:
                 logger.exception("Issue lifecycle completion needs reconciliation")
             try:
+                from preloop.services.issue_cost_rollup import (
+                    record_execution_finished_safely,
+                )
+
+                record_execution_finished_safely(self.db, self.execution_log.id)
+            except Exception:
+                logger.exception("Issue cost rollup needs a rebuild")
+            try:
                 from preloop.services.security_maintenance_runtime import (
                     maintenance_execution_finished,
                 )
@@ -6019,6 +7185,9 @@ class FlowExecutionOrchestrator:
                     "Could not resume the parent of execution %s; the sweep will retry",
                     self.execution_log.id,
                 )
+            # A Jira-triggered run that opened a pull request writes it back
+            # onto the issue whatever flow.notifications says (issue #957).
+            jira_comment_posted = await self._write_pull_request_back_to_jira(result)
             notifications = getattr(self.flow, "notifications", None)
             if not notifications:
                 return
@@ -6043,6 +7212,8 @@ class FlowExecutionOrchestrator:
                 trigger_event_details=trigger_details,
                 result=result_payload if isinstance(result_payload, dict) else None,
                 tracker_client=tracker_client,
+                # The Jira write-back already commented the PR URL.
+                skip_success_comment=jira_comment_posted,
             )
         except Exception:
             logger.warning(
@@ -6182,9 +7353,12 @@ class FlowExecutionOrchestrator:
 
         The safety boundary is the container's post-execution block (git push,
         pull-request/merge-request creation), which the agent entrypoints run
-        only when the agent process exited ``0``. A non-zero exit therefore
-        means no external side effect was produced by the container and the
-        attempt can be repeated safely. Anything else — an exit code of 0, an
+        only when the agent process exited ``0``. A non-zero exit usually
+        means no external side effect was produced by the container, but not
+        when the block itself failed after pushing (it exits non-zero too), so
+        publication evidence is checked as well: a bound PR, the fresh branch
+        on the remote, or the block's push / PR-create lines in the tail (see
+        :meth:`_publication_side_effect_evidence`). Anything else — an exit code of 0, an
         unknown exit code, or side effects already recorded on the timeline —
         is treated as unsafe, because re-running it risks a duplicate comment,
         push or pull request. A wrong retry is worse than no retry.
@@ -6205,6 +7379,13 @@ class FlowExecutionOrchestrator:
 
         if self.execution_logger.get_actions_taken():
             return "the agent already recorded actions; retrying could repeat them"
+
+        published = self._publication_side_effect_evidence(agent_result)
+        if published:
+            return (
+                "the post-execution publication block already ran "
+                f"({published}); relaunching would redo pushed work"
+            )
 
         if not self._failure_is_transient(agent_result):
             return "the failure is not a transient upstream failure"
@@ -6334,6 +7515,12 @@ class FlowExecutionOrchestrator:
                     )
                 break
 
+            if agent_result.get("status") == "FAILED":
+                # Side-effect evidence for the retry boundary: the PR bound
+                # by branch lookup, or the fresh branch now on the remote.
+                await self._bind_published_pr_by_branch()
+                if self._opened_pr is None:
+                    await self._probe_remote_branch_published()
             reason = self._retry_decision(agent_result)
             if reason is not None:
                 logger.info(
@@ -6475,8 +7662,9 @@ class FlowExecutionOrchestrator:
             )
         git_config: dict[str, Any] = {}
         flow = getattr(self, "flow", None)
-        if flow is not None and isinstance(flow.git_clone_config, dict):
-            git_config = dict(flow.git_clone_config)
+        effective_config = self._effective_git_clone_config()
+        if flow is not None and isinstance(effective_config, dict):
+            git_config = dict(effective_config)
         policy = getattr(self, "_isolated_publication_policy", None)
         clone_shas: dict[str, str] = {}
         requested_pins: dict[str, str] = {}
@@ -6903,6 +8091,126 @@ class FlowExecutionOrchestrator:
                                 {"reason": str(exc)},
                             )
 
+    def _resolve_backport_plan(self) -> Optional["BackportPlan"]:
+        """The flow's backport plan, or None for an ordinary agent flow.
+
+        Raises:
+            BackportConfigError: The block is enabled but invalid. Raised
+                rather than ignored so a misconfigured backport flow fails
+                instead of running an agent nobody asked for.
+        """
+        from preloop.services.backport import resolve_backport_plan
+
+        if self.flow is None:
+            return None
+        return resolve_backport_plan(getattr(self.flow, "git_clone_config", None))
+
+    async def _run_backport_within_budget(self, plan: "BackportPlan") -> Dict[str, Any]:
+        """Run the backport under the flow's wall-clock budget.
+
+        The agent path enforces ``timeout_seconds`` in its monitor, which a
+        backport never reaches, so the same budget is applied here. A run cut
+        short keeps whatever it already pushed or opened, and a retry picks
+        that work up (branch names are deterministic).
+
+        Args:
+            plan: The flow's validated backport plan.
+
+        Returns:
+            The backport result, or a FAILED timeout result.
+        """
+        budget = self._execution_timeout_budget()
+        try:
+            async with asyncio.timeout(budget.seconds):
+                return await self._run_backport(plan)
+        except TimeoutError:
+            message = budget.timeout_message()
+            return {
+                "status": "FAILED",
+                "output_summary": f"Backport did not finish: {message}",
+                "error_message": message,
+                "failure_category": FAILURE_CATEGORY_TIMEOUT,
+                "result": {"backport": {"error": message, "targets": []}},
+            }
+
+    async def _run_backport(self, plan: "BackportPlan") -> Dict[str, Any]:
+        """Run the control-plane backport and shape it like an agent result.
+
+        Args:
+            plan: The flow's validated backport plan.
+
+        Returns:
+            A dict the terminal path of :meth:`run` understands: ``status``,
+            ``output_summary``, ``error_message``, ``failure_category`` and
+            ``result`` (the per-target report under ``backport``).
+        """
+        from preloop.models.crud import crud_tracker
+        from preloop.services.backport import (
+            BackportEventError,
+            agent_result_for,
+            agent_result_for_error,
+            event_base_branch,
+            extract_merged_change,
+            run_backport,
+        )
+        from preloop.services.backport_hosts import (
+            BackportHostError,
+            backport_host_for,
+        )
+
+        # Defense in depth: the trigger service already refuses these events.
+        if event_base_branch(self.trigger_event_data) != plan.source_branch:
+            return agent_result_for_error(
+                "the event is not a merge into the configured source branch "
+                f"{plan.source_branch}"
+            )
+        try:
+            change = extract_merged_change(self.trigger_event_data)
+        except BackportEventError as error:
+            return agent_result_for_error(str(error))
+
+        tracker_id = self.trigger_event_data.get("tracker_id")
+        tracker = crud_tracker.get(self.db, id=tracker_id) if tracker_id else None
+        if tracker is None:
+            return agent_result_for_error("the triggering tracker was not found")
+        try:
+            backport_host_for(tracker.tracker_type, None)
+        except BackportHostError as error:
+            return agent_result_for_error(str(error))
+
+        client = await self._get_tracker_client_for_status()
+        if client is None:
+            return agent_result_for_error(
+                "no tracker client could be resolved for the triggering repository"
+            )
+        host = backport_host_for(tracker.tracker_type, client)
+        token = await resolve_tracker_git_token(tracker)
+
+        git_config = getattr(self.flow, "git_clone_config", None)
+        if not isinstance(git_config, dict):
+            git_config = {}
+        report = await run_backport(
+            plan,
+            change,
+            host,
+            token=token,
+            committer_name=str(git_config.get("git_user_name") or "Preloop"),
+            committer_email=str(git_config.get("git_user_email") or "git@preloop.ai"),
+        )
+        if report.comment_status == "failed":
+            await self._emit_execution_warning(
+                "Backport summary comment could not be posted on the original "
+                f"pull request: {report.comment_error}",
+            )
+        for item in report.targets:
+            if item.review_request_error:
+                await self._emit_execution_warning(
+                    f"Backport to {item.target_branch}: the review request "
+                    f"failed ({item.review_request_error}). The pull request "
+                    "stays open.",
+                )
+        return agent_result_for(report)
+
     async def run(self):
         """
         Execute the flow through its full lifecycle.
@@ -6948,26 +8256,41 @@ class FlowExecutionOrchestrator:
             # Stage 3: Mark as initializing
             await self._update_execution_log(status="INITIALIZING")
 
-            # Stage 3: Prepare execution context
-            execution_context = await self._prepare_execution_context()
+            # Backport flows (issue #961) run no agent: the control plane
+            # cherry-picks the merged change and opens the pull requests, so
+            # a conflict can never be "resolved" by a model.
+            backport_plan = self._resolve_backport_plan()
+            if backport_plan is not None:
+                await self._update_execution_log(
+                    status="RUNNING",
+                    resolved_input_prompt=(
+                        "Backport (no agent): cherry-pick the merged change "
+                        f"from {backport_plan.source_branch} onto "
+                        + ", ".join(backport_plan.target_branches)
+                    ),
+                )
+                agent_result = await self._run_backport_within_budget(backport_plan)
+            else:
+                # Stage 3: Prepare execution context
+                execution_context = await self._prepare_execution_context()
 
-            # Store resolved prompt for debugging/audit and mark as STARTING
-            await self._update_execution_log(
-                status="STARTING",
-                resolved_input_prompt=execution_context["prompt"],
-            )
+                # Store resolved prompt for debugging/audit and mark as STARTING
+                await self._update_execution_log(
+                    status="STARTING",
+                    resolved_input_prompt=execution_context["prompt"],
+                )
 
-            # Stages 4 and 5: start the agent and monitor it, retrying the
-            # whole attempt when the upstream model provider failed in a way
-            # that another attempt could plausibly survive.
-            agent_result, session_reference = await self._run_agent_with_retries(
-                execution_context
-            )
+                # Stages 4 and 5: start the agent and monitor it, retrying the
+                # whole attempt when the upstream model provider failed in a
+                # way that another attempt could plausibly survive.
+                agent_result, session_reference = await self._run_agent_with_retries(
+                    execution_context
+                )
 
-            # Fold private-runner logs before terminal binding. Isolated
-            # publication still ignores agent-controlled PR markers.
-            await self._replay_persisted_runner_logs()
-            await self._finish_isolated_publication(agent_result)
+                # Fold private-runner logs before terminal binding. Isolated
+                # publication still ignores agent-controlled PR markers.
+                await self._replay_persisted_runner_logs()
+                await self._finish_isolated_publication(agent_result)
 
             # Update execution log with final results including detailed logs
             final_status = agent_result.get("status", "FAILED")
@@ -7084,6 +8407,10 @@ class FlowExecutionOrchestrator:
             # reaches Python; bind it here, before the refresh below, so the
             # merged result keeps pr_url for comment-driven resume.
             self._bind_opened_pr(output_summary)
+            # Marker missing: the tracker is the source of truth for the PR
+            # the deterministic post-exec block opened, whatever the status.
+            if self._opened_pr is None:
+                await self._bind_published_pr_by_branch()
             # Same channel pattern for the native CLI session id: rescued
             # from the output summary when the live stream missed it.
             self._bind_cli_session(output_summary)

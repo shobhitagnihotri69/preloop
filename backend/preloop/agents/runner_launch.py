@@ -75,15 +75,27 @@ async def prepare_runner_delivery(
     public_job = {key: value for key, value in job.items() if key != "_publication"}
     try:
         if job.get("completion_protocol") == "host_exec":
-            from preloop.services.host_exec import host_exec_profile_name
+            from preloop.services.host_exec import (
+                host_exec_profile_name,
+                is_host_exec_agent_type,
+            )
 
             if (
-                job.get("agent_type") != "cursor"
+                not is_host_exec_agent_type(job.get("agent_type"))
                 or not host_exec_profile_name(job)
                 or "launch_version" in job
             ):
                 raise ValueError("Invalid native host lease")
-            return dict(job)
+            from preloop.services.host_exec_delivery import (
+                HostExecDeliveryError,
+                hydrate_host_exec_job,
+            )
+
+            try:
+                return await hydrate_host_exec_job(db, dict(job))
+            except HostExecDeliveryError as exc:
+                # Messages are authored here, never upstream text.
+                return {**public_job, "launch_error": str(exc)[:512]}
         state = job.get("_publication")
         if state is not None:
             public_job["publication"] = public_publication_descriptor(state)

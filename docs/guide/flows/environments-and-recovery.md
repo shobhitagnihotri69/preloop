@@ -1,5 +1,7 @@
 # Execution environments and checkpoint recovery
 
+Editions: OSS, Cloud, Enterprise. Unless stated otherwise, everything on this page ships in OSS.
+
 Default images are generic harness/toolchain images. They do not bundle the
 Preloop application, PostgreSQL, or another customer's application. A project can
 supply its own image and dependencies. An optional hosted environment profile
@@ -18,7 +20,8 @@ copy of the application.
 
 `environments/preloop/Dockerfile` is a Preloop-specific example and integration
 fixture, not a default agent image. It extends the existing `Dockerfile.dev` image
-with pinned Codex, Playwright/Chromium and a PostgreSQL Python driver. Build
+with pinned Codex, Playwright/Chromium, a PostgreSQL Python driver, and a
+distro Perl toolchain (`perlver`, `perlcritic`, and `prove`). Build
 from the repository root so the hash-pinned `tools/` lockfile and
 `requirements.txt` copy in. Build the dev image first, then pass its digest as
 `DEV_IMAGE`. Register the resulting image digest. `environments/preloop/profile.json.example` contains
@@ -71,15 +74,118 @@ steps are joined with newlines). Issue acceptance command IDs must also appear
 in the verification policy. Capability readiness is not test-result attestation;
 agent-sandbox files and log markers cannot authorize isolated publication.
 
+## Backend and frontend tests in the image
+
+The image built from `environments/preloop/Dockerfile` runs the Preloop
+test suites from a checkout with no network and no install step.
+
+- `/opt/preloop-tests` is a virtualenv installed from
+  `.github/requirements/app-dev.txt`, the hash-pinned lock the CI backend
+  shards install (runtime dependencies plus the `dev` extra, including
+  pytest). It is on `PATH`. The checkout itself is not installed.
+- `preloop-pytest [pytest args]` runs pytest from the checkout root with
+  `backend/` on `PYTHONPATH`. When `DATABASE_URL` is unset it starts a
+  throwaway PostgreSQL 16 cluster under `/tmp` (pgvector 0.8.6, built in
+  the image because Ubuntu's 0.6.0 lacks `subvector()`), applies the
+  checkout's migrations with `scripts/init_db.py`, and reapplies them only
+  when `backend/preloop/models/alembic` changes. With `DATABASE_URL` set
+  (the backend profile's sidecar) it uses that database as is. Tests,
+  migrations and `init_db.py` run under an environment allowlist: provider
+  keys are `mock_key` and agent API, gateway and git tokens are dropped.
+  It works as root, uid 1000 and uid 10000 (the Docker harness user, which
+  the image gives a passwd entry so `initdb` can run).
+- `preloop-frontend-deps` copies the image's `frontend/node_modules`
+  into the checkout when `frontend/package-lock.json` is byte-identical to
+  the one the image was built from, then `cd frontend && npm test` (or
+  `npx --no-install web-test-runner <file>`) runs offline against the
+  frontend's own pinned headless Chromium. On a different lock it exits 65; run
+  `npm --prefix frontend ci`, which needs registry access.
+- A pull request that changes `app-dev.txt` makes `preloop-pytest` warn
+  that the baked venv may lack a new dependency. Rebuild the image to pick
+  it up.
+
+`environments/preloop/python-venv-smoke.sh` is the build gate (imports
+only). Given a checkout path it runs a database-backed backend test file
+and a frontend test file offline:
+
+```text
+docker run --rm --network none --user 10000:10000 -e HOME=/tmp \
+  -v "$PWD:/src:ro" <image> /opt/preloop-pip/python-venv-smoke.sh /src
+```
+
+`backend/tests/test_preloop_backend_test_venv.py` runs the same command
+when `PRELOOP_ENVIRONMENT_IMAGE` names a built image and skips otherwise.
+The backend venv (about 980 MB), frontend tree (about 280 MB) and second
+headless Chromium (about 270 MB) grow the image from 2.5 GB to 3.8 GB
+unpacked (1.07 GB to 1.52 GB compressed).
+
+## Browser profile
+
+`preloop-browser` in `environments/preloop/profile.json.example` uses the same
+image as the component profile and adds an `egress-proxy` sidecar. The proxy
+contract (listen port, `EGRESS_ALLOWED_ORIGINS`, `EGRESS_ALLOW_PRIVATE_CIDRS`,
+`EGRESS_DENY_PRIVATE`, and `GET /healthz`) is the one in
+`environments/egress-proxy/README.md`. `DependencyService.env` already stores
+that service environment on the registered profile. A flow only selects the
+profile identifier, so the origin allowlist is fixed per profile rather than
+copied from `agent_config`.
+
+`environments/preloop/browser/enable.sh` reads `PRELOOP_BROWSER_PROXY`
+(`http://egress-proxy:3128` on Docker, `http://127.0.0.1:3128` on Kubernetes),
+renders `playwright-mcp.config.json`, and registers a `browser` MCP server for
+`PRELOOP_HARNESS` (`codex` or `claude`). Codex reads
+`~/.codex/config.toml` (`[mcp_servers.browser]` with `command` and `args`).
+The hosted Codex executor writes `[mcp_servers.preloop]` from
+`backend/preloop/agents/codex.py` and would replace that file; setup also
+leaves `~/.codex/preloop-browser-mcp.toml`, which the executor appends after
+its own write. There is no Claude Code writer in this repository; Claude Code
+reads `.mcp.json` in the checkout, and `enable.sh` merges the `browser` entry
+there. The pinned package is `@playwright/mcp@0.0.82`, installed in the profile
+image next to Playwright `1.64.0-alpha-1789764292000` (the build that package
+bundles). The MCP command is the image binary
+`/opt/preloop-env-tools/node_modules/.bin/playwright-mcp` with `--config`,
+`--proxy-server`, `--isolated`, and `--headless`. Setup does not fetch the
+package from the npm registry. `--isolated` starts Chromium with an empty
+profile: no cookies and no operator storage state. The rendered launch args
+also include `--proxy-bypass-list=<-loopback>` so loopback is not a path
+around the proxy. The self-check probes the metadata address, a
+non-allowlisted origin, and a listener on `127.0.0.1`.
+
+The example profile does not list `test_commands`. A flow that gates
+verification on command IDs must add those IDs to the registered profile;
+otherwise readiness reports `environment_command_missing`.
+
+Chromium is started with the two flags the proxy README requires:
+`--proxy-server` and `--host-resolver-rules=MAP * ~NOTFOUND , EXCLUDE
+<proxy host>`. Without them the browser can open connections that never pass
+the allowlist. `--no-sandbox` is added only when the probe runs as uid 0.
+
+The proxy enforces origins. The harness MCP entry and Preloop tool permissions
+decide which tools the agent may call. Tool selection is not a network
+boundary. `enable.sh` then runs `selfcheck.sh`, which requires
+`$PRELOOP_BROWSER_PROXY/healthz` to answer `ok` and launches Chromium once
+against `http://169.254.169.254/` and `https://example.org/`. Both probes must
+fail with a proxy error (`egress_denied` or a Chromium proxy/tunnel error).
+Any other outcome, including a missing proxy variable, a failed health check,
+or a probe that loads, exits `browser_egress_not_enforced` and aborts profile
+setup.
+
+Routing this browser MCP server through the Preloop firewall is a follow-up.
+The control plane cannot reach the execution network to sit on that path
+today. Issue #885 would then add timeline rows for those tool calls.
+
 ## Durable hosted artifacts
 
 Enable `FLOW_ARTIFACT_DIRECT_UPLOAD` when the runner can reach `PRELOOP_URL`.
-The [checkpoint Helm overlay](../../../helm/preloop/values-native-checkpoints.yaml)
+The [checkpoint Helm overlay](https://github.com/preloop/preloop/blob/main/helm/preloop/values-native-checkpoints.yaml)
 enables direct uploads with a 64 MiB compressed cap and matching 80 MiB proxy
 limits. Merge its `extraEnv` entries with existing installation values.
 Without it, the legacy snapshot path remains in effect, including the 2 MiB
 Kubernetes log-channel cap. Raising `WORKSPACE_SNAPSHOT_MAX_BYTES` alone does
-not raise that log cap. A skipped legacy snapshot does not mean setup failed.
+not raise that log cap. `FLOW_EVIDENCE_LOG_PLAINTEXT=false` refuses that log
+channel (the snapshot is then skipped with `plaintext_disabled`); see
+[evidence storage](evidence-storage.md). A skipped legacy snapshot does not
+mean setup failed.
 With direct upload enabled, workspace
 checkpoints travel through authenticated HTTP, never the pod log channel.
 The service validates compressed and expanded size, archive paths and file
@@ -106,8 +212,11 @@ modification times and membership for changes during capture, declining a busy
 snapshot rather than committing inconsistent state. The last completed
 checkpoint survives process/pod loss; writes after that checkpoint can be lost.
 Controlled exits attempt a final checkpoint. Before legacy wrapper publication,
-a failed checkpoint blocks publication. A trusted external publisher must make
-this checkpoint barrier part of its handoff as well.
+a failed checkpoint blocks publication, except when the archive exceeds the
+storage cap: that case logs `PRELOOP_CHECKPOINT skipped checkpoint_oversized`,
+exits 0, and leaves the last completed checkpoint as the resume point. A
+trusted external publisher must make this checkpoint barrier part of its
+handoff as well.
 
 Restore occurs before setup or agent startup on Docker and Kubernetes. It logs
 the age of the checkpoint it recovered (`PRELOOP_CHECKPOINT restored

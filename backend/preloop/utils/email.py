@@ -98,14 +98,33 @@ def send_email(
         raise EmailError(f"Failed to send email: {str(e)}")
 
 
-def send_verification_email(user_email: str, token: str) -> None:
+def _for_user_lines(username: Optional[str], action: str) -> tuple[str, str]:
+    """Text and HTML lines naming the user a link acts on (empty without one).
+
+    One address can hold a user in several accounts, and each gets its own
+    message. Naming the username tells the reader which account a link is for.
+    """
+    if not username:
+        return "", ""
+    return (
+        f"This link {action} for the user {username}.\n",
+        f"<p>This link {action} for the user <strong>{html.escape(username)}"
+        "</strong>.</p>",
+    )
+
+
+def send_verification_email(
+    user_email: str, token: str, username: Optional[str] = None
+) -> None:
     """Send a verification email to a newly registered user.
 
     Args:
         user_email: The user's email address.
         token: The verification token.
+        username: The user the link verifies, named in the message.
     """
     verification_link = f"{PRELOOP_URL}/verify-email?token={token}"
+    for_text, for_html = _for_user_lines(username, "verifies the address")
 
     subject = f"Verify your {APP_NAME} account"
     text_body = f"""
@@ -114,7 +133,7 @@ def send_verification_email(user_email: str, token: str) -> None:
     Please verify your email address by clicking the link below:
 
     {verification_link}
-
+    {for_text}
     If you didn't register for {APP_NAME}, please ignore this email.
 
     Thank you,
@@ -127,6 +146,7 @@ def send_verification_email(user_email: str, token: str) -> None:
         <h2>Welcome to {APP_NAME}!</h2>
         <p>Please verify your email address by clicking the link below:</p>
         <p><a href="{verification_link}">Verify your email</a></p>
+        {for_html}
         <p>If you didn't register for {APP_NAME}, please ignore this email.</p>
         <p>Thank you,<br>The {APP_NAME} Team</p>
     </body>
@@ -136,14 +156,19 @@ def send_verification_email(user_email: str, token: str) -> None:
     send_email(user_email, subject, text_body, html_body)
 
 
-def send_password_reset_email(user_email: str, token: str) -> None:
+def send_password_reset_email(
+    user_email: str, token: str, username: Optional[str] = None
+) -> None:
     """Send a password reset email.
 
     Args:
         user_email: The user's email address.
         token: The password reset token.
+        username: The user whose password the link resets, named in the
+            message.
     """
     reset_link = f"{PRELOOP_URL}/reset-password?token={token}"
+    for_text, for_html = _for_user_lines(username, "resets the password")
 
     subject = f"Reset your {APP_NAME} password"
     text_body = f"""
@@ -152,7 +177,7 @@ def send_password_reset_email(user_email: str, token: str) -> None:
     Please click the link below to set a new password:
 
     {reset_link}
-
+    {for_text}
     If you didn't request a password reset, please ignore this email.
 
     Thank you,
@@ -166,6 +191,7 @@ def send_password_reset_email(user_email: str, token: str) -> None:
         <p>You have requested to reset your {APP_NAME} password.</p>
         <p>Please click the link below to set a new password:</p>
         <p><a href="{reset_link}">Reset your password</a></p>
+        {for_html}
         <p>If you didn't request a password reset, please ignore this email.</p>
         <p>Thank you,<br>The {APP_NAME} Team</p>
     </body>
@@ -413,6 +439,7 @@ async def send_approval_request_email(
     agent_reasoning: Optional[str] = None,
     summary: Optional[str] = None,
     agent_name: Optional[str] = None,
+    runtime_session_id: Optional[str] = None,
 ) -> None:
     """Send an approval request email to an approver.
 
@@ -426,6 +453,7 @@ async def send_approval_request_email(
         agent_name: The agent that asked, when known. An approver reading an
             inbox decides on the caller as much as on the tool, so the name
             goes in the subject and replaces the generic "An AI agent" line.
+        runtime_session_id: Authenticated runtime session for non-native calls.
 
     Raises:
         EmailError: If email sending fails.
@@ -442,9 +470,12 @@ async def send_approval_request_email(
     # Format tool arguments for display (redact sensitive fields)
     import json
 
-    from preloop.utils.redaction import redact_dict
+    from preloop.utils.redaction import omit_preloop_markers, redact_dict
 
-    tool_args = redact_dict(tool_args)
+    from preloop.utils.approval_origin import approval_origin_text
+
+    origin_text = approval_origin_text(tool_args, runtime_session_id)
+    tool_args = omit_preloop_markers(redact_dict(tool_args))
     tool_args_formatted = json.dumps(tool_args, indent=2)
 
     # Plain text version
@@ -475,6 +506,8 @@ async def send_approval_request_email(
 
     if asker:
         text_parts.append(f"Agent: {asker}")
+    if origin_text:
+        text_parts.append(origin_text)
 
     if agent_reasoning:
         text_parts.append("")
@@ -562,6 +595,8 @@ async def send_approval_request_email(
 
     if asker:
         html_parts.append(f"      <p>Agent: {esc(asker)}</p>")
+    if origin_text:
+        html_parts.append(f"      <p>{esc(origin_text)}</p>")
 
     if agent_reasoning:
         html_parts.extend(

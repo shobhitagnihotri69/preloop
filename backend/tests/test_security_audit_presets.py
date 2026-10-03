@@ -347,6 +347,11 @@ class TestSbomVerifyPreset:
         assert "may only summarize" in norm
         assert "Strictly one page" in norm
 
+    def test_minimum_elements_come_from_the_measure_command(self):
+        prompt = _load_preset(PRESET_FILES["SBOM Verify"])["prompt_template"]
+        assert "python -m preloop.cra measure" in prompt
+        assert "are not a supplier" in prompt
+
 
 class TestSbomExploitCheckPreset:
     def test_vuln_sources_and_honest_limits(self):
@@ -360,6 +365,12 @@ class TestSbomExploitCheckPreset:
         assert "kev_snapshot_date" in prompt
         # Never claim absence for unmatchable components.
         assert "unmatchable" in prompt
+
+    def test_cvss_and_epss_are_json_numbers(self):
+        prompt = _load_preset(PRESET_FILES["SBOM Exploit Check"])["prompt_template"]
+        assert "Write cvss and epss as JSON numbers or null, never as strings" in _norm(
+            prompt
+        )
 
     def test_completion_status_contract(self):
         """The vulnscan schema has no top-level verdict, so a required
@@ -396,6 +407,17 @@ class TestReleaseSecurityAuditPreset:
         assert "never guess a baseline" in _norm(prompt)
         assert "api.osv.dev/v1/querybatch" in prompt
         assert "known_exploited_vulnerabilities.json" in prompt
+
+    def test_cvss_and_epss_are_json_numbers(self):
+        prompt = _load_preset(PRESET_FILES["Release Security Audit"])["prompt_template"]
+        assert "Write cvss and epss as JSON numbers or null, never as strings" in _norm(
+            prompt
+        )
+
+    def test_measure_command_and_counted_severities(self):
+        prompt = _load_preset(PRESET_FILES["Release Security Audit"])["prompt_template"]
+        assert "python -m preloop.cra measure" in prompt
+        assert "Count that list" in prompt
 
     def test_designed_for_schedules(self):
         data = _load_preset(PRESET_FILES["Release Security Audit"])
@@ -738,6 +760,13 @@ class TestPerSourceScreeningMatrix:
         assert "source_matrix" in prompt
         assert "screened_by_no_source" in prompt
         assert "evidence/source-matrix.json" in prompt
+
+    def test_release_audit_may_use_types_only_property(self):
+        prompt = _load_preset(PRESET_FILES["Release Security Audit"])["prompt_template"]
+        norm = _norm(prompt)
+        assert "preloop:types_only" in prompt
+        assert "does not itself suppress a finding" in norm
+        assert "VEX statement still does" in norm
 
     def test_git_range_source_screens_vendored_code(self, prompt):
         """OSV commit queries via the vcs_url in enriched purls — the win

@@ -74,6 +74,18 @@ it*, not about severity:
     A command or script the agent ran inside the workspace failed.
 ``agent_error``
     The agent process itself exited non-zero without a classifiable cause.
+``budget_exceeded``
+    The execution crossed a ceiling an operator set on the run itself
+    (``agent_config.limits``): total tokens, USD, or turns. The gateway
+    refuses further model requests once the ceiling is reached and the run
+    ends here. Unlike ``provider_billing`` (the upstream says "pay us"), this
+    is the account's own per-run cap doing its job.
+``model_stream_idle``
+    The execution exceeded its wall-clock budget while the model stream was
+    silent: the harness hit its stream idle timeout, reconnected, and the
+    model had produced nothing since (issue #872). Distinct from ``timeout``
+    because the fix is a shorter ``agent_config.stream_idle_timeout_seconds``
+    or another model or provider, not a larger budget.
 ``timeout``
     The execution exceeded its wall-clock budget.
 ``cancelled``
@@ -88,6 +100,7 @@ from __future__ import annotations
 import re
 from typing import Any, Mapping, Optional
 
+from preloop.services.stream_stall import STALL_MESSAGE_MARKER
 from preloop.services.upstream_errors import (
     ERROR_CLASS_HOSTED_TARIFF_UNCONFIGURED,
     ERROR_CLASS_NETWORK,
@@ -105,6 +118,7 @@ FAILURE_CATEGORY_MODEL_TRANSIENT = "model_transient"
 FAILURE_CATEGORY_MODEL_AUTH = "model_auth"
 FAILURE_CATEGORY_MODEL_QUOTA = "model_quota"
 FAILURE_CATEGORY_PROVIDER_BILLING = "provider_billing"
+FAILURE_CATEGORY_BUDGET_EXCEEDED = "budget_exceeded"
 FAILURE_CATEGORY_MODEL_CONFIG = "model_config"
 FAILURE_CATEGORY_NO_CONFIRMATION = "no_confirmation"
 FAILURE_CATEGORY_AGENT_NO_PROGRESS = "agent_no_progress"
@@ -113,6 +127,7 @@ FAILURE_CATEGORY_VERIFICATION_FAILED = "verification_failed"
 FAILURE_CATEGORY_VERIFICATION_BLOCKED = "verification_blocked"
 FAILURE_CATEGORY_TOOL_ERROR = "tool_error"
 FAILURE_CATEGORY_AGENT_ERROR = "agent_error"
+FAILURE_CATEGORY_MODEL_STREAM_IDLE = "model_stream_idle"
 FAILURE_CATEGORY_TIMEOUT = "timeout"
 FAILURE_CATEGORY_CANCELLED = "cancelled"
 FAILURE_CATEGORY_UNKNOWN = "unknown"
@@ -123,6 +138,7 @@ FAILURE_CATEGORIES = (
     FAILURE_CATEGORY_MODEL_TRANSIENT,
     FAILURE_CATEGORY_MODEL_AUTH,
     FAILURE_CATEGORY_PROVIDER_BILLING,
+    FAILURE_CATEGORY_BUDGET_EXCEEDED,
     FAILURE_CATEGORY_MODEL_QUOTA,
     FAILURE_CATEGORY_MODEL_CONFIG,
     FAILURE_CATEGORY_NO_CONFIRMATION,
@@ -132,6 +148,7 @@ FAILURE_CATEGORIES = (
     FAILURE_CATEGORY_VERIFICATION_BLOCKED,
     FAILURE_CATEGORY_TOOL_ERROR,
     FAILURE_CATEGORY_AGENT_ERROR,
+    FAILURE_CATEGORY_MODEL_STREAM_IDLE,
     FAILURE_CATEGORY_TIMEOUT,
     FAILURE_CATEGORY_CANCELLED,
     FAILURE_CATEGORY_UNKNOWN,
@@ -190,6 +207,15 @@ _RUNNER_ERROR_RE = re.compile(
     r"|imagepullbackoff|errimagepull|createcontainerconfigerror",
     re.IGNORECASE,
 )
+# "Execution timed out after 900 seconds (this flow's timeout budget) while
+# waiting on a silent model stream." Preloop's own sentence, written only when
+# the timed-out run's log shows the stream was still idle (see
+# preloop.services.stream_stall). Matched before the plain timeout rule. Built
+# from the marker the message is written with, so the two cannot drift.
+_MODEL_STREAM_IDLE_RE = re.compile(
+    r"timed out after \d+ seconds[^\n]{0,80}" + re.escape(STALL_MESSAGE_MARKER),
+    re.IGNORECASE,
+)
 # "Execution timed out after 3600 seconds"
 _TIMEOUT_RE = re.compile(
     r"execution timed out after|timed out after \d+ seconds|deadline exceeded",
@@ -233,6 +259,15 @@ _PROVIDER_BILLING_RE = re.compile(
 # reconnecting five times against what it read as a provider outage.
 _HOSTED_TARIFF_RE = re.compile(
     r"hosted_tariff_unconfigured|has no operator tariff",
+    re.IGNORECASE,
+)
+# "Execution budget exceeded: execution token ceiling reached: 2100000 tokens
+# used of 2000000 allowed." Preloop's own refusal when a run crosses the
+# per-execution ceiling (agent_config.limits). Matched structurally, before
+# the provider rules: the agent may also log an upstream 429/5xx it produced
+# while retrying the same refused request, and the money rule is the cause.
+_EXECUTION_BUDGET_RE = re.compile(
+    r"execution budget exceeded|execution [_a-z]+ ceiling reached",
     re.IGNORECASE,
 )
 # "zai does not support parameters: ['parallel_tool_calls']",
@@ -340,12 +375,14 @@ _AGENT_ERROR_RE = re.compile(
 _STRUCTURAL_MESSAGE_RULES = (
     (_AGENT_NO_PROGRESS_RE, FAILURE_CATEGORY_AGENT_NO_PROGRESS),
     (_HOSTED_TARIFF_RE, FAILURE_CATEGORY_MODEL_CONFIG),
+    (_EXECUTION_BUDGET_RE, FAILURE_CATEGORY_BUDGET_EXCEEDED),
     (_PROVIDER_BILLING_RE, FAILURE_CATEGORY_PROVIDER_BILLING),
     (_SETUP_FAILED_RE, FAILURE_CATEGORY_SETUP_FAILED),
     (_VERIFICATION_BLOCKED_RE, FAILURE_CATEGORY_VERIFICATION_BLOCKED),
     (_VERIFICATION_FAILED_RE, FAILURE_CATEGORY_VERIFICATION_FAILED),
     (_RUNNER_CONFLICT_RE, FAILURE_CATEGORY_RUNNER_CONFLICT),
     (_RUNNER_ERROR_RE, FAILURE_CATEGORY_RUNNER_ERROR),
+    (_MODEL_STREAM_IDLE_RE, FAILURE_CATEGORY_MODEL_STREAM_IDLE),
     (_TIMEOUT_RE, FAILURE_CATEGORY_TIMEOUT),
     (_CANCELLED_RE, FAILURE_CATEGORY_CANCELLED),
     (_NO_CONFIRMATION_RE, FAILURE_CATEGORY_NO_CONFIRMATION),

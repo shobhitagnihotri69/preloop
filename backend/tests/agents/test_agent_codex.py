@@ -217,8 +217,8 @@ class TestCodexBuildScript:
         assert "_post_exec_sleep()" in script
         assert "trap _post_exec_sleep EXIT" in script
 
-    def test_script_always_attaches_preloop_mcp(self):
-        """Empty allowlist still attaches Preloop MCP. Overhead is tools."""
+    def test_script_omits_preloop_mcp_when_allowlists_are_empty(self):
+        """Empty allowlists must not open an MCP session."""
         agent = CodexAgent({})
         bare = agent._build_codex_script(
             {
@@ -227,9 +227,63 @@ class TestCodexBuildScript:
                 "flow_name": "test-flow",
             }
         )
-        assert "[mcp_servers.preloop]" in bare
+        assert "[mcp_servers.preloop]" not in bare
+        assert "rmcp_client = true" not in bare
+        assert 'echo "MCP Server: not attached"' in bare
         assert "preloop.security.mcp_server" not in bare
         assert "repo-audit" not in bare
+
+    def test_script_attaches_preloop_mcp_when_a_tool_is_allowed(self):
+        """A non-empty allowlist still configures the Preloop MCP server."""
+        agent = CodexAgent({})
+        script = agent._build_codex_script(
+            {
+                "prompt": "test",
+                "execution_id": "exec-1",
+                "flow_name": "test-flow",
+                "allowed_mcp_tools": [{"name": "get_pull_request"}],
+            }
+        )
+        assert "rmcp_client = true" in script
+        assert "[mcp_servers.preloop]" in script
+        assert 'echo "MCP Server: $PRELOOP_MCP_URL"' in script
+
+    def test_read_only_sandbox_does_not_pass_yolo(self):
+        """sandbox_type read-only is the platform shell lock."""
+        agent = CodexAgent({})
+        assert agent.live_nudge_command is None
+        script = agent._build_codex_script(
+            {
+                "prompt": "test",
+                "execution_id": "exec-1",
+                "flow_name": "test-flow",
+                "agent_config": {"sandbox_type": "read-only"},
+                "completion_nudge_enabled": True,
+            }
+        )
+        assert script.count("--sandbox read-only") >= 3
+        assert script.count("--disable shell_tool") >= 3
+        assert 'approval_policy = "never"' in script
+        assert 'sandbox_mode = "read-only"' in script
+        assert "--yolo" not in script
+        assert "--sandbox read-only" in agent.live_nudge_command
+        assert "--disable shell_tool" in agent.live_nudge_command
+        assert "--yolo" not in agent.live_nudge_command
+
+    def test_exec_sandbox_keeps_yolo(self):
+        """The preset default sandbox_type exec still bypasses the sandbox."""
+        agent = CodexAgent({})
+        script = agent._build_codex_script(
+            {
+                "prompt": "test",
+                "execution_id": "exec-1",
+                "flow_name": "test-flow",
+                "agent_config": {"sandbox_type": "exec"},
+            }
+        )
+        assert "--yolo" in script
+        assert "--sandbox read-only" not in script
+        assert "approval_policy" not in script
 
     def test_script_contains_codex_exec_command(self):
         """Script runs codex exec with correct flags."""
@@ -262,6 +316,16 @@ class TestCodexBuildScript:
         }
         script = agent._build_codex_script(context)
         assert "git" in script.lower()
+
+    def test_browser_mcp_fragment_is_appended_after_config_write(self):
+        """Codex replaces config.toml; the browser fragment is attached after."""
+        agent = CodexAgent({})
+        script = agent._build_codex_script(
+            {"prompt": "test", "execution_id": "exec-1", "flow_name": "test-flow"}
+        )
+        assert script.index("cat > ~/.codex/config.toml") < script.index(
+            "preloop-browser-mcp.toml"
+        )
 
 
 class TestCodexAuthConfig:
@@ -328,6 +392,36 @@ class TestCodexAuthConfig:
         assert "stream_max_retries" not in auth_block
         assert "stream_idle_timeout_ms" not in auth_block
 
+    def test_attach_mcp_false_omits_the_server(self):
+        """An empty allowlist must not write an MCP client into config.toml."""
+        agent = CodexAgent({})
+        auth_block = agent._build_codex_auth_config(
+            "deepseek-v4-flash",
+            "openrouter",
+            "https://openrouter.ai/api/v1",
+            attach_mcp=False,
+        )
+        assert "rmcp_client" not in auth_block
+        assert "[mcp_servers.preloop]" not in auth_block
+        assert 'model = "deepseek-v4-flash"' in auth_block
+        assert "request_max_retries = 4" in auth_block
+
+    def test_shell_lock_on_custom_provider_precedes_the_provider_block(self):
+        """Read-only config pins approval and sandbox before the provider."""
+        agent = CodexAgent({})
+        auth_block = agent._build_codex_auth_config(
+            "deepseek-v4-flash",
+            "openrouter",
+            "https://openrouter.ai/api/v1",
+            shell_locked=True,
+        )
+        assert auth_block.index('approval_policy = "never"') < auth_block.index(
+            "[model_providers.openrouter]"
+        )
+        assert auth_block.index('sandbox_mode = "read-only"') < auth_block.index(
+            "[model_providers.openrouter]"
+        )
+
     def test_custom_provider_no_endpoint(self):
         """Custom provider without endpoint omits base_url."""
         agent = CodexAgent({})
@@ -352,6 +446,90 @@ class TestCodexAuthConfig:
         )
         assert 'base_url = "https://review.preloop.ai/openai/v1"' in script
         assert 'model = "google/gemini-2.5-pro"' in script
+
+
+class TestCodexStreamIdleBound:
+    """The stream idle wait is per flow and stays inside the budget (#872)."""
+
+    @staticmethod
+    def _script(agent_config=None, flow_timeout_seconds=None, provider="openrouter"):
+        context = {
+            "prompt": "review",
+            "execution_id": "exec-1",
+            "flow_name": "Manual PR Reviewer",
+            "model_provider": provider,
+            "model_identifier": "deepseek/deepseek-v4-flash",
+            "model_endpoint": "https://openrouter.ai/api/v1",
+            "agent_config": agent_config,
+        }
+        if flow_timeout_seconds is not None:
+            context["flow_timeout_seconds"] = flow_timeout_seconds
+        return CodexAgent({})._build_codex_script(context)
+
+    def test_unset_keeps_the_previous_wait(self):
+        script = self._script({"sandbox_type": "read-only"}, 3600)
+
+        assert "stream_idle_timeout_ms = 600000" in script
+        assert "PRELOOP_STREAM_IDLE_TIMEOUT_SECONDS=600" in script
+
+    def test_flow_setting_is_written_to_the_provider_block(self):
+        script = self._script({"stream_idle_timeout_seconds": 90}, 1800)
+
+        provider_block = script[script.index("[model_providers.openrouter]") :]
+        assert "stream_idle_timeout_ms = 90000" in provider_block
+        assert "stream_idle_timeout_ms = 600000" not in script
+        assert 'echo "PRELOOP_STREAM_IDLE_TIMEOUT_SECONDS=90"' in script
+
+    def test_wait_fits_twice_inside_the_flow_budget(self):
+        """A 600s wait on a 900s run is stopped before it can reconnect."""
+        script = self._script({}, 900)
+
+        assert "stream_idle_timeout_ms = 450000" in script
+
+    def test_gateway_provider_gets_the_same_bound(self):
+        script = CodexAgent({})._build_codex_script(
+            {
+                "prompt": "review",
+                "execution_id": "exec-1",
+                "flow_name": "Manual PR Reviewer",
+                "model_gateway_enabled": True,
+                "model_gateway_provider": "preloop",
+                "model_gateway_model_alias": "deepseek/deepseek-v4-flash",
+                "model_gateway_url": "https://review.preloop.ai/openai/v1",
+                "agent_config": {"stream_idle_timeout_seconds": 120},
+                "flow_timeout_seconds": 1800,
+            }
+        )
+
+        assert "stream_idle_timeout_ms = 120000" in script
+
+    def test_native_openai_keeps_codex_defaults(self):
+        script = self._script(
+            {"stream_idle_timeout_seconds": 90}, 1800, provider="openai"
+        )
+
+        assert "stream_idle_timeout_ms" not in script
+        assert "PRELOOP_STREAM_IDLE_TIMEOUT_SECONDS" not in script
+
+    def test_retry_reason_is_logged_before_codex_runs(self):
+        """Without it, 'Reconnecting... n/m' does not say the stream idled."""
+        script = self._script({}, 1800)
+
+        export = 'export RUST_LOG="${RUST_LOG:-error},codex_core::responses_retry=warn"'
+        assert export in script
+        assert script.index(export) < script.index("| codex exec $CODEX_RESUME_ARGS")
+
+    def test_script_is_valid_bash(self, tmp_path):
+        import shutil
+        import subprocess
+
+        bash = shutil.which("bash")
+        if bash is None:
+            pytest.skip("bash not available")
+        path = tmp_path / "codex.sh"
+        path.write_text(self._script({"stream_idle_timeout_seconds": 90}, 900))
+
+        subprocess.run([bash, "-n", str(path)], check=True)
 
 
 class TestCodexPrepareEnvironment:
@@ -690,4 +868,67 @@ class TestCodexContextLimits:
         )
         assert auth_block.index("model_max_output_tokens") < auth_block.index(
             "[model_providers.preloop]"
+        )
+
+
+class TestCodexReasoningEffort:
+    """A routed effort reaches Codex through config.toml (#851).
+
+    Codex takes its effort from its config file, not from the request, so a
+    flow-level "think harder on this label" has to be written here.
+    """
+
+    def test_a_routed_effort_is_written(self):
+        agent = CodexAgent({})
+        auth_block = agent._build_codex_auth_config(
+            "gpt-5.4", "openai", "", None, "high"
+        )
+        assert 'model_reasoning_effort = "high"' in auth_block
+
+    def test_no_routed_effort_leaves_the_model_default(self):
+        agent = CodexAgent({})
+        auth_block = agent._build_codex_auth_config("gpt-5.4", "openai", "")
+        assert "model_reasoning_effort" not in auth_block
+
+    def test_an_effort_codex_does_not_accept_is_dropped(self, caplog):
+        """A config file Codex refuses to parse would fail the whole run."""
+        agent = CodexAgent({})
+        with caplog.at_level(logging.INFO, logger="preloop.agents.codex"):
+            auth_block = agent._build_codex_auth_config(
+                "gpt-5.4", "openai", "", None, "maximum"
+            )
+        assert "model_reasoning_effort" not in auth_block
+        assert any(
+            "Ignoring reasoning effort" in record.getMessage()
+            for record in caplog.records
+        )
+
+    def test_the_effort_travels_on_the_model_parameters(self):
+        """End to end: what the orchestrator wrote reaches the config."""
+        script = CodexAgent({})._build_codex_script(
+            {
+                "prompt": "test",
+                "execution_id": "exec-1",
+                "flow_name": "test-flow",
+                "model_identifier": "gpt-5.4",
+                "model_provider": "openai",
+                "model_parameters": {"reasoning_effort": "high"},
+            }
+        )
+        assert 'model_reasoning_effort = "high"' in script
+
+    def test_the_effort_sits_beside_the_context_limits(self):
+        agent = CodexAgent({})
+        auth_block = agent._build_codex_auth_config(
+            "gpt-5.4",
+            "preloop",
+            "https://gw.example.com/openai/v1",
+            limits_for_execution({"model_identifier": "gpt-5.4"}),
+            "medium",
+        )
+        assert auth_block.index("model_context_window") < auth_block.index(
+            "model_reasoning_effort"
+        )
+        assert auth_block.index("model_reasoning_effort") < auth_block.index(
+            "rmcp_client = true"
         )

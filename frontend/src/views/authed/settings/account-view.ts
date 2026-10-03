@@ -13,6 +13,7 @@ import '@shoelace-style/shoelace/dist/components/details/details.js';
 import consoleStyles from '../../../styles/console-styles.css?inline';
 import pricingStyles from '../../../styles/pricing-styles.css?inline';
 import { Router } from '../../../router';
+import type { SessionArtifactUsage } from '../../../types';
 import { PLAN_PAGE_PATH } from '../../../utils/premium-features';
 import '@shoelace-style/shoelace/dist/components/input/input.js';
 import '@shoelace-style/shoelace/dist/components/button/button.js';
@@ -137,6 +138,7 @@ export class AccountView extends LitElement {
   @state() private _loading = true;
   @state() private _error: string | null = null;
   @state() private _canManageBilling = false;
+  @state() private _sessionArtifactUsage: SessionArtifactUsage | null = null;
 
   // The 2026 ladder's limits, in the order a buyer weighs them. The legacy
   // keys (api_calls_monthly, ai_calls_monthly, issues_ingested_monthly,
@@ -217,6 +219,27 @@ export class AccountView extends LitElement {
       this.accountOrganization = accountOrganization;
       this.features = features;
       this.organizationName = accountOrganization.organization_name || '';
+
+      try {
+        const usageRes = await fetchWithAuth(
+          '/api/v1/account/session-artifacts/usage'
+        );
+        if (usageRes.ok) {
+          const body = await usageRes.json();
+          const byKind = body?.by_kind;
+          if (
+            typeof body?.used_bytes === 'number' &&
+            typeof body?.budget_bytes === 'number' &&
+            typeof byKind?.screenshot === 'number' &&
+            typeof byKind?.recording === 'number'
+          ) {
+            this._sessionArtifactUsage = body;
+            this._scrollToArtifactStorageWhenLinked();
+          }
+        }
+      } catch {
+        this._sessionArtifactUsage = null;
+      }
 
       // Only fetch billing data for proprietary version
       const isProprietary = features.features['billing'] === true;
@@ -406,7 +429,7 @@ export class AccountView extends LitElement {
       });
 
       this.accountOrganization = updated;
-      this.orgSuccessMessage = 'Organization name saved successfully';
+      this.orgSuccessMessage = 'Account name saved successfully';
       setTimeout(() => (this.orgSuccessMessage = ''), 3000);
     } catch (error) {
       this.orgErrorMessage = (error as Error).message;
@@ -507,6 +530,98 @@ export class AccountView extends LitElement {
    * consequence is thinner analytics detail. This is a product-safety rule
    * from the canonical pricing spec, not a tone preference.
    */
+  /** Format a byte count with binary units. */
+  private _formatBytes(value: number): string {
+    const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
+    let size = value;
+    let unit = 0;
+    while (size >= 1024 && unit < units.length - 1) {
+      size /= 1024;
+      unit += 1;
+    }
+    const text = Number.isInteger(size) ? String(size) : size.toFixed(1);
+    return `${text} ${units[unit]}`;
+  }
+
+  /**
+   * Timeline placeholders for evicted or expired screenshots link here with
+   * `#session-artifact-storage`; bring the card into view once it renders.
+   */
+  private _scrollToArtifactStorageWhenLinked(): void {
+    if (window.location.hash !== '#session-artifact-storage') return;
+    void this.updateComplete.then(() => {
+      this.renderRoot
+        .querySelector('#session-artifact-storage')
+        ?.scrollIntoView({ block: 'start' });
+    });
+  }
+
+  /**
+   * Kinds other than screenshot and recording that hold bytes. Shown with the
+   * raw kind name until display labels land (#1083); unknown future kinds
+   * render the same way instead of breaking the card.
+   */
+  private _otherArtifactKinds(usage: SessionArtifactUsage): [string, number][] {
+    return Object.entries(usage.by_kind).filter(
+      ([kind, bytes]) =>
+        kind !== 'screenshot' &&
+        kind !== 'recording' &&
+        typeof bytes === 'number' &&
+        bytes > 0
+    );
+  }
+
+  /** ``generated_file`` becomes ``Generated file``. */
+  private _kindLabel(kind: string): string {
+    const words = kind.replace(/_/g, ' ');
+    return words.charAt(0).toUpperCase() + words.slice(1);
+  }
+
+  private _renderSessionArtifactUsage() {
+    const usage = this._sessionArtifactUsage;
+    if (!usage) return '';
+    return html`
+      <div
+        class="card"
+        id="session-artifact-storage"
+        data-testid="session-artifact-usage"
+      >
+        <div class="current-row">
+          <span class="plan-name">Session artifact storage</span>
+        </div>
+        <div class="usage-grid">
+          <div class="usage-metric">
+            <div class="usage-label">Used</div>
+            <div class="usage-value">
+              ${this._formatBytes(usage.used_bytes)} /
+              ${this._formatBytes(usage.budget_bytes)}
+            </div>
+          </div>
+          <div class="usage-metric">
+            <div class="usage-label">Screenshots</div>
+            <div class="usage-value">
+              ${this._formatBytes(usage.by_kind.screenshot)}
+            </div>
+          </div>
+          <div class="usage-metric">
+            <div class="usage-label">Recordings</div>
+            <div class="usage-value">
+              ${this._formatBytes(usage.by_kind.recording)}
+            </div>
+          </div>
+          ${this._otherArtifactKinds(usage).map(
+            ([kind, bytes]) => html`
+              <div class="usage-metric" data-kind=${kind}>
+                <div class="usage-label">${this._kindLabel(kind)}</div>
+                <div class="usage-value">${this._formatBytes(bytes)}</div>
+              </div>
+            `
+          )}
+        </div>
+      </div>
+    `;
+  }
+
   private _renderIngestionQuota(quota: IngestionQuota | null) {
     if (!quota || quota.is_unlimited) return '';
     const percent = Math.min(Math.round(quota.usage_ratio * 100), 100);
@@ -885,10 +1000,10 @@ export class AccountView extends LitElement {
       <view-header headerText="Account" width="narrow"></view-header>
       <div class="column-layout narrow">
         <div class="main-column">
-          <!-- Organization Details Section -->
+          <!-- Account details section -->
           <sl-card style="margin-bottom: 2rem;">
             <h2 slot="header" style="margin: 0; font-size: 1.25rem;">
-              Organization Details
+              Account
             </h2>
 
             ${
@@ -917,8 +1032,8 @@ export class AccountView extends LitElement {
 
             <div style="display: flex; flex-direction: column; gap: 1rem;">
               <sl-input
-                label="Organization Name"
-                placeholder="Enter your organization name"
+                label="Account name"
+                placeholder="Enter your account name"
                 value=${this.organizationName}
                 @sl-input=${(e: any) =>
                   (this.organizationName = e.target.value)}
@@ -935,12 +1050,13 @@ export class AccountView extends LitElement {
                   @click=${this._handleSaveOrganization}
                   ?loading=${this.isSavingOrg}
                 >
-                  Save Organization Name
+                  Save account name
                 </sl-button>
               </div>
             </div>
           </sl-card>
 
+          ${this._renderSessionArtifactUsage()}
           ${
             isProprietary
               ? html`

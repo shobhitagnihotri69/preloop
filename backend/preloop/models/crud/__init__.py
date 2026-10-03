@@ -51,6 +51,8 @@ from .flow_execution import CRUDFlowExecution
 from .flow_execution_log import CRUDFlowExecutionLog
 from .flow_runner import CRUDFlowRunner, crud_flow_runner
 from .issue import CRUDIssue
+from .issue_cost import crud_issue_cost
+from .cli_session import CRUDCliSession, crud_cli_session
 from .issue_lifecycle import crud_issue_lifecycle
 from .security_maintenance import crud_security_maintenance
 from .organization import CRUDOrganization  # Removed create_organization import
@@ -75,6 +77,12 @@ from .provider_billing import (
     CRUDProviderBillingConnection,
     CRUDProviderBillingSnapshot,
 )
+from .copilot_import import (
+    CRUDCopilotImportConnection,
+    CRUDCopilotUsage,
+    crud_copilot_import_connection,
+    crud_copilot_usage,
+)
 from .tool_configuration import CRUDToolConfiguration
 from .mcp_server import CRUDMCPServer
 from .mcp_tool import CRUDMCPTool
@@ -97,7 +105,7 @@ from .plan import (
     subscription,
     monthly_usage,
 )
-from .user import CRUDUser, crud_user
+from .user import AmbiguousEmailError, CRUDUser, crud_user
 from .permission import (
     CRUDPermission,
     CRUDRole,
@@ -117,10 +125,17 @@ from .cli_client import CRUDCliClient, crud_cli_client
 from .event import CRUDEvent, crud_event
 from .visitor import CRUDVisitor, crud_visitor
 from .identity_link import CRUDIdentityLink, crud_identity_link
+from .policy_notice_hit import CRUDPolicyNoticeHit, crud_policy_notice_hit
 from .account_milestone import CRUDAccountMilestone, crud_account_milestone
 from .attention_dismissal import (
     CRUDAttentionDismissal,
     crud_attention_dismissal,
+)
+from .spend_outlier import (
+    CRUDSpendOutlierFinding,
+    CRUDSpendOutlierSettings,
+    crud_spend_outlier_finding,
+    crud_spend_outlier_settings,
 )
 from .oauth_app_installation import (
     CRUDOAuthAppInstallation,
@@ -134,6 +149,7 @@ from .repricing_job import crud_repricing_job
 from .policy_snapshot import CRUDPolicySnapshot, crud_policy_snapshot
 from .runtime_session import CRUDRuntimeSession
 from .runtime_session_activity import CRUDRuntimeSessionActivity
+from . import runtime_session_artifact as crud_runtime_session_artifact
 from .runtime_session_optimization_action import (
     CRUDRuntimeSessionOptimizationAction,
 )
@@ -224,6 +240,9 @@ crud_tool_access_rule = CRUDToolAccessRule()  # Instantiate CRUDToolAccessRule
 
 __all__ = [
     "crud_flow_feedback",
+    "crud_issue_cost",
+    "CRUDCliSession",
+    "crud_cli_session",
     "crud_issue_lifecycle",
     "crud_security_maintenance",
     "CRUDBase",
@@ -315,6 +334,10 @@ __all__ = [
     "crud_model_price_override",
     "crud_provider_billing_connection",
     "crud_provider_billing_snapshot",
+    "CRUDCopilotImportConnection",
+    "CRUDCopilotUsage",
+    "crud_copilot_import_connection",
+    "crud_copilot_usage",
     "crud_tool_configuration",
     "crud_mcp_server",
     "crud_mcp_tool",
@@ -330,6 +353,7 @@ __all__ = [
     "plan",
     "subscription",
     "monthly_usage",
+    "AmbiguousEmailError",
     "crud_user",
     "crud_permission",
     "crud_role",
@@ -349,10 +373,16 @@ __all__ = [
     "crud_visitor",
     "CRUDIdentityLink",
     "crud_identity_link",
+    "CRUDPolicyNoticeHit",
+    "crud_policy_notice_hit",
     "CRUDAccountMilestone",
     "crud_account_milestone",
     "CRUDAttentionDismissal",
     "crud_attention_dismissal",
+    "CRUDSpendOutlierFinding",
+    "CRUDSpendOutlierSettings",
+    "crud_spend_outlier_finding",
+    "crud_spend_outlier_settings",
     "CRUDOAuthAppInstallation",
     "crud_oauth_app_installation",
     "CRUDOAuthToken",
@@ -365,6 +395,7 @@ __all__ = [
     "crud_policy_snapshot",
     "crud_runtime_session",
     "crud_runtime_session_activity",
+    "crud_runtime_session_artifact",
     "crud_runtime_session_optimization_action",
     "crud_runtime_session_replay_run",
     "crud_runtime_session_optimization_result",

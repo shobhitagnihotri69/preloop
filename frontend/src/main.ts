@@ -1,4 +1,5 @@
-import * as Sentry from '@sentry/browser';
+import { initSentry } from './sentry-init';
+import { debugLog } from './utils/debug';
 
 const getEnvironment = () => {
   const hostname = window.location.hostname;
@@ -14,11 +15,9 @@ const getEnvironment = () => {
 
 export const env = getEnvironment();
 
-Sentry.init({
-  dsn: 'https://bbb6424da65046eb96863bd8d3128b6d@glitch.ina.sh/2',
-  tracesSampleRate: 0.01,
-  environment: env,
-});
+// Browser error reporting is opt-in per build: set VITE_SENTRY_DSN when
+// running `vite build`. Without it Sentry is never initialised.
+initSentry(import.meta.env.VITE_SENTRY_DSN, env);
 
 import './components/lit-app.ts';
 import { Theme, DEFAULT_THEME } from './theme';
@@ -89,7 +88,7 @@ function trackCurrentPage() {
     // Remember the previous SPA route so web-analytics conversion events
     // can attribute which page led to the conversion (prev_path prop).
     recordPathChange(currentPath);
-    console.debug('Tracked page view:', currentPath);
+    debugLog('Tracked page view:', currentPath);
   }
 }
 
@@ -109,6 +108,6 @@ window.addEventListener('popstate', () => {
 // Log connection state changes (for debugging)
 if (env === 'development') {
   unifiedWebSocketManager.onStateChange((state) => {
-    console.log(`WebSocket state: ${state}`);
+    debugLog(`WebSocket state: ${state}`);
   });
 }

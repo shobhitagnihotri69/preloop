@@ -22,8 +22,10 @@ from preloop.models.schemas.mcp_server import (
     MCPServerCreate,
     MCPServerResponse,
     MCPServerUpdate,
+    merge_auth_config,
 )
 from preloop.models.schemas.mcp_tool import MCPToolResponse
+from preloop.plugins.account_hooks import VISIBLE_MCP_SERVER, filter_viewable
 from preloop.services.mcp_tool_discovery import (
     get_cached_tools_for_server,
     scan_mcp_server_tools,
@@ -82,6 +84,9 @@ async def create_mcp_server(
             detail=f"MCP server with name '{server_data.name}' already exists",
         )
 
+    # Redaction markers carry no secret on create; drop them.
+    auth_config = merge_auth_config(server_data.auth_config, None)
+
     # Validate connection to the MCP server before saving
     # Skip validation for OAuth — no credentials until the OAuth flow completes
     from preloop.services.mcp_client_pool import MCPClient
@@ -98,7 +103,7 @@ async def create_mcp_server(
             test_client = MCPClient(
                 url=server_data.url,
                 auth_type=server_data.auth_type or "none",
-                auth_config=server_data.auth_config,
+                auth_config=auth_config,
                 transport=server_data.transport or "http-streaming",
             )
 
@@ -120,7 +125,7 @@ async def create_mcp_server(
             url=server_data.url,
             transport=server_data.transport or "http-streaming",
             auth_type=server_data.auth_type or "none",
-            auth_config=server_data.auth_config,
+            auth_config=auth_config,
             status="error" if validation_error else "active",
             last_error=validation_error if validation_error else None,
         )
@@ -200,6 +205,7 @@ def list_mcp_servers(
         servers = crud_mcp_server.get_multi_by_account(
             db, account_id=str(current_user.account_id)
         )
+        servers = filter_viewable(db, current_user, VISIBLE_MCP_SERVER, servers)
         logger.info(f"Found {len(servers)} MCP servers")
 
         return [MCPServerResponse.model_validate(server) for server in servers]
@@ -275,6 +281,11 @@ async def update_mcp_server(
 
     # Update fields
     update_data = server_update.model_dump(exclude_unset=True)
+    if "auth_config" in update_data:
+        # Write-only secrets: markers echoed back from a read keep the stored value.
+        update_data["auth_config"] = merge_auth_config(
+            update_data["auth_config"], server.auth_config
+        )
 
     try:
         old_snapshot = {

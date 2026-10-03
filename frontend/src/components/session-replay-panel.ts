@@ -1,3 +1,17 @@
+import {
+  renderSessionApproval,
+  renderSessionActivity,
+} from './session-approval-presentation';
+import './session-tool-card';
+import './session-approval-card';
+import './session-live-activity';
+import { type SessionApprovalState } from './session-live-activity';
+import {
+  sessionTools,
+  sessionTimelineTime,
+  type SessionTool,
+} from '../utils/session-live';
+import type { ApprovalRequest } from '../types';
 import { LitElement, css, html, nothing } from 'lit';
 import { customElement, property, state } from 'lit/decorators.js';
 import { repeat } from 'lit/directives/repeat.js';
@@ -35,6 +49,14 @@ import {
   getGatewayEventUserRequest,
 } from '../utils/session-observer';
 import { outcomeLabel } from '../utils/outcome-label';
+import { getApprovalRepository } from '../utils/approval-identity';
+import './repository-chip';
+import './browser-step-row';
+import {
+  browserStepKey,
+  isBrowserStep,
+  sortBrowserSteps,
+} from '../utils/session-artifacts';
 import { getExampleSessionOptimization } from '../api';
 import './preloop-gateway-event';
 import './session-optimization-panel';
@@ -137,6 +159,9 @@ type ChatTurn = {
   // Activity (operator/talk) turns are NOT gateway requests: they carry no real
   // token/cost/tool stats, so the header suppresses those meaningless zeros.
   isActivity: boolean;
+  // Set for a `browser_step` activity turn: rendered as a browser-step row
+  // with its screenshot thumbnail instead of chat bubbles.
+  browserStep?: RuntimeSessionActivityItem | null;
   // Measured idle-TTL cache expiry for this turn (from optimize context profile).
   idleExpiry: ChatTurnIdleExpiry | null;
 };
@@ -176,6 +201,29 @@ const REPLAY_SCROLL_RESUME_DELAY_MS = 550;
 
 @customElement('session-replay-panel')
 export class SessionReplayPanel extends LitElement {
+  @state() private approvalState: SessionApprovalState = {
+    requests: [],
+    canDecide: false,
+    author: '',
+    now: Date.now(),
+  };
+  private renderApproval(request: ApprovalRequest) {
+    return renderSessionApproval(this, this.approvalState, request);
+  }
+  private renderActivity() {
+    if (this.replayMode === 'conversation') return nothing;
+    return renderSessionActivity(
+      this,
+      this.session?.id || '',
+      this.events,
+      this.activity,
+      Boolean(this.session?.endedAt),
+      this.approvalState,
+      (state) => {
+        this.approvalState = state;
+      }
+    );
+  }
   @property({ type: Object })
   session: ObservedSession | null = null;
 
@@ -448,6 +496,12 @@ export class SessionReplayPanel extends LitElement {
 
     .timeline-event,
     .chat-message,
+    .chat-turn.browser-step-turn {
+      padding: 0;
+      border: none;
+      background: transparent;
+      box-shadow: none;
+    }
     .activity-event {
       background: var(--sl-color-neutral-0);
       border: 1px solid var(--sl-color-neutral-200);
@@ -1537,6 +1591,17 @@ export class SessionReplayPanel extends LitElement {
     }
   }
 
+  willUpdate(changed: Map<string | number | symbol, unknown>): void {
+    const previous = changed.get('session') as
+      ObservedSession | null | undefined;
+    if (changed.has('session') && previous?.id !== this.session?.id)
+      this.approvalState = {
+        requests: [],
+        canDecide: false,
+        author: '',
+        now: Date.now(),
+      };
+  }
   updated(changed: Map<string | number | symbol, unknown>): void {
     if (changed.has('availableModels') && !this.optimizeModelId) {
       // Preselect the account default so the optimization model dropdown shows
@@ -4196,8 +4261,10 @@ export class SessionReplayPanel extends LitElement {
   }
 
   private getSupportingActivity(): RuntimeSessionActivityItem[] {
-    if (!this.events.length) return this.activity;
-    return this.activity.filter((item) => {
+    // Browser steps render as their own turns with screenshots.
+    const activity = this.activity.filter((item) => !isBrowserStep(item));
+    if (!this.events.length) return activity;
+    return activity.filter((item) => {
       if (item.activity_type === 'model_interaction') return false;
       if (item.activity_type === 'model_gateway_call') return false;
       if (this.isToolCallActivity(item)) return false;
@@ -4206,6 +4273,7 @@ export class SessionReplayPanel extends LitElement {
   }
 
   private isToolCallActivity(item: RuntimeSessionActivityItem): boolean {
+    if (isBrowserStep(item)) return false;
     return item.activity_type === 'tool_call' || Boolean(item.tool_name);
   }
 
@@ -4358,6 +4426,7 @@ export class SessionReplayPanel extends LitElement {
 
   private getChatTurns(): ChatTurn[] {
     const events = this.getChatEvents();
+    const tools = sessionTools(this.events, this.activity);
     const seenSignatures = new Set<string>();
     const eventTurns: ChatTurn[] = [];
     const idleExpiryById = this.getIdleExpiryByEventId();
@@ -4377,6 +4446,16 @@ export class SessionReplayPanel extends LitElement {
         if (text && seenSignatures.has(signature)) return;
         if (text) seenSignatures.add(signature);
         const isToolRelated = this.messageIsToolRelated(message);
+        if (
+          isToolRelated &&
+          message.tool_call_ids?.length &&
+          message.tool_call_ids.every((id) =>
+            tools.some(
+              (tool) => tool.callId === id && tool.result !== undefined
+            )
+          )
+        )
+          return;
         if (isToolRelated) toolCallCount += 1;
         deltaMessages.push({
           ...message,
@@ -4436,7 +4515,28 @@ export class SessionReplayPanel extends LitElement {
         idleExpiry: null,
       }));
 
-    const turns = [...eventTurns, ...activityTurns].sort(
+    const browserStepTurns: ChatTurn[] = sortBrowserSteps(this.activity).map(
+      (item) => ({
+        id: browserStepKey(item),
+        index: 0,
+        event: null,
+        timestamp: item.timestamp || null,
+        title: item.title || 'Browser step',
+        deltaMessages: [],
+        totalTokens: 0,
+        promptTokens: 0,
+        completionTokens: 0,
+        cachedTokens: null,
+        estimatedCost: 0,
+        toolCallCount: 0,
+        failed: String(item.status || '').toLowerCase() === 'failed',
+        isActivity: true,
+        browserStep: item,
+        idleExpiry: null,
+      })
+    );
+
+    const turns = [...eventTurns, ...activityTurns, ...browserStepTurns].sort(
       (left, right) =>
         new Date(left.timestamp || 0).getTime() -
         new Date(right.timestamp || 0).getTime()
@@ -4459,6 +4559,8 @@ export class SessionReplayPanel extends LitElement {
 
   private turnPassesTypeFilter(turn: ChatTurn): boolean {
     if (this.chatTypeFilter === 'all') return true;
+    // A browser action is tool activity, not a message.
+    if (turn.browserStep) return this.chatTypeFilter === 'tools';
     if (this.chatTypeFilter === 'tools') return turn.toolCallCount > 0;
     // messages only: non-tool delta messages present.
     return turn.deltaMessages.some((message) => !message.isToolRelated);
@@ -4970,9 +5072,9 @@ export class SessionReplayPanel extends LitElement {
   }
 
   // Drill-down: full request context for an expanded turn. Uses the lazy
-  // eventDetails fetch — the complete message list, model, tokens, finish
-  // reason, retries, and tools with per-tool schema cost.
-  // TODO: deeper nested-tree drill-down (per-message / per-tool sub-trees).
+  // eventDetails fetch: the complete message list, model, tokens, finish
+  // reason, retries, and tools with per-tool schema cost. It does not open
+  // a further tree per message or per tool.
   private renderChatTurnDetail(turn: ChatTurn) {
     if (!turn.event) return nothing;
     const detail = this.eventDetails[turn.event.id];
@@ -5133,10 +5235,33 @@ export class SessionReplayPanel extends LitElement {
     `;
   }
 
+  /** Scroll the turn of one browser step into view and focus it. */
+  scrollToBrowserStep(key: string): boolean {
+    const row = this.renderRoot.querySelector<HTMLElement>(
+      `[data-browser-step-key="${key}"]`
+    );
+    if (!row) return false;
+    row.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    row.focus({ preventScroll: true });
+    return true;
+  }
+
   private renderChatTurn(
     turn: ChatTurn,
     mostExpensiveTurnId: string | null = null
   ) {
+    if (turn.browserStep) {
+      return html`<div
+        class="chat-turn browser-step-turn"
+        tabindex="0"
+        data-browser-step-key=${turn.id}
+      >
+        <browser-step-row
+          .item=${turn.browserStep}
+          .sessionId=${this.session?.id || ''}
+        ></browser-step-row>
+      </div>`;
+    }
     const event = turn.event;
     const isMostExpensive = Boolean(
       mostExpensiveTurnId && turn.id === mostExpensiveTurnId
@@ -5450,21 +5575,58 @@ export class SessionReplayPanel extends LitElement {
   private renderChatView() {
     const turns = this.getVisibleChatTurns();
     const mostExpensiveTurnId = this.getMostExpensiveTurnId();
+    const rows: Array<{
+      id: string;
+      timestamp: string | null;
+      turn?: ChatTurn;
+      tool?: SessionTool;
+      request?: ApprovalRequest;
+    }> = [
+      ...turns.map((turn) => ({
+        id: turn.id,
+        timestamp: turn.timestamp,
+        turn,
+      })),
+      ...sessionTools(this.events, this.activity).map((tool) => ({
+        id: tool.id,
+        timestamp: tool.timestamp,
+        tool,
+      })),
+      ...this.approvalState.requests.map((request) => ({
+        id: `approval:${request.id}`,
+        timestamp: request.requested_at,
+        request,
+      })),
+    ];
+    if (this.chatSort === 'newest' || this.chatSort === 'oldest')
+      rows.sort(
+        (a, b) =>
+          (sessionTimelineTime(a.timestamp) -
+            sessionTimelineTime(b.timestamp)) *
+          (this.chatSort === 'newest' ? -1 : 1)
+      );
     return html`
       <div class="panel">
         ${this.renderFocusJumpHint()} ${this.renderChatSummaryBar()}
         ${this.renderChatControlBar(turns.length)}
         ${
-          turns.length
+          rows.length
             ? html`
                 <div
                   class="chat-thread"
                   @keydown=${this.handleChatThreadKeydown}
                 >
                   ${repeat(
-                    turns,
-                    (turn) => turn.id,
-                    (turn) => this.renderChatTurn(turn, mostExpensiveTurnId)
+                    rows,
+                    (row) => row.id,
+                    (row) =>
+                      row.turn
+                        ? this.renderChatTurn(row.turn, mostExpensiveTurnId)
+                        : row.tool
+                          ? html`<session-tool-card
+                              .tool=${row.tool}
+                            ></session-tool-card>`
+                          : this.renderApproval(row.request!)
                   )}
                 </div>
               `
@@ -5511,6 +5673,13 @@ export class SessionReplayPanel extends LitElement {
           <span class="tool-row-name">
             ${item.tool_name || item.title || 'Tool call'}
           </span>
+          ${
+            getApprovalRepository(item.metadata)
+              ? html`<repository-chip
+                  .toolArgs=${item.metadata}
+                ></repository-chip>`
+              : nothing
+          }
           ${
             item.server_name
               ? html`<span class="event-meta">${item.server_name}</span>`
@@ -5608,6 +5777,10 @@ export class SessionReplayPanel extends LitElement {
   }
 
   render() {
+    return html`${this.renderActivity()}${this.renderContent()}`;
+  }
+
+  private renderContent() {
     if (this.loading) {
       return html`
         <div class="loading">
@@ -5621,8 +5794,12 @@ export class SessionReplayPanel extends LitElement {
       return html`<div class="empty">${this.emptyText}</div>`;
     }
 
-    if (!this.events.length && !this.activity.length) {
-      return html`<div class="empty">
+    if (
+      !this.events.length &&
+      !this.activity.length &&
+      !this.approvalState.requests.length
+    ) {
+      return html` <div class="empty">
         No interactions captured for this session.
       </div>`;
     }

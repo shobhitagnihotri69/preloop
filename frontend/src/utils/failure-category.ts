@@ -52,6 +52,11 @@ export const FAILURE_CATEGORY_META: Record<string, FailureCategoryMeta> = {
     tooltip:
       'The provider refused the call: billing or quota. Retry after the account is topped up.',
   },
+  budget_exceeded: {
+    label: 'budget exceeded',
+    tooltip:
+      'The run reached a token, USD or turn ceiling configured for it, so the gateway refused further model calls.',
+  },
   /**
    * Superseded by `provider_billing`, which the server writes now. Kept so
    * runs classified before it still read as something.
@@ -82,6 +87,11 @@ export const FAILURE_CATEGORY_META: Record<string, FailureCategoryMeta> = {
   agent_error: {
     label: 'agent error',
     tooltip: 'The agent process itself ended with an error.',
+  },
+  model_stream_idle: {
+    label: 'model stream idle',
+    tooltip:
+      'The run reached its time limit while the model stream was sending nothing. Lower agent_config.stream_idle_timeout_seconds or use another model; a longer limit rarely helps.',
   },
   timeout: {
     label: 'timeout',

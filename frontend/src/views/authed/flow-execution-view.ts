@@ -1,8 +1,9 @@
-import { LitElement, html, css, unsafeCSS } from 'lit';
+import { LitElement, html, css, nothing, unsafeCSS } from 'lit';
 import { customElement, property, state } from 'lit/decorators.js';
 import { unsafeHTML } from 'lit/directives/unsafe-html.js';
 import { AnsiUp } from 'ansi_up';
 import DOMPurify from 'dompurify';
+import { router } from '../../router';
 import { unifiedWebSocketManager } from '../../services/unified-websocket-manager';
 
 const ansiConverter = new AnsiUp();
@@ -15,9 +16,11 @@ import {
   getFlowExecutionMetrics,
   getFlowExecutionLogs,
   getFlowExecutionGatewayEvents,
+  getFlowExecutionHostSessions,
   getFlowExecutionGatewayEvent,
   retryFlowExecution,
 } from '../../api';
+import type { HostExecSessionsResponse } from '../../api';
 import type { FlowGatewayEvent, GatewayTokenUsage } from '../../types';
 import {
   formatLocalTime,
@@ -31,6 +34,7 @@ import {
   canRetryExecution,
   confirmRetryExecution,
 } from '../../actions/flow-execution-actions';
+import { showToast } from '../../components/confirm-dialog';
 import '../../components/resource-actions.ts';
 import '../../components/operator-note-composer.ts';
 import {
@@ -64,6 +68,13 @@ import '../../components/preloop-gateway-event.ts';
 import '../../components/preloop-execution-continuation';
 import '../../components/preloop-execution-tree';
 import '../../components/view-header.ts';
+import '../../components/execution-records-card';
+import '../../components/execution-report-panel';
+import { getEvidenceStatus, type EvidenceStatus } from '../../records-api';
+import {
+  findingsSummaryLabel,
+  sameEvidencePack,
+} from '../../utils/evidence-report';
 import '../../components/json-tree.ts';
 import '../../components/session-chat-view';
 import '@shoelace-style/shoelace/dist/components/badge/badge.js';
@@ -93,6 +104,8 @@ interface FlowExecutionUpdate {
 interface FlowExecution {
   id: string;
   flow_id: string;
+  /** Set on the detail row, so the title paints before the flow loads. */
+  flow_name?: string | null;
   status: string;
   start_time: string;
   end_time?: string;
@@ -109,6 +122,13 @@ interface FlowExecution {
   agent_session_reference?: string;
   error_message?: string;
   /**
+   * Why an automatic stop ended this run, e.g. its pull request was merged
+   * (#1032). Absent on a run an operator stopped and on older servers.
+   */
+  stop_reason?: string | null;
+  /** Machine-readable cause of the automatic stop (`pr_merged`, ...). */
+  stop_source?: string | null;
+  /**
    * Which layer broke this run (#361). Absent on a run that did not fail and
    * on servers that do not derive it yet.
    */
@@ -119,12 +139,31 @@ interface FlowExecution {
   /** The in/out/cache split behind `total_tokens`, when the server attributes one. */
   token_usage?: GatewayTokenUsage | null;
   estimated_cost?: number;
+  /**
+   * Publishing execution this repair resumes. Absent on a first publication.
+   * Distinct from parent_execution_id (delegation tree).
+   */
+  resume_of?: string | null;
+  /**
+   * Summed tokens and cost for the publishing execution plus every repair
+   * that points at it. Absent when the row is not part of a multi-turn chain.
+   */
+  resume_totals?: {
+    total_tokens: number;
+    estimated_cost: number;
+  } | null;
   execution_logs?: FlowExecutionUpdate[];
   /**
    * Why a WAITING_FOR_HUMAN run is waiting, and until when. Present only
    * while the run is parked on a decision.
    */
   park?: ExecutionPark | null;
+}
+
+interface FlowExecutionLimits {
+  max_total_tokens?: number;
+  max_usd?: number;
+  max_turns?: number;
 }
 
 interface Flow {
@@ -135,6 +174,8 @@ interface Flow {
   trigger_event_source: string;
   trigger_event_type: string;
   ai_model_name?: string | null;
+  /** Per-execution ceilings the run is measured against, when configured. */
+  agent_config?: { limits?: FlowExecutionLimits } | null;
 }
 
 interface ToolActivityEntry {
@@ -151,6 +192,7 @@ interface ToolActivityEntry {
 const EXECUTION_TABS = [
   'timeline',
   'output',
+  'report',
   'transcript',
   'logs',
   'input',
@@ -182,6 +224,21 @@ function firstErrorLine(message?: string | null): string {
   if (!message) return '';
   const line = message.split('\n').find((part) => part.trim().length > 0);
   return (line || '').trim();
+}
+
+/**
+ * Why a stopped run stopped, when the server stopped it on its own: its
+ * pull request was merged, closed or got a new head (#1032). The row's
+ * error_message is overwritten by the orchestrator's generic "stopped by
+ * user request" line once the container is gone, so stop_reason is the
+ * durable answer.
+ */
+function automaticStopReason(execution: {
+  status: string;
+  stop_reason?: string | null;
+}): string {
+  if ((execution.status || '').toUpperCase() !== 'STOPPED') return '';
+  return (execution.stop_reason || '').trim();
 }
 
 /**
@@ -279,6 +336,16 @@ function providerErrorMessage(detail?: string | null): string {
   return liftLogfmtErrorField(firstErrorLine(text));
 }
 
+/** Log rows the page asks for before it has painted anything else. */
+const INITIAL_LOGS_TAIL = 500;
+
+/**
+ * Model calls the page reads up front. Most runs make fewer, so for them the
+ * first read is the whole list; a longer run shows its newest calls and the
+ * timeline offers the rest.
+ */
+export const INITIAL_GATEWAY_EVENTS_TAIL = 500;
+
 /**
  * The gateway-events endpoint returns every log row of the execution; only
  * the model calls carry request/response detail worth a card.
@@ -355,6 +422,18 @@ export class FlowExecutionView extends LitElement {
         align-items: center;
         gap: 8px;
       }
+      .resume-line {
+        font-size: var(--console-text-meta);
+        color: var(--console-meta-color);
+        margin-top: var(--sl-spacing-2x-small);
+      }
+      .resume-line a {
+        color: var(--sl-color-primary-600);
+        text-decoration: none;
+      }
+      .resume-line a:hover {
+        text-decoration: underline;
+      }
       /* One of the page's two ambient animations: the dot that says this run
          is still going. The chip beside it stays a soft tint. */
       .status-dot {
@@ -394,6 +473,19 @@ export class FlowExecutionView extends LitElement {
         border-bottom: 1px solid var(--console-hairline);
         margin-bottom: 16px;
       }
+      .host-sessions {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: baseline;
+        gap: 4px 20px;
+        margin: -8px 0 16px;
+      }
+      .host-session {
+        display: inline-flex;
+        align-items: baseline;
+        gap: 6px;
+        min-width: 0;
+      }
       .strip-item {
         display: flex;
         align-items: baseline;
@@ -431,6 +523,13 @@ export class FlowExecutionView extends LitElement {
       .strip-link:focus-visible {
         text-decoration: underline;
       }
+      button.strip-link {
+        background: none;
+        border: 0;
+        cursor: pointer;
+        font-family: inherit;
+        padding: 0;
+      }
       .strip-value sl-copy-button::part(button) {
         padding: 0 2px;
       }
@@ -458,6 +557,21 @@ export class FlowExecutionView extends LitElement {
         overflow: hidden;
         overflow-wrap: anywhere;
         white-space: normal;
+      }
+      /* A run the server stopped because its pull request moved on is not
+         broken: neutral, and it says why. */
+      .stop-line {
+        display: flex;
+        align-items: flex-start;
+        gap: 8px;
+        margin: -4px 0 16px;
+        color: var(--sl-color-neutral-700);
+        font-size: var(--console-text-body);
+        overflow-wrap: anywhere;
+      }
+      .stop-line sl-icon {
+        flex-shrink: 0;
+        margin-top: 3px;
       }
       /* A parked run is waiting on a person, not broken: amber, and it says
          who and until when rather than spinning. */
@@ -494,6 +608,22 @@ export class FlowExecutionView extends LitElement {
       }
       .panel-empty {
         padding: 32px 0;
+        color: var(--console-meta-color);
+        font-size: var(--console-text-body);
+      }
+      .panel-loading {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 16px 0;
+        color: var(--console-meta-color);
+        font-size: var(--console-text-body);
+      }
+      .timeline-truncated {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
         color: var(--console-meta-color);
         font-size: var(--console-text-body);
       }
@@ -808,6 +938,23 @@ export class FlowExecutionView extends LitElement {
   @state()
   private isLoadingGatewayEvents = false;
 
+  /**
+   * The events on the page are the newest calls of a run that made more.
+   * Their sum is then a floor, not the run's usage.
+   */
+  @state()
+  private gatewayEventsTruncated = false;
+
+  /** The last read asked for the short first page, so more can be fetched. */
+  private gatewayEventsBounded = false;
+
+  /**
+   * The first page of logs is in flight. The page itself is already painted
+   * from the detail row; only the logs panel and the timeline wait.
+   */
+  @state()
+  private isLoadingLogs = false;
+
   @state()
   private toolCalls = 0;
 
@@ -853,6 +1000,14 @@ export class FlowExecutionView extends LitElement {
   /** Which tab is showing; seeded from `?tab=` or the remembered choice. */
   @state()
   private activeTab: ExecutionTab = 'timeline';
+
+  /** Hook sessions and seat usage of a Copilot or Cursor host run. */
+  @state()
+  private hostSessions: HostExecSessionsResponse | null = null;
+
+  /** Same receipt the Records card reads, so the Report tab cannot disagree. */
+  @state()
+  private evidenceStatus: EvidenceStatus | null = null;
 
   /** Whether the timeline pins itself to the newest entry as items arrive. */
   @state()
@@ -917,6 +1072,7 @@ export class FlowExecutionView extends LitElement {
         return;
       this.execution = execution;
       this.hydrateMetricsFromExecution();
+      void this.loadEvidenceStatus(executionId);
     } catch (error) {
       // Preserve live event details if the authoritative read fails.
       console.error('Failed to refresh execution metadata:', error);
@@ -1507,31 +1663,62 @@ export class FlowExecutionView extends LitElement {
    */
   gatewayEventsFullLoaded = false;
 
-  async loadGatewayEvents(metadataOnly: boolean = false) {
-    if (!this.executionId) return;
+  /**
+   * Read the execution's gateway events.
+   *
+   * @param metadataOnly Drop the large payloads; the transcript needs them.
+   * @param bounded Ask only for the newest `INITIAL_GATEWAY_EVENTS_TAIL`
+   *   model calls. This is the page's first read: without it the endpoint
+   *   returns every log row of the run, agent log lines included. Unbounded
+   *   is the older read, kept for the transcript and "load earlier calls".
+   */
+  async loadGatewayEvents(
+    metadataOnly: boolean = false,
+    bounded: boolean = false
+  ) {
+    const executionId = this.executionId;
+    const generation = this.executionGeneration;
+    if (!executionId) return;
+    // A response for an execution the page has left must not land on the
+    // one it is showing now.
+    const current = () =>
+      this.isConnected &&
+      this.executionId === executionId &&
+      this.executionGeneration === generation;
     this.isLoadingGatewayEvents = true;
     // A retry starts clean, so the banner belongs to this attempt.
     this.gatewayEventsError = null;
     try {
+      // Every metadata read feeds only model-call consumers (timeline cards,
+      // the strip, the model list, the error line), so it asks for model
+      // calls alone. The transcript's full read stays as it always was.
+      const modelCallsOnly = metadataOnly;
+      const tail = bounded ? INITIAL_GATEWAY_EVENTS_TAIL : undefined;
       const response = await getFlowExecutionGatewayEvents(
-        this.executionId,
-        undefined,
-        metadataOnly
+        executionId,
+        tail,
+        metadataOnly,
+        modelCallsOnly
       );
+      if (!current()) return;
       this.gatewayEvents = response.logs || [];
       this.gatewayEventsSource = response.source;
       this.gatewayEventsLoaded = true;
       this.gatewayEventsFullLoaded = !metadataOnly;
+      this.gatewayEventsBounded = bounded;
+      this.gatewayEventsTruncated = !!response.has_more;
       this.applyGatewayMetricsFromEvents();
     } catch (error) {
+      if (!current()) return;
       console.error('Failed to fetch gateway events:', error);
       this.gatewayEventsError =
         error instanceof Error
           ? error.message
           : 'Failed to load execution gateway events';
     } finally {
-      this.isLoadingGatewayEvents = false;
+      if (current()) this.isLoadingGatewayEvents = false;
     }
+    if (!current()) return;
 
     // A switch to the transcript while this fetch was in flight was dropped by
     // `handleTabShow`, which leaves the transcript reading the metadata-only
@@ -1568,6 +1755,20 @@ export class FlowExecutionView extends LitElement {
     }
   }
 
+  /**
+   * Load the execution page.
+   *
+   * The detail row alone is enough to paint the header, status, metadata and
+   * the strip's figures, so the page renders as soon as it lands. Logs, the
+   * flow, the metrics and the gateway events then load side by side; each
+   * fills its own section when it arrives and a failure in one leaves the
+   * others alone.
+   *
+   * Resolves once the logs have settled: `updated()` appends the summary line
+   * to them and subscribes to the live stream only after that, so a late
+   * logs response cannot overwrite either. The flow, metrics and gateway
+   * reads keep going in the background.
+   */
   async fetchExecution() {
     const executionId = this.executionId;
     const generation = this.executionGeneration;
@@ -1577,94 +1778,27 @@ export class FlowExecutionView extends LitElement {
       this.executionGeneration === generation;
     if (!executionId) return;
 
+    this.isLoading = true;
+    this.isLoadingGatewayEvents = true;
+    this.isLoadingLogs = true;
+    this.loadingError = null;
+    this.gatewayEventsError = null;
+    this.gatewayEvents = [];
+    this.gatewayEventsSource = null;
+    this.gatewayEventsLoaded = false;
+    this.gatewayEventsFullLoaded = false;
+    this.gatewayEventsTruncated = false;
+    this.gatewayEventsBounded = false;
+    this.liveToolActivityEvents = [];
+    // Sessions belong to one execution; a refresh of the same one keeps
+    // them so the panel does not flicker, a new execution starts empty.
+    if (this.hostSessions?.execution_id !== executionId) {
+      this.hostSessions = null;
+    }
+
+    let execution: FlowExecution;
     try {
-      this.isLoading = true;
-      this.isLoadingGatewayEvents = true;
-      this.loadingError = null;
-      this.gatewayEventsError = null;
-      this.gatewayEvents = [];
-      this.gatewayEventsSource = null;
-      this.gatewayEventsLoaded = false;
-      this.gatewayEventsFullLoaded = false;
-      this.liveToolActivityEvents = [];
-
-      // Fetch execution details
-      const execution = await getFlowExecution(executionId);
-      if (!current()) return;
-      this.execution = execution;
-      this.hydrateMetricsFromExecution();
-
-      // Fetch logs
-      const INITIAL_FETCH_LIMIT = 500;
-      this.logsSkip = 0;
-
-      const logsResult = await getFlowExecutionLogs(executionId, {
-        tail: INITIAL_FETCH_LIMIT,
-      }).catch((error) => {
-        console.error('Failed to fetch logs:', error);
-        if (
-          this.execution &&
-          this.execution.execution_logs &&
-          Array.isArray(this.execution.execution_logs)
-        ) {
-          return {
-            logs: this.execution.execution_logs,
-            source: 'fallback',
-            has_more: false,
-          };
-        }
-        return { logs: [], source: 'none', has_more: false };
-      });
-
-      if (!current()) return;
-      if (logsResult && Array.isArray(logsResult.logs)) {
-        this.logs = logsResult.logs;
-        this.hasMoreLogs = !!logsResult.has_more;
-      }
-      this.hydrateToolActivityLogs();
-
-      // The timeline is the default tab and merges gateway requests, so the
-      // events are part of the first paint rather than a tab-open fetch.
-      // A deep link straight to the transcript needs the full payloads.
-      this.isLoadingGatewayEvents = false;
-      void this.loadGatewayEvents(this.activeTab !== 'transcript');
-
-      // Fetch flow details
-      if (this.execution && this.execution.flow_id) {
-        try {
-          const flow = await getFlow(this.execution.flow_id);
-          if (!current()) return;
-          this.flow = flow;
-        } catch (error) {
-          console.error('Failed to fetch flow details:', error);
-          // Don't fail the whole page if flow fetch fails
-        }
-      }
-
-      // Fetch execution metrics (for completed executions)
-      if (this.execution) {
-        try {
-          const metrics = await getFlowExecutionMetrics(executionId);
-          if (!current()) return;
-          this.toolCalls = Math.max(this.toolCalls, metrics.tool_calls);
-          this.budgetUsed = Math.max(this.budgetUsed, metrics.estimated_cost);
-          this.totalTokens = Math.max(
-            this.totalTokens,
-            metrics.token_usage.total_tokens
-          );
-          this.tokenUsage = this.pickRicherUsage(
-            this.tokenUsage,
-            metrics.token_usage as GatewayTokenUsage
-          );
-          this.hasPricing = this.hasPricing || metrics.has_pricing;
-        } catch (error) {
-          console.error('Failed to fetch execution metrics:', error);
-          // Don't fail the whole page if metrics fetch fails
-        }
-      }
-
-      if (!current()) return;
-      this.isLoading = false;
+      execution = await getFlowExecution(executionId);
     } catch (error) {
       if (!current()) return;
       console.error('Failed to fetch execution:', error);
@@ -1674,6 +1808,115 @@ export class FlowExecutionView extends LitElement {
           : 'Failed to load execution details';
       this.isLoading = false;
       this.isLoadingGatewayEvents = false;
+      this.isLoadingLogs = false;
+      return;
+    }
+    if (!current()) return;
+    this.execution = execution;
+    this.hydrateMetricsFromExecution();
+    // First paint: everything below fills in its own section.
+    this.isLoading = false;
+    void this.loadEvidenceStatus(executionId);
+
+    // The timeline is the default tab and merges model calls, so their first
+    // read starts with the page rather than on tab open. A deep link straight
+    // to the transcript needs the full payloads, so it asks for those.
+    void this.loadGatewayEvents(
+      this.activeTab !== 'transcript',
+      this.activeTab !== 'transcript'
+    );
+    void this.loadFlowForExecution(execution, current);
+    void this.loadMetricsForExecution(executionId, current);
+    await this.loadInitialLogs(executionId, current);
+  }
+
+  private async loadInitialLogs(executionId: string, current: () => boolean) {
+    this.logsSkip = 0;
+    const logsResult = await getFlowExecutionLogs(executionId, {
+      tail: INITIAL_LOGS_TAIL,
+    }).catch((error) => {
+      console.error('Failed to fetch logs:', error);
+      if (
+        this.execution &&
+        this.execution.execution_logs &&
+        Array.isArray(this.execution.execution_logs)
+      ) {
+        return {
+          logs: this.execution.execution_logs,
+          source: 'fallback',
+          has_more: false,
+        };
+      }
+      return { logs: [], source: 'none', has_more: false };
+    });
+
+    if (!current()) return;
+    if (logsResult && Array.isArray(logsResult.logs)) {
+      this.logs = logsResult.logs;
+      this.hasMoreLogs = !!logsResult.has_more;
+    }
+    this.hydrateToolActivityLogs();
+    this.isLoadingLogs = false;
+  }
+
+  private async loadFlowForExecution(
+    execution: FlowExecution,
+    current: () => boolean
+  ) {
+    if (!execution.flow_id) return;
+    try {
+      const flow = await getFlow(execution.flow_id);
+      if (!current()) return;
+      this.flow = flow;
+      if (flow.agent_type === 'copilot' || flow.agent_type === 'cursor') {
+        void this.loadHostSessions(execution.id, current);
+      }
+    } catch (error) {
+      // The title falls back to the detail row's flow name.
+      console.error('Failed to fetch flow details:', error);
+    }
+  }
+
+  /** Host sessions for the execution on screen, never a previous one. */
+  private currentHostSessions(): HostExecSessionsResponse | null {
+    const sessions = this.hostSessions;
+    return sessions && sessions.execution_id === this.executionId
+      ? sessions
+      : null;
+  }
+
+  private async loadHostSessions(executionId: string, current: () => boolean) {
+    try {
+      const sessions = await getFlowExecutionHostSessions(executionId);
+      if (!current()) return;
+      this.hostSessions = sessions;
+    } catch (error) {
+      // The strip still reads the premium count from the result.
+      console.error('Failed to fetch host execution sessions:', error);
+    }
+  }
+
+  private async loadMetricsForExecution(
+    executionId: string,
+    current: () => boolean
+  ) {
+    try {
+      const metrics = await getFlowExecutionMetrics(executionId);
+      if (!current()) return;
+      this.toolCalls = Math.max(this.toolCalls, metrics.tool_calls);
+      this.budgetUsed = Math.max(this.budgetUsed, metrics.estimated_cost);
+      this.totalTokens = Math.max(
+        this.totalTokens,
+        metrics.token_usage.total_tokens
+      );
+      this.tokenUsage = this.pickRicherUsage(
+        this.tokenUsage,
+        metrics.token_usage as GatewayTokenUsage
+      );
+      this.hasPricing = this.hasPricing || metrics.has_pricing;
+    } catch (error) {
+      // The strip keeps the figures the detail row hydrated.
+      console.error('Failed to fetch execution metrics:', error);
     }
   }
 
@@ -1778,6 +2021,12 @@ export class FlowExecutionView extends LitElement {
     if (!isExecutionRequestFailureStatus(execution.status)) {
       return '';
     }
+    // A run the server stopped because its pull request moved on did not
+    // fail; the stop line says why, and the stored error_message is only
+    // the orchestrator's generic "stopped by user request" (#1032).
+    if (automaticStopReason(execution)) {
+      return '';
+    }
     const failed = this.firstFailedGatewayEvent();
     if (failed) {
       const message = providerErrorMessage(
@@ -1843,6 +2092,14 @@ export class FlowExecutionView extends LitElement {
       summary.estimatedCost > 0 ||
       summary.hasPricing
     ) {
+      if (this.gatewayEventsTruncated) {
+        // The newest calls only: a floor under the run's usage, never its
+        // total. The detail row and /metrics count every call.
+        this.totalTokens = Math.max(this.totalTokens, summary.totalTokens);
+        this.budgetUsed = Math.max(this.budgetUsed, summary.estimatedCost);
+        this.hasPricing = this.hasPricing || summary.hasPricing;
+        return;
+      }
       this.totalTokens = summary.totalTokens;
       this.budgetUsed = summary.estimatedCost;
       this.hasPricing = summary.hasPricing;
@@ -1866,16 +2123,24 @@ export class FlowExecutionView extends LitElement {
           : 0;
     this.toolCalls = executionToolCalls;
 
-    if (!this.hasGatewayUsageEvents()) {
+    // Only a complete set of events outranks the row. A truncated set is the
+    // newest calls, so the row's totals, which count every call, still apply
+    // and may only raise what the events already show.
+    const truncated = this.gatewayEventsTruncated;
+    if (truncated || !this.hasGatewayUsageEvents()) {
       if (typeof this.execution.total_tokens === 'number') {
-        this.totalTokens = this.execution.total_tokens;
+        this.totalTokens = truncated
+          ? Math.max(this.totalTokens, this.execution.total_tokens)
+          : this.execution.total_tokens;
       }
       this.tokenUsage = this.pickRicherUsage(
         this.tokenUsage,
         this.execution.token_usage ?? null
       );
       if (typeof this.execution.estimated_cost === 'number') {
-        this.budgetUsed = this.execution.estimated_cost;
+        this.budgetUsed = truncated
+          ? Math.max(this.budgetUsed, this.execution.estimated_cost)
+          : this.execution.estimated_cost;
         // Only a non-zero stored cost proves the execution was priced. A 0
         // alongside spent tokens means "we could not price this", not "this
         // was free", and must fall through to the token display.
@@ -1893,6 +2158,25 @@ export class FlowExecutionView extends LitElement {
       (inputTokensOf(this.tokenUsage) > 0 ||
         outputTokensOf(this.tokenUsage) > 0)
     );
+  }
+
+  /**
+   * The per-execution ceilings the run is measured against, when the flow
+   * configured any. Read straight off the flow's `agent_config.limits`, so the
+   * strip can show "used / allowed" while the run is still going, not only
+   * once the metrics endpoint has a final number.
+   */
+  private get executionLimits(): FlowExecutionLimits | null {
+    const limits = this.flow?.agent_config?.limits;
+    if (!limits) return null;
+    if (
+      limits.max_total_tokens === undefined &&
+      limits.max_usd === undefined &&
+      limits.max_turns === undefined
+    ) {
+      return null;
+    }
+    return limits;
   }
 
   /**
@@ -2205,6 +2489,36 @@ export class FlowExecutionView extends LitElement {
     return 'timeline';
   }
 
+  private packStatus(): string {
+    return this.evidenceStatus?.status || '';
+  }
+
+  private showReportTab(): boolean {
+    return ['available', 'expired', 'failed'].includes(this.packStatus());
+  }
+
+  private async loadEvidenceStatus(executionId: string): Promise<void> {
+    try {
+      const status = await getEvidenceStatus(executionId);
+      if (!this.isConnected || this.executionId !== executionId) return;
+      if (sameEvidencePack(this.evidenceStatus, status)) return;
+      this.evidenceStatus = status;
+      if (!this.showReportTab() && this.activeTab === 'report') {
+        this.activeTab = 'timeline';
+      }
+    } catch {
+      if (this.executionId === executionId && this.evidenceStatus !== null) {
+        this.evidenceStatus = null;
+      }
+    }
+  }
+
+  private openReportTab(): void {
+    if (!this.showReportTab()) return;
+    this.activeTab = 'report';
+    this.rememberTab('report');
+  }
+
   private rememberTab(tab: ExecutionTab) {
     try {
       window.localStorage.setItem(TAB_STORAGE_KEY, tab);
@@ -2231,7 +2545,7 @@ export class FlowExecutionView extends LitElement {
       return;
     }
     if (name === 'timeline' && !this.gatewayEventsLoaded) {
-      this.loadGatewayEvents(true);
+      this.loadGatewayEvents(true, true);
     }
   }
 
@@ -2339,7 +2653,9 @@ export class FlowExecutionView extends LitElement {
           timestamp: execution.end_time,
           statusLabel: executionStatusLabel(execution.status),
           statusVariant: executionStatusVariant(execution.status),
-          statusDetail: firstErrorLine(execution.error_message),
+          statusDetail: firstErrorLine(
+            automaticStopReason(execution) || execution.error_message
+          ),
         });
       }
     }
@@ -2498,7 +2814,10 @@ export class FlowExecutionView extends LitElement {
 
     if (item.kind === 'tool' && item.tool) {
       const tool = item.tool;
-      const failed = tool.status === 'error' || tool.status === 'failed';
+      const failed =
+        tool.status === 'error' ||
+        tool.status === 'failed' ||
+        tool.status === 'refused';
       return html`
         <div class="timeline-row timeline-tool">
           ${this.renderTimelineTime(row.timestamp)}
@@ -2549,6 +2868,11 @@ export class FlowExecutionView extends LitElement {
 
   private renderTimelinePanel(running: boolean) {
     const rows = this.getTimelineRows();
+    // The first reads only. Status rows from the detail row can already be
+    // showing, so this is a line under them, not a replacement for them.
+    const timelineLoading =
+      this.isLoadingLogs ||
+      (this.isLoadingGatewayEvents && !this.gatewayEventsLoaded);
     return html`
       <div class="timeline-panel">
         <div class="timeline-toolbar">
@@ -2581,11 +2905,50 @@ export class FlowExecutionView extends LitElement {
           @scroll=${this.handleTimelineScroll}
         >
           ${
-            rows.length === 0
+            this.gatewayEventsTruncated
+              ? html`<div
+                  class="load-previous timeline-truncated"
+                  data-testid="timeline-truncated"
+                >
+                  <span>
+                    Showing the latest
+                    ${this.gatewayEvents.filter(isModelGatewayCall).length}
+                    model
+                    calls${
+                      this.gatewayEventsBounded
+                        ? '.'
+                        : ', the most one read returns. The summary totals still cover the whole run.'
+                    }
+                  </span>
+                  ${
+                    this.gatewayEventsBounded
+                      ? html`<sl-button
+                          size="small"
+                          variant="default"
+                          data-testid="load-earlier-calls"
+                          ?loading=${this.isLoadingGatewayEvents}
+                          @click=${() => void this.loadGatewayEvents(true)}
+                        >
+                          Load earlier model calls
+                        </sl-button>`
+                      : ''
+                  }
+                </div>`
+              : ''
+          }
+          ${
+            rows.length === 0 && !timelineLoading
               ? html`<div class="panel-empty">
                   Nothing recorded for this run yet.
                 </div>`
               : rows.map((row) => this.renderTimelineRow(row))
+          }
+          ${
+            timelineLoading
+              ? html`<div class="panel-loading" data-testid="timeline-loading">
+                  <sl-spinner></sl-spinner> Loading activity...
+                </div>`
+              : ''
           }
         </div>
         ${
@@ -2605,7 +2968,9 @@ export class FlowExecutionView extends LitElement {
   }
 
   private renderOutputPanel(execution: FlowExecution) {
+    const stopReason = automaticStopReason(execution);
     const hasAnything =
+      stopReason ||
       execution.error_message ||
       execution.result ||
       execution.model_output_summary ||
@@ -2656,7 +3021,17 @@ export class FlowExecutionView extends LitElement {
             : ''
         }
         ${
-          execution.error_message
+          stopReason
+            ? html`
+                <section class="output-section" data-testid="stop-reason">
+                  <h2 class="section-title">Why it stopped</h2>
+                  <p>${stopReason}</p>
+                </section>
+              `
+            : ''
+        }
+        ${
+          execution.error_message && !stopReason
             ? html`
                 <section class="output-section">
                   <h2 class="section-title">Error</h2>
@@ -2807,7 +3182,9 @@ ${execution.model_output_summary}</pre>
                     ${
                       query
                         ? `No log line matches "${query}".`
-                        : 'Waiting for logs...'
+                        : this.isLoadingLogs
+                          ? 'Loading logs...'
+                          : 'Waiting for logs...'
                     }
                   </p>
                 </div>`
@@ -2900,6 +3277,44 @@ ${execution.resolved_input_prompt}</pre>
   }
 
   /**
+   * CLI sessions the runner's usage hook linked to this host run. Hidden for
+   * container runs and for host runs whose hook reported nothing.
+   */
+  private renderHostSessions() {
+    const sessions = this.currentHostSessions()?.sessions ?? [];
+    if (sessions.length === 0) {
+      return '';
+    }
+    return html`<div class="host-sessions" data-testid="host-sessions">
+      <span class="strip-label">Host CLI sessions</span>
+      ${sessions.map((session) => {
+        const id = session.conversation_id || 'unnamed session';
+        const types = Object.entries(session.event_types)
+          .map(([type, count]) => `${type} ${count}`)
+          .join(', ');
+        return html`<div
+          class="host-session"
+          data-testid="host-session"
+          title=${types}
+        >
+          <a
+            class="strip-link"
+            href="/console/runtime-sessions?query=${encodeURIComponent(id)}"
+            >${shortenIdentifier(id)}</a
+          >
+          <span class="strip-note"
+            >${session.source || ''} · ${session.event_count.toLocaleString()}
+            hook
+            event${session.event_count === 1 ? '' : 's'}${
+              session.models.length ? ` · ${session.models.join(', ')}` : ''
+            }</span
+          >
+        </div>`;
+      })}
+    </div>`;
+  }
+
+  /**
    * One hairline row instead of five cards: what ran, how long, on which
    * model, what it cost and where to find the session. Values are the
    * loudest thing in the row; the labels stay in the meta register.
@@ -2907,19 +3322,85 @@ ${execution.resolved_input_prompt}</pre>
   private renderSummaryStrip(execution: FlowExecution) {
     const toolEntries = this.getToolActivityEntries();
     const failedTools = toolEntries.filter(
-      (entry) => entry.status === 'error' || entry.status === 'failed'
+      (entry) =>
+        entry.status === 'error' ||
+        entry.status === 'failed' ||
+        entry.status === 'refused'
     ).length;
     const toolCount = this.getTotalToolCallCount();
     const sessionReference = execution.agent_session_reference;
 
-    const costText = this.hasPricing
-      ? formatEstimatedCost(this.budgetUsed)
-      : this.totalTokens > 0
-        ? 'Not priced'
-        : '—';
+    // Host CLI runs bill the runner user's own subscription. The server sets
+    // gateway_metered=false on those completions; there is no gateway spend
+    // to estimate, so say so instead of printing a dash or $0.
+    const hostMetering = hostExecMetering(execution.result);
+    const costText = hostMetering
+      ? html`<sl-badge
+          variant="neutral"
+          pill
+          data-testid="strip-not-metered"
+          title=${hostMetering.title}
+          >${hostExecCostLabel(
+            execution.result,
+            this.currentHostSessions()?.premium_requests
+          )}</sl-badge
+        >`
+      : this.hasPricing
+        ? formatEstimatedCost(this.budgetUsed)
+        : this.totalTokens > 0
+          ? 'Not priced'
+          : '—';
 
+    const limits = this.executionLimits;
+    const tokenLimit = limits?.max_total_tokens;
+    const usdLimit = limits?.max_usd;
+    const tokenCeiling =
+      tokenLimit !== undefined
+        ? html`<span class="strip-note">
+            / ${formatTokenCount(tokenLimit)}</span
+          >`
+        : '';
+    const costCeiling =
+      usdLimit !== undefined
+        ? html`<span class="strip-note">
+            / ${formatEstimatedCost(usdLimit)}</span
+          >`
+        : '';
+
+    const verdict = execution.result?.verdict;
+    const findingsLabel = findingsSummaryLabel(
+      execution.result?.findings_summary
+    );
     return html`
       <div class="summary-strip" data-testid="summary-strip">
+        ${
+          verdict || findingsLabel
+            ? html`<div class="strip-item" data-testid="strip-verdict">
+                <span class="strip-label">Verdict</span>
+                <span class="strip-value">
+                  ${
+                    verdict
+                      ? html`<sl-badge pill variant="neutral"
+                          >${verdict}</sl-badge
+                        >`
+                      : ''
+                  }
+                  ${
+                    findingsLabel
+                      ? html`<button
+                          type="button"
+                          class="strip-link"
+                          data-testid="strip-findings"
+                          @click=${() => this.openReportTab()}
+                        >
+                          ${findingsLabel}
+                        </button>`
+                      : ''
+                  }
+                </span>
+              </div>`
+            : ''
+        }
         <div class="strip-item">
           <span class="strip-label">Started</span>
           <span
@@ -2989,12 +3470,14 @@ ${execution.resolved_input_prompt}</pre>
                   : // The same absence the token figures component prints,
                     // drawn the same way on the same page.
                     '-'
-            }</span
+            }${tokenCeiling}</span
           >
         </div>
         <div class="strip-item">
           <span class="strip-label">$ est.</span>
-          <span class="strip-value" data-testid="strip-cost">${costText}</span>
+          <span class="strip-value" data-testid="strip-cost"
+            >${costText}${costCeiling}</span
+          >
         </div>
         <div class="strip-item">
           <span class="strip-label">Tools</span>
@@ -3041,6 +3524,40 @@ ${execution.resolved_input_prompt}</pre>
         </div>
       </div>
     `;
+  }
+
+  /**
+   * Review/CI repair label: not a delegation child. Link the publishing
+   * execution and state the chain total when the server rolled one up.
+   */
+  private renderResumeLine(
+    execution: FlowExecution,
+    options: { asDescriptionSlot?: boolean } = {}
+  ) {
+    const resumeOf = execution.resume_of;
+    const totals = execution.resume_totals;
+    if (!resumeOf && !totals) return '';
+    const chain =
+      totals != null
+        ? html` · ${formatTokenCount(totals.total_tokens)} ·
+          ${formatEstimatedCost(totals.estimated_cost)}`
+        : '';
+    const href = resumeOf
+      ? router.urlForPath(`/console/flows/executions/${resumeOf}`)
+      : '';
+    const body = resumeOf
+      ? html`Resumption of
+          <a href=${href} data-testid="resume-of-link"
+            >${resumeOf.slice(0, 8)}</a
+          >${chain}`
+      : html`Chain total${chain}`;
+    return html`<div
+      class="resume-line"
+      data-testid="resume-line"
+      slot=${options.asDescriptionSlot ? 'description' : nothing}
+    >
+      ${body}
+    </div>`;
   }
 
   /**
@@ -3159,10 +3676,11 @@ ${execution.resolved_input_prompt}</pre>
     const running = this.isExecutionRunning();
     const statusVariant = executionStatusVariant(execution.status);
     const errorLine = this.errorLineText(execution);
+    const stopLine = automaticStopReason(execution);
 
     return html`
       <view-header
-        headerText=${this.flow?.name || 'Flow execution'}
+        headerText=${this.flow?.name || execution.flow_name || 'Flow execution'}
         width="wide"
       >
         <div slot="top" class="back-row">
@@ -3190,14 +3708,18 @@ ${execution.resolved_input_prompt}</pre>
           !isSubjectFallback(execution)
             ? html`<div slot="description" class="execution-subject-line">
                 ${renderExecutionSubject(execution)}
+                ${this.renderResumeLine(execution)}
               </div>`
-            : ''
+            : this.renderResumeLine(execution, { asDescriptionSlot: true })
         }
         ${this.renderHeaderActions(execution)}
       </view-header>
       <div class="column-layout wide">
         <div class="main-column">
-          ${this.renderSummaryStrip(execution)}
+          ${this.renderSummaryStrip(execution)} ${this.renderHostSessions()}
+          <execution-records-card
+            execution-id=${execution.id}
+          ></execution-records-card>
           <!-- What this run delegated, and what that cost. Renders one quiet
                line for the overwhelming majority of runs, which delegate
                nothing. -->
@@ -3221,6 +3743,14 @@ ${execution.resolved_input_prompt}</pre>
                 </div>`
               : ''
           }
+          ${
+            stopLine
+              ? html`<div class="stop-line" data-testid="stop-line">
+                  <sl-icon name="stop-circle"></sl-icon>
+                  <span>${stopLine}</span>
+                </div>`
+              : ''
+          }
           <sl-tab-group
             class="execution-tabs"
             @sl-tab-show=${this.handleTabShow}
@@ -3237,6 +3767,17 @@ ${execution.resolved_input_prompt}</pre>
               ?active=${this.activeTab === 'output'}
               >Output</sl-tab
             >
+            ${
+              this.showReportTab()
+                ? html`<sl-tab
+                    slot="nav"
+                    panel="report"
+                    data-testid="report-tab"
+                    ?active=${this.activeTab === 'report'}
+                    >Report</sl-tab
+                  >`
+                : ''
+            }
             <sl-tab
               slot="nav"
               panel="transcript"
@@ -3261,6 +3802,20 @@ ${execution.resolved_input_prompt}</pre>
             <sl-tab-panel name="output" ?active=${this.activeTab === 'output'}
               >${this.renderOutputPanel(execution)}</sl-tab-panel
             >
+            ${
+              this.showReportTab()
+                ? html`<sl-tab-panel
+                    name="report"
+                    ?active=${this.activeTab === 'report'}
+                  >
+                    <execution-report-panel
+                      execution-id=${execution.id}
+                      .result=${execution.result || null}
+                      .evidence=${this.evidenceStatus}
+                    ></execution-report-panel>
+                  </sl-tab-panel>`
+                : ''
+            }
             <sl-tab-panel
               name="transcript"
               ?active=${this.activeTab === 'transcript'}
@@ -3462,7 +4017,11 @@ ${log.payload.content}</pre>
       this.requestUpdate();
     } catch (error) {
       console.error('Failed to stop execution:', error);
-      // TODO: Show error notification to user
+      const detail =
+        error instanceof Error && error.message
+          ? error.message
+          : 'Failed to stop the run.';
+      showToast(detail, 'danger');
     }
   }
 
@@ -3476,7 +4035,7 @@ ${log.payload.content}</pre>
     if (!this.executionId) return;
 
     const confirmed = await confirmRetryExecution({
-      flow_name: this.flow?.name,
+      flow_name: this.flow?.name ?? this.execution?.flow_name ?? undefined,
       agent_type: this.flow?.agent_type,
       model_name: this.flow?.ai_model_name,
     });
@@ -3512,4 +4071,57 @@ ${log.payload.content}</pre>
   getStatusVariant(status: string) {
     return executionStatusVariant(status);
   }
+}
+
+/**
+ * Visible cost cell for a host-exec run: the seat usage the CLI reported,
+ * or a plain "not metered" note when it reported none.
+ */
+export function hostExecCostLabel(
+  result: Record<string, unknown> | null | undefined,
+  fallbackPremium?: number | null
+): string {
+  const reported = result?.premium_requests;
+  const premium =
+    typeof reported === 'number' && Number.isFinite(reported) && reported >= 0
+      ? reported
+      : typeof fallbackPremium === 'number' &&
+          Number.isFinite(fallbackPremium) &&
+          fallbackPremium >= 0
+        ? fallbackPremium
+        : null;
+  if (premium === null) {
+    return 'Not gateway metered';
+  }
+  return `${premium} premium request${premium === 1 ? '' : 's'}, not metered by the gateway`;
+}
+
+/**
+ * Metering note for a host-exec run that bypassed the model gateway.
+ *
+ * Only the server-set marker on a Cursor or Copilot host completion counts;
+ * container runs never show it.
+ */
+export function hostExecMetering(
+  result: Record<string, unknown> | null | undefined
+): { title: string } | null {
+  if (!result || result.gateway_metered !== false) {
+    return null;
+  }
+  const harness = result.harness;
+  if (harness !== 'cursor_cli' && harness !== 'copilot_cli') {
+    return null;
+  }
+  const subscription =
+    harness === 'copilot_cli'
+      ? "the runner user's GitHub Copilot seat"
+      : "the runner user's Cursor plan";
+  const premium = result.premium_requests;
+  const spend =
+    typeof premium === 'number' && Number.isFinite(premium) && premium >= 0
+      ? ` Copilot reported ${premium} premium request${premium === 1 ? '' : 's'}.`
+      : '';
+  return {
+    title: `Model spend for this run is billed to ${subscription}, not the Preloop gateway.${spend}`,
+  };
 }

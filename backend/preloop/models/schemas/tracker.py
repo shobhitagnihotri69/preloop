@@ -10,6 +10,8 @@ class TrackerTypeSchema(str, PydanticEnum):
     GITHUB = "github"
     GITLAB = "gitlab"
     JIRA = "jira"
+    BITBUCKET = "bitbucket"
+    BITBUCKET_DC = "bitbucket_dc"
 
 
 class TrackerBase(BaseModel):

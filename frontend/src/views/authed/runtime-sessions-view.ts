@@ -12,10 +12,12 @@ import '@shoelace-style/shoelace/dist/components/option/option.js';
 import '@shoelace-style/shoelace/dist/components/select/select.js';
 import '@shoelace-style/shoelace/dist/components/spinner/spinner.js';
 import '../../components/view-header.ts';
+import '../../components/legal-hold-control';
 import '../../components/json-tree.ts';
 import '../../components/list-toolbar.ts';
 import '../../components/preloop-session-observer.ts';
 import '../../components/token-figures.ts';
+import '../../components/session-embedding-settings.ts';
 import {
   getAccountRuntimeSessionDetail,
   getAccountRuntimeSessions,
@@ -43,6 +45,7 @@ import type {
   RuntimeSessionActivityItem,
   RuntimeSessionSummary,
   SessionSearchResponse,
+  SessionSearchArtifactRef,
   SessionSearchResult,
   SessionSearchSnippet,
 } from '../../types';
@@ -79,7 +82,52 @@ const MATCH_TAG_LABELS: Record<string, string> = {
   operator_note: 'Operator note',
   session_summary: 'Session summary',
   flow_log: 'Flow log',
+  artifact: 'Artifact',
 };
+
+/** Readable artifact kinds for an artifact match tag. */
+const ARTIFACT_KIND_LABELS: Record<string, string> = {
+  transcript: 'Transcript',
+  document: 'Document',
+  screenshot: 'Screenshot',
+  recording: 'Recording',
+  screencast: 'Screencast',
+  audio: 'Audio',
+  generated_file: 'Generated file',
+  trace: 'Trace',
+};
+
+/**
+ * The header lines the indexer writes at the top of an artifact chunk
+ * (`backend/preloop/services/session_search_index.py`, `_artifact_header`).
+ */
+export function artifactHeaderLines(
+  artifact: SessionSearchArtifactRef
+): string[] {
+  const labels = Object.keys(artifact.labels || {})
+    .sort()
+    .map((key) => {
+      const value = artifact.labels[key];
+      return `${key}=${Array.isArray(value) ? value.join(' ') : value}`;
+    })
+    .join(' ');
+  return [
+    'kind: artifact',
+    artifact.kind ? `artifact_kind: ${artifact.kind}` : '',
+    artifact.name ? `name: ${artifact.name}` : '',
+    artifact.tool_name ? `tool_name: ${artifact.tool_name}` : '',
+    labels ? `labels: ${labels}` : '',
+  ].filter(Boolean);
+}
+
+/** `m:ss` (or `h:mm:ss`) for a transcript cue start in seconds. */
+export function formatCueStart(seconds: number): string {
+  const whole = Math.max(0, Math.floor(seconds));
+  const h = Math.floor(whole / 3600);
+  const m = Math.floor((whole % 3600) / 60);
+  const s = String(whole % 60).padStart(2, '0');
+  return h > 0 ? `${h}:${String(m).padStart(2, '0')}:${s}` : `${m}:${s}`;
+}
 
 /**
  * Corpus kinds whose source_id names a turn the transcript can scroll to.
@@ -248,6 +296,22 @@ export class RuntimeSessionsView extends LitElement {
         font-size: var(--sl-font-size-x-small);
         text-align: left;
         cursor: pointer;
+      }
+
+      .embedding-settings-toggle {
+        display: block;
+        margin: 0 0 var(--sl-spacing-small) auto;
+        padding: 0;
+        border: none;
+        background: transparent;
+        color: var(--sl-color-primary-600);
+        font-size: var(--sl-font-size-x-small);
+        cursor: pointer;
+      }
+
+      .embedding-settings {
+        display: block;
+        margin-bottom: var(--sl-spacing-medium);
       }
 
       .titles-upsell-hint:hover {
@@ -958,6 +1022,12 @@ export class RuntimeSessionsView extends LitElement {
   }
 
   @state() private isPremium = true;
+  /**
+   * Whether the semantic search opt in card is open. Closed by default, and
+   * the card reads its setting only once opened, so a page load does not pay
+   * for the corpus progress count nobody asked to see.
+   */
+  @state() private embeddingSettingsOpen = false;
 
   /** Open the shell upgrade modal for AI session titles (passive list hint). */
   private openTitlesUpgrade(): void {
@@ -1338,14 +1408,25 @@ export class RuntimeSessionsView extends LitElement {
     return TURN_JUMP_KINDS.has(snippet.source_kind);
   }
 
+  /**
+   * The timeline row a snippet opens at. An artifact hit names its deposit
+   * row (`activity_id`), so the location is right as soon as the timeline
+   * draws artifact rows; until it does, the hit keeps the "Opens the
+   * session" hint rather than claiming a jump it cannot make.
+   */
+  private snippetTurnId(snippet: SessionSearchSnippet): string | null {
+    if (snippet.source_kind === 'artifact') {
+      return snippet.artifact?.activity_id ?? null;
+    }
+    return this.snippetJumpsToTurn(snippet) ? snippet.source_id : null;
+  }
+
   private openSnippet(
     result: SessionSearchResult,
     snippet: SessionSearchSnippet
   ) {
     this.selectedSessionId = result.runtime_session_id;
-    this.focusTurnId = this.snippetJumpsToTurn(snippet)
-      ? snippet.source_id
-      : null;
+    this.focusTurnId = this.snippetTurnId(snippet);
     this.syncUrl({ push: true });
   }
 
@@ -1580,6 +1661,54 @@ export class RuntimeSessionsView extends LitElement {
     );
   }
 
+  /** Whether the answer was keyword-only because the account never opted in. */
+  private semanticNotEnabled(): boolean {
+    return (
+      this.searchResults?.degraded?.reasons?.includes('semantic_not_enabled') ??
+      false
+    );
+  }
+
+  private toggleEmbeddingSettings(): void {
+    this.embeddingSettingsOpen = !this.embeddingSettingsOpen;
+  }
+
+  /**
+   * A saved opt in changes what the current search can do, so ask again
+   * rather than leave a stale "not opted in" notice on screen.
+   */
+  private handleEmbeddingChanged(): void {
+    if (this.searchQuery.trim()) {
+      void this.loadSearchResults();
+    }
+  }
+
+  private renderEmbeddingSettings() {
+    return html`
+      <button
+        type="button"
+        class="embedding-settings-toggle"
+        data-testid="embedding-settings-toggle"
+        aria-expanded=${this.embeddingSettingsOpen ? 'true' : 'false'}
+        @click=${this.toggleEmbeddingSettings}
+      >
+        ${
+          this.embeddingSettingsOpen
+            ? 'Hide semantic search settings'
+            : 'Semantic search settings'
+        }
+      </button>
+      ${
+        this.embeddingSettingsOpen
+          ? html`<session-embedding-settings
+              class="embedding-settings"
+              @session-embedding-changed=${this.handleEmbeddingChanged}
+            ></session-embedding-settings>`
+          : nothing
+      }
+    `;
+  }
+
   private renderSearchNotices() {
     const coverage = this.partialCoverageThrough();
     const floor = this.coverageFloorFrom();
@@ -1634,6 +1763,19 @@ export class RuntimeSessionsView extends LitElement {
                 <sl-alert variant="warning" open data-testid="degraded-notice">
                   <sl-icon slot="icon" name="exclamation-triangle"></sl-icon>
                   ${degraded}
+                  ${
+                    this.semanticNotEnabled() && !this.embeddingSettingsOpen
+                      ? html`<sl-button
+                          size="small"
+                          variant="text"
+                          data-testid="open-embedding-settings"
+                          @click=${() => {
+                            this.embeddingSettingsOpen = true;
+                          }}
+                          >Turn on semantic search</sl-button
+                        >`
+                      : nothing
+                  }
                 </sl-alert>
               `
             : ''
@@ -1642,8 +1784,45 @@ export class RuntimeSessionsView extends LitElement {
     `;
   }
 
+  /**
+   * Labels and cue time of an artifact match, so a transcript hit says which
+   * site it came from and where in the recording it is.
+   */
+  private renderArtifactMeta(snippet: SessionSearchSnippet) {
+    const artifact = snippet.artifact;
+    if (snippet.source_kind !== 'artifact' || !artifact) return '';
+    const labels = Object.entries(artifact.labels || {}).map(([key, value]) =>
+      Array.isArray(value) ? `${key}: ${value.join(', ')}` : `${key}: ${value}`
+    );
+    return html`
+      ${labels.map(
+        (label) =>
+          html`<sl-badge
+            variant="primary"
+            pill
+            data-testid="snippet-artifact-label"
+            >${label}</sl-badge
+          >`
+      )}
+      ${
+        typeof artifact.cue_start === 'number'
+          ? html`<span data-testid="snippet-cue-start"
+              >from ${formatCueStart(artifact.cue_start)}</span
+            >`
+          : ''
+      }
+    `;
+  }
+
   /** The readable reason a snippet matched, with the role when there is one. */
   private matchTag(snippet: SessionSearchSnippet): string {
+    const artifact = snippet.artifact;
+    if (snippet.source_kind === 'artifact' && artifact) {
+      const kind = artifact.kind
+        ? (ARTIFACT_KIND_LABELS[artifact.kind] ?? artifact.kind)
+        : 'Artifact';
+      return artifact.name ? `${kind} · ${artifact.name}` : kind;
+    }
     const label = MATCH_TAG_LABELS[snippet.source_kind] ?? snippet.source_kind;
     return snippet.role ? `${label} · ${snippet.role}` : label;
   }
@@ -1663,12 +1842,35 @@ export class RuntimeSessionsView extends LitElement {
         session to see the turn.</span
       >`;
     }
-    const parts = snippet.text.split(/<mark>|<\/mark>/);
+    const parts = this.snippetBody(snippet).split(/<mark>|<\/mark>/);
     return html`<span class="snippet-text"
       >${parts.map((part, index) =>
         index % 2 === 1 ? html`<mark>${part}</mark>` : part
       )}</span
     >`;
+  }
+
+  /**
+   * The snippet text without the artifact header lines (kind, name, labels)
+   * that the badges already show. A header line that carries a marked term
+   * stays, since it is why the chunk matched.
+   */
+  private snippetBody(snippet: SessionSearchSnippet): string {
+    const text = snippet.text ?? '';
+    const artifact = snippet.artifact;
+    if (snippet.source_kind !== 'artifact' || !artifact) return text;
+    const header = artifactHeaderLines(artifact);
+    const lines = text.split('\n');
+    let skip = 0;
+    while (
+      skip < lines.length - 1 &&
+      !lines[skip].includes('<mark>') &&
+      lines[skip].trim() &&
+      header.some((line) => line.endsWith(lines[skip].trim()))
+    ) {
+      skip += 1;
+    }
+    return lines.slice(skip).join('\n');
   }
 
   private searchResultTitle(result: SessionSearchResult): string {
@@ -1706,6 +1908,7 @@ export class RuntimeSessionsView extends LitElement {
                   <sl-badge variant="neutral" pill
                     >${this.matchTag(snippet)}</sl-badge
                   >
+                  ${this.renderArtifactMeta(snippet)}
                   <span>${this.formatDateTime(snippet.occurred_at)}</span>
                 </div>
                 ${this.renderSnippetText(snippet)}
@@ -2239,6 +2442,11 @@ export class RuntimeSessionsView extends LitElement {
               <sl-badge variant=${this.getSessionVariant(session)}>
                 ${this.getSessionLabel(session)}
               </sl-badge>
+              <legal-hold-control
+                resource-type="runtime_session"
+                resource-id=${session.id}
+                ?known-held=${session.legal_hold === true}
+              ></legal-hold-control>
             </div>
           </div>
           <div class="detail-meta">
@@ -2344,7 +2552,7 @@ export class RuntimeSessionsView extends LitElement {
         <div class="main-column">
           <div class="page">
             <list-toolbar
-              searchPlaceholder="Search prompts, responses, and tool calls"
+              searchPlaceholder="Search prompts, responses, tool calls, and artifacts"
               searchLabel="Search session content"
               .search=${this.searchQuery}
               .views=${[]}
@@ -2406,6 +2614,7 @@ export class RuntimeSessionsView extends LitElement {
               </div>
               <span slot="count">${this.sessionCountLabel}</span>
             </list-toolbar>
+            ${this.renderEmbeddingSettings()}
             ${
               this.isPremium
                 ? nothing

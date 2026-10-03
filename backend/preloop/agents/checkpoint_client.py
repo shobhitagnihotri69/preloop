@@ -18,6 +18,7 @@ import tempfile
 import time
 import urllib.request
 from pathlib import Path, PurePosixPath
+from typing import BinaryIO
 
 WORKSPACE_ROOT = Path("/workspace")
 EVIDENCE_REFERENCE_PATH = Path("/tmp/preloop-evidence-reference.json")
@@ -126,6 +127,52 @@ def checkpoint_base(repo: Path, root: Path) -> str | None:
     return git_value(repo, "merge-base", "HEAD", "refs/remotes/origin/HEAD")
 
 
+class _CheckpointBuffer:
+    """Enforce the compressed cap while writing, even within a large member."""
+
+    def __init__(self, limit: int) -> None:
+        self.buffer = io.BytesIO()
+        self.limit = limit
+
+    def write(self, data: bytes) -> int:
+        if self.tell() + len(data) > self.limit:
+            raise ValueError("checkpoint_oversized")
+        return self.buffer.write(data)
+
+    def tell(self) -> int:
+        return self.buffer.tell()
+
+    def getvalue(self) -> bytes:
+        return self.buffer.getvalue()
+
+    def read(self, size: int = -1) -> bytes:
+        return self.buffer.read(size)
+
+    def seek(self, offset: int, whence: int = 0) -> int:
+        return self.buffer.seek(offset, whence)
+
+    def close(self) -> None:
+        self.buffer.close()
+
+
+class _CheckpointReader:
+    """Hash file chunks as tarfile streams them, without loading the member."""
+
+    def __init__(self, source: BinaryIO, expected_size: int) -> None:
+        self.source = source
+        self.remaining = expected_size
+        self.digest = hashlib.sha256()
+
+    def read(self, size: int = -1) -> bytes:
+        requested = self.remaining if size < 0 else min(size, self.remaining)
+        data = self.source.read(requested)
+        if len(data) != requested:
+            raise ValueError("checkpoint_workspace_busy")
+        self.remaining -= len(data)
+        self.digest.update(data)
+        return data
+
+
 def capture(root: Path, *, max_bytes: int) -> bytes:
     """Capture a stable file set, detecting concurrent writes before upload."""
     root = root.resolve()
@@ -158,7 +205,7 @@ def capture(root: Path, *, max_bytes: int) -> bytes:
                     "base_sha": checkpoint_base(repo, root),
                 }
             )
-    buffer = io.BytesIO()
+    buffer = _CheckpointBuffer(max_bytes)
     digest = hashlib.sha256()
     with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
         for path, before in files:
@@ -166,21 +213,23 @@ def capture(root: Path, *, max_bytes: int) -> bytes:
                 # Runtime remotes can embed clone credentials; recreate from
                 # trusted repository configuration when resuming.
                 continue
-            data = path.read_bytes()
-            after = path.stat()
+            relative = str(path.relative_to(root))
+            info = tarfile.TarInfo("workspace/" + relative)
+            info.size = before.st_size
+            info.mode = before.st_mode & 0o777
+            try:
+                with path.open("rb") as source:
+                    reader = _CheckpointReader(source, before.st_size)
+                    archive.addfile(info, reader)
+                after = path.stat()
+            except FileNotFoundError:
+                raise ValueError("checkpoint_workspace_busy") from None
             if (before.st_size, before.st_mtime_ns) != (
                 after.st_size,
                 after.st_mtime_ns,
             ):
                 raise ValueError("checkpoint_workspace_busy")
-            relative = str(path.relative_to(root))
-            digest.update(relative.encode() + b"\0" + hashlib.sha256(data).digest())
-            info = tarfile.TarInfo("workspace/" + relative)
-            info.size = len(data)
-            info.mode = before.st_mode & 0o777
-            archive.addfile(info, io.BytesIO(data))
-            if buffer.tell() > max_bytes:
-                raise ValueError("checkpoint_oversized")
+            digest.update(relative.encode() + b"\0" + reader.digest.digest())
         metadata = json.dumps(
             {
                 "version": 1,
@@ -194,7 +243,10 @@ def capture(root: Path, *, max_bytes: int) -> bytes:
         archive.addfile(info, io.BytesIO(metadata))
     # Detect files changing between their individual capture and archive end.
     for path, before in files:
-        after = path.stat()
+        try:
+            after = path.stat()
+        except FileNotFoundError:
+            raise ValueError("checkpoint_workspace_busy") from None
         if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
             raise ValueError("checkpoint_workspace_busy")
     final_paths: set[Path] = set()
@@ -618,7 +670,22 @@ def main() -> None:
                     raise SystemExit(2) from None
                 print("PRELOOP_EVIDENCE failed " + type(exc).__name__, flush=True)
                 raise SystemExit(1) from None
-            print("PRELOOP_CHECKPOINT failed " + type(exc).__name__, flush=True)
+            # The cap is a storage limit, not a failed review. The legacy
+            # snapshot path prints a skip and returns 0; a direct upload that
+            # cannot fit must do the same or prepublication exits 1 after the
+            # agent has already finished.
+            if str(exc) == "checkpoint_oversized":
+                print(
+                    "PRELOOP_CHECKPOINT skipped checkpoint_oversized",
+                    flush=True,
+                )
+                return
+            reason = str(exc)
+            detail = " " + reason if re.fullmatch(r"[a-z0-9_]+", reason) else ""
+            print(
+                "PRELOOP_CHECKPOINT failed " + type(exc).__name__ + detail,
+                flush=True,
+            )
             raise SystemExit(1) from None
 
 

@@ -27,6 +27,10 @@ const (
 	permissionSourceClaudeCode = "claude_code"
 	permissionSourceCodexCLI   = "codex_cli"
 	permissionSourceCursor     = "cursor"
+	// permissionSourceCopilotCLI is GitHub Copilot CLI's user-level hooks
+	// (~/.copilot/hooks/preloop.json). Native tools skip the MCP firewall;
+	// preToolUse routes them through permission-check.
+	permissionSourceCopilotCLI = "copilot_cli"
 	// permissionSourceOpenCode is sent by the OpenCode runtime plugin's
 	// tool.execute.before gate, not by this CLI's permission-hook command:
 	// onboarding registers the plugin instead of writing a command hook.
@@ -60,7 +64,9 @@ type permissionCheckRequest struct {
 	ToolName        string                 `json:"tool_name"`
 	ToolInput       map[string]interface{} `json:"tool_input,omitempty"`
 	SessionID       string                 `json:"session_id,omitempty"`
+	Model           string                 `json:"model,omitempty"`
 	Cwd             string                 `json:"cwd,omitempty"`
+	Repository      *repositoryIdentity    `json:"repository,omitempty"`
 	AgentReasoning  string                 `json:"agent_reasoning,omitempty"`
 	ClientDecision  string                 `json:"client_decision,omitempty"`
 	EvaluationPhase string                 `json:"evaluation_phase,omitempty"`
@@ -151,7 +157,7 @@ func init() {
 	agentsPermissionHookCmd.Flags().String(
 		"source",
 		"",
-		"agent source: claude_code, codex_cli, or cursor",
+		"agent source: claude_code, codex_cli, cursor, or copilot_cli",
 	)
 	agentsPermissionHookCmd.Flags().String("hook-event", "", "Codex event: PreToolUse or PermissionRequest (default PermissionRequest)")
 	agentsPermissionHookCmd.Flags().Bool(
@@ -165,12 +171,18 @@ func runAgentsPermissionHook(cmd *cobra.Command, args []string) error {
 	source := normalizePermissionSource(mustFlagString(cmd, "source"))
 	failOpen, _ := cmd.Flags().GetBool("fail-open")
 	if source == "" {
-		return fmt.Errorf("--source must be one of claude_code, codex_cli, cursor")
+		return fmt.Errorf("--source must be one of claude_code, codex_cli, cursor, copilot_cli")
 	}
 
 	hookEvent := mustFlagString(cmd, "hook-event")
 	if hookEvent != "" && (source != permissionSourceCodexCLI || (hookEvent != "PreToolUse" && hookEvent != "PermissionRequest")) {
 		return fmt.Errorf("--hook-event is only supported for Codex PreToolUse or PermissionRequest")
+	}
+	// Codex refreshes its ChatGPT login on its own. Push a newer local
+	// bundle before deciding. A push error is logged once and does not
+	// change this decision or the sync stamp.
+	if source == permissionSourceCodexCLI {
+		maybeSyncCodexOAuthFromPermissionHook()
 	}
 	// The event is needed to route an operator note: Cursor serves all three
 	// of its hooks from one command, so only the payload names the event.
@@ -499,6 +511,8 @@ func permissionSourceDisplayName(source string) string {
 		return "Codex CLI"
 	case permissionSourceCursor:
 		return "Cursor"
+	case permissionSourceCopilotCLI:
+		return "Copilot CLI"
 	case permissionSourceOpenCode:
 		return "OpenCode"
 	default:
@@ -538,8 +552,15 @@ func buildPermissionRequest(
 	}
 
 	req := permissionCheckRequest{Source: source}
-	req.SessionID = firstStringField(event, "session_id", "conversation_id", "turn_id")
+	req.SessionID = hookEventSessionID(raw)
+	req.Model = firstStringField(event, "model", "model_name")
+	if source == permissionSourceCodexCLI && req.Model == "" {
+		req.Model = codexPermissionModel(req.SessionID, firstStringField(event, "transcript_path", "rollout_path"), firstStringField(event, "turn_id"))
+	}
 	req.Cwd = firstStringField(event, "cwd")
+	// Repository identity is a trusted observation of the hook's own cwd, never
+	// of the caller-supplied tool arguments: MCP paths are untrusted.
+	req.Repository = resolveRepositoryIdentity(req.Cwd)
 
 	switch source {
 	case permissionSourceClaudeCode:
@@ -571,6 +592,15 @@ func buildPermissionRequest(
 		// agent's native permissions.json (+ sandbox) so only would-prompt
 		// calls escalate to Preloop.
 		req.ClientDecision = cursorPermissionClientDecision(event, req, cred)
+	case permissionSourceCopilotCLI:
+		// Prefer camelCase (toolName / toolArgs); accept the PascalCase VS Code
+		// form (tool_name / tool_input) when the hook file uses PreToolUse.
+		req.ToolName = firstStringField(event, "toolName", "tool_name")
+		if _, hasArgs := event["toolArgs"]; hasArgs {
+			req.ToolInput = coerceToolInput(event["toolArgs"])
+		} else {
+			req.ToolInput = coerceToolInput(event["tool_input"])
+		}
 	}
 
 	req.AgentReasoning = firstNonEmptyString(
@@ -890,6 +920,21 @@ func renderHookDecision(source string, decision hookDecision) map[string]interfa
 			payload["additional_context"] = decision.OperatorNote
 		}
 		return payload
+	case permissionSourceCopilotCLI:
+		// Copilot preToolUse decision object (hooks reference): distinct from
+		// Cursor's {"permission": ...} schema.
+		if allow {
+			return map[string]interface{}{"permissionDecision": "allow"}
+		}
+		behavior := "deny"
+		if ask {
+			behavior = "ask"
+		}
+		payload := map[string]interface{}{"permissionDecision": behavior}
+		if decision.Reason != "" {
+			payload["permissionDecisionReason"] = decision.Reason
+		}
+		return payload
 	default:
 		return map[string]interface{}{"permission": "deny"}
 	}
@@ -903,6 +948,8 @@ func normalizePermissionSource(source string) string {
 		return permissionSourceCodexCLI
 	case permissionSourceCursor:
 		return permissionSourceCursor
+	case permissionSourceCopilotCLI, "copilot", "copilot cli", "copilot-cli", "github copilot cli":
+		return permissionSourceCopilotCLI
 	default:
 		return ""
 	}

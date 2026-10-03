@@ -21,6 +21,12 @@ from preloop.models.crud import (
     crud_comment,
     crud_tracker,
 )
+from preloop.models.crud.project import (
+    REPOSITORY_ID_TRACKER_TYPES,
+    find_same_repository_projects,
+    lock_repository_identity,
+    repository_host,
+)
 from preloop.models.db.session import release_transaction
 from preloop.models.models import (
     Issue,
@@ -57,12 +63,15 @@ class TrackerClient:
         if not initialize_client:
             # Webhook payload transforms need identity and URL configuration,
             # never API credentials, OAuth installation lookup or network auth.
+            from ..trackers.bitbucket import BitbucketTracker
             from ..trackers.github import GitHubTracker
             from ..trackers.gitlab import GitLabTracker
             from ..trackers.jira import JiraTracker
 
             if self.tracker_type == "github":
                 self.client = GitHubTracker(tracker.id, "", connection_details)
+            elif self.tracker_type == "bitbucket":
+                self.client = BitbucketTracker(tracker.id, "", connection_details)
             elif self.tracker_type == "gitlab":
                 self.client = GitLabTracker(
                     tracker.id, "", connection_details, initialize_client=False
@@ -130,6 +139,24 @@ class TrackerClient:
             from ..trackers.jira import JiraTracker
 
             self.client = JiraTracker(
+                tracker.id, tracker.resolved_api_key, connection_details
+            )
+        elif self.tracker_type == "bitbucket_dc":
+            from ..trackers.bitbucket_dc import BitbucketDCTracker
+
+            connection_details["auth_type"] = (
+                getattr(tracker, "auth_type", None) or "api_token"
+            )
+            self.client = BitbucketDCTracker(
+                tracker.id, tracker.resolved_api_key, connection_details
+            )
+        elif self.tracker_type == "bitbucket":
+            from ..trackers.bitbucket import BitbucketTracker
+
+            connection_details["auth_type"] = (
+                getattr(tracker, "auth_type", None) or "api_token"
+            )
+            self.client = BitbucketTracker(
                 tracker.id, tracker.resolved_api_key, connection_details
             )
         else:
@@ -282,10 +309,51 @@ class TrackerClient:
                     account_id=self.tracker.account_id,
                 )
                 if existing_project:
+                    # Same repository ID: this picks up renames. Merge rather
+                    # than replace meta_data so Preloop-owned keys such as
+                    # the repository transfer history survive a refresh.
+                    if isinstance(proj_create_data.get("meta_data"), dict):
+                        proj_create_data["meta_data"] = {
+                            **(existing_project.meta_data or {}),
+                            **proj_create_data["meta_data"],
+                        }
                     project = crud_project.update(
                         db, db_obj=existing_project, obj_in=proj_create_data
                     )
                 else:
+                    org_tracker = organization.tracker
+                    if org_tracker.tracker_type in REPOSITORY_ID_TRACKER_TYPES:
+                        # Serialize with API creates/transfers of this repo;
+                        # released by the commit in crud_project.create.
+                        lock_repository_identity(
+                            db,
+                            account_id=self.tracker.account_id,
+                            host=repository_host(org_tracker),
+                            identifier=str(project_identifier),
+                        )
+                    registered = find_same_repository_projects(
+                        db,
+                        organization=organization,
+                        identifier=str(project_identifier),
+                        account_id=self.tracker.account_id,
+                    )
+                    if registered:
+                        # The repository moved here from another organization.
+                        # Creating a second project would split its history
+                        # and make webhook routing ambiguous; rebinding needs
+                        # an authorised, explicit transfer (#1159).
+                        logger.warning(
+                            f"Repository {project_identifier} ({project_name}) is "
+                            f"visible in organization {organization.id} but is "
+                            f"registered as project {registered[0].id} in "
+                            f"organization {registered[0].organization_id}. Not "
+                            "creating a duplicate. Move it with POST "
+                            f"/api/v1/projects/{registered[0].id}/transfer."
+                        )
+                        # Nothing to write: end the transaction so the
+                        # repository lock is not held past this check.
+                        release_transaction(db)
+                        continue
                     project = crud_project.create(db, obj_in=proj_create_data)
                 processed_projects.append(project)
                 # The project resolved, so any unknown-project backoff/degraded
@@ -312,6 +380,9 @@ class TrackerClient:
         force_update: bool = False,
     ) -> Tuple[List[Issue], int]:
         """Scan and update issues for a project."""
+        if self.tracker_type == "bitbucket_dc":
+            # DC is a repository host. Issue sync belongs to the Jira tracker.
+            return [], 0
         logger.info(
             f"Scanning issues for project {project.id} ({project.name}) since {since}"
         )
@@ -498,7 +569,7 @@ async def _process_organization(
         logger.warning(
             "PRELOOP_URL environment variable not set. Skipping webhook registration."
         )
-    else:
+    elif client.tracker_type != "bitbucket_dc":
         try:
             webhook_target_path = (
                 f"/api/v1/private/webhooks/{client.tracker_type}/{org.id}"
@@ -624,6 +695,26 @@ async def _process_organization(
                         exc_info=True,
                     )
                     org_stats["organizations"]["errors"] += 1
+            elif client.tracker_type == "bitbucket":
+                # Bitbucket hooks are per repository; the workspace-level hook
+                # API is not used so a repository access token also works.
+                for project in projects:
+                    try:
+                        if not await client.client.is_webhook_registered_for_project(
+                            project, webhook_target_url
+                        ):
+                            await client.client.register_webhook(
+                                db=db,
+                                project=project,
+                                webhook_url=webhook_target_url,
+                                secret=current_secret_to_use,
+                            )
+                    except Exception as e:
+                        logger.error(
+                            f"Error registering webhook for Bitbucket repository {project.identifier}: {e}",
+                            exc_info=True,
+                        )
+                        org_stats["organizations"]["errors"] += 1
             else:
                 # Handle other tracker types here if necessary
                 pass

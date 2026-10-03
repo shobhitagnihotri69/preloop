@@ -236,4 +236,42 @@ def test_flow_runners_revision_chains_onto_approval_rule_context() -> None:
     assert plan_choice.down_revision == "20260917_onboarding_claim"
     auth_generation = script.get_revision("20260921_auth_generation")
     assert auth_generation.down_revision == "20260917_plan_choice"
-    assert script.get_heads() == ["20260921_auth_generation"]
+    session_artifact = script.get_revision("20260924_session_artifact")
+    assert session_artifact.down_revision == "20260921_auth_generation"
+    browser_step_idx = script.get_revision("20260924_browser_step_idx")
+    assert browser_step_idx.down_revision == "20260924_session_artifact"
+    usage_principal_ts = script.get_revision("20260924_usage_principal_ts")
+    assert usage_principal_ts.down_revision == "20260924_browser_step_idx"
+    exec_log_type_ts = script.get_revision("20260927_exec_log_type_ts")
+    assert exec_log_type_ts.down_revision == "20260924_usage_principal_ts"
+    review_instructions = script.get_revision("20260927_review_instructions")
+    assert review_instructions.down_revision == "20260927_exec_log_type_ts"
+    copilot_import = script.get_revision("20260927_copilot_import")
+    assert copilot_import.down_revision == "20260927_review_instructions"
+    spend_outliers = script.get_revision("20260927_spend_outliers")
+    assert spend_outliers.down_revision == "20260927_copilot_import"
+    issue_cost_rollup = script.get_revision("20260927_issue_cost_rollup")
+    assert issue_cost_rollup.down_revision == "20260927_spend_outliers"
+    policy_notice_hit = script.get_revision("20260927_policy_notice_hit")
+    assert policy_notice_hit.down_revision == "20260927_issue_cost_rollup"
+    cli_login_session = script.get_revision("20260928_cli_session")
+    assert cli_login_session.down_revision == "20260927_policy_notice_hit"
+    account_hierarchy = script.get_revision("20260928_account_hierarchy")
+    assert account_hierarchy.down_revision == "20260928_cli_session"
+    access_grants = script.get_revision("20260928_access_grants")
+    assert access_grants.down_revision == "20260928_account_hierarchy"
+    person_membership = script.get_revision("20260928_person_membership")
+    assert person_membership.down_revision == "20260928_access_grants"
+    person_backfill = script.get_revision("20260928_person_backfill")
+    assert person_backfill.down_revision == "20260928_person_membership"
+    person_constraints = script.get_revision("20260928_person_constraints")
+    assert person_constraints.down_revision == "20260928_person_backfill"
+    share_tag_rule = script.get_revision("20260928_share_tag_rule")
+    assert share_tag_rule.down_revision == "20260928_person_constraints"
+    issue_cost_accuracy = script.get_revision("20260927_issue_cost_accuracy")
+    assert issue_cost_accuracy.down_revision == "20260928_share_tag_rule"
+    artifact_kinds = script.get_revision("20261001_artifact_kinds_labels")
+    assert artifact_kinds.down_revision == "20260927_issue_cost_accuracy"
+    session_cwd = script.get_revision("20261002_runtime_session_cwd")
+    assert session_cwd.down_revision == "20261001_artifact_kinds_labels"
+    assert script.get_heads() == ["20261002_runtime_session_cwd"]

@@ -29,6 +29,8 @@ describe('AttentionView', () => {
   let usageByModel: any[];
   let agentDeletes: string[];
   let dismissalWrites: { url: string; method: string; body: any }[];
+  let policyNoticesResponse: any[] = [];
+  let spendOutliersResponse: any[];
 
   const json = (data: unknown) =>
     new Response(JSON.stringify(data), {
@@ -48,6 +50,7 @@ describe('AttentionView', () => {
     agentsResponse = [];
     usageByModel = [];
     agentDeletes = [];
+    spendOutliersResponse = [];
     window.location.hash = '';
 
     approvalsResponse = [
@@ -137,6 +140,22 @@ describe('AttentionView', () => {
         if (url.startsWith('/api/v1/approval-requests')) {
           return json(approvalsResponse);
         }
+        if (url.startsWith('/api/v1/policies/notices/summary')) {
+          return json({ days: 7, rules: policyNoticesResponse });
+        }
+        if (url.startsWith('/api/v1/attention/spend-outliers/settings')) {
+          return json({
+            daily_multiple: 3,
+            min_history_days: 7,
+            top_tier_model_prefixes: ['top-model'],
+            top_tier_share: 0.5,
+            session_cost_threshold_usd: null,
+            configured: false,
+          });
+        }
+        if (url.startsWith('/api/v1/attention/spend-outliers')) {
+          return json({ items: spendOutliersResponse });
+        }
         if (url.startsWith('/api/v1/flows/executions')) {
           return json(executionsResponse);
         }
@@ -200,6 +219,7 @@ describe('AttentionView', () => {
   });
 
   afterEach(() => {
+    policyNoticesResponse = [];
     invalidateApiCaches();
     fetchStub.restore();
     connectStub.restore();
@@ -582,6 +602,37 @@ describe('AttentionView', () => {
     expect(flowsChip.textContent!.trim()).to.equal('1 flow');
   });
 
+  it('shows a policy notice card with the redacted excerpt', async () => {
+    policyNoticesResponse = [
+      {
+        rule_id: 'notify-codename',
+        rule_description: 'Mentions of the codename',
+        target: 'model.request',
+        count: 2,
+        last_hit_id: 'hit-2',
+        last_hit_at: new Date(Date.now() - 60_000).toISOString(),
+        last_excerpt: 'the project-x plan uses [REDACTED]',
+        last_username: 'alex',
+        last_user_id: 'user-1',
+      },
+    ];
+    const el = await mount();
+
+    const section = el.shadowRoot!.querySelector('#policy-notices')!;
+    expect(section, 'policy notices section').to.exist;
+    const rows = section.querySelectorAll('.attention-row');
+    expect(rows).to.have.length(1);
+    expect(rows[0].textContent).to.contain('Mentions of the codename');
+    const evidence = section.querySelector('.row-evidence')!;
+    expect(
+      evidence.querySelector('.policy-notice-excerpt')!.textContent!.trim()
+    ).to.equal('the project-x plan uses [REDACTED]');
+    expect(evidence.textContent).to.contain('by alex');
+    expect(evidence.querySelector('sl-button')!.getAttribute('href')).to.equal(
+      '/console/policies'
+    );
+  });
+
   it('shows a chip per kind, muted when the kind is empty', async () => {
     const el = await mount();
     const chips = Array.from(el.shadowRoot!.querySelectorAll('.chip')).map(
@@ -593,7 +644,9 @@ describe('AttentionView', () => {
       '1 flow',
       '0 models',
       '1 budget',
+      '0 spend outliers',
       '0 pricing',
+      '0 policy notices',
     ]);
     const agentsChip = el.shadowRoot!.querySelectorAll('.chip')[1];
     expect(agentsChip.classList.contains('empty')).to.be.true;
@@ -612,6 +665,81 @@ describe('AttentionView', () => {
     expect(
       el.shadowRoot!.querySelector('budget-limits-dialog')!.hasAttribute('open')
     ).to.be.true;
+  });
+
+  describe('spend outliers', () => {
+    const spendFinding = (overrides: Record<string, unknown> = {}) => ({
+      id: 'finding-1',
+      item_id: 'spend:daily_spend:user-7',
+      fingerprint: 'daily_spend|user-7|2026-09-01',
+      rule: 'daily_spend',
+      rule_label: 'Daily spend spike',
+      user_id: 'user-7',
+      user_name: 'dev-seven',
+      runtime_session_id: null,
+      session_title: null,
+      day: '2026-09-01',
+      detected_at: new Date().toISOString(),
+      details: {
+        spend_usd: 45,
+        median_usd: 10,
+        multiple: 4.5,
+        threshold_multiple: 3,
+        imported_usd: 15,
+        imported_sources: ['copilot'],
+      },
+      summary: '',
+      ...overrides,
+    });
+
+    it('lists a finding in its own section with the numbers behind it', async () => {
+      spendOutliersResponse = [spendFinding()];
+      const el = await mount();
+
+      const section = el.shadowRoot!.querySelector('#spend-outliers')!;
+      expect(section).to.exist;
+      const sectionText = section.textContent!.replace(/\s+/g, ' ');
+      expect(sectionText).to.contain('dev-seven · Daily spend spike');
+      expect(sectionText).to.contain('28-day median');
+      expect(sectionText).to.contain('not metered by the gateway');
+    });
+
+    it('offers the dismiss menu on a spend card', async () => {
+      permissions = ['view_cost', 'manage_agents'];
+      spendOutliersResponse = [spendFinding()];
+      const el = await mount();
+
+      expect(el.shadowRoot!.querySelector('#spend-outliers .dismiss-dropdown'))
+        .to.exist;
+    });
+
+    it('opens the alert settings from the header for a budget manager', async () => {
+      permissions = ['view_cost', 'manage_budgets'];
+      const el = await mount();
+
+      const button = el.shadowRoot!.querySelector(
+        '.spend-settings-button'
+      ) as HTMLElement;
+      expect(button).to.exist;
+      button.click();
+      await el.updateComplete;
+
+      expect(
+        el
+          .shadowRoot!.querySelector('spend-outlier-settings-dialog')!
+          .hasAttribute('open')
+      ).to.be.true;
+    });
+
+    it('hides the alert settings from a member without manage_budgets', async () => {
+      permissions = ['view_cost'];
+      spendOutliersResponse = [spendFinding()];
+      const el = await mount();
+
+      expect(el.shadowRoot!.querySelector('.spend-settings-button')).to.not
+        .exist;
+      expect(text(el)).to.not.contain('Alert settings');
+    });
   });
 
   it('drops a section when its request fails and keeps the rest', async () => {

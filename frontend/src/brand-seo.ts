@@ -264,6 +264,18 @@ export function get_meta_for_route(
   config: BrandConfig,
   posts: BlogPost[] = []
 ): RouteMeta {
+  const meta = get_route_meta(route, config, posts);
+  return {
+    ...meta,
+    og_image: absolute_url(meta.og_image, config),
+  };
+}
+
+function get_route_meta(
+  route: string,
+  config: BrandConfig,
+  posts: BlogPost[] = []
+): RouteMeta {
   const meta = config.landing?.meta || {};
   const default_title = meta.title || config.name || 'Preloop';
   const default_description = meta.description || '';
@@ -472,11 +484,15 @@ function get_origin(config: BrandConfig): string {
   return `https://${config.domain}`;
 }
 
-function absolute_url(path: string, config: BrandConfig): string {
+/**
+ * Resolve a site-relative path against the brand's public origin.
+ * Already-absolute http(s) and protocol-relative URLs are returned unchanged.
+ */
+export function absolute_url(path: string, config: BrandConfig): string {
   if (!path) {
     return '';
   }
-  if (/^https?:\/\//i.test(path)) {
+  if (/^(?:https?:)?\/\//i.test(path)) {
     return path;
   }
   const origin = get_origin(config);
@@ -743,10 +759,10 @@ export function buildSoftwareApplicationSchema(
       'Python 3.11+, PostgreSQL 14+ with PGVector, Docker (optional)',
   };
 
-  // TODO(seo): add `aggregateRating` here once real user-review data is
-  // available (for example from G2, Capterra, or verified first-party
-  // reviews). Per Google's structured-data policy, aggregate ratings must
-  // correspond to genuine reviews and must not be fabricated.
+  // aggregateRating stays off this object until real review data exists
+  // (a review site, or verified first-party reviews). Google's structured
+  // data policy requires the rating to match genuine reviews. Do not
+  // invent one. The software application test pins that the field is absent.
 
   return schema;
 }

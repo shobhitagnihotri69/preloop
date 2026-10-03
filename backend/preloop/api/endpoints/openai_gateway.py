@@ -13,12 +13,9 @@ from preloop.services.agent_session_headers import (
     native_parent_session_id_from_headers,
     native_session_id_from_headers,
 )
-from preloop.services.model_gateway_auth import (
-    ModelGatewayAuthContext,
-    authenticate_bearer_token,
-)
+from preloop.api.gateway_auth_dependency import get_model_gateway_auth_context
+from preloop.services.model_gateway_auth import ModelGatewayAuthContext
 from preloop.api.deps import get_budget_enforcer
-from preloop.services.model_gateway_errors import ModelGatewayAPIError
 from preloop.services.gateway_streaming import GatewayStreamingResponse
 from preloop.services.openai_gateway import OpenAIGatewayService
 
@@ -60,13 +57,20 @@ def _with_gateway_warnings(
     could not be enforced because the model has no known price. Surfacing
     them as ``X-Preloop-Warning`` keeps the body OpenAI-compatible while
     making the condition visible to the caller.
+
+    The id of the usage row written for the request is returned as
+    ``X-Preloop-Usage-Id`` so a caller (``preloop models smoke``) can name
+    the exact row the Cost page counts.
     """
+    headers: Dict[str, str] = {}
     warning = service.response_warning
     if warning:
-        return JSONResponse(
-            content=result,
-            headers={"X-Preloop-Warning": _sanitize_header_value(warning)},
-        )
+        headers["X-Preloop-Warning"] = _sanitize_header_value(warning)
+    usage_id = getattr(service, "last_usage_id", None)
+    if isinstance(usage_id, str) and usage_id:
+        headers["X-Preloop-Usage-Id"] = _sanitize_header_value(usage_id)
+    if headers:
+        return JSONResponse(content=result, headers=headers)
     return result
 
 
@@ -92,29 +96,6 @@ def _streaming_with_gateway_warnings(
         ),
         on_complete=service.flush_deferred_stream_record,
     )
-
-
-async def get_model_gateway_auth_context(
-    authorization: Optional[str] = Header(None),
-    db: Session = Depends(get_db_session),
-) -> ModelGatewayAuthContext:
-    """Authenticate a bearer token for the model gateway."""
-    if not authorization or not authorization.lower().startswith("bearer "):
-        raise ModelGatewayAPIError(
-            provider="openai",
-            status_code=401,
-            message="Missing bearer token",
-        )
-
-    token = authorization[7:]
-    auth_context = await authenticate_bearer_token(token, db, owns_db_session=True)
-    if not auth_context:
-        raise ModelGatewayAPIError(
-            provider="openai",
-            status_code=401,
-            message="Invalid authentication credentials",
-        )
-    return auth_context
 
 
 @router.get("/models")
@@ -156,6 +137,9 @@ def create_chat_completion(
         owns_db_session=True,
         client_session_id=x_preloop_session_id
         or native_session_id_from_headers(request.headers, auth_context=auth_context),
+        # Only the explicit Preloop header opts a plain API key into a
+        # runtime session; a vendor-native header must not.
+        client_session_id_is_explicit=bool(x_preloop_session_id),
         client_parent_session_id=(
             None
             if x_preloop_session_id
@@ -195,6 +179,9 @@ def create_response(
         client_identity_headers=request.headers,
         client_session_id=x_preloop_session_id
         or native_session_id_from_headers(request.headers, auth_context=auth_context),
+        # Only the explicit Preloop header opts a plain API key into a
+        # runtime session; a vendor-native header must not.
+        client_session_id_is_explicit=bool(x_preloop_session_id),
         client_parent_session_id=(
             None
             if x_preloop_session_id
@@ -234,6 +221,9 @@ def create_embedding(
         owns_db_session=True,
         client_session_id=x_preloop_session_id
         or native_session_id_from_headers(request.headers, auth_context=auth_context),
+        # Only the explicit Preloop header opts a plain API key into a
+        # runtime session; a vendor-native header must not.
+        client_session_id_is_explicit=bool(x_preloop_session_id),
         client_parent_session_id=(
             None
             if x_preloop_session_id

@@ -1,5 +1,7 @@
 # Cost Analytics and Budgeting
 
+Editions: OSS. Contributor documentation for this repository.
+
 Cost analytics turns gateway telemetry into explainable spend and budget health. This chapter covers the `ApiUsage` ledger, OSS API/UX boundaries, and the Enterprise plugin split.
 
 ## Progressive reporting
@@ -30,6 +32,20 @@ This changes request scheduling and selected query execution only. Account
 isolation, history policies, ledger accounting, attribution, reporting limits,
 and full-query ordering remain unchanged. It adds no rollups or response cache.
 
+## Query shape
+
+Session breakdowns aggregate raw `api_usage` rows by session and model first.
+Session name, agent, flow, and principal labels are joined onto that aggregate.
+The response limit applies after the full aggregation, so a capped session list
+still carries complete totals for each returned group. Daily series aggregate
+in a materialized day bucket, then sort those buckets. Per-user windows filter
+`runtime_principal_id` through `ix_api_usage_account_principal_id_ts`
+(`account_id`, `runtime_principal_id`, `timestamp` for `model_gateway` rows).
+`ix_api_usage_account_principal_ts` still leads with principal type. Accounting
+rules are unchanged: replay-validation rows stay excluded, retries stay included
+unless the caller sets `exclude_retries`, and there is no daily rollup or
+response cache.
+
 ## Cost Analytics and Budgeting
 *   **Purpose:** Turn model usage telemetry into explainable spend, enforceable budgets, and optimization guidance.
 *   **Canonical Ledger:** `ApiUsage` remains the source of truth for model call tokens, estimated cost, provider, model, runtime principal, API key, flow, managed agent, and runtime-session attribution.
@@ -43,6 +59,173 @@ and full-query ordering remain unchanged. It adds no rollups or response cache.
 *   **Default AI Model Use:** Enterprise session-value analysis should call the account's default AI model through the Preloop Gateway, producing an auditable meta-usage record for the evaluation itself. The analysis should reference redacted session summaries, gateway events, tool calls, approvals, and final outcomes rather than unrestricted raw prompts.
 *   **Plugin Boundary:** Backend features beyond OSS summaries and budget-health tracking must live in Enterprise plugins under `./plugins/`, likely extending `plugins/billing/` for budget policy enforcement, pricing overrides, FinOps, credits, promotions, forecasting, exports, and value-review jobs. The shared frontend should gate those panels with feature flags.
 *   **Budget Actions:** Core enforcement should continue to block or warn before upstream dispatch. Enterprise plugins can add escalations, Slack/mobile notifications, approval requirements for expensive calls, and post-hoc anomaly workflows.
+
+## Cost and cycle time per tracker issue
+
+`preloop.services.issue_cost_rollup` rolls execution cost, tokens and pull
+request cycle times up to the tracker issue, across flows. The per-flow Cost
+page is unchanged.
+
+*   **Tables:** `issue_cost_rollup` (one row per account, tracker and issue
+    key), `issue_cost_execution` (one fact per execution id, so a replay or a
+    rebuild upserts instead of double counting) and `issue_cost_pull_request`
+    (publication, approval and merge times, the claiming issue and an
+    ambiguity flag). Row sums are always recomputed from the facts.
+*   **Attribution:** first match wins: issue lifecycle, resume lineage,
+    delegated parent, retry parent, an issue trigger subject, a pull request
+    already claimed by one issue, exactly one closing reference. Anything else
+    is unassigned. A pull request claimed by two issues is marked ambiguous,
+    and executions linked only through it move to the unassigned bucket.
+*   **Write hooks:** the orchestrator terminal hook, the execution monitor's
+    stale pass and the crashed local dispatch path (terminal statuses written
+    outside the orchestrator), `record_opened_pr` (publication time),
+    `process_webhook_event` (approval and merge times, never creating rows)
+    and `sync_execution_cost_rollup` (repricing). Each runs in a savepoint
+    and never fails its caller.
+*   **PR opened time:** `issue_cost_pull_request.opened_at_source` says where
+    `opened_at` came from. `forge` is the pull request's own `created_at`,
+    read through the tracker's `list_open_pull_requests_by_source_branch` on the
+    branch lookup bind path (GitHub, GitLab and Bitbucket) or from any later
+    pull request webhook; it replaces a Preloop time even when that is
+    earlier. `bind` is the time Preloop bound the pull request to the run and
+    `run_end` the end of the publishing run; both only fill an empty value.
+    The issue row carries the source as `pr_opened_at_source`.
+*   **Rebuild:** `POST /api/v1/cost/by-issue/rebuild` records finished
+    executions of a window of at most 92 days that have no fact yet, each in
+    its own savepoint. It is the recovery path for executions that ended
+    outside the orchestrator or whose hook failed.
+*   **Scheduled rebuild:** the API role runs the same rebuild every
+    `ISSUE_COST_REBUILD_INTERVAL_SECONDS` (default 3600) for executions that
+    started in the last `ISSUE_COST_REBUILD_LOOKBACK_HOURS` (default 72), at
+    most `ISSUE_COST_REBUILD_MAX_EXECUTIONS_PER_ACCOUNT` (default 500) per
+    account per pass. Each account is rebuilt in its own transaction under a
+    `pg_try_advisory_xact_lock`, so replicas skip an account another one is
+    rebuilding. The pass then re-reads the estimate of recently active issues
+    from their synced issue rows. `ISSUE_COST_REBUILD_ENABLED=false` turns it
+    off. Older history still needs the rebuild endpoint.
+*   **Estimate:** the human estimate as the tracker states it, never
+    derived, for comparing AI cost with the estimate. Hours come from Jira
+    Original Estimate (`timeoriginalestimate`) or GitLab `time_estimate`.
+    Points, and hours on trackers without a native field, come from the
+    tracker's `meta_data.issue_estimate` configuration: `points_field` (an
+    issue field such as a Jira story points custom field or GitLab `weight`),
+    `hours_label_prefix` and `points_label_prefix` (labels such as
+    `estimate:4h` or `sp:3`; two labels with different values are no
+    estimate). Set it with `PUT /api/v1/trackers/{id}`; `meta_data` is
+    replaced as a whole, so send the existing keys too. Values are read from
+    the trigger payload when it is about the issue and from the synced issue
+    row (Jira and GitLab store the native fields in
+    `meta_data.estimate_fields`), the synced row winning. A reading that
+    states nothing never clears a stored estimate. Empty when the tracker has
+    no estimate.
+*   **Report:** `GET /api/v1/cost/by-issue` filters issues by first event
+    time and shows their lifetime totals. The per-project and per-flow
+    summaries are sums of the rows. `/unassigned/executions` lists the runs
+    in the unassigned bucket for the same filter. `/export` returns CSV
+    (issue grain plus one unassigned row) or JSON (with execution ids).
+*   **Cost coverage:** `estimated_cost` is the subtotal of the runs that
+    carry a cost, so on its own it cannot tell a free ticket from an
+    unpriced one. Every issue row, every project and flow summary and the
+    unassigned bucket therefore also report `cost_coverage`,
+    `known_cost_run_count`, `unknown_cost_run_count` and `attributed_cost_usd`.
+    Coverage is `complete` when every contributing run has a cost, `partial`
+    when both kinds are present and `unknown` when none has one; an empty
+    bucket is `unknown` with both counts zero, and a known zero counts as
+    known. `attributed_cost_usd` is the subtotal only for `complete`
+    coverage and null otherwise, so a partial or unknown bucket is never
+    read as a total. The counts come from the same account-scoped fact
+    aggregates as the sums, so they follow the report's filters (a flow
+    filter prices only that flow's runs) without a per-execution usage
+    query.
+*   **What coverage is not:** it describes execution-cost availability, never
+    invoice accuracy. A `complete` row is still an estimate priced from
+    published model rates. The three other cost signals stay deliberately
+    outside these numbers: the premium-request counts a host CLI run
+    reports (`host_exec_usage`, shown on the execution), the daily GitHub
+    Copilot import (`copilot_usage_import`, account level and never
+    attributed to a ticket) and any per-seat subscription price. No daily
+    import dollars are added to an issue total and no seat charge is
+    inferred per ticket. Existing facts keep their stored cost: an explicit
+    historical zero stays known unless its producer is independently shown
+    to be wrong.
+*   **Export columns:** CSV columns, in order: `tracker`, `issue_key`,
+    `title`, `project`, `estimated_cost`, `total_tokens`, `run_count`,
+    `failed_run_count`, `first_event_at`, `pr_opened_at`, `approved_at`,
+    `merged_at`, `first_event_to_pr_opened_hours`,
+    `pr_opened_to_approved_hours`, `approved_to_merged_hours`, `issue_url`,
+    `pr_url`, `pr_opened_at_source`, `estimate_hours`,
+    `estimate_hours_source`, `estimate_points`, `estimate_points_source`,
+    then the appended `cost_coverage`, `known_cost_run_count`,
+    `unknown_cost_run_count`, `attributed_cost_usd`.
+    Blank means unknown, never zero. The JSON export's `issues[]` objects
+    carry the same fields (null for unknown) plus `execution_ids`. Estimate
+    sources are `jira:timeoriginalestimate`, `gitlab:time_estimate`,
+    `<tracker type>:<points_field>` or `label:<prefix>`.
+
+    The four coverage columns are appended, so an older consumer keeps
+    reading the same names in the same order and `estimated_cost` keeps its
+    type. What changes is the interpretation, not the shape: a consumer that
+    adds the issue rows together now sees the priced subtotal only, which
+    understates a ticket whose runs were subscription-backed.
+
+    ```csv
+    tracker,issue_key,title,project,estimated_cost,...,cost_coverage,known_cost_run_count,unknown_cost_run_count,attributed_cost_usd
+    GitHub,example-org/example-repo#12,Add the export button,Example,2.0,...,partial,1,1,
+    GitHub,example-org/example-repo#13,Subscription-backed work,Example,0.0,...,unknown,0,2,
+    ```
+
+    The second row is not a free ticket: two runs carry no per-run price, so
+    the row reports no attributable total. A consumer that wants a total
+    only where one exists sums `attributed_cost_usd` and treats the blanks as
+    unknown.
+
+## Spend outlier alerts
+
+`preloop.services.spend_outliers` flags a developer or session whose spend
+departs from the usual pattern. It reads gateway `ApiUsage` rows
+(`action_type='model_gateway'`, replay validation excluded) grouped by user,
+UTC day and model. It does not add `flow_execution.estimated_cost`, because
+those calls are already usage rows.
+
+*   **Daily spend:** spend on UTC day D is at least `daily_multiple` (default
+    3) times the median of the days with spend among the previous 28. The rule
+    needs `min_history_days` (default 7) such days, and a zero median never
+    fires.
+*   **Model mix:** one model matching a `top_tier_model_prefixes` entry (case
+    insensitive, with or without a `provider/` prefix) is more than
+    `top_tier_share` (default 0.5) of the developer's spend on both D and D-1.
+*   **Session:** one runtime session costs more than
+    `session_cost_threshold_usd`. The rule is off while that is null.
+
+The daily rules run at 00:30 UTC for the day that just ended. The session rule
+runs every 15 minutes over sessions active in the last two hours. Settings
+live in `spend_outlier_settings`, one row per account, and are edited under
+`/api/v1/attention/spend-outliers/settings` (`manage_budgets` to write,
+`view_cost` to read).
+
+**Fires once.** Each finding is a row in `spend_outlier_finding`, unique on
+`(account_id, fingerprint)` and written with `ON CONFLICT DO NOTHING`, so a
+rerun, a retry or two workers racing record it once. The attention item id is
+stable per rule and developer (`spend:<rule>:<user_id>`, or
+`spend:session_cost:<session_id>`). The fingerprint names the UTC day
+(`<rule>|<user_id>|<YYYY-MM-DD>`, or `session_cost|<user_id>|<session_id>`).
+
+**Dismissal.** Cards use the existing attention dismissals. A dismissal hides
+the card while its fingerprint matches, so a developer who is still an outlier
+on the next day gets a new card. A snooze is the exception: for spend cards an
+unexpired snooze hides the card whatever the fingerprint, until the snooze
+ends. The dismissal endpoints stamp `dismissed_at` on the matching finding,
+and a restore clears it.
+
+**Digest.** `build_spend_outlier_digest_section(db, account_id, now)` returns
+the findings detected in the last seven days, one entry per fingerprint, each
+marked `dismissed` when a dismissal or an active snooze covers it. It is the
+section for the weekly digest service, which is resolved through the plugin
+registry and lives outside this repository.
+
+**Imported spend.** Spend that does not pass through the gateway enters
+through `register_imported_spend_source`. Cards and digest entries that
+include such dollars say they are not metered by the gateway.
 
 ## Reviewed price publication
 

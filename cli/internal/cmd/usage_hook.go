@@ -54,6 +54,7 @@ const (
 	usageHookFormatCursor  usageHookFormat = "cursor"
 	usageHookFormatGeneric usageHookFormat = "generic"
 	usageHookFormatCodex   usageHookFormat = "codex"
+	usageHookFormatCopilot usageHookFormat = "copilot"
 )
 
 // cursorHookEventMap maps Cursor hook event names (cursor.com/docs/agent/
@@ -150,7 +151,7 @@ By default the command auto-detects the payload:
     are the contract third-party harnesses should target
   - Codex CLI session rollouts (JSONL under $CODEX_HOME/sessions)
 
-Override detection with --from cursor|generic|codex.
+Override detection with --from cursor|generic|codex|copilot.
 
 Cursor hook payloads carry no token counts and no billed amounts. When
 Cursor names a transcript file (transcript_path, or the
@@ -178,7 +179,7 @@ func init() {
 	usageHookCmd.Flags().String("agent-id", "", "managed agent UUID to attribute the events to (default: the onboarded agent matching --source)")
 	usageHookCmd.Flags().String("source", "cursor", "origin label stored on each record (generic defaults to generic, Codex to codex, unless this flag is set)")
 	usageHookCmd.Flags().String("parent-conversation-id", "", "conversation this chat was spawned from, when the payload reports none (also PRELOOP_PARENT_CONVERSATION_ID)")
-	usageHookCmd.Flags().String("from", "auto", "payload format: auto, cursor, generic, or codex")
+	usageHookCmd.Flags().String("from", "auto", "payload format: auto, cursor, generic, codex, or copilot")
 	usageHookCmd.Flags().String("file", "", "read events from a file instead of stdin (generic NDJSON or a Codex rollout JSONL)")
 	usageHookCmd.Flags().Bool("store-transcript", false, "Cursor only: also ship the transcript text since the last event as runtime session activities (default: counts, title and a short summary only; a store_transcript key in the Cursor hook credential file has the same effect)")
 }
@@ -243,9 +244,11 @@ func runUsageHook(cmd *cobra.Command, _ []string) error {
 		records = recordsFromGenericEvents(cmd, raws, parentFlag, now)
 	case usageHookFormatCodex:
 		records = recordsFromCodexRollout(cmd, raws, parentFlag, now)
+	case usageHookFormatCopilot:
+		records, err = recordsFromCopilotHook(raws[0], parentFlag, now)
 	default:
 		return usageHookFailOpen(cmd, fmt.Errorf(
-			"unrecognized usage hook payload; pass --from cursor, generic, or codex",
+			"unrecognized usage hook payload; pass --from cursor, generic, codex, or copilot",
 		))
 	}
 	if err != nil {
@@ -262,6 +265,7 @@ func runUsageHook(cmd *cobra.Command, _ []string) error {
 		return nil
 	}
 
+	stampUsageHookFlowExecution(records, os.Getenv("PRELOOP_FLOW_EXECUTION_ID"))
 	resolvedSource := resolveUsageHookSource(detected, source, sourceChanged)
 	timeout := usageHookTimeout
 	if filePath != "" {
@@ -291,8 +295,10 @@ func parseUsageHookFormat(raw string) (usageHookFormat, error) {
 		return usageHookFormatGeneric, nil
 	case "codex":
 		return usageHookFormatCodex, nil
+	case "copilot":
+		return usageHookFormatCopilot, nil
 	default:
-		return "", fmt.Errorf("--from must be auto, cursor, generic, or codex, got %q", raw)
+		return "", fmt.Errorf("--from must be auto, cursor, generic, codex, or copilot, got %q", raw)
 	}
 }
 
@@ -330,7 +336,13 @@ func detectUsageHookFormat(raw json.RawMessage) usageHookFormat {
 	if err := json.Unmarshal(raw, &probe); err != nil {
 		return ""
 	}
-	if _, ok := probe["hook_event_name"]; ok {
+	if name, ok := jsonRawString(probe["hook_event_name"]); ok {
+		// Copilot's VS Code / PascalCase form uses PascalCase event names
+		// (SessionStart, Stop, …). Cursor uses camelCase (sessionStart, stop).
+		// Never treat a Copilot PascalCase payload as Cursor.
+		if isCopilotVSCodeHookEventName(name) {
+			return usageHookFormatCopilot
+		}
 		return usageHookFormatCursor
 	}
 	if schema, ok := jsonRawString(probe["schema"]); ok && strings.HasPrefix(schema, "preloop.usage.event.") {
@@ -339,6 +351,10 @@ func detectUsageHookFormat(raw json.RawMessage) usageHookFormat {
 	typeName, _ := jsonRawString(probe["type"])
 	if _, hasPayload := probe["payload"]; hasPayload && isCodexRolloutType(typeName) {
 		return usageHookFormatCodex
+	}
+	if _, ok := probe["sessionId"]; ok {
+		// Copilot CLI camelCase hooks carry sessionId and no hook_event_name.
+		return usageHookFormatCopilot
 	}
 	if _, ok := probe["conversation_id"]; ok {
 		return usageHookFormatGeneric
@@ -379,6 +395,10 @@ func resolveUsageHookSource(format usageHookFormat, flagValue string, flagChange
 		return "generic"
 	case usageHookFormatCodex:
 		return "codex"
+	case usageHookFormatCopilot:
+		// Must match managedAgentKindForAgent("Copilot CLI"). The ingest
+		// API attributes by exact agent_kind, and "copilot" matches nothing.
+		return permissionSourceCopilotCLI
 	default:
 		if strings.TrimSpace(flagValue) == "" {
 			return "cursor"
@@ -525,6 +545,26 @@ func attachCursorCompactionContext(input cursorHookInput, record map[string]inte
 	}
 	if input.IsFirstCompaction != nil {
 		metadata["is_first_compaction"] = *input.IsFirstCompaction
+	}
+}
+
+// stampUsageHookFlowExecution links hook records to the flow execution a
+// private runner started this CLI for. The runner exports the id to the
+// host-exec CLI process and hooks inherit it. The control plane checks the
+// id belongs to the caller's account and to a host profile run before it
+// links anything, so a stray value cannot attach usage to another flow.
+func stampUsageHookFlowExecution(records []map[string]interface{}, executionID string) {
+	executionID = strings.ToLower(strings.TrimSpace(executionID))
+	if !uuidRe.MatchString(executionID) {
+		return
+	}
+	for _, record := range records {
+		if record == nil {
+			continue
+		}
+		if _, exists := record["flow_execution_id"]; !exists {
+			record["flow_execution_id"] = executionID
+		}
 	}
 }
 

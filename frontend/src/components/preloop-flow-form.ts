@@ -43,7 +43,7 @@ import './preloop-runner-pool-select';
 import './schedule-config-editor';
 import { defaultScheduleConfig } from './schedule-config-editor';
 import './preloop-flow-preset-picker';
-import { BLANK_PRESET_ID } from './preloop-flow-preset-picker';
+import { BLANK_PRESET_ID, presetSlug } from './preloop-flow-preset-picker';
 import '@shoelace-style/shoelace/dist/components/input/input.js';
 import '@shoelace-style/shoelace/dist/components/textarea/textarea.js';
 import '@shoelace-style/shoelace/dist/components/select/select.js';
@@ -71,6 +71,77 @@ export const FLOW_TIMEOUT_MAX_SECONDS = 86400;
 /** Matches the API `approval_window_seconds` constraint `ge=60, le=2592000`. */
 export const APPROVAL_WINDOW_MIN_SECONDS = 60;
 export const APPROVAL_WINDOW_MAX_SECONDS = 2592000;
+
+/**
+ * Characters the reviewer prompt keeps.
+ *
+ * The preset injects `{{flow.review_instructions|truncate(16384)}}`. 16,384
+ * characters is the 16 KiB cap operators are warned about. The API still
+ * accepts up to 32,768 characters; the rest is stored and then dropped.
+ */
+export const REVIEW_INSTRUCTIONS_PROMPT_CAP = 16384;
+
+/** Catalog slug of the Pull Request Reviewer preset. */
+export const REVIEWER_PRESET_SLUG = 'pull-request-reviewer';
+
+/** Docs for `.preloop/review-policy.md`, the same markdown this field stores. */
+export const REVIEW_POLICY_DOCS_URL =
+  'https://docs.preloop.ai/guide/flows/pull-request-review#repository-review-policy';
+
+/** True when the prompt template names the flow review-instructions placeholder. */
+export function promptReferencesReviewInstructions(
+  template: string | null | undefined
+): boolean {
+  return (
+    typeof template === 'string' &&
+    template.includes('flow.review_instructions')
+  );
+}
+
+/**
+ * Value to persist. Blank and whitespace become null so an update clears
+ * a saved policy. The API strips the same way.
+ */
+export function reviewInstructionsForSave(
+  value: string | null | undefined
+): string | null {
+  if (typeof value !== 'string') return null;
+  const text = value.trim();
+  return text.length > 0 ? text : null;
+}
+
+/** True when the stored text is longer than the reviewer prompt keeps. */
+export function reviewInstructionsOverPromptCap(
+  value: string | null | undefined
+): boolean {
+  const stored = reviewInstructionsForSave(value);
+  return stored !== null && stored.length > REVIEW_INSTRUCTIONS_PROMPT_CAP;
+}
+
+/**
+ * Whether the flow form should offer Review instructions.
+ *
+ * Shown for the Pull Request Reviewer preset, and for any prompt that
+ * references `flow.review_instructions`. `presetSlugValue` is the catalog
+ * slug already resolved from the flow or from its source preset.
+ */
+export function showsReviewInstructionsField(
+  flow: {
+    slug?: string | null;
+    prompt_template?: string | null;
+  },
+  presetSlugValue: string | null
+): boolean {
+  if (promptReferencesReviewInstructions(flow.prompt_template)) return true;
+  const slug = (
+    typeof flow.slug === 'string' && flow.slug.trim()
+      ? flow.slug
+      : presetSlugValue || ''
+  )
+    .trim()
+    .toLowerCase();
+  return slug === REVIEWER_PRESET_SLUG;
+}
 
 /**
  * Approval windows are set in hours and days, not seconds.
@@ -102,6 +173,20 @@ export function splitApprovalWindow(seconds: number | null | undefined): {
   if (total % 3600 === 0) return { amount: total / 3600, unit: 'hours' };
   return { amount: Math.round(total / 60), unit: 'minutes' };
 }
+
+type HostExecAgentType = 'cursor' | 'copilot';
+
+/** Agent config key holding each host CLI's per-flow model alias. */
+const HOST_EXEC_MODEL_KEYS: Record<HostExecAgentType, string> = {
+  cursor: 'cursor_model',
+  copilot: 'copilot_model',
+};
+
+/** Runner capability a host profile advertises for each host CLI. */
+const HOST_EXEC_HARNESSES: Record<HostExecAgentType, string> = {
+  cursor: 'cursor_cli',
+  copilot: 'copilot_cli',
+};
 
 const FEEDBACK_LIMITS = {
   max_turns: {
@@ -392,6 +477,16 @@ export class PreloopFlowForm extends LitElement {
     agent_type: string;
   }> = [];
 
+  // The short label-to-model shape (agent_config.model_by_label). Held apart
+  // from routingRules because it is stored apart: one label, one model, one
+  // effort, which is what most flows actually want.
+  @state()
+  private labelRules: Array<{
+    label: string;
+    ai_model_id: string;
+    reasoning_effort: string;
+  }> = [];
+
   // The custom container image as typed. Undefined means "not touched on this
   // form", in which case the saved value is read back from agent_config. This
   // keeps a typed draft when the runner selection temporarily hides the
@@ -416,6 +511,9 @@ export class PreloopFlowForm extends LitElement {
 
   @state()
   private pickerSelectedId = '';
+
+  @state()
+  private persistentPresetNotice = '';
 
   @state()
   private pickerCollapsed = false;
@@ -641,6 +739,7 @@ export class PreloopFlowForm extends LitElement {
           this.targetAgentId = cfg.target_agent_id || '';
         }
         this.syncRoutingRulesFromConfig(cfg);
+        this.syncLabelRulesFromConfig(cfg);
       }
 
       // Determine trigger type and load tracker scope data
@@ -683,7 +782,9 @@ export class PreloopFlowForm extends LitElement {
       this.triggerType = 'schedule';
     } else if (source) {
       this.triggerType = 'tracker';
-    } else if (this.flow?.webhook_config) {
+    } else if (this.flow?.webhook_config?.webhook_secret) {
+      // A tracker flow can carry webhook_config for its other settings
+      // (supersede_on_update); only a secret makes it a webhook flow.
       this.triggerType = 'webhook';
     }
 
@@ -1169,6 +1270,15 @@ export class PreloopFlowForm extends LitElement {
         max_budget: this.flow.max_budget || undefined,
         is_enabled: this.flow.is_enabled ?? true,
         runner_pool: this.normalizedFlowRunnerPool(),
+        // Sent only when this form has the field. An unrelated fixture that
+        // never loaded it leaves the stored value alone. Blank clears it.
+        ...('review_instructions' in this.flow
+          ? {
+              review_instructions: reviewInstructionsForSave(
+                this.flow.review_instructions
+              ),
+            }
+          : {}),
         // Sent only once filters exist on the form. An explicit null (set by
         // clearEventFilters) is forwarded so the backend clears saved filters.
         ...(this.flow.trigger_config !== undefined
@@ -1263,6 +1373,197 @@ export class PreloopFlowForm extends LitElement {
     });
   }
 
+  private syncLabelRulesFromConfig(config: unknown) {
+    const cfg =
+      config && typeof config === 'object'
+        ? (config as Record<string, unknown>)
+        : {};
+    const stored = cfg.model_by_label;
+    const rules = Array.isArray(stored) ? stored : [];
+    this.labelRules = rules
+      .filter((rule): rule is Record<string, unknown> =>
+        Boolean(rule && typeof rule === 'object')
+      )
+      .map((rule) => ({
+        label: typeof rule.label === 'string' ? rule.label : '',
+        ai_model_id:
+          typeof rule.ai_model_id === 'string' ? rule.ai_model_id : '',
+        reasoning_effort:
+          typeof rule.reasoning_effort === 'string'
+            ? rule.reasoning_effort
+            : '',
+      }));
+  }
+
+  private normalizedLabelRules() {
+    const seen = new Set<string>();
+    return this.labelRules.map((rule, index) => {
+      const label = rule.label.trim();
+      if (!label) {
+        throw new Error(
+          `Label rule ${index + 1} needs a label. Complete it or remove it before saving.`
+        );
+      }
+      if (!rule.ai_model_id && !rule.reasoning_effort) {
+        throw new Error(
+          `Label rule "${label}" changes nothing. Pick a model, an effort, or remove the rule.`
+        );
+      }
+      if (seen.has(label)) {
+        throw new Error(
+          `Label "${label}" appears twice. Only the first rule would ever apply.`
+        );
+      }
+      seen.add(label);
+      const normalized: Record<string, string> = { label };
+      if (rule.ai_model_id) {
+        normalized.ai_model_id = rule.ai_model_id;
+      }
+      if (rule.reasoning_effort) {
+        normalized.reasoning_effort = rule.reasoning_effort;
+      }
+      return normalized;
+    });
+  }
+
+  private addLabelRule() {
+    this.labelRules = [
+      ...this.labelRules,
+      { label: '', ai_model_id: '', reasoning_effort: '' },
+    ];
+  }
+
+  private removeLabelRule(index: number) {
+    this.labelRules = this.labelRules.filter((_, i) => i !== index);
+  }
+
+  private moveLabelRule(index: number, delta: number) {
+    const target = index + delta;
+    if (target < 0 || target >= this.labelRules.length) {
+      return;
+    }
+    const rules = [...this.labelRules];
+    const [moved] = rules.splice(index, 1);
+    rules.splice(target, 0, moved);
+    this.labelRules = rules;
+  }
+
+  private updateLabelRule(
+    index: number,
+    field: 'label' | 'ai_model_id' | 'reasoning_effort',
+    value: string
+  ) {
+    this.labelRules = this.labelRules.map((rule, i) =>
+      i === index ? { ...rule, [field]: value } : rule
+    );
+  }
+
+  private renderModelByLabelEditor(
+    selectableModels: Array<{ id: string; name: string }>
+  ) {
+    return html`
+      <div data-label-routing-editor>
+        <h5
+          style="font-weight: 600; color: var(--sl-color-neutral-700); margin: var(--sl-spacing-medium) 0 var(--sl-spacing-x-small) 0;"
+        >
+          Model by label
+        </h5>
+        <p class="routing-help">
+          The short form: one label, one model, one reasoning effort. The first
+          rule whose label is on the issue wins, and a rule that sets only an
+          effort keeps this flow's model and asks it to think harder. Routing
+          rules above are evaluated first.
+        </p>
+        <div class="routing-rules">
+          ${this.labelRules.map(
+            (rule, index) => html`
+              <div class="routing-rule" data-label-rule=${index}>
+                <div class="routing-rule-header">
+                  <sl-input
+                    label="Label"
+                    size="small"
+                    placeholder="e.g. complexity:high"
+                    .value=${rule.label}
+                    @sl-input=${(e: Event) =>
+                      this.updateLabelRule(
+                        index,
+                        'label',
+                        (e.target as HTMLInputElement).value
+                      )}
+                    help-text="Matched against the issue's current labels"
+                  ></sl-input>
+                  <div class="routing-rule-actions">
+                    <sl-button
+                      size="small"
+                      variant="text"
+                      ?disabled=${index === 0}
+                      @click=${() => this.moveLabelRule(index, -1)}
+                    >
+                      Up
+                    </sl-button>
+                    <sl-button
+                      size="small"
+                      variant="text"
+                      ?disabled=${index === this.labelRules.length - 1}
+                      @click=${() => this.moveLabelRule(index, 1)}
+                    >
+                      Down
+                    </sl-button>
+                    <sl-button
+                      size="small"
+                      variant="text"
+                      @click=${() => this.removeLabelRule(index)}
+                    >
+                      Remove
+                    </sl-button>
+                  </div>
+                </div>
+                <sl-select
+                  label="Model"
+                  placeholder="This flow's model"
+                  .value=${rule.ai_model_id || ''}
+                  @sl-change=${(e: Event) =>
+                    this.updateLabelRule(
+                      index,
+                      'ai_model_id',
+                      (e.target as HTMLSelectElement).value
+                    )}
+                >
+                  <sl-option value="">This flow's model</sl-option>
+                  ${selectableModels.map(
+                    (m) => html`<sl-option .value=${m.id}>${m.name}</sl-option>`
+                  )}
+                </sl-select>
+                <sl-select
+                  label="Reasoning effort"
+                  .value=${rule.reasoning_effort || ''}
+                  @sl-change=${(e: Event) =>
+                    this.updateLabelRule(
+                      index,
+                      'reasoning_effort',
+                      (e.target as HTMLSelectElement).value
+                    )}
+                >
+                  <sl-option value="">Model default</sl-option>
+                  <sl-option value="low">Low</sl-option>
+                  <sl-option value="medium">Medium</sl-option>
+                  <sl-option value="high">High</sl-option>
+                </sl-select>
+              </div>
+            `
+          )}
+        </div>
+        <sl-button
+          size="small"
+          data-add-label-rule
+          @click=${() => this.addLabelRule()}
+        >
+          Add label rule
+        </sl-button>
+      </div>
+    `;
+  }
+
   private normalizedRoutingRules() {
     return this.routingRules.map((rule, index) => {
       const anyLabels = this.splitLabelList(rule.anyLabels);
@@ -1306,6 +1607,11 @@ export class PreloopFlowForm extends LitElement {
       for (const [key, limit] of Object.entries(FEEDBACK_LIMITS)) {
         if (!(key in feedback)) feedback[key] = limit.default;
       }
+      // A missing list is a new opt-in. A saved empty list means every bot
+      // stays ignored, including after the toggle is switched off and on.
+      if (!('trusted_reviewer_ids' in feedback)) {
+        feedback.trusted_reviewer_ids = ['preloop'];
+      }
     }
     this.flow = {
       ...this.flow,
@@ -1345,18 +1651,36 @@ export class PreloopFlowForm extends LitElement {
               .map((id) => id.trim())
               .filter(Boolean)
           : raw;
-      if (
-        !Array.isArray(ids) ||
-        ids.some(
-          (id) =>
-            !(
-              (typeof id === 'string' && /^[1-9][0-9]*$/.test(id)) ||
-              (typeof id === 'number' && Number.isSafeInteger(id) && id > 0)
-            )
-        )
-      ) {
+      const numeric = (id: unknown) =>
+        (typeof id === 'string' && /^[1-9][0-9]*$/.test(id)) ||
+        (typeof id === 'number' && Number.isSafeInteger(id) && id > 0);
+      const login = (id: unknown) =>
+        typeof id === 'string' &&
+        /^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,37}[A-Za-z0-9])?(?:\[bot\])?$/.test(
+          id
+        );
+      // Bitbucket reviewer identities: a user UUID (braces optional) or an
+      // Atlassian account ID such as 712020:<uuid>. Legacy 24-hex account IDs
+      // pass the username rule. Resource identifiers (ari:cloud:...) are
+      // rejected: Bitbucket never reports them as an actor's account_id, so
+      // a trusted-reviewer entry in that form could never match.
+      const bitbucketActor = (id: unknown) =>
+        typeof id === 'string' &&
+        (/^\{?[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}\}?$/.test(
+          id
+        ) ||
+          /^[0-9]+:[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$/.test(
+            id
+          ));
+      const valid =
+        key === 'trusted_reviewer_ids'
+          ? (id: unknown) => numeric(id) || login(id) || bitbucketActor(id)
+          : numeric;
+      if (!Array.isArray(ids) || ids.some((id) => !valid(id))) {
         throw new Error(
-          'Follow-up: enter comma-separated numeric provider actor IDs, not usernames.'
+          key === 'trusted_reviewer_ids'
+            ? 'Follow-up: enter reviewer usernames or app slugs such as preloop, numeric actor IDs, or Bitbucket account IDs / user UUIDs.'
+            : 'Follow-up: enter comma-separated numeric provider actor IDs, not usernames.'
         );
       }
       feedback[key] = ids;
@@ -1402,8 +1726,8 @@ export class PreloopFlowForm extends LitElement {
                   ${[
                     [
                       'trusted_reviewer_ids',
-                      'Trusted reviewer actor IDs',
-                      'Comma-separated GitHub or GitLab numeric user IDs from the reviewer account or integration. Unlisted bots are ignored; comment markers do not grant trust.',
+                      'Trusted reviewers',
+                      'Usernames or app slugs, for example preloop. On GitHub, preloop matches reviews posted by the preloop[bot] App; a staging app is preloop-staging. On Bitbucket, use the reviewer username, account ID or user UUID (approvals and change requests count as reviews). Numeric actor IDs still work. Unlisted bots are ignored.',
                     ],
                     [
                       'implementer_actor_ids',
@@ -1482,6 +1806,12 @@ export class PreloopFlowForm extends LitElement {
       config.model_routing = { version: 1, rules };
     } else {
       delete config.model_routing;
+    }
+    const labelRules = this.normalizedLabelRules();
+    if (labelRules.length > 0) {
+      config.model_by_label = labelRules;
+    } else {
+      delete config.model_by_label;
     }
     return config;
   }
@@ -1666,17 +1996,50 @@ export class PreloopFlowForm extends LitElement {
   private composedAgentConfig(): Record<string, unknown> {
     const base = this.buildAgentConfig();
     const profile = String(base.host_exec_profile || '').trim();
-    if ((this.flow.agent_type || '') === 'cursor') {
+    const hostType = this.hostExecAgentType();
+    if (hostType) {
       if (profile) {
         base.host_exec_profile = profile;
       } else {
         delete base.host_exec_profile;
       }
+      const key = HOST_EXEC_MODEL_KEYS[hostType];
+      const raw = base[key];
+      const model = typeof raw === 'string' ? raw.trim() : '';
+      if (model && !/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/.test(model)) {
+        throw new Error(
+          hostType === 'cursor'
+            ? 'Cursor model must be a Cursor model id such as grok-4.7-high, or blank for Auto.'
+            : 'Copilot model must be a model alias from the runner profile model_map, or blank for the Copilot default.'
+        );
+      }
+      if (model) {
+        base[key] = model;
+      } else {
+        delete base[key];
+      }
+      // A model alias for the other host CLI never applies to this flow.
+      for (const other of Object.values(HOST_EXEC_MODEL_KEYS)) {
+        if (other !== key) {
+          delete base[other];
+        }
+      }
     } else {
       delete base.host_exec_profile;
+      for (const key of Object.values(HOST_EXEC_MODEL_KEYS)) {
+        delete base[key];
+      }
     }
     this.applyCustomImageOverride(base);
     return base;
+  }
+
+  /** The host CLI this flow runs as, or null for container harnesses. */
+  private hostExecAgentType(): HostExecAgentType | null {
+    const kind = (this.flow.agent_type || '') as HostExecAgentType;
+    return Object.prototype.hasOwnProperty.call(HOST_EXEC_MODEL_KEYS, kind)
+      ? kind
+      : null;
   }
 
   private hostExecProfileName(): string {
@@ -1684,18 +2047,53 @@ export class PreloopFlowForm extends LitElement {
     return typeof raw === 'string' ? raw.trim() : '';
   }
 
-  private advertisedHostExecProfiles(): string[] {
+  private advertisedHostExecProfiles(harness?: string): string[] {
     const names = new Set<string>();
     for (const runner of this.runners) {
       const advertised = runner.capabilities?.host_exec_profiles || [];
       for (const item of advertised) {
         const name = (item?.name || '').trim();
-        if (name) {
+        const caps: string[] = Array.isArray(item?.capabilities)
+          ? item.capabilities
+          : [];
+        if (name && (!harness || caps.includes(harness))) {
           names.add(name);
         }
       }
     }
     return [...names].sort();
+  }
+
+  private handleCursorModelInput(event: Event) {
+    const value = (event.target as HTMLInputElement).value;
+    this.flow = {
+      ...this.flow,
+      agent_config: {
+        ...(this.flow.agent_config || {}),
+        cursor_model: value,
+      },
+    };
+  }
+
+  private cursorModelValue(): string {
+    const raw = this.parseAgentConfig(this.flow.agent_config).cursor_model;
+    return typeof raw === 'string' ? raw : '';
+  }
+
+  private handleCopilotModelInput(event: Event) {
+    const value = (event.target as HTMLInputElement).value;
+    this.flow = {
+      ...this.flow,
+      agent_config: {
+        ...(this.flow.agent_config || {}),
+        copilot_model: value,
+      },
+    };
+  }
+
+  private copilotModelValue(): string {
+    const raw = this.parseAgentConfig(this.flow.agent_config).copilot_model;
+    return typeof raw === 'string' ? raw : '';
   }
 
   private handleHostExecProfileInput(event: Event) {
@@ -1710,16 +2108,79 @@ export class PreloopFlowForm extends LitElement {
     this.requestUpdate();
   }
 
-  private renderHostExecProfileField() {
-    if ((this.flow.agent_type || '') !== 'cursor') {
+  private renderCopilotHostExecFields() {
+    return html`
+      <p class="notifications-help">
+        Copilot runs as the copilot command on the private runner, using that
+        machine's GitHub Copilot login and seat. Model spend is billed to that
+        seat as premium requests and is not metered by the Preloop gateway.
+        Preloop's model catalog is not the seat's model list, so it is hidden
+        here.
+      </p>
+      <sl-input
+        label="Copilot model"
+        data-copilot-model
+        placeholder="Copilot default"
+        help-text="Optional model alias. The runner passes the mapped model as --model only when the profile model_map lists this alias. Blank uses the Copilot default."
+        .value=${this.copilotModelValue()}
+        @sl-input=${this.handleCopilotModelInput}
+      ></sl-input>
+      ${this.renderHostExecCloneNotice('Copilot')}
+    `;
+  }
+
+  /**
+   * Explain what a host profile does with this flow's checkout settings.
+   *
+   * A host runner clones the flow's repositories only when its local
+   * profile sets allow_checkout. It never opens a pull request, so a flow
+   * that publishes one is refused.
+   */
+  private renderHostExecCloneNotice(label: string) {
+    const clone = this.flow.git_clone_config;
+    if (!clone?.enabled) {
       return nothing;
     }
-    const advertised = this.advertisedHostExecProfiles();
+    if (clone.create_pull_request) {
+      return html`<sl-alert
+        variant="warning"
+        open
+        data-host-exec-clone-notice="refused"
+      >
+        <sl-icon slot="icon" name="exclamation-triangle"></sl-icon>
+        Host execution cannot open a pull request. This flow publishes one, so a
+        ${label} runner will refuse the run.
+      </sl-alert>`;
+    }
+    return html`<sl-alert
+      variant="primary"
+      open
+      data-host-exec-clone-notice="checkout"
+    >
+      <sl-icon slot="icon" name="info-circle"></sl-icon>
+      The ${label} runner clones this flow's repositories into the execution
+      directory only when its host profile sets <code>allow_checkout</code>.
+      Without it the run fails with <code>host_checkout_not_allowed</code>.
+    </sl-alert>`;
+  }
+
+  private renderHostExecProfileField() {
+    const hostType = this.hostExecAgentType();
+    if (!hostType) {
+      return nothing;
+    }
+    const advertised = this.advertisedHostExecProfiles(
+      HOST_EXEC_HARNESSES[hostType]
+    );
+    const login = hostType === 'cursor' ? 'Cursor' : 'GitHub Copilot';
     return html`
       <sl-input
         label="Host execution profile"
-        help-text="Named profile on a private runner. Runs as the runner user with its local Cursor login and filesystem access."
-        placeholder=${advertised[0] || 'cursor-ask'}
+        help-text="Named profile on a private runner. Runs as the runner user with its local ${login} login and filesystem access."
+        placeholder=${
+          advertised[0] ||
+          (hostType === 'cursor' ? 'cursor-ask' : 'copilot-review')
+        }
         .value=${this.hostExecProfileName()}
         @sl-input=${this.handleHostExecProfileInput}
       ></sl-input>
@@ -1799,8 +2260,7 @@ export class PreloopFlowForm extends LitElement {
   /** True when the flow launches on the runner host instead of in a container. */
   private isNativeHostExecFlow(): boolean {
     return (
-      (this.flow.agent_type || '') === 'cursor' &&
-      this.hostExecProfileName() !== ''
+      this.hostExecAgentType() !== null && this.hostExecProfileName() !== ''
     );
   }
 
@@ -2024,6 +2484,45 @@ export class PreloopFlowForm extends LitElement {
     }
   }
 
+  private applyExecutionPath(path: 'ephemeral' | 'persistent') {
+    this.flowExecutionPath = path;
+    if (path !== 'persistent') {
+      this.persistentPresetNotice = '';
+    } else {
+      if (!this.targetAgentId && this.longRunningAgents.length > 0) {
+        const enabledAgents = this.persistentControlAgents();
+        const onlineAgents = enabledAgents.filter(
+          (agent) => getAgentControlState(agent).online
+        );
+        const pick = onlineAgents[0] || enabledAgents[0];
+        if (pick) {
+          this.targetAgentId = pick.id;
+        }
+      }
+      this.updateModelSelectionForAgent();
+      this.clearUnsupportedPersistentPreset();
+    }
+    this.requestUpdate();
+  }
+
+  private clearUnsupportedPersistentPreset() {
+    if (!this.pickerSelectedId || this.pickerSelectedId === BLANK_PRESET_ID) {
+      this.persistentPresetNotice = '';
+      return;
+    }
+    const preset = this.presets.find(
+      (item) => item.id === this.pickerSelectedId
+    );
+    if (!preset || preset.supports_persistent === true) {
+      this.persistentPresetNotice = '';
+      return;
+    }
+    this.pickerSelectedId = '';
+    this.sourcePresetId = null;
+    this.persistentPresetNotice =
+      'This preset does not support persistent execution. It expects an ephemeral checkout. Pick another preset.';
+  }
+
   private async applyPresetSelection(presetId: string) {
     if (presetId === BLANK_PRESET_ID) {
       this.selectBlankFlow();
@@ -2050,6 +2549,7 @@ export class PreloopFlowForm extends LitElement {
     };
     this.triggerType = 'webhook';
     this.routingRules = [];
+    this.labelRules = [];
     this.capturePresetSnapshot();
   }
 
@@ -2083,6 +2583,7 @@ export class PreloopFlowForm extends LitElement {
       is_enabled: true,
     };
     this.syncRoutingRulesFromConfig(preset.agent_config);
+    this.syncLabelRulesFromConfig(preset.agent_config);
     this.sourcePresetId = preset.id;
     await this._autoPopulatePresetFields();
     this.capturePresetSnapshot();
@@ -2125,7 +2626,7 @@ export class PreloopFlowForm extends LitElement {
       this.triggerType = 'webhook';
     }
 
-    if (!this.flow.ai_model_id && this.flow.agent_type !== 'cursor') {
+    if (!this.flow.ai_model_id && !this.hostExecAgentType()) {
       let selectableModels = this.models.filter(
         (m) => m.model_kind !== 'stt' && m.model_kind !== 'tts'
       );
@@ -2323,6 +2824,16 @@ export class PreloopFlowForm extends LitElement {
     `;
   }
 
+  /**
+   * The host's own name for a change request, used in filter copy.
+   *
+   * GitLab calls it a merge request; GitHub and Bitbucket call it a pull
+   * request. Unknown hosts fall back to the neutral "pull request".
+   */
+  private changeRequestNoun(trackerType?: string): string {
+    return trackerType === 'gitlab' ? 'merge request' : 'pull request';
+  }
+
   private renderEventFilters() {
     const tracker = this.trackers.find(
       (t: any) => t.id === this.flow.trigger_event_source
@@ -2427,9 +2938,14 @@ export class PreloopFlowForm extends LitElement {
                       ? html`
                           <sl-input
                             label="${
-                              tracker.tracker_type === 'gitlab'
-                                ? 'Reviewer (username)'
-                                : 'Requested reviewer (username)'
+                              tracker.tracker_type === 'github'
+                                ? 'Requested reviewer (username)'
+                                : 'Reviewer (username)'
+                            }"
+                            help-text="${
+                              tracker.tracker_type === 'bitbucket'
+                                ? 'Bitbucket username (nickname) of a reviewer added to the pull request. Approve and request changes are reviewer actions on the pull request, not separate reviews.'
+                                : 'Matches if any reviewer matches'
                             }"
                             placeholder="e.g. jane_smith"
                             .value=${this.flow.trigger_config?.reviewer || ''}
@@ -2444,7 +2960,6 @@ export class PreloopFlowForm extends LitElement {
                               }
                               this.requestUpdate();
                             }}
-                            help-text="Filter by reviewer (matches if any reviewer matches)"
                           ></sl-input>
                         `
                       : nothing
@@ -2542,6 +3057,24 @@ export class PreloopFlowForm extends LitElement {
                             }}
                             help-text="Filter by Jira issue type"
                           ></sl-input>
+
+                          <sl-input
+                            label="Moved to status"
+                            placeholder="e.g. Ready for Dev"
+                            .value=${this.flow.trigger_config?.status_to || ''}
+                            @sl-input=${(e: any) => {
+                              if (!this.flow.trigger_config)
+                                this.flow.trigger_config = {};
+                              const value = e.target.value.trim();
+                              if (value) {
+                                this.flow.trigger_config.status_to = value;
+                              } else {
+                                delete this.flow.trigger_config.status_to;
+                              }
+                              this.requestUpdate();
+                            }}
+                            help-text="Jira status name the issue moved to. Use with the Issue Status Changed event."
+                          ></sl-input>
                         `
                       : nothing
                   }
@@ -2563,13 +3096,9 @@ export class PreloopFlowForm extends LitElement {
                               this.requestUpdate();
                             }}
                           >
-                            Only when
-                            ${
-                              tracker.tracker_type === 'gitlab'
-                                ? 'Merge Request'
-                                : 'Pull Request'
-                            }
-                            is merged
+                            Only when the
+                            ${this.changeRequestNoun(tracker.tracker_type)} is
+                            merged
                           </sl-checkbox>
 
                           <sl-checkbox
@@ -2699,7 +3228,43 @@ export class PreloopFlowForm extends LitElement {
                                       >
                                     </sl-select>
                                   `
-                                : nothing
+                                : tracker.tracker_type === 'bitbucket'
+                                  ? html`
+                                      <sl-select
+                                        label="Pull request state"
+                                        .value=${this.flow.trigger_config?.state || ''}
+                                        @sl-change=${(e: any) => {
+                                          if (!this.flow.trigger_config)
+                                            this.flow.trigger_config = {};
+                                          const value = e.target.value;
+                                          if (value) {
+                                            this.flow.trigger_config.state =
+                                              value;
+                                          } else {
+                                            delete this.flow.trigger_config
+                                              .state;
+                                          }
+                                          this.requestUpdate();
+                                        }}
+                                        clearable
+                                        help-text="Filter by Bitbucket pull request state (declined and superseded are the closed states)"
+                                      >
+                                        <sl-option value=""
+                                          >Any state</sl-option
+                                        >
+                                        <sl-option value="open">Open</sl-option>
+                                        <sl-option value="merged"
+                                          >Merged</sl-option
+                                        >
+                                        <sl-option value="declined"
+                                          >Declined</sl-option
+                                        >
+                                        <sl-option value="superseded"
+                                          >Superseded</sl-option
+                                        >
+                                      </sl-select>
+                                    `
+                                  : nothing
                           }
                         `
                       : nothing
@@ -2715,6 +3280,94 @@ export class PreloopFlowForm extends LitElement {
               `
             : nothing
         }
+      </div>
+    `;
+  }
+
+  /**
+   * Catalog slug for the preset this form is editing, when one can be named.
+   *
+   * An account flow has no slug of its own. The source preset does, either
+   * as `slug` or, when the API omits it, as the slug derived from its name.
+   * A preset just chosen on this form wins over the saved source, because
+   * that choice replaced the prompt.
+   */
+  private resolvedPresetSlug(): string | null {
+    const direct = this.flow.slug;
+    if (typeof direct === 'string' && direct.trim()) {
+      return direct.trim().toLowerCase();
+    }
+    const sourceId =
+      this.sourcePresetId ||
+      (typeof this.flow.source_preset_id === 'string'
+        ? this.flow.source_preset_id
+        : '');
+    if (!sourceId) return null;
+    const preset = this.presets.find((item) => item && item.id === sourceId);
+    return preset ? presetSlug(preset) : null;
+  }
+
+  private showsReviewInstructions(): boolean {
+    return showsReviewInstructionsField(this.flow, this.resolvedPresetSlug());
+  }
+
+  private clearReviewInstructions(): void {
+    this.flow = { ...this.flow, review_instructions: null };
+    this.requestUpdate();
+  }
+
+  private renderReviewInstructionsField() {
+    if (!this.showsReviewInstructions()) return nothing;
+    const value =
+      typeof this.flow.review_instructions === 'string'
+        ? this.flow.review_instructions
+        : '';
+    const capKib = REVIEW_INSTRUCTIONS_PROMPT_CAP / 1024;
+    const capLabel = REVIEW_INSTRUCTIONS_PROMPT_CAP.toLocaleString('en-US');
+    const helpText = `Blocking policy for the reviewer. The prompt keeps the first ${capKib} KiB (${capLabel} characters). Leave blank when the repository file is enough.`;
+    const capWarning = `The reviewer prompt keeps the first ${capKib} KiB. Text after ${capLabel} characters is dropped when the review runs.`;
+    return html`
+      <div data-review-instructions>
+        <sl-textarea
+          label="Review instructions"
+          data-review-instructions-input
+          rows="6"
+          .value=${value}
+          help-text=${helpText}
+          @sl-input=${(e: Event) =>
+            this.handleInputChange('review_instructions', e)}
+        ></sl-textarea>
+        <p class="notifications-help">
+          Same markdown as
+          <a
+            href=${REVIEW_POLICY_DOCS_URL}
+            target="_blank"
+            rel="noopener noreferrer"
+            data-review-instructions-docs
+            >.preloop/review-policy.md</a
+          >. Stored on the flow, so a preset update does not wipe it.
+        </p>
+        ${
+          reviewInstructionsOverPromptCap(value)
+            ? html`<sl-alert
+                variant="warning"
+                open
+                data-review-instructions-cap
+              >
+                <sl-icon slot="icon" name="exclamation-triangle"></sl-icon>
+                ${capWarning}
+              </sl-alert>`
+            : nothing
+        }
+        <sl-button
+          type="button"
+          size="small"
+          variant="text"
+          data-review-instructions-clear
+          @click=${this.clearReviewInstructions}
+        >
+          Clear
+        </sl-button>
       </div>
     `;
   }
@@ -2810,9 +3463,17 @@ export class PreloopFlowForm extends LitElement {
                   .presets=${this.presets}
                   .selectedId=${this.pickerSelectedId}
                   ?collapsed=${this.pickerCollapsed}
+                  ?persistent=${this.flowExecutionPath === 'persistent'}
                   @preset-select=${this.handlePickerSelect}
                   @preset-change-request=${this.handlePickerChangeRequest}
                 ></preloop-flow-preset-picker>
+                ${
+                  this.persistentPresetNotice
+                    ? html`<p class="persistent-preset-notice">
+                        ${this.persistentPresetNotice}
+                      </p>`
+                    : nothing
+                }
               `
             : nothing
         }
@@ -3004,27 +3665,12 @@ export class PreloopFlowForm extends LitElement {
                     </label>
                     <sl-radio-group
                       value=${this.flowExecutionPath}
-                      @sl-change=${(e: any) => {
-                        this.flowExecutionPath = e.target.value as
-                          'ephemeral' | 'persistent';
-                        if (this.flowExecutionPath === 'persistent') {
-                          if (
-                            !this.targetAgentId &&
-                            this.longRunningAgents.length > 0
-                          ) {
-                            const enabledAgents =
-                              this.persistentControlAgents();
-                            const onlineAgents = enabledAgents.filter(
-                              (a) => getAgentControlState(a).online
-                            );
-                            const pick = onlineAgents[0] || enabledAgents[0];
-                            if (pick) {
-                              this.targetAgentId = pick.id;
-                            }
-                          }
-                          this.updateModelSelectionForAgent();
+                      @sl-change=${(e: Event) => {
+                        const target = e.target as HTMLInputElement | null;
+                        const value = target?.value;
+                        if (value === 'ephemeral' || value === 'persistent') {
+                          this.applyExecutionPath(value);
                         }
-                        this.requestUpdate();
                       }}
                       style="display: flex; gap: var(--sl-spacing-large);"
                     >
@@ -3101,39 +3747,69 @@ export class PreloopFlowForm extends LitElement {
                     <sl-option value="cursor"
                       >Cursor CLI (private runner host profile)</sl-option
                     >
+                    <sl-option value="copilot"
+                      >Copilot CLI (private runner host profile)</sl-option
+                    >
                   </sl-select>
                 `
           }
-
-          <div
-            style="display: flex; flex-direction: column; gap: var(--sl-spacing-2x-small); margin-bottom: var(--sl-spacing-medium);"
-          >
-            <sl-select
-              label=${this.flow.agent_type === 'cursor' ? 'Requested AI Model' : 'AI model'}
-              help-text=${this.flow.agent_type === 'cursor' ? 'The local profile must map this model. The observed Cursor model is recorded only when reported.' : ''}
-              placeholder="Select an AI model"
-              .value=${this.flow.ai_model_id || ''}
-              @sl-change=${(e: any) => {
-                this.flow.ai_model_id = e.target.value;
-              }}
-              style="margin-bottom: 0;"
-            >
-              ${this.flow.agent_type === 'cursor' ? html`<sl-option value="">Profile default</sl-option>` : nothing}
-              ${selectableModels.map(
-                (m) => html`<sl-option .value=${m.id}>${m.name}</sl-option>`
-              )}
-            </sl-select>
-            <sl-button
-              size="small"
-              variant="text"
-              @click=${this.openAddAIModelDialog}
-              style="align-self: flex-start; margin-top: -0.25rem; height: auto; padding: 0;"
-            >
-              <sl-icon slot="prefix" name="plus-lg"></sl-icon> Add AI model
-            </sl-button>
-          </div>
-
-          ${this.renderModelRoutingEditor(selectableModels)}
+          ${
+            this.flow.agent_type === 'cursor'
+              ? html`
+                  <p class="notifications-help">
+                    Cursor runs as cursor-agent on the private runner, using
+                    that machine's Cursor login. Preloop's model catalog is not
+                    Cursor's catalog, so it is hidden here. Leave Cursor model
+                    blank and cursor-agent uses Auto, Cursor's own selector.
+                    Auto is not Grok 4.7. To pin Grok 4.7, enter grok-4.7-high
+                    and map that same id in the runner profile model_map.
+                  </p>
+                  <sl-input
+                    label="Cursor model"
+                    data-cursor-model
+                    placeholder="Auto"
+                    help-text="Optional Cursor model id. The runner passes it as --model only when the profile model_map lists it. Blank uses Auto."
+                    .value=${this.cursorModelValue()}
+                    @sl-input=${this.handleCursorModelInput}
+                  ></sl-input>
+                  ${this.renderHostExecCloneNotice('Cursor')}
+                `
+              : this.flow.agent_type === 'copilot'
+                ? this.renderCopilotHostExecFields()
+                : html`
+                    <div
+                      style="display: flex; flex-direction: column; gap: var(--sl-spacing-2x-small); margin-bottom: var(--sl-spacing-medium);"
+                    >
+                      <sl-select
+                        label="AI model"
+                        placeholder="Select an AI model"
+                        .value=${this.flow.ai_model_id || ''}
+                        @sl-change=${(e: any) => {
+                          this.flow.ai_model_id = e.target.value;
+                        }}
+                        style="margin-bottom: 0;"
+                      >
+                        ${selectableModels.map(
+                          (m) =>
+                            html`<sl-option .value=${m.id}
+                              >${m.name}</sl-option
+                            >`
+                        )}
+                      </sl-select>
+                      <sl-button
+                        size="small"
+                        variant="text"
+                        @click=${this.openAddAIModelDialog}
+                        style="align-self: flex-start; margin-top: -0.25rem; height: auto; padding: 0;"
+                      >
+                        <sl-icon slot="prefix" name="plus-lg"></sl-icon> Add AI
+                        model
+                      </sl-button>
+                    </div>
+                    ${this.renderModelRoutingEditor(selectableModels)}
+                    ${this.renderModelByLabelEditor(selectableModels)}
+                  `
+          }
           ${this.renderRunnerPoolField()} ${this.renderHostExecProfileField()}
           ${this.renderCustomImageField()}
 
@@ -3146,13 +3822,25 @@ export class PreloopFlowForm extends LitElement {
             @sl-input=${(e: Event) =>
               this.handleInputChange('prompt_template', e)}
           ></sl-textarea>
+          ${this.renderReviewInstructionsField()}
         </sl-card>
 
         <sl-card>
           <div slot="header" class="card-header-title">
             <sl-icon name="tools"></sl-icon> Allowed MCP tools
           </div>
-          ${this.flow.agent_type === 'cursor' ? html`<p>Cursor profiles use local MCP configuration. These flow tool settings do not apply.</p>` : nothing}
+          ${
+            this.flow.agent_type === 'cursor' ||
+            this.flow.agent_type === 'copilot'
+              ? html`<p data-host-exec-mcp-note>
+                  The runner adds these tools to the
+                  ${this.flow.agent_type === 'cursor' ? 'Cursor' : 'Copilot'}
+                  CLI as the <code>preloop-flow</code> MCP server, with a token
+                  scoped to this execution. The runner user's own MCP servers
+                  stay available.
+                </p>`
+              : nothing
+          }
 
           <div
             style="display: flex; flex-direction: column; gap: var(--sl-spacing-medium);"

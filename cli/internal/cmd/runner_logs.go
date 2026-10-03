@@ -32,13 +32,17 @@ type runnerLogBuffer struct {
 	native        bool
 	nativeCapture cursorCapture
 	nativeResults int
-	mu            sync.Mutex
-	partial       []byte
-	discarding    bool
-	pending       []string
-	pendingBytes  int
-	results       []string
-	overflow      bool
+	// harness selects the native stream parser. Empty means Cursor
+	// stream-json, which keeps older call sites unchanged.
+	harness        string
+	copilotCapture copilotCapture
+	mu             sync.Mutex
+	partial        []byte
+	discarding     bool
+	pending        []string
+	pendingBytes   int
+	results        []string
+	overflow       bool
 }
 
 func (b *runnerLogBuffer) Write(data []byte) (int, error) {
@@ -74,7 +78,11 @@ func (b *runnerLogBuffer) Write(data []byte) (int, error) {
 }
 
 func (b *runnerLogBuffer) appendLineLocked(line string) {
-	if b.native {
+	if b.native && b.harness == hostExecHarnessCopilot {
+		if !applyCopilotLine(&b.copilotCapture, line) {
+			return
+		}
+	} else if b.native {
 		var event cursorStreamEvent
 		if json.Unmarshal([]byte(line), &event) == nil {
 			applyCursorEvent(&b.nativeCapture, event)
@@ -93,6 +101,28 @@ func (b *runnerLogBuffer) appendLineLocked(line string) {
 		}
 		return
 	}
+	if line == "" {
+		return
+	}
+	if len(line) > runnerLogLineLimit {
+		line = line[:runnerLogLineLimit] + " [line truncated]"
+	}
+	if b.pendingBytes+len(line) > runnerLogQueueLimit || len(b.pending) >= 8192 {
+		b.overflow = true
+		return
+	}
+	b.pending = append(b.pending, line)
+	b.pendingBytes += len(line)
+}
+
+// note appends a runner-authored status line (for example checkout
+// progress) to the execution log. It bypasses the native stream parsers, so
+// a runner line can never be mistaken for CLI output such as a Copilot
+// startup error or a Cursor result event.
+func (b *runnerLogBuffer) note(line string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	line = strings.TrimSpace(line)
 	if line == "" {
 		return
 	}
@@ -240,6 +270,9 @@ func nativeRunnerResult(b *runnerLogBuffer, waitErr error) (map[string]any, erro
 	if b.overflow {
 		return nil, fmt.Errorf("native log buffer exceeded its limit")
 	}
+	if b.harness == hostExecHarnessCopilot {
+		return copilotRunnerResult(b.copilotCapture)
+	}
 	if b.nativeResults != 1 || !b.nativeCapture.HasResult {
 		return nil, fmt.Errorf("host execution exited without a valid structured completion result")
 	}
@@ -247,7 +280,7 @@ func nativeRunnerResult(b *runnerLogBuffer, waitErr error) (map[string]any, erro
 	if b.nativeCapture.ResultErr {
 		status = "failure"
 	}
-	result := map[string]any{"status": status, "harness": "cursor_cli"}
+	result := map[string]any{"status": status, "harness": hostExecHarnessCursor}
 	if b.nativeCapture.SessionID != "" {
 		result["session_id"] = b.nativeCapture.SessionID
 	}
