@@ -1,52 +1,96 @@
 import asyncio
-from datetime import datetime, timezone
+import functools
 import logging
 import threading
 import uuid
-from typing import Any, Dict, List, Optional, Tuple
+from datetime import datetime, timezone
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
-from sqlalchemy.exc import IntegrityError
 from sqlalchemy.engine import Connection
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
+from preloop.plugins.account_hooks import AuthorizationContext
+
 from preloop.models.crud import crud_flow, crud_flow_execution, crud_issue
+from preloop.models.db.session import get_session_factory
 from preloop.models.models import Flow
 from preloop.models.models.flow_execution import FlowExecution
+from preloop.models.schemas.flow_execution import (
+    FlowExecutionCreate,
+    FlowExecutionUpdate,
+)
+from preloop.schemas.issue_triage import provider_revision
+from preloop.services.flow_ci_feedback import (
+    GITHUB_CI_EVENT_TYPES,
+    bind_ci_failure_resume_or_skip,
+    flow_requires_ci_failure_resume,
+)
+from preloop.services.flow_failure_category import (
+    FAILURE_CATEGORY_RUNNER_ERROR,
+    FAILURE_CATEGORY_UNKNOWN,
+    derive_failure_category,
+)
+from preloop.services.issue_triage_trigger import (
+    issue_update_touches_content,
+    skip_triage_flow_for_event,
+)
+from preloop.services.kill_switch import FlowHaltActiveError, flows_halted
 from preloop.services.model_routing import (
     ModelRoutingError,
     apply_no_progress_escalation,
     load_source_execution_for_flow,
     prepare_execution_routing,
 )
-from preloop.models.schemas.flow_execution import FlowExecutionCreate
-from preloop.services.flow_ci_feedback import (
-    GITHUB_CI_EVENT_TYPES,
-    bind_ci_failure_resume_or_skip,
-    flow_requires_ci_failure_resume,
-)
-from .flow_orchestrator import FlowExecutionOrchestrator
-from preloop.services.kill_switch import FlowHaltActiveError, flows_halted
-from preloop.sync.event_normalizer import (
-    LABEL_CHANGE_ACTIONS,
-    LABEL_CHANGE_EVENT_TYPES,
-    attach_trigger_subject,
-    gitlab_label_delta,
-)
-from preloop.sync.services.event_bus import get_nats_client
 from preloop.services.webhook_delivery_dedupe import (
     delivery_key_for_event,
     find_execution_for_delivery,
     is_delivery_key_conflict,
 )
-from preloop.utils.workspace_seed import attach_workspace_file_paths
-from preloop.models.db.session import get_session_factory
-from preloop.schemas.issue_triage import provider_revision
-from preloop.services.issue_triage_trigger import (
-    issue_update_touches_content,
-    skip_triage_flow_for_event,
+from preloop.sync.event_normalizer import (
+    LABEL_CHANGE_ACTIONS,
+    LABEL_CHANGE_EVENT_TYPES,
+    PR_CLOSE_STOP_SOURCES,
+    PR_HEAD_UPDATE_EVENT_TYPES,
+    PR_STOP_SOURCE_MERGED,
+    PR_STOP_SOURCE_SUPERSEDED,
+    attach_trigger_subject,
+    gitlab_label_delta,
+    pr_close_stop_source,
 )
+from preloop.sync.services.event_bus import get_nats_client
+from preloop.utils.bitbucket import normalize_uuid as normalize_bitbucket_uuid
+from preloop.utils.bitbucket import payload_commit_hash as bitbucket_payload_commit_hash
+from preloop.utils.workspace_seed import attach_workspace_file_paths
+
+from .flow_orchestrator import FlowExecutionOrchestrator
 
 logger = logging.getLogger(__name__)
+
+
+def _schedule_now() -> datetime:
+    """Wall-clock time of a schedule tick (patched in tests)."""
+    return datetime.now(timezone.utc)
+
+
+def _previous_fire_iso(raw_schedule: Any, now: datetime) -> str:
+    """Previous fire time of a stored schedule as of ``now``, ISO 8601 UTC.
+
+    An unparseable stored config cannot say when it last fired; the run
+    still gets a window, one minimum interval wide, rather than none.
+    """
+    from preloop.models.schemas.flow import (
+        MIN_SCHEDULE_INTERVAL,
+        parse_schedule_config,
+    )
+
+    try:
+        _, previous = parse_schedule_config(raw_schedule).fire_window(now)
+    except Exception:
+        logger.warning("Could not compute previous fire time", exc_info=True)
+        previous = now - MIN_SCHEDULE_INTERVAL
+    return previous.isoformat()
+
 
 # Maximum number of matrix cells a single trigger may fan out to. Keeps a
 # runaway matrix from creating unbounded executions in one request; the
@@ -78,6 +122,46 @@ TRACKER_OBJECT_ACTIVE_STATUSES = (
 COALESCE_EXEMPT_EVENT_TYPES: frozenset = frozenset(
     {"comment_created", "comment_updated", "comment_deleted"}
 ) | frozenset(GITHUB_CI_EVENT_TYPES)
+
+# Resource-key kinds that name a pull or merge request, the objects whose
+# executions are stopped when the request is merged, closed or gets a new
+# head (#1032).
+PR_OBJECT_KINDS: frozenset = frozenset({"pr", "merge_request"})
+
+
+def flow_supersedes_on_update(flow: Any) -> bool:
+    """Whether a new head on a pull request stops this flow's older run.
+
+    Opt-in per flow through ``webhook_config.supersede_on_update`` (#1032).
+    Off by default, so a flow that wants every head reviewed keeps today's
+    behaviour; the Pull Request Reviewer preset turns it on.
+    """
+    config = getattr(flow, "webhook_config", None)
+    return isinstance(config, dict) and config.get("supersede_on_update") is True
+
+
+def flow_handles_pr_close(flow: Any) -> bool:
+    """Whether the flow itself triggers on a merged or closed pull request.
+
+    Such a flow runs *because* the request ended, so its executions on that
+    request are never stopped for it.
+    """
+    types = getattr(flow, "trigger_event_types", None) or []
+    return any(event_type in PR_CLOSE_STOP_SOURCES for event_type in types)
+
+
+def _describe_pr_object(object_key: str) -> str:
+    """``pull request owner/repo#12`` or ``merge request group/project!7``."""
+    parts = object_key.split(":")
+    repo = ":".join(parts[1:-2])
+    kind, ident = parts[-2], parts[-1]
+    if kind == "merge_request":
+        return f"merge request {repo}!{ident}"
+    return f"pull request {repo}#{ident}"
+
+
+def _short(sha: str) -> str:
+    return sha[:8]
 
 
 def _label_name(item: Any) -> Optional[str]:
@@ -118,6 +202,37 @@ def _label_names_from_payload(payload: Dict[str, Any]) -> List[str]:
     if isinstance(obj_attrs, dict):
         _add(obj_attrs.get("labels"))
     _add(payload.get("label"))
+    return names
+
+
+def _object_label_names(payload: Dict[str, Any]) -> List[str]:
+    """Label names currently on the issue or merge request.
+
+    Unlike ``_label_names_from_payload`` this ignores the event's single
+    ``label`` subject, so an ``unlabeled`` delivery does not count the label
+    that just left. GitHub ``issue.labels`` / ``pull_request.labels`` and
+    GitLab top-level ``labels`` already reflect the state after the change.
+    """
+    names: List[str] = []
+    seen: set[str] = set()
+
+    def _add(value: Any) -> None:
+        if not isinstance(value, list):
+            return
+        for item in value:
+            name = _label_name(item)
+            if name and name not in seen:
+                seen.add(name)
+                names.append(name)
+
+    _add(payload.get("labels"))
+    for key in ("issue", "pull_request", "object_attributes"):
+        obj = payload.get(key)
+        if isinstance(obj, dict):
+            _add(obj.get("labels"))
+            fields = obj.get("fields")  # Jira issue.fields.labels
+            if isinstance(fields, dict):
+                _add(fields.get("labels"))
     return names
 
 
@@ -169,6 +284,216 @@ def _event_label_names(payload: Dict[str, Any]) -> List[str]:
     _add(added)
     _add(removed)
     return names
+
+
+#: Local-dispatch tasks started by ``_start_flow_execution`` when no execution
+#: worker is enabled. The event loop keeps only weak references to tasks, so an
+#: unreferenced one can be garbage-collected mid-run; holding it here until it
+#: finishes also guarantees its done-callback runs and sees the outcome.
+_LOCAL_RUN_TASKS: Set["asyncio.Task[None]"] = set()
+
+#: Worker-thread writes that record a crashed local dispatch as FAILED, held
+#: until they finish for the same reason as ``_LOCAL_RUN_TASKS``.
+_LOCAL_RUN_FAILURE_WRITES: Set["asyncio.Task[bool]"] = set()
+
+#: Statuses a crashed local dispatch may overwrite with FAILED. Terminal rows
+#: already say how the run ended, and parked or resuming rows belong to the
+#: park/resume handshake, so neither is touched.
+_LOCAL_RUN_FAILABLE_STATUSES = frozenset(
+    {"PENDING", "INITIALIZING", "STARTING", "RUNNING"}
+)
+
+
+def _record_local_run_failure(
+    session_factory: Callable[[], Session],
+    execution_id: uuid.UUID,
+    exc: BaseException,
+) -> bool:
+    """Mark a locally dispatched execution FAILED after its task raised.
+
+    The row is only updated while it is still in a pre-terminal status and no
+    agent runtime was recorded for it. A row with an agent session reference
+    has a live container that execution recovery can still adopt, so it is
+    left for recovery instead of being failed underneath the container.
+
+    Args:
+        session_factory: Zero-argument callable returning a fresh Session. The
+            callback runs after the dispatching request finished, so it cannot
+            reuse that request's session.
+        execution_id: The execution the failed task was running.
+        exc: The exception the task raised.
+
+    Returns:
+        True when the execution was marked FAILED, False when it was left
+        unchanged (missing, already finished, parked, has a runtime, or the
+        update itself failed).
+    """
+    db = session_factory()
+    try:
+        execution = crud_flow_execution.get(db, id=execution_id)
+        if execution is None:
+            return False
+        if execution.status not in _LOCAL_RUN_FAILABLE_STATUSES:
+            return False
+        if execution.agent_session_reference:
+            return False
+        message = f"Local flow dispatch failed: {type(exc).__name__}: {exc}"
+        category = derive_failure_category(
+            status="FAILED", error_message=message, exception=exc
+        )
+        if category in (None, FAILURE_CATEGORY_UNKNOWN):
+            # The run never reached an agent: the in-process dispatcher lost
+            # it, which is a runner failure rather than an agent one.
+            category = FAILURE_CATEGORY_RUNNER_ERROR
+        crud_flow_execution.update(
+            db,
+            db_obj=execution,
+            obj_in=FlowExecutionUpdate(
+                status="FAILED",
+                error_message=message,
+                failure_category=category,
+                end_time=datetime.now(timezone.utc),
+            ),
+        )
+        db.commit()
+        # The dispatch died before the orchestrator's terminal hook, so record
+        # the issue cost fact here. Never raises; a failure is picked up by
+        # the scheduled rebuild.
+        from preloop.services.issue_cost_rollup import (
+            record_execution_finished_safely,
+        )
+
+        record_execution_finished_safely(db, execution_id)
+        return True
+    except Exception:
+        logger.exception(
+            "Could not record the local dispatch failure of execution %s",
+            execution_id,
+        )
+        try:
+            db.rollback()
+        except Exception:  # noqa: BLE001 - best-effort rollback
+            pass
+        return False
+    finally:
+        db.close()
+
+
+def _supervise_local_run(
+    task: "asyncio.Task[None]",
+    *,
+    execution_id: uuid.UUID,
+    session_factory: Callable[[], Session],
+) -> None:
+    """Done-callback for a local-dispatch task: log and fail on an exception.
+
+    Without it, an exception raised by the in-process run is never retrieved:
+    nothing is logged and the execution stays PENDING until the next process
+    restart runs execution recovery. The error is logged here; the FAILED
+    write is handed to a worker thread so it never blocks the event loop.
+
+    Args:
+        task: The finished local-dispatch task.
+        execution_id: The execution the task was running.
+        session_factory: Zero-argument callable returning a fresh Session.
+    """
+    _LOCAL_RUN_TASKS.discard(task)
+    if task.cancelled():
+        # Cancellation is a shutdown, not a failure: the row stays active and
+        # execution recovery re-dispatches it when the process comes back.
+        logger.warning(
+            "Local flow run for execution %s was cancelled; leaving it for "
+            "execution recovery",
+            execution_id,
+        )
+        return
+    exc = task.exception()
+    if exc is None:
+        return
+    logger.error(
+        "Local flow run for execution %s failed: %s",
+        execution_id,
+        exc,
+        exc_info=exc,
+    )
+    # This callback runs on the event-loop thread. The status write is
+    # synchronous SQLAlchemy work that can block on a slow or exhausted pool
+    # (plausibly the very reason the run failed), so it runs in a worker
+    # thread instead of stalling every other request on the loop.
+    write = asyncio.to_thread(
+        _record_local_run_failure_and_log, session_factory, execution_id, exc
+    )
+    try:
+        write_task = task.get_loop().create_task(write)
+    except RuntimeError:
+        # The loop is closing: nothing scheduled now would run. The row stays
+        # active and execution recovery picks it up on the next start.
+        write.close()
+        logger.warning(
+            "Could not schedule the failure write for execution %s; leaving "
+            "it for execution recovery",
+            execution_id,
+        )
+        return
+    _LOCAL_RUN_FAILURE_WRITES.add(write_task)
+    write_task.add_done_callback(
+        functools.partial(_log_failure_write_outcome, execution_id=execution_id)
+    )
+
+
+def _record_local_run_failure_and_log(
+    session_factory: Callable[[], Session],
+    execution_id: uuid.UUID,
+    exc: BaseException,
+) -> bool:
+    """Record a crashed local dispatch and log when the row was marked.
+
+    Runs in a worker thread (see ``_supervise_local_run``).
+
+    Args:
+        session_factory: Zero-argument callable returning a fresh Session.
+        execution_id: The execution the failed task was running.
+        exc: The exception the task raised.
+
+    Returns:
+        True when the execution was marked FAILED.
+    """
+    marked = _record_local_run_failure(session_factory, execution_id, exc)
+    if marked:
+        logger.info(
+            "Execution %s marked FAILED after its local dispatch raised",
+            execution_id,
+        )
+    return marked
+
+
+def _log_failure_write_outcome(
+    write_task: "asyncio.Task[bool]", *, execution_id: uuid.UUID
+) -> None:
+    """Done-callback for the failure write: release it and log a crash.
+
+    ``_record_local_run_failure`` already logs its own database errors, so
+    this only reports a write that was cancelled or failed outside it.
+
+    Args:
+        write_task: The finished failure-write task.
+        execution_id: The execution whose failure was being recorded.
+    """
+    _LOCAL_RUN_FAILURE_WRITES.discard(write_task)
+    if write_task.cancelled():
+        logger.warning(
+            "Failure write for execution %s was cancelled; leaving it for "
+            "execution recovery",
+            execution_id,
+        )
+        return
+    write_exc = write_task.exception()
+    if write_exc is not None:
+        logger.error(
+            "Could not record the local dispatch failure of execution %s",
+            execution_id,
+            exc_info=write_exc,
+        )
 
 
 def _triage_timestamp(value: Any) -> Optional[datetime]:
@@ -300,6 +625,29 @@ class FlowTriggerService:
                 tag = payload.get("tag")
                 if project_path and tag:
                     return f"gitlab:{project_path}:release:{tag}"
+
+        elif source == "bitbucket":
+            pr = payload.get("pullrequest") or {}
+            repo_full_name = (payload.get("repository") or {}).get("full_name", "")
+            if isinstance(pr, dict) and pr.get("id") and repo_full_name:
+                return f"bitbucket:{repo_full_name}:pr:{pr['id']}"
+
+        elif source == "bitbucket_dc":
+            # Keyed on the immutable repository id, never the mutable slug.
+            pr = payload.get("pull_request") or {}
+            repo_id = (payload.get("repository") or {}).get("id")
+            if isinstance(pr, dict) and pr.get("number") and repo_id:
+                return f"bitbucket_dc:{repo_id}:pr:{pr['number']}"
+
+        elif source == "jira":
+            # Webhook and manual-run payloads both carry issue.key. Derive the
+            # whole key from the payload: callers that rebuild event data from
+            # a stored execution keep only source and payload, and the
+            # coalescing guards already scope matches to one flow and account.
+            issue = payload.get("issue") or {}
+            key = issue.get("key") if isinstance(issue, dict) else None
+            if isinstance(key, str) and "-" in key:
+                return f"jira:{key.rsplit('-', 1)[0]}:issue:{key}"
 
         return None
 
@@ -551,6 +899,292 @@ class FlowTriggerService:
                 exc_info=True,
             )
 
+    @staticmethod
+    def _execution_event_data(execution: FlowExecution) -> Dict[str, Any]:
+        """The ``source``/``type``/``payload`` an execution was started from."""
+        trigger_details = execution.trigger_event_details or {}
+        payload = trigger_details.get("payload", {})
+        return {
+            "source": trigger_details.get("source", ""),
+            "type": trigger_details.get("type"),
+            "payload": payload if isinstance(payload, dict) else {},
+        }
+
+    def _extract_pr_object_key(self, event_data: Dict[str, Any]) -> Optional[str]:
+        """Resource key of the pull or merge request an event is about.
+
+        Includes comments on the request: a GitHub ``issue_comment`` names
+        the PR as an ``issue`` with a ``pull_request`` link, a GitLab note
+        as ``merge_request``. Mirrors
+        :func:`preloop.models.crud.flow_execution.pull_request_payload_match`.
+        """
+        key = self._extract_tracker_object_key(event_data)
+        if key and key.split(":")[-2] in PR_OBJECT_KINDS:
+            return key
+        source = str(event_data.get("source") or "").lower()
+        payload = event_data.get("payload") or {}
+        if not isinstance(payload, dict):
+            return None
+        if source == "github":
+            issue = payload.get("issue") or {}
+            repo = (payload.get("repository") or {}).get("full_name")
+            if isinstance(issue, dict) and issue.get("pull_request") and repo:
+                number = issue.get("number")
+                if number:
+                    return f"github:{repo}:pr:{number}"
+        elif source == "gitlab":
+            merge_request = payload.get("merge_request") or {}
+            path = (payload.get("project") or {}).get("path_with_namespace")
+            if isinstance(merge_request, dict) and merge_request.get("iid") and path:
+                return f"gitlab:{path}:merge_request:{merge_request['iid']}"
+        return None
+
+    async def _stop_for_pull_request(
+        self,
+        execution: FlowExecution,
+        *,
+        flow: Any,
+        object_key: str,
+        stop_source: str,
+        reason: str,
+        event_data: Dict[str, Any],
+        nats_client: Any,
+    ) -> bool:
+        """Stop one execution through the shared stop path and audit it."""
+        from preloop.services.flow_execution_stop import stop_execution
+
+        outcome = await stop_execution(
+            self.db,
+            execution,
+            account_id=flow.account_id,
+            nats_client=nats_client,
+            error_message=reason,
+            stop_reason=reason,
+            stop_source=stop_source,
+        )
+        if not outcome.stopped:
+            return False
+        logger.info(
+            "Stopped execution %s of flow '%s' (%s): %s",
+            execution.id,
+            flow.name,
+            flow.id,
+            reason,
+        )
+        try:
+            from preloop.models.crud import crud_event
+
+            crud_event.log_event(
+                self.db,
+                event_type="flow_execution_stopped_for_pull_request",
+                account_id=flow.account_id,
+                event_data={
+                    "flow_id": str(flow.id),
+                    "flow_name": flow.name,
+                    "execution_id": str(execution.id),
+                    "object_key": object_key,
+                    "stop_source": stop_source,
+                    "trigger_source": event_data.get("source"),
+                    "trigger_type": event_data.get("type"),
+                },
+            )
+        except Exception:  # noqa: BLE001 - audit must never block the stop
+            logger.warning(
+                "Could not record the pull request stop of execution %s",
+                execution.id,
+                exc_info=True,
+            )
+        return True
+
+    async def stop_executions_for_ended_pull_request(
+        self,
+        event_data: Dict[str, Any],
+        *,
+        nats_client: Any = None,
+    ) -> List[str]:
+        """Stop every execution still working on a merged or closed PR (#1032).
+
+        Runs for every normalized ``pull_request_merged``/``_closed`` and
+        ``merge_request_merged``/``_closed`` delivery, whether or not a flow
+        subscribes to it. Covers every flow in the account and every status
+        that still holds the request (queued, running, parked). Left alone:
+        executions not bound to this request, and executions of flows that
+        trigger on the merge or close themselves.
+
+        Args:
+            event_data: The normalized event.
+            nats_client: Connected NATS client, fetched on demand when None.
+
+        Returns:
+            Ids of the executions this call stopped. Empty, and nothing
+            written, when no execution is bound to the request.
+        """
+        stop_source = pr_close_stop_source(event_data.get("type"))
+        account_id = event_data.get("account_id")
+        if not stop_source or not account_id:
+            return []
+        object_key = self._extract_pr_object_key(event_data)
+        if not object_key:
+            return []
+        candidates = crud_flow_execution.get_active_for_pull_request(
+            self.db,
+            account_id=uuid.UUID(str(account_id)),
+            tracker_object_key=object_key,
+            statuses=TRACKER_OBJECT_ACTIVE_STATUSES,
+        )
+        described = _describe_pr_object(object_key)
+        outcome_text = (
+            "was merged"
+            if stop_source == PR_STOP_SOURCE_MERGED
+            else "was closed without merging"
+        )
+        reason = f"Stopped because {described} {outcome_text}"
+        stopped: List[str] = []
+        for execution in candidates:
+            exec_event = self._execution_event_data(execution)
+            if self._extract_pr_object_key(exec_event) != object_key:
+                continue
+            flow = execution.flow
+            if flow is None or flow_handles_pr_close(flow):
+                continue
+            if exec_event.get("type") in PR_CLOSE_STOP_SOURCES:
+                continue
+            if nats_client is None:
+                try:
+                    nats_client = await get_nats_client()
+                except Exception:  # noqa: BLE001 - the stop is durable without it
+                    logger.warning("No NATS client for the pull request stop")
+            try:
+                if await self._stop_for_pull_request(
+                    execution,
+                    flow=flow,
+                    object_key=object_key,
+                    stop_source=stop_source,
+                    reason=reason,
+                    event_data=event_data,
+                    nats_client=nats_client,
+                ):
+                    stopped.append(str(execution.id))
+            except Exception:
+                logger.exception(
+                    "Could not stop execution %s for %s", execution.id, object_key
+                )
+                self._rollback_quietly()
+        return stopped
+
+    @staticmethod
+    def _pull_request_version(event_data: Dict[str, Any]) -> Optional[int]:
+        """Data Center pull request ``version`` carried by an event, if any."""
+        if str(event_data.get("source") or "").lower() != "bitbucket_dc":
+            return None
+        pr = (event_data.get("payload") or {}).get("pull_request")
+        version = pr.get("version") if isinstance(pr, dict) else None
+        if isinstance(version, bool) or not isinstance(version, int):
+            return None
+        return version
+
+    def _is_out_of_order_head(self, flow: Flow, event_data: Dict[str, Any]) -> bool:
+        """True when a Data Center PR update is older than one already seen.
+
+        Data Center increments the pull request ``version`` on every change,
+        and deliveries are not ordered. A late delivery for an older state
+        must neither supersede the run on the newer head nor start a review
+        of the stale one, whether the newer run is still active or has
+        already finished.
+        """
+        version = self._pull_request_version(event_data)
+        if version is None:
+            return False
+        object_key = self._extract_pr_object_key(event_data)
+        if not object_key:
+            return False
+        recent = crud_flow_execution.get_recent_for_pull_request(
+            self.db,
+            flow_id=flow.id,
+            account_id=flow.account_id,
+            tracker_object_key=object_key,
+        )
+        for execution in recent:
+            exec_event = self._execution_event_data(execution)
+            if self._extract_pr_object_key(exec_event) != object_key:
+                continue
+            active_version = self._pull_request_version(exec_event)
+            if active_version is not None and active_version > version:
+                return True
+        return False
+
+    async def supersede_older_heads(
+        self,
+        flow: Flow,
+        event_data: Dict[str, Any],
+        *,
+        commit_sha: str,
+        nats_client: Any = None,
+    ) -> List[str]:
+        """Stop this flow's runs on an older head of the same PR (#1032).
+
+        Called for a ``pull_request_updated``/``merge_request_updated``
+        delivery on a flow with ``webhook_config.supersede_on_update`` set,
+        before the execution for the new head is created. A run whose own
+        head is unknown or equals ``commit_sha`` is left alone, and so is a
+        comment or CI resume: those feed the run more input, they do not
+        review a head.
+
+        Returns:
+            Ids of the executions this call stopped.
+        """
+        object_key = self._extract_pr_object_key(event_data)
+        if not object_key or not commit_sha:
+            return []
+        actives = crud_flow_execution.get_running_by_flow(
+            self.db,
+            flow_id=flow.id,
+            account_id=flow.account_id,
+            running_statuses=list(TRACKER_OBJECT_ACTIVE_STATUSES),
+            tracker_object_key=object_key,
+        )
+        described = _describe_pr_object(object_key)
+        stopped: List[str] = []
+        for execution in actives:
+            exec_event = self._execution_event_data(execution)
+            if self._extract_pr_object_key(exec_event) != object_key:
+                continue
+            if exec_event.get("type") in COALESCE_EXEMPT_EVENT_TYPES:
+                continue
+            old_sha = self._extract_commit_sha(exec_event)
+            if not old_sha or old_sha == commit_sha:
+                continue
+            reason = (
+                f"Stopped because {described} got a new head "
+                f"{_short(commit_sha)}; this run on {_short(old_sha)} was superseded"
+            )
+            try:
+                if await self._stop_for_pull_request(
+                    execution,
+                    flow=flow,
+                    object_key=object_key,
+                    stop_source=PR_STOP_SOURCE_SUPERSEDED,
+                    reason=reason,
+                    event_data=event_data,
+                    nats_client=nats_client,
+                ):
+                    stopped.append(str(execution.id))
+            except Exception:
+                logger.exception(
+                    "Could not stop superseded execution %s for %s",
+                    execution.id,
+                    object_key,
+                )
+                self._rollback_quietly()
+        return stopped
+
+    def _rollback_quietly(self) -> None:
+        """Leave the session usable after a failed stop; triggering goes on."""
+        try:
+            self.db.rollback()
+        except Exception:  # noqa: BLE001 - nothing more to undo
+            logger.debug("Rollback after a failed pull request stop failed")
+
     def _extract_repo_key(self, event_data: Dict[str, Any]) -> Optional[str]:
         """
         Extract a repository identifier from the event payload.
@@ -576,6 +1210,17 @@ class FlowTriggerService:
             project_path = project.get("path_with_namespace", "")
             if project_path:
                 return f"gitlab:{project_path}"
+
+        elif source == "bitbucket":
+            repo = payload.get("repository") or {}
+            repo_full_name = repo.get("full_name", "") if isinstance(repo, dict) else ""
+            if repo_full_name:
+                return f"bitbucket:{repo_full_name}"
+
+        elif source == "bitbucket_dc":
+            repo = payload.get("repository") or {}
+            if isinstance(repo, dict) and repo.get("id"):
+                return f"bitbucket_dc:{repo['id']}"
 
         return None
 
@@ -625,6 +1270,28 @@ class FlowTriggerService:
             repo_identifier = project.get("path_with_namespace") or project.get("name")
             repo_external_id = str(project.get("id", "")) if project.get("id") else None
 
+        elif source == "bitbucket":
+            repo = payload.get("repository", {})
+            # Bitbucket uses full_name like "workspace/repo"; projects store
+            # the repository UUID without braces as the identifier.
+            repo_identifier = repo.get("full_name") or repo.get("name")
+            repo_external_id = normalize_bitbucket_uuid(repo.get("uuid")) or None
+
+        elif source == "jira":
+            return self._extract_jira_project_id(payload, tracker_id)
+
+        elif source == "bitbucket_dc":
+            # Data Center projects store the immutable repository id as the
+            # identifier; a slug or display name never selects the project.
+            repo = payload.get("repository") or {}
+            repo_id = repo.get("id") if isinstance(repo, dict) else None
+            if not repo_id:
+                return None
+            project = crud_project.get_for_tracker_by_identifier(
+                self.db, tracker_id=tracker_id, identifier=str(repo_id)
+            )
+            return str(project.id) if project else None
+
         if not repo_identifier:
             return None
 
@@ -662,6 +1329,47 @@ class FlowTriggerService:
         logger.debug(
             f"Could not match repo '{repo_identifier}' (external_id={repo_external_id}) "
             f"to any of {len(projects)} projects for tracker {tracker_id}"
+        )
+        return None
+
+    def _extract_jira_project_id(
+        self, payload: Dict[str, Any], tracker_id: str
+    ) -> Optional[str]:
+        """Resolve the synced Jira project an issue webhook belongs to.
+
+        Jira sync stores the project key as the slug (older rows used it as
+        the identifier). Only the key and the numeric project id are
+        compared: matching a Jira key against project display names could
+        pick an unrelated project.
+
+        Args:
+            payload: Jira webhook payload.
+            tracker_id: Jira tracker the webhook arrived on.
+
+        Returns:
+            Internal project UUID as a string, or None.
+        """
+        from preloop.models.crud import crud_project
+
+        issue = payload.get("issue") if isinstance(payload, dict) else None
+        fields = issue.get("fields") if isinstance(issue, dict) else None
+        project = fields.get("project") if isinstance(fields, dict) else None
+        if not isinstance(project, dict):
+            return None
+        key = str(project.get("key") or "").strip()
+        external_id = str(project.get("id") or "").strip()
+        if not key and not external_id:
+            return None
+        found = crud_project.get_for_tracker_by_key(
+            self.db, tracker_id=tracker_id, key=key, external_id=external_id
+        )
+        if found is not None:
+            return str(found.id)
+        logger.debug(
+            "Could not match Jira project %s (id=%s) for tracker %s",
+            key,
+            external_id,
+            tracker_id,
         )
         return None
 
@@ -754,6 +1462,11 @@ class FlowTriggerService:
                 sha = head.get("sha")
                 if sha:
                     return sha
+
+        # Bitbucket Cloud PR or repo:push
+        sha = bitbucket_payload_commit_hash(payload)
+        if sha:
+            return sha
 
         # Direct commit reference
         if "commit" in payload:
@@ -894,6 +1607,29 @@ class FlowTriggerService:
         finally:
             orchestrator_db.close()
 
+    async def _authorize_flow_run(
+        self, flow: Flow, context: AuthorizationContext | None = None
+    ) -> None:
+        from preloop.plugins.account_hooks import (
+            ACTION_FLOW_RUN,
+            authorize,
+            get_authorizer,
+        )
+        from preloop.api.loop_safety import run_db_off_loop
+
+        if get_authorizer() is None:
+            return
+        ctx = context or AuthorizationContext(
+            account_id=flow.account_id,
+            db=self.db,
+            attributes={"flow_id": str(flow.id), "resource_type": "flow"},
+        )
+        decision = await run_db_off_loop(lambda: authorize(ctx, ACTION_FLOW_RUN, flow))
+        if not decision.allowed:
+            raise PermissionError(
+                decision.reason or "Flow denied by account access policy"
+            )
+
     async def _start_flow_execution(
         self,
         flow: Flow,
@@ -904,6 +1640,7 @@ class FlowTriggerService:
         test_mode: bool = False,
         precreated_execution: Any = None,
         source_execution: Optional[FlowExecution] = None,
+        authorization_context: AuthorizationContext | None = None,
     ) -> Any:
         """Create (or reuse) a PENDING execution and hand it to a worker or local task.
 
@@ -915,6 +1652,8 @@ class FlowTriggerService:
                 flow executions (#157). No execution row is created and
                 nothing is dispatched.
         """
+        from preloop.api.loop_safety import run_db_off_loop
+        from preloop.models import crud, models
         from preloop.services.flow_execution_dispatcher import (
             dispatch_execute,
             flow_execution_worker_enabled,
@@ -925,6 +1664,16 @@ class FlowTriggerService:
             is_triage_flow,
             reserve_triage_execution,
         )
+
+        await self._authorize_flow_run(flow, authorization_context)
+
+        if isinstance(precreated_execution, models.FlowExecution):
+            await run_db_off_loop(
+                lambda: crud.crud_ci_execution.authorize_dispatch(
+                    self.db,
+                    execution=precreated_execution,
+                )
+            )
 
         if self._flows_halted(flow.account_id):
             if precreated_execution is None:
@@ -1097,7 +1846,15 @@ class FlowTriggerService:
         if flow_execution_worker_enabled():
             await dispatch_execute(execution_id)
         else:
-            asyncio.create_task(_local_run())
+            local_task = asyncio.create_task(_local_run())
+            _LOCAL_RUN_TASKS.add(local_task)
+            local_task.add_done_callback(
+                functools.partial(
+                    _supervise_local_run,
+                    execution_id=execution_id,
+                    session_factory=self._create_orchestrator_session,
+                )
+            )
 
         return execution
 
@@ -1137,6 +1894,20 @@ class FlowTriggerService:
         """
         Check if the event matches the flow's trigger_config (if specified).
 
+        Two label conditions combine with AND:
+
+        * ``labels`` (any-of): "this event added one of". On a label-change
+          delivery it reads the label the event carries; otherwise the
+          object's label list.
+        * ``labels_all`` (all-of): "and the issue carries all of". Always read
+          from the object's current label list (after the change), so
+          ``{"labels": ["agent-ready"], "labels_all": ["complexity:low"]}``
+          routes one ``agent-ready`` delivery to the complexity:low flow only.
+          An event with no label list never satisfies ``labels_all``.
+
+        A bound implementation comment (its PR need not repeat intake
+        labels) skips both label conditions.
+
         Args:
             flow: The flow definition
             event_data: The event data containing payload and metadata
@@ -1144,6 +1915,20 @@ class FlowTriggerService:
         Returns:
             True if the event matches the trigger config, False otherwise
         """
+        # A backport flow (issue #961) starts only for a merge into its
+        # configured source branch; a merge anywhere else never starts it.
+        from preloop.services.backport import backport_event_matches
+
+        if not backport_event_matches(
+            getattr(flow, "git_clone_config", None), event_data
+        ):
+            logger.info(
+                "Flow %s: backport gate did not match (not a merge into the "
+                "source branch, or an invalid backport block)",
+                flow.id,
+            )
+            return False
+
         if not flow.trigger_config:
             # No additional conditions, event matches
             return True
@@ -1175,13 +1960,44 @@ class FlowTriggerService:
             f"Payload keys: {list(payload.keys())}"
         )
 
-        for key, expected_value in flattened_config.items():
-            if key == "labels":
+        bound_cache: List[bool] = []
+
+        def _bound_comment() -> bool:
+            # Shared by both label conditions so the bound-execution lookup
+            # runs at most once per event.
+            if not bound_cache:
                 from preloop.services.flow_pr_binding import (
                     is_bound_implementation_comment,
                 )
 
-                if is_bound_implementation_comment(self.db, flow, event_data):
+                bound_cache.append(
+                    bool(is_bound_implementation_comment(self.db, flow, event_data))
+                )
+            return bound_cache[0]
+
+        for key, expected_value in flattened_config.items():
+            if key == "labels_all":
+                required = (
+                    expected_value
+                    if isinstance(expected_value, list)
+                    else [expected_value]
+                )
+                required = [r for r in required if isinstance(r, str) and r]
+                if not required:
+                    continue
+                if _bound_comment():
+                    continue
+                present = _object_label_names(payload)
+                missing = [r for r in required if r not in present]
+                if missing:
+                    logger.debug(
+                        f"Flow {flow.id} trigger_config mismatch: "
+                        f"labels_all missing {missing} (issue has {present})"
+                    )
+                    return False
+                continue
+            if key == "labels":
+                if _bound_comment():
                     # The issue qualified at intake; its PR need not duplicate
                     # that label. Every other configured condition still applies.
                     continue
@@ -1354,6 +2170,27 @@ class FlowTriggerService:
                 author = obj_attrs.get("author", {})
                 if isinstance(author, dict):
                     sender = author.get("username", "").lower()
+        elif source == "bitbucket_dc":
+            # The intake compares the actor with the user Preloop acts as on
+            # that instance; the configured user slug is not a fixed bot name.
+            dc = payload.get("bitbucket_dc") or {}
+            if isinstance(dc, dict) and dc.get("self_generated") is True:
+                logger.info("Ignoring Bitbucket Data Center event sent by Preloop")
+                return True
+            sender_obj = payload.get("sender")
+            if isinstance(sender_obj, str):
+                sender = sender_obj.lower()
+        elif source == "bitbucket":
+            # Bitbucket names the acting user "actor"; filter_fields adds the
+            # nickname as "sender".
+            actor = payload.get("actor")
+            sender_obj = payload.get("sender")
+            if isinstance(sender_obj, str) and sender_obj:
+                sender = sender_obj.lower()
+            elif isinstance(actor, dict):
+                sender = str(
+                    actor.get("nickname") or actor.get("display_name") or ""
+                ).lower()
 
         if not sender:
             return False
@@ -1463,6 +2300,70 @@ class FlowTriggerService:
         expiry = _triage_timestamp(expires_at)
         return expiry is not None and expiry > datetime.now(timezone.utc)
 
+    def _add_secondary_event_flows(
+        self,
+        event_data: Dict[str, Any],
+        matching_flows: List[Flow],
+        *,
+        query_source: Any,
+        project_id: Optional[str],
+        account_id: Any,
+    ) -> Tuple[List[Flow], Dict[Any, str]]:
+        """Append flows subscribed to a secondary type of this delivery.
+
+        See ``secondary_event_types``: one Jira edit can add a label, change
+        the status and remove a label, and it is still an issue update.
+        Flows subscribed to any of those types are considered. Each flow
+        appears once, under the first type it matched (primary first).
+
+        A secondary type the loop guard would drop is not expanded: a label
+        edit by the bot passes the guard as ``issue_labeled``, but the same
+        edit must not start ``issue_updated`` or status flows.
+
+        Args:
+            event_data: The event being processed.
+            matching_flows: Flows matched on the primary event type.
+            query_source: Tracker id or source used for the primary lookup.
+            project_id: Project used for the primary lookup.
+            account_id: Account scope.
+
+        Returns:
+            The primary flows followed by any additional ones, and the event
+            type each secondary flow matched on (keyed by flow id).
+        """
+        from preloop.sync.event_normalizer import secondary_event_types
+
+        extra_types = secondary_event_types(
+            event_data.get("source"),
+            event_data.get("type"),
+            event_data.get("payload"),
+        )
+        flows = list(matching_flows)
+        matched_types: Dict[Any, str] = {}
+        if not extra_types:
+            return flows, matched_types
+        seen = {flow.id for flow in flows}
+        for extra_type in extra_types:
+            if self._is_preloop_triggered_event({**event_data, "type": extra_type}):
+                logger.info(
+                    "Not expanding %s delivery to %s: sent by the Preloop bot",
+                    event_data.get("type"),
+                    extra_type,
+                )
+                continue
+            for flow in crud_flow.get_by_trigger(
+                self.db,
+                event_source=query_source,
+                event_type=extra_type,
+                project_id=project_id,
+                account_id=account_id,
+            ):
+                if flow.id not in seen:
+                    seen.add(flow.id)
+                    flows.append(flow)
+                    matched_types[flow.id] = extra_type
+        return flows, matched_types
+
     async def process_event(self, event_data: Dict[str, Any]):
         """
         Process an incoming event and trigger any matching flows.
@@ -1497,6 +2398,21 @@ class FlowTriggerService:
 
         ingest_feedback(self.db, event_data)
 
+        # A merged or closed pull request ends every run still working on it
+        # (#1032), before anything else: the flow lookup below returns early
+        # when no flow subscribes to the merge, which is the common case, and
+        # a merge done by the Preloop bot is still a merge.
+        if pr_close_stop_source(event_type):
+            try:
+                await self.stop_executions_for_ended_pull_request(event_data)
+            except Exception:
+                logger.exception(
+                    "Could not stop executions for %s event from %s",
+                    event_type,
+                    event_source,
+                )
+                self._rollback_quietly()
+
         # Check if this event was triggered by Preloop itself to prevent infinite loops
         if self._is_preloop_triggered_event(event_data):
             logger.info(
@@ -1527,6 +2443,13 @@ class FlowTriggerService:
                 project_id=project_id,
                 account_id=account_id,
             )
+            matching_flows, secondary_types = self._add_secondary_event_flows(
+                event_data,
+                matching_flows,
+                query_source=query_source,
+                project_id=project_id,
+                account_id=account_id,
+            )
 
             if not matching_flows:
                 logger.warning(
@@ -1550,7 +2473,14 @@ class FlowTriggerService:
             # Filter flows by trigger_config and enabled status
             flows_to_trigger = []
             for flow in matching_flows:
-                if feedback_policy(flow) and event_type in FEEDBACK_TYPES:
+                # A flow found through a secondary type (Jira) is filtered as
+                # that type, so a "labels" condition on an issue_updated flow
+                # reads the issue's labels, not the delta.
+                flow_event = event_data
+                if flow.id in secondary_types:
+                    flow_event = {**event_data, "type": secondary_types[flow.id]}
+                flow_event_type = flow_event.get("type")
+                if feedback_policy(flow) and flow_event_type in FEEDBACK_TYPES:
                     # This flow's durable subscription owns follow-up routing.
                     # Independent reviewer and ordinary event flows still run.
                     continue
@@ -1571,7 +2501,7 @@ class FlowTriggerService:
                 if skip_triage_flow_for_event(
                     self.db,
                     flow,
-                    event_data,
+                    flow_event,
                     event_touches_content=triage_content_change,
                 ):
                     logger.info(
@@ -1582,7 +2512,7 @@ class FlowTriggerService:
                     )
                     continue
 
-                if not self._matches_trigger_config(flow, event_data):
+                if not self._matches_trigger_config(flow, flow_event):
                     logger.info(
                         f"Skipping flow '{flow.name}' ({flow.id}) - trigger_config does not match. "
                         f"Config: {flow.trigger_config}"
@@ -1615,6 +2545,36 @@ class FlowTriggerService:
             # Trigger each matching flow
             for flow in flows_to_trigger:
                 try:
+                    employee_binding = (flow.trigger_config or {}).get(
+                        "employee_events"
+                    )
+                    if isinstance(employee_binding, dict):
+                        from preloop.services.employee_events import (
+                            ingest_employee_event,
+                        )
+
+                        subject = self._extract_resource_key(event_data)
+                        if not subject:
+                            raise ValueError(
+                                "Employee tracker event is missing an owned subject"
+                            )
+                        # Created/merged objects have one lifecycle event. Providers
+                        # lacking delivery IDs still get a stable replay identity.
+                        event_id = (
+                            event_data.get("delivery_id") or f"{event_type}:{subject}"
+                        )
+                        await ingest_employee_event(
+                            self.db,
+                            account_id=account_id,
+                            flow_id=flow.id,
+                            source=event_source,
+                            connection_id=str(tracker_id or event_source),
+                            event_id=str(event_id),
+                            kind=event_type,
+                            subject=subject,
+                            payload=event_data.get("payload") or {},
+                        )
+                        continue
                     # One provider delivery, one execution per flow. At-least-
                     # once message delivery (a drained pod naks its in-flight
                     # message, ack_wait expires, a pod dies before acking)
@@ -1657,6 +2617,37 @@ class FlowTriggerService:
                                 f"are triggered for the same commit."
                             )
                             continue
+
+                    # A new head on a pull request supersedes this flow's
+                    # run on the older head when the flow opts in (#1032).
+                    # Stopped before the new execution is created, and before
+                    # the one-active-run guard below, which would otherwise
+                    # keep the stale run and drop the new head.
+                    if (
+                        account_id
+                        and event_type in PR_HEAD_UPDATE_EVENT_TYPES
+                        and self._is_out_of_order_head(flow, event_data)
+                    ):
+                        logger.info(
+                            "Skipping flow '%s' (%s): the pull request update "
+                            "is older than the head an active run works on",
+                            flow.name,
+                            flow.id,
+                        )
+                        continue
+
+                    if (
+                        commit_sha
+                        and account_id
+                        and event_type in PR_HEAD_UPDATE_EVENT_TYPES
+                        and flow_supersedes_on_update(flow)
+                    ):
+                        await self.supersede_older_heads(
+                            flow,
+                            event_data,
+                            commit_sha=commit_sha,
+                            nats_client=nats_client,
+                        )
 
                     # Fallback dedup for commit-less deliveries (generic
                     # webhooks, release events): coalesce on a resource key.
@@ -1864,8 +2855,6 @@ class FlowTriggerService:
             One of "triggered", "skipped_overlap", "suppressed_disabled",
             "suppressed_halted", or "not_scheduled".
         """
-        from datetime import datetime, timezone as dt_timezone
-
         from preloop.models.crud import crud_event
 
         flow = crud_flow.get(self.db, id=str(flow_id))
@@ -1907,7 +2896,9 @@ class FlowTriggerService:
             schedule_config = parse_schedule_config(raw_schedule).model_dump()
         except Exception:
             schedule_config = raw_schedule
-        scheduled_at = datetime.now(dt_timezone.utc).isoformat()
+        now = _schedule_now()
+        scheduled_at = now.isoformat()
+        previous_scheduled_at = _previous_fire_iso(raw_schedule, now)
 
         running = crud_flow_execution.get_running_by_flow(self.db, flow_id=flow.id)
         if running:
@@ -1927,6 +2918,7 @@ class FlowTriggerService:
                     "schedule": schedule_config,
                     "timezone": schedule_config.get("timezone", "UTC"),
                     "scheduled_at": scheduled_at,
+                    "previous_scheduled_at": previous_scheduled_at,
                 },
             )
             return "skipped_overlap"
@@ -1945,6 +2937,17 @@ class FlowTriggerService:
                 "schedule": described_schedule,
                 "timezone": schedule_config.get("timezone", "UTC"),
                 "scheduled_at": scheduled_at,
+                # The window since the previous fire of this schedule, from
+                # its definition: a skipped or failed run still moves it, so
+                # consecutive windows tile time. Catch-up is the run's call,
+                # using last_successful_scheduled_at from history.
+                "previous_scheduled_at": previous_scheduled_at,
+                "window": {"from": previous_scheduled_at, "to": scheduled_at},
+                "last_successful_scheduled_at": (
+                    crud_flow_execution.last_successful_scheduled_at(
+                        self.db, flow_id=flow.id
+                    )
+                ),
             }
         )
         event_data = {
@@ -1976,6 +2979,7 @@ class FlowTriggerService:
         delegation_depth: int = 0,
         batch_id: Optional[uuid.UUID] = None,
         no_progress_escalation: Optional[Dict[str, Any]] = None,
+        authorization_context: AuthorizationContext | None = None,
     ) -> Dict[str, Any]:
         """
         Manually trigger a flow execution for testing purposes or as a retry.
@@ -2017,6 +3021,8 @@ class FlowTriggerService:
 
         if not flow:
             raise ValueError(f"Flow {flow_id} not found")
+
+        await self._authorize_flow_run(flow, authorization_context)
 
         if flows_halted(self.db, flow.account_id):
             raise FlowHaltActiveError(
@@ -2153,6 +3159,7 @@ class FlowTriggerService:
                 event_data=trigger_details,
                 nats_client=nats_client,
                 precreated_execution=execution,
+                authorization_context=authorization_context,
             )
         except Exception as e:
             raise FlowDispatchError(str(execution_id), execution_status, e) from e
@@ -2171,6 +3178,7 @@ class FlowTriggerService:
         test_mode: bool = False,
         trigger_event_data: Optional[Dict[str, Any]] = None,
         triggered_by: Optional[str] = None,
+        authorization_context: AuthorizationContext | None = None,
     ) -> Dict[str, Any]:
         """Fan a single trigger out to one execution per matrix entry.
 
@@ -2216,6 +3224,8 @@ class FlowTriggerService:
             raise TriageControllerError(
                 "Triage uses one revision claim per issue; use issue batches"
             )
+
+        await self._authorize_flow_run(flow, authorization_context)
 
         if flows_halted(self.db, flow.account_id):
             raise FlowHaltActiveError(
@@ -2288,6 +3298,7 @@ class FlowTriggerService:
                 event_data=execution.trigger_event_details,
                 nats_client=nats_client,
                 precreated_execution=execution,
+                authorization_context=authorization_context,
             )
 
         return {

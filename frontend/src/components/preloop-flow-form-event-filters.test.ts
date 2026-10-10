@@ -84,6 +84,11 @@ describe('PreloopFlowForm event filters section', () => {
     expect(source).to.include('trigger_config.issue_type');
   });
 
+  it('renders the moved-to-status filter for Jira trackers', () => {
+    expect(source).to.include('trigger_config.status_to');
+    expect(source).to.include('Moved to status');
+  });
+
   it('renders merged and draft checkbox filters for PR/MR events', () => {
     expect(source).to.include('trigger_config.merged');
     expect(source).to.include('trigger_config.draft');
@@ -100,6 +105,13 @@ describe('PreloopFlowForm event filters section', () => {
     expect(source).to.include('Pull request state');
     expect(source).to.include('trigger_config.mergeable_state');
     expect(source).to.include('Mergeable state');
+  });
+
+  it('renders Bitbucket-specific state filter with its own vocabulary', () => {
+    expect(source).to.include('Filter by Bitbucket pull request state');
+    expect(source).to.include('Declined');
+    expect(source).to.include('Superseded');
+    expect(source).to.include('changeRequestNoun(tracker.tracker_type)');
   });
 
   it('renders filter semantics help alert', () => {
@@ -132,6 +144,16 @@ const GITLAB_TRACKER = {
   id: 'tracker-gitlab',
   name: 'GitLab',
   tracker_type: 'gitlab',
+};
+const BITBUCKET_TRACKER = {
+  id: 'tracker-bitbucket',
+  name: 'Bitbucket',
+  tracker_type: 'bitbucket',
+};
+const JIRA_TRACKER = {
+  id: 'tracker-jira',
+  name: 'Jira',
+  tracker_type: 'jira',
 };
 const ORGANIZATION = {
   id: 'org-1',
@@ -170,7 +192,14 @@ describe('PreloopFlowForm event filters behaviour', () => {
     sandbox.stub(window, 'fetch').callsFake(async (url: any) => {
       const target = String(url);
       if (target.includes('/api/v1/trackers')) {
-        return new Response(JSON.stringify([GITHUB_TRACKER, GITLAB_TRACKER]));
+        return new Response(
+          JSON.stringify([
+            GITHUB_TRACKER,
+            GITLAB_TRACKER,
+            BITBUCKET_TRACKER,
+            JIRA_TRACKER,
+          ])
+        );
       }
       if (target.includes('/api/v1/organizations')) {
         return new Response(JSON.stringify({ items: [ORGANIZATION] }));
@@ -253,6 +282,33 @@ describe('PreloopFlowForm event filters behaviour', () => {
     });
   });
 
+  it('round-trips the all-of labels filter', async () => {
+    const element = await mount(
+      trackerFlow({ labels: ['agent-ready'], labels_all: ['complexity:low'] })
+    );
+    (element as any).filtersExpanded = true;
+    await element.updateComplete;
+
+    const all = filterInput(
+      element,
+      'Issue must also carry all of these labels'
+    );
+    expect(all.value).to.equal('complexity:low');
+    all.value = ' complexity:medium, risk:low ';
+    all.dispatchEvent(new CustomEvent('sl-input'));
+
+    let payload = await submit(element);
+    expect(payload.trigger_config).to.deep.equal({
+      labels: ['agent-ready'],
+      labels_all: ['complexity:medium', 'risk:low'],
+    });
+
+    all.value = '';
+    all.dispatchEvent(new CustomEvent('sl-input'));
+    payload = await submit(element);
+    expect(payload.trigger_config).to.deep.equal({ labels: ['agent-ready'] });
+  });
+
   it('does not create trigger_config while rendering a flow without filters', async () => {
     const element = await mount(trackerFlow());
 
@@ -285,9 +341,53 @@ describe('PreloopFlowForm event filters behaviour', () => {
     await element.updateComplete;
 
     expect(element.flow.trigger_config).to.equal(null);
+    // A tracker change clears the events, and a tracker trigger needs one.
+    element.flow.trigger_event_types = ['merge_request_opened'];
     const payload = await submit(element);
     expect(payload.trigger_event_source).to.equal(GITLAB_TRACKER.id);
     expect(payload.trigger_config).to.equal(null);
+  });
+
+  it('shows Bitbucket vocabulary and pull request states for a Bitbucket tracker', async () => {
+    const element = await mount({
+      ...trackerFlow({ state: 'declined' }),
+      trigger_event_source: BITBUCKET_TRACKER.id,
+      trigger_organization_id: undefined,
+    });
+    (element as any).filtersExpanded = true;
+    await element.updateComplete;
+
+    const reviewer = filterInput(element, 'Reviewer (username)');
+    expect(reviewer).to.not.equal(null);
+    expect(reviewer.getAttribute('help-text')).to.include('request changes');
+    expect(filterInput(element, 'Requested reviewer (username)')).to.equal(
+      null
+    );
+
+    const state = element.shadowRoot!.querySelector(
+      'sl-select[label="Pull request state"]'
+    ) as any;
+    expect(state).to.not.equal(null);
+    expect(state.value).to.equal('declined');
+    const options = Array.from(state.querySelectorAll('sl-option')).map(
+      (option: any) => option.value
+    );
+    expect(options).to.deep.equal([
+      '',
+      'open',
+      'merged',
+      'declined',
+      'superseded',
+    ]);
+    expect(
+      element.shadowRoot!.querySelector('sl-select[label="Mergeable state"]')
+    ).to.equal(null);
+    expect(element.shadowRoot!.textContent!.replace(/\s+/g, ' ')).to.include(
+      'Only when the pull request is merged'
+    );
+
+    const payload = await submit(element);
+    expect(payload.trigger_config).to.deep.equal({ state: 'declined' });
   });
 
   it('keeps filters when the same tracker is re-selected', async () => {
@@ -299,5 +399,33 @@ describe('PreloopFlowForm event filters behaviour', () => {
     await element.updateComplete;
 
     expect(element.flow.trigger_config).to.deep.equal({ author: 'octocat' });
+  });
+
+  it('records the Jira moved-to-status filter as status_to', async () => {
+    const element = await mount({
+      ...trackerFlow(),
+      trigger_event_source: JIRA_TRACKER.id,
+      trigger_event_types: ['issue_status_changed'],
+    });
+    (element as any).filtersExpanded = true;
+    await element.updateComplete;
+
+    const status = filterInput(element, 'Moved to status');
+    expect(status).to.exist;
+    status.value = ' Ready for Dev ';
+    status.dispatchEvent(new CustomEvent('sl-input'));
+
+    const payload = await submit(element);
+    expect(payload.trigger_config).to.deep.equal({
+      status_to: 'Ready for Dev',
+    });
+  });
+
+  it('does not offer the moved-to-status filter for code hosts', async () => {
+    const element = await mount(trackerFlow());
+    (element as any).filtersExpanded = true;
+    await element.updateComplete;
+
+    expect(filterInput(element, 'Moved to status')).to.equal(null);
   });
 });

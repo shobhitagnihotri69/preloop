@@ -1,4 +1,15 @@
-import { LitElement, css, html, unsafeCSS, TemplateResult, nothing } from 'lit';
+import { ConsoleStatus } from '../../controllers/console-status';
+import { parseUTCDate } from '../../utils/date';
+import { formatUsd, formatUsdExact } from '../../utils/money';
+import {
+  LitElement,
+  css,
+  html,
+  unsafeCSS,
+  TemplateResult,
+  nothing,
+  PropertyValues,
+} from 'lit';
 import { customElement, property, state } from 'lit/decorators.js';
 
 import '@shoelace-style/shoelace/dist/components/alert/alert.js';
@@ -74,6 +85,11 @@ import { getAgentControlState } from '../../utils/agent-control';
 import { isCliOnboardableAgentKind } from '../../utils/agent-kinds';
 import { renderAgentIcon } from '../../utils/agent-icons';
 import {
+  findModelForAllowedEntry,
+  gatewayAliasForModel,
+} from '../../utils/model-allowlist';
+import { hasInAppHistory } from '../../utils/in-app-history';
+import {
   REMOVE_AGENT_CONSEQUENCE,
   getAgentSourceLabel,
   getAgentStatusChip,
@@ -81,6 +97,7 @@ import {
   getVisibleAgentTags,
 } from '../../utils/agent-display';
 import { consoleDialogStyles } from '../../styles/console-dialog';
+import '../../components/capability-extension';
 
 interface GovernanceToolDefinition {
   name: string;
@@ -119,6 +136,7 @@ const UUID_IN_IDENTIFIER =
 
 @customElement('agent-detail-view')
 export class AgentDetailView extends LitElement {
+  private readonly accessibilityStatus = new ConsoleStatus(this);
   @property({ type: String })
   agentId = '';
 
@@ -152,6 +170,9 @@ export class AgentDetailView extends LitElement {
 
   @state()
   private associatedFlows: any[] = [];
+  @state() private associatedFlowsLoaded = false;
+  @state() private associatedFlowsLoading = false;
+  @state() private associatedFlowsError: string | null = null;
 
   @state()
   private sshTerminalOutput: string[] = [
@@ -616,6 +637,17 @@ export class AgentDetailView extends LitElement {
     }
 
     if (this.initialized && changed) {
+      ++this.detailLoadGeneration;
+      ++this.editorContextGeneration;
+      this.editorContextRequest = null;
+      this.editorContextReady = false;
+      this.agent = null;
+      ++this.associatedFlowsGeneration;
+      this.associatedFlowsLoading = false;
+      this.associatedFlowsLoaded = false;
+      this.associatedFlowsError = null;
+      this.associatedFlows = [];
+      this.loading = true;
       void this.loadData();
     }
   }
@@ -631,8 +663,24 @@ export class AgentDetailView extends LitElement {
     }
   }
 
+  protected updated(changed: PropertyValues): void {
+    super.updated(changed);
+    if (
+      changed.has('activeTab') &&
+      this.agentId &&
+      this.isConnected &&
+      (this.activeTab === 'tools' || this.activeTab === 'models')
+    ) {
+      void this.ensureEditorContext();
+    }
+  }
+
   disconnectedCallback(): void {
     super.disconnectedCallback();
+    ++this.detailLoadGeneration;
+    ++this.editorContextGeneration;
+    ++this.associatedFlowsGeneration;
+    this.associatedFlowsLoading = false;
     this.unsubscribeRealtime?.();
     if (this.refreshTimer !== null) {
       window.clearTimeout(this.refreshTimer);
@@ -674,6 +722,15 @@ export class AgentDetailView extends LitElement {
     }, 250);
   }
 
+  private detailLoadGeneration = 0;
+  private associatedFlowsGeneration = 0;
+  private editorContextGeneration = 0;
+  private editorContextAgentId = '';
+  private editorContextReadyGeneration = -1;
+  private editorContextRequest: Promise<void> | null = null;
+  @state() private editorContextReady = false;
+  @state() private editorContextError: string | null = null;
+
   private loadInFlight: Promise<void> | null = null;
   private liveRefreshQueued = false;
   private explicitRefreshWaiters = 0;
@@ -710,6 +767,7 @@ export class AgentDetailView extends LitElement {
   }
 
   private async performLoadData(isSoftRefresh: boolean): Promise<void> {
+    const generation = ++this.detailLoadGeneration;
     if (!this.agentId) {
       if (!isSoftRefresh) this.error = 'Missing agent id.';
       this.loading = false;
@@ -719,6 +777,14 @@ export class AgentDetailView extends LitElement {
     if (!isSoftRefresh) {
       this.loading = true;
       this.error = null;
+      this.editorContextReady = false;
+      ++this.editorContextGeneration;
+      this.editorContextRequest = null;
+      if (this.agent?.id !== this.agentId) {
+        this.agent = null;
+        this.associatedFlowsLoaded = false;
+        this.associatedFlows = [];
+      }
       this.aggregate = null;
       this.usageByModel = [];
       this.activityByServer = [];
@@ -744,33 +810,40 @@ export class AgentDetailView extends LitElement {
     }
 
     try {
-      const [
-        detail,
-        users,
-        governance,
-        tools,
-        servers,
-        workflows,
-        features,
-        models,
-      ] = await Promise.all([
-        getAccountAgent(this.agentId, { start_date: startDate }),
-        this.fetchUsers(),
-        getAgentGovernance(this.agentId),
-        getTools(),
-        getMCPServers(),
-        getApprovalWorkflows(),
-        getFeatures(),
-        getAIModels(),
+      await Promise.all([
+        getAccountAgent(this.agentId, { start_date: startDate }).then(
+          (detail) => {
+            if (generation !== this.detailLoadGeneration) return detail;
+            this.agent = detail.agent;
+            this.aggregate = detail.aggregate;
+            this.usageByModel = detail.usage_by_model;
+            this.activityByServer = detail.activity_by_server;
+            this.activityByTool = detail.activity_by_tool;
+            this.sessions = detail.sessions;
+            this.selectedOwnerUserId = detail.agent.owner_user_id ?? '';
+            if (!isSoftRefresh)
+              this.editableDisplayName = detail.agent.display_name;
+            this.loading = false;
+            return detail;
+          }
+        ),
+        (isSoftRefresh
+          ? Promise.resolve(this.availableUsers)
+          : this.fetchUsers()
+        )
+          .then((users) => {
+            if (generation === this.detailLoadGeneration)
+              this.availableUsers = users;
+          })
+          .catch(() => undefined),
+        getFeatures()
+          .then((features) => {
+            if (generation === this.detailLoadGeneration)
+              this.featureFlags = features?.features || {};
+          })
+          .catch(() => undefined),
       ]);
-      this.agent = detail.agent;
-      this.availableModels = models || [];
-      this.mcpServers = servers || [];
-      this.aggregate = detail.aggregate;
-      this.usageByModel = detail.usage_by_model;
-      this.activityByServer = detail.activity_by_server;
-      this.activityByTool = detail.activity_by_tool;
-      this.sessions = detail.sessions;
+      if (generation !== this.detailLoadGeneration) return;
       if (!isSoftRefresh) {
         this.liveActivity = {
           modelCalls: 0,
@@ -778,72 +851,149 @@ export class AgentDetailView extends LitElement {
           lastActivityAt: null,
         };
       }
-      this.governance = governance.config;
-      this.confirmedGovernance = governance.config;
-      // Resolve what "inherit" currently means for the approvals selector.
-      void getAccountGovernanceDefaults()
-        .then((defaults) => {
-          this.accountNativeApprovalDefault =
-            defaults.defaults.native_tool_approvals ?? 'enforce';
-        })
-        .catch(() => {
-          this.accountNativeApprovalDefault = null;
-        });
-      this.scopedToolRules = normalizeScopedToolRules(
-        governance.config.tool_rules
-      );
-      this.toolEnabledOverrides =
-        governance.config.tool_enabled_overrides || {};
-      this.allowedModelsText = this.formatAllowedModelsText(
-        governance.config.allowed_models
-      );
-      this.modelBudgetsText = JSON.stringify(
-        governance.config.model_budgets || {},
-        null,
-        2
-      );
-      this.toolCatalog = tools || [];
-      this.approvalWorkflows = workflows || [];
-      this.featureFlags = features?.features || {};
-      this.availableUsers = users;
-      this.selectedOwnerUserId = detail.agent.owner_user_id ?? '';
-      if (!isSoftRefresh) {
-        this.editableDisplayName = detail.agent.display_name;
-      }
-
-      // Load and filter associated flows
-      try {
-        const flows = await getFlows();
-        this.associatedFlows = (flows || []).filter((f: any) => {
-          try {
-            const config =
-              typeof f.agent_config === 'string'
-                ? JSON.parse(f.agent_config)
-                : f.agent_config;
-            return (
-              config &&
-              config.execution_path === 'persistent' &&
-              config.target_agent_id === this.agentId
-            );
-          } catch (e) {
-            return false;
-          }
-        });
-      } catch (e) {
-        console.warn('Failed to load associated flows', e);
-      }
+      if (this.activeTab === 'tools' || this.activeTab === 'models')
+        void this.ensureEditorContext(isSoftRefresh);
+      if (this.activeTab === 'associated-flows')
+        void this.loadAssociatedFlows(true);
     } catch (error) {
+      if (generation !== this.detailLoadGeneration) return;
       console.error('Failed to load managed agent detail:', error);
       if (!isSoftRefresh) {
-        this.error =
+        const message =
           error instanceof Error
             ? error.message
             : 'Failed to load managed agent';
+        if (this.agent) this.editorContextError = message;
+        else this.error = message;
       }
     } finally {
-      if (!isSoftRefresh) {
+      if (!isSoftRefresh && generation === this.detailLoadGeneration) {
         this.loading = false;
       }
+    }
+  }
+
+  /** Editor catalogs are needed only after opening Tools or Models. */
+  private ensureEditorContext(refresh = false): Promise<void> {
+    if (this.editorContextRequest) return this.editorContextRequest;
+    if (this.editorContextReady && !refresh) return Promise.resolve();
+    const generation = this.editorContextGeneration;
+    const agentId = this.agentId;
+    const reuseCatalogs = this.editorContextReady;
+    this.editorContextError = null;
+    let request!: Promise<void>;
+    request = (async () => {
+      try {
+        const [governance, tools, servers, workflows, models, defaults] =
+          await Promise.all([
+            getAgentGovernance(agentId),
+            reuseCatalogs ? Promise.resolve(this.toolCatalog) : getTools(),
+            reuseCatalogs ? Promise.resolve(this.mcpServers) : getMCPServers(),
+            reuseCatalogs
+              ? Promise.resolve(this.approvalWorkflows)
+              : getApprovalWorkflows(),
+            reuseCatalogs
+              ? Promise.resolve(this.availableModels)
+              : getAIModels(),
+            getAccountGovernanceDefaults().catch(() => null),
+          ]);
+        if (
+          generation !== this.editorContextGeneration ||
+          agentId !== this.agentId ||
+          !this.isConnected
+        )
+          return;
+        this.availableModels = models || [];
+        this.governance = governance.config;
+        this.confirmedGovernance = governance.config;
+        this.accountNativeApprovalDefault =
+          defaults?.defaults.native_tool_approvals ?? null;
+        this.scopedToolRules = normalizeScopedToolRules(
+          governance.config.tool_rules
+        );
+        this.toolEnabledOverrides =
+          governance.config.tool_enabled_overrides || {};
+        this.allowedModelsText = this.formatAllowedModelsText(
+          governance.config.allowed_models
+        );
+        this.modelBudgetsText = JSON.stringify(
+          governance.config.model_budgets || {},
+          null,
+          2
+        );
+        this.toolCatalog = tools || [];
+        this.mcpServers = servers || [];
+        this.approvalWorkflows = workflows || [];
+        this.availableModels = models || [];
+        this.editorContextAgentId = agentId;
+        this.editorContextReadyGeneration = generation;
+        this.editorContextReady = true;
+      } catch (error) {
+        if (
+          generation !== this.editorContextGeneration ||
+          agentId !== this.agentId ||
+          !this.isConnected
+        )
+          return;
+        this.editorContextReady = false;
+        this.editorContextError =
+          error instanceof Error
+            ? error.message
+            : 'Could not load editor settings';
+      } finally {
+        if (this.editorContextRequest === request)
+          this.editorContextRequest = null;
+      }
+    })();
+    this.editorContextRequest = request;
+    return request;
+  }
+
+  private async loadAssociatedFlows(refresh = false): Promise<void> {
+    if (this.associatedFlowsLoading || (this.associatedFlowsLoaded && !refresh))
+      return;
+    this.associatedFlowsLoading = true;
+    this.associatedFlowsError = null;
+    const generation = ++this.associatedFlowsGeneration;
+    const agentId = this.agentId;
+    try {
+      const flows = await getFlows();
+      if (
+        generation !== this.associatedFlowsGeneration ||
+        agentId !== this.agentId ||
+        !this.isConnected
+      )
+        return;
+      this.associatedFlows = (flows || []).filter((flow: any) => {
+        try {
+          const config =
+            typeof flow.agent_config === 'string'
+              ? JSON.parse(flow.agent_config)
+              : flow.agent_config;
+          return (
+            config?.execution_path === 'persistent' &&
+            config.target_agent_id === agentId
+          );
+        } catch {
+          return false;
+        }
+      });
+      this.associatedFlowsLoaded = true;
+    } catch (error) {
+      if (
+        generation !== this.associatedFlowsGeneration ||
+        agentId !== this.agentId ||
+        !this.isConnected
+      )
+        return;
+      console.warn('Failed to load associated flows', error);
+      this.associatedFlowsError = 'Could not load associated flows.';
+    } finally {
+      if (
+        generation === this.associatedFlowsGeneration &&
+        agentId === this.agentId
+      )
+        this.associatedFlowsLoading = false;
     }
   }
 
@@ -860,10 +1010,6 @@ export class AgentDetailView extends LitElement {
 
   private getSourceLabel(sourceType: string | null | undefined): string {
     return getAgentSourceLabel(sourceType);
-  }
-
-  private formatMoney(amount: number | null | undefined): string {
-    return `$${(amount || 0).toFixed(2)}`;
   }
 
   private getLifecycleVariant(): string {
@@ -991,10 +1137,10 @@ export class AgentDetailView extends LitElement {
       const usageA = this.usageByModel.find((u) => u.model_alias === a);
       const usageB = this.usageByModel.find((u) => u.model_alias === b);
       const timeA = usageA?.last_request_at
-        ? new Date(usageA.last_request_at).getTime()
+        ? parseUTCDate(usageA.last_request_at).getTime()
         : 0;
       const timeB = usageB?.last_request_at
-        ? new Date(usageB.last_request_at).getTime()
+        ? parseUTCDate(usageB.last_request_at).getTime()
         : 0;
       return timeB - timeA;
     });
@@ -1117,7 +1263,7 @@ export class AgentDetailView extends LitElement {
             ></token-figures>
           </span>
           <span class="strip-value"
-            >${this.formatMoney(aggregate?.estimated_cost)}</span
+            >${html`<span title=${formatUsdExact(aggregate?.estimated_cost)}>${formatUsd(aggregate?.estimated_cost)}</span>`}</span
           >
           <span class="strip-requests"
             >${requests} request${requests === 1 ? '' : 's'}</span
@@ -1203,6 +1349,7 @@ export class AgentDetailView extends LitElement {
           >${status.label}</sl-badge
         >
       </sl-tooltip>
+      ${this.renderDesktopBadge()}
       ${
         liveCount > 0
           ? html`<sl-badge variant="success" pill>Live ${liveCount}</sl-badge>`
@@ -1238,6 +1385,19 @@ export class AgentDetailView extends LitElement {
         `
       )}
     `;
+  }
+
+  /**
+   * Loopback desktop the runtime advertised. Hidden when the agent has none.
+   * Brokered viewing is not available yet; the badge only names the signal.
+   */
+  private renderDesktopBadge(): TemplateResult | typeof nothing {
+    const desktop = this.agent?.desktop;
+    if (desktop !== 'vnc' && desktop !== 'rdp') return nothing;
+    const kind = desktop === 'rdp' ? 'RDP' : 'VNC';
+    return html`<sl-badge class="desktop-badge" variant="primary" pill
+      >Desktop: ${kind} (loopback, brokered access coming)</sl-badge
+    >`;
   }
 
   private handleGatewayActivity(message: any): void {
@@ -1439,7 +1599,7 @@ export class AgentDetailView extends LitElement {
     if (!this.agentId) return nothing;
     return html`
       <sl-card
-        style="border: none; box-shadow: 0 10px 32px rgba(19,27,46,0.03); border-radius: var(--sl-border-radius-large); background: #ffffff; width: 100%; margin-top: var(--sl-spacing-medium);"
+        style="border: none; box-shadow: 0 10px 32px rgba(19,27,46,0.03); border-radius: var(--sl-border-radius-large); background: var(--console-surface); width: 100%; margin-top: var(--sl-spacing-medium);"
       >
         <div style="padding: var(--sl-spacing-large);">
           <div
@@ -1470,11 +1630,23 @@ export class AgentDetailView extends LitElement {
     }
   }
 
-  private async saveGovernance(): Promise<void> {
-    if (!this.agentId) {
+  private canSaveEditorContext(): boolean {
+    return (
+      this.isConnected &&
+      this.editorContextReady &&
+      this.editorContextAgentId === this.agentId &&
+      this.editorContextReadyGeneration === this.editorContextGeneration
+    );
+  }
+
+  private async saveGovernance(propagateError = false): Promise<void> {
+    if (!this.canSaveEditorContext()) {
+      if (propagateError)
+        throw new Error('Governance is not ready. Please try again.');
       return;
     }
     this.actionLoading = true;
+    const generation = this.editorContextGeneration;
     try {
       const parsedBudgets = JSON.parse(this.modelBudgetsText || '{}');
       const config: SubjectGovernanceConfig = {
@@ -1488,6 +1660,7 @@ export class AgentDetailView extends LitElement {
         native_tool_approvals: this.governance.native_tool_approvals ?? null,
       };
       const response = await updateAgentGovernance(this.agentId, config);
+      if (generation !== this.editorContextGeneration) return;
       this.governance = response.config;
       this.confirmedGovernance = response.config;
       this.scopedToolRules = normalizeScopedToolRules(
@@ -1506,6 +1679,7 @@ export class AgentDetailView extends LitElement {
       console.error('Failed to update agent governance:', error);
       this.error =
         error instanceof Error ? error.message : 'Failed to update governance';
+      if (propagateError) throw error;
     } finally {
       this.actionLoading = false;
     }
@@ -1521,13 +1695,21 @@ export class AgentDetailView extends LitElement {
    * state instead of leaving unpersisted selections on screen.
    */
   private async saveAllowedModels(models: string[]): Promise<void> {
-    if (!this.agentId) {
+    if (!this.canSaveEditorContext()) {
       return;
     }
     this.governance = { ...this.governance, allowed_models: [...models] };
     this.allowedModelsText = this.formatAllowedModelsText(models);
     this.actionLoading = true;
-    const task = this.modelSaveChain.then(() => this.persistAllowedModels());
+    const generation = this.editorContextGeneration;
+    const agentId = this.agentId;
+    const task = this.modelSaveChain.then(() => {
+      if (
+        generation === this.editorContextGeneration &&
+        agentId === this.agentId
+      )
+        return this.persistAllowedModels();
+    });
     this.modelSaveChain = task.then(
       () => undefined,
       () => undefined
@@ -1540,13 +1722,15 @@ export class AgentDetailView extends LitElement {
   }
 
   private async persistAllowedModels(): Promise<void> {
-    if (!this.agentId) {
+    if (!this.canSaveEditorContext()) {
       return;
     }
+    const generation = this.editorContextGeneration;
     try {
       const response = await updateAgentGovernance(this.agentId, {
         ...this.governance,
       });
+      if (generation !== this.editorContextGeneration) return;
       this.confirmedGovernance = response.config;
       this.governance = response.config;
       this.scopedToolRules = normalizeScopedToolRules(
@@ -1615,56 +1799,23 @@ export class AgentDetailView extends LitElement {
    * gateway preflight keys on it and it reads as a policy.
    */
   private gatewayAliasForModel(model: AllowedModelCandidate): string {
-    const meta = (model.meta_data || {}) as Record<string, unknown>;
-    const gateway = (meta.gateway as Record<string, unknown> | undefined) || {};
-    const explicit = gateway.model_alias;
-    if (typeof explicit === 'string' && explicit.trim()) {
-      return explicit.trim();
-    }
-    const provider = (model.provider_name || 'openai').trim().toLowerCase();
-    const identifier = (model.model_identifier || '').trim();
-    return identifier ? `${provider}/${identifier}` : provider;
+    return gatewayAliasForModel(model);
   }
 
   /**
    * Find the account model one stored allowlist entry refers to.
-   * Matching contract: backend/preloop/services/model_allowlist.py
-   * Entries may be a gateway alias (or its bare tail), an AI model id, or a
-   * display name (case-insensitive).
+   * Matching contract: utils/model-allowlist.ts, which mirrors
+   * backend/preloop/services/model_allowlist.py. A spelling two models
+   * answer to (a shared bare identifier) resolves to neither, so it is kept
+   * as typed rather than narrowed to one alias.
    */
   private findModelForAllowedEntry(
     entry: string
   ): AllowedModelCandidate | null {
-    const needle = entry.trim();
-    if (!needle) return null;
-    const folded = needle.toLowerCase();
-    const models = this.availableModels as AllowedModelCandidate[];
-    for (const model of models) {
-      if (this.gatewayAliasForModel(model) === needle) return model;
-    }
-    for (const model of models) {
-      if (String(model.id).toLowerCase() === folded) return model;
-    }
-    for (const model of models) {
-      if ((model.name || '').trim().toLowerCase() === folded) return model;
-    }
-    // A bare tail may be shared by two imports of the same upstream model
-    // (acme/alpha-chat and vendor/alpha-chat). The backend honours the
-    // entry for both rows, so rewriting it to one alias would silently
-    // narrow the policy: only resolve when exactly one row matches.
-    let tailMatch: AllowedModelCandidate | null = null;
-    let tailMatches = 0;
-    for (const model of models) {
-      const alias = this.gatewayAliasForModel(model);
-      const tail = alias.includes('/')
-        ? alias.split('/').slice(1).join('/')
-        : '';
-      if (tail && tail === needle) {
-        tailMatch = model;
-        tailMatches += 1;
-      }
-    }
-    return tailMatches === 1 ? tailMatch : null;
+    return findModelForAllowedEntry(
+      entry,
+      this.availableModels as AllowedModelCandidate[]
+    );
   }
 
   /** Persisted key for an allowlist entry: its model's alias, else as typed. */
@@ -1788,7 +1939,7 @@ export class AgentDetailView extends LitElement {
     this.scopedToolRules = nextRules;
   }
 
-  private saveScopedToolRule(
+  private async saveScopedToolRule(
     toolName: string,
     existingRule: AccessRuleSummary | null,
     formData: {
@@ -1798,8 +1949,10 @@ export class AgentDetailView extends LitElement {
       description: string | null;
       is_enabled: boolean;
       approval_workflow_id: string | null;
-    }
-  ): void {
+    },
+    settlement?: { resolve?: () => void; reject?: (message: string) => void }
+  ): Promise<void> {
+    const previous = this.scopedToolRules;
     const currentRules = [...(this.scopedToolRules[toolName] || [])].sort(
       (left, right) => left.priority - right.priority
     );
@@ -1822,7 +1975,22 @@ export class AgentDetailView extends LitElement {
         priority: index,
       })),
     };
-    void this.saveGovernance();
+    try {
+      await this.saveGovernance(true);
+      settlement?.resolve?.();
+      this.dispatchEvent(
+        new CustomEvent('show-toast', {
+          detail: { message: 'Rule saved.' },
+          bubbles: true,
+          composed: true,
+        })
+      );
+    } catch (err) {
+      this.scopedToolRules = previous;
+      settlement?.reject?.(
+        err instanceof Error ? err.message : 'Failed to save rule'
+      );
+    }
   }
 
   private deleteScopedToolRule(toolName: string, ruleId: string): void {
@@ -1947,7 +2115,7 @@ export class AgentDetailView extends LitElement {
     if (!value) {
       return 'None';
     }
-    const parsed = new Date(value);
+    const parsed = parseUTCDate(value);
     if (Number.isNaN(parsed.getTime())) {
       return value;
     }
@@ -2100,7 +2268,7 @@ export class AgentDetailView extends LitElement {
       >
         <sl-card
           style="border: none; box-shadow: 0 10px 32px rgba(19,27,46,0.03); border-radius: var(--sl-border-radius-large); background: ${
-            this.isFullscreen ? '#1e293b' : '#ffffff'
+            this.isFullscreen ? '#1e293b' : 'var(--console-surface)'
           }; width: 100%;"
         >
           <div style="padding: var(--sl-spacing-large);">
@@ -2296,7 +2464,7 @@ export class AgentDetailView extends LitElement {
       >
         <sl-card
           style="border: none; box-shadow: 0 10px 32px rgba(19,27,46,0.03); border-radius: var(--sl-border-radius-large); background: ${
-            this.isFullscreen ? '#1e293b' : '#ffffff'
+            this.isFullscreen ? '#1e293b' : 'var(--console-surface)'
           }; width: 100%;"
         >
           <div style="padding: var(--sl-spacing-large);">
@@ -2531,7 +2699,7 @@ export class AgentDetailView extends LitElement {
       >
         <sl-card
           style="border: none; box-shadow: 0 10px 32px rgba(19,27,46,0.03); border-radius: var(--sl-border-radius-large); background: ${
-            this.isFullscreen ? '#1e293b' : '#ffffff'
+            this.isFullscreen ? '#1e293b' : 'var(--console-surface)'
           }; width: 100%;"
         >
           <div style="padding: var(--sl-spacing-large);">
@@ -2687,9 +2855,14 @@ export class AgentDetailView extends LitElement {
   }
 
   private renderFlowsTab() {
+    if (!this.associatedFlowsLoaded) {
+      return html`<p role="status">
+        ${this.associatedFlowsError || 'Loading associated flows…'}
+      </p>`;
+    }
     return html`
       <sl-card
-        style="border: none; box-shadow: 0 10px 32px rgba(19,27,46,0.03); border-radius: var(--sl-border-radius-large); background: #ffffff; width: 100%;"
+        style="border: none; box-shadow: 0 10px 32px rgba(19,27,46,0.03); border-radius: var(--sl-border-radius-large); background: var(--console-surface); width: 100%;"
       >
         <div style="padding: var(--sl-spacing-large);">
           <div
@@ -2739,7 +2912,7 @@ export class AgentDetailView extends LitElement {
                       No flow uses this agent yet.
                     </p>
                     <p
-                      style="margin: 4px 0 0 0; font-size: var(--sl-font-size-small); color: var(--sl-color-neutral-400);"
+                      style="margin: 4px 0 0 0; font-size: var(--sl-font-size-small); color: var(--console-meta-color);"
                     >
                       Add it as a step in a flow to have it run on a schedule or
                       on an event.
@@ -2762,8 +2935,8 @@ export class AgentDetailView extends LitElement {
                       (flow) => html`
                         <div
                           style="
-                        background: #ffffff;
-                        border: 1px solid var(--sl-color-neutral-200);
+                        background: var(--console-surface);
+                        border: 1px solid var(--console-hairline);
                         border-radius: var(--sl-border-radius-medium);
                         padding: var(--sl-spacing-large);
                         display: flex;
@@ -2788,7 +2961,7 @@ export class AgentDetailView extends LitElement {
                               ${flow.description || 'No description provided.'}
                             </div>
                             <div
-                              style="font-size: var(--sl-font-size-x-small); color: var(--sl-color-neutral-400); margin-top: 6px; display: flex; gap: 12px;"
+                              style="font-size: var(--sl-font-size-x-small); color: var(--console-meta-color); margin-top: 6px; display: flex; gap: 12px;"
                             >
                               <span
                                 >Trigger:
@@ -2827,6 +3000,49 @@ export class AgentDetailView extends LitElement {
     `;
   }
 
+  /**
+   * Back returns to the page the reader came from when the router navigated
+   * here from inside the console. Opened directly, from a shared link or a
+   * new tab there is nothing in-app behind it, so the button's own link to
+   * the Agents list is used instead of leaving the console.
+   */
+  private handleBack = (event: Event): void => {
+    if (!hasInAppHistory()) return;
+    event.preventDefault();
+    window.history.back();
+  };
+
+  /** Writes the open tab to `?tab=` so a reload or a shared link keeps it. */
+  private rememberTab(tab: string): void {
+    const url = new URL(window.location.href);
+    if (url.searchParams.get('tab') === tab) return;
+    url.searchParams.set('tab', tab);
+    window.history.replaceState(
+      window.history.state,
+      '',
+      `${url.pathname}${url.search}${url.hash}`
+    );
+  }
+
+  /** An error or a missing agent, with a way back to the list. */
+  private renderLoadProblem(body: unknown) {
+    return html`
+      <view-header headerText="Agent">
+        <div slot="top" style="margin-bottom: var(--sl-spacing-small);">
+          <sl-button
+            variant="text"
+            size="small"
+            href="/console/agents"
+            style="margin-left: -12px;"
+          >
+            <sl-icon slot="prefix" name="arrow-left"></sl-icon> Back to Agents
+          </sl-button>
+        </div>
+      </view-header>
+      <div class="page" style="padding-top: 0;">${body}</div>
+    `;
+  }
+
   render() {
     if (this.loading) {
       return html`
@@ -2838,11 +3054,28 @@ export class AgentDetailView extends LitElement {
     }
 
     if (this.error) {
-      return html`<sl-alert open variant="danger">${this.error}</sl-alert>`;
+      return this.renderLoadProblem(
+        html`<sl-alert open variant="danger" role="alert" data-agent-error>
+          <sl-icon slot="icon" name="exclamation-octagon"></sl-icon>
+          <strong>Could not load this agent</strong><br />
+          ${this.error}
+          <div style="margin-top: var(--sl-spacing-small);">
+            <sl-button size="small" @click=${() => void this.loadData()}>
+              <sl-icon slot="prefix" name="arrow-clockwise"></sl-icon>
+              Try again
+            </sl-button>
+          </div>
+        </sl-alert>`
+      );
     }
 
     if (!this.agent) {
-      return html`<div class="empty-state">Managed agent not found.</div>`;
+      return this.renderLoadProblem(
+        html`<div class="empty-state" data-agent-not-found>
+          Agent not found. It may have been removed, or you may not have access
+          to it.
+        </div>`
+      );
     }
 
     const aggregate = this.aggregate;
@@ -2855,7 +3088,9 @@ export class AgentDetailView extends LitElement {
           <sl-button
             variant="text"
             size="small"
-            @click=${() => window.history.back()}
+            href="/console/agents"
+            class="back-button"
+            @click=${this.handleBack}
             style="margin-left: -12px;"
           >
             <sl-icon slot="prefix" name="arrow-left"></sl-icon> Back
@@ -2877,6 +3112,10 @@ export class AgentDetailView extends LitElement {
       <div class="page" style="padding-top: 0;">
         ${this.renderSummaryStrip(aggregate)} ${this.renderIdentityHistory()}
         ${this.renderOperatorNotes()}
+        <capability-extension
+          name="resource-access"
+          .context=${{ kind: 'managed_agent', resourceId: this.agent.id }}
+        ></capability-extension>
 
         <!-- Sub-view Tab Navigation -->
         ${(() => {
@@ -2895,8 +3134,14 @@ export class AgentDetailView extends LitElement {
               style="margin-top: var(--sl-spacing-large); margin-bottom: var(--sl-spacing-large); border-bottom: 1px solid var(--sl-color-neutral-200); padding-bottom: 4px;"
             >
               <sl-tab-group
-                @sl-tab-show=${(e: any) =>
-                  (this.activeTab = e.detail.name as any)}
+                @sl-tab-show=${(e: any) => {
+                  this.activeTab = e.detail.name as typeof this.activeTab;
+                  this.rememberTab(this.activeTab);
+                  if (this.activeTab === 'tools' || this.activeTab === 'models')
+                    void this.ensureEditorContext();
+                  if (this.activeTab === 'associated-flows')
+                    void this.loadAssociatedFlows();
+                }}
                 style="--indicator-color: var(--sl-color-primary-600);"
               >
                 <sl-tab
@@ -2955,8 +3200,8 @@ export class AgentDetailView extends LitElement {
                           slot="nav"
                           panel="associated-flows"
                           ?active=${this.activeTab === 'associated-flows'}
-                          >Associated flows
-                          (${this.associatedFlows.length})</sl-tab
+                          >Associated
+                          flows${this.associatedFlowsLoaded ? ` (${this.associatedFlows.length})` : ''}</sl-tab
                         >
                       `
                     : nothing
@@ -2989,6 +3234,7 @@ export class AgentDetailView extends LitElement {
                                 Session History
                                 <sl-icon-button
                                   name="arrow-clockwise"
+                                  label="Refresh sessions"
                                   style="font-size: 1.1rem; color: var(--console-meta-color);"
                                   @click=${() => this.loadData(true)}
                                 ></sl-icon-button>
@@ -3021,7 +3267,15 @@ export class AgentDetailView extends LitElement {
                 : nothing
             }
             ${
-              this.activeTab === 'tools'
+              (this.activeTab === 'tools' || this.activeTab === 'models') &&
+              !this.editorContextReady
+                ? html`<p role="status">
+                    ${this.editorContextError || 'Loading governance and model settings…'}
+                  </p>`
+                : nothing
+            }
+            ${
+              this.activeTab === 'tools' && this.editorContextReady
                 ? html`
                     <sl-card
                       class="tools-card"
@@ -3075,6 +3329,7 @@ export class AgentDetailView extends LitElement {
                               style="display: flex; align-items: center; gap: var(--sl-spacing-medium); flex-shrink: 0;"
                             >
                               <sl-select
+                                aria-label="Native tool approval mode"
                                 id="agent-native-tool-approvals-mode"
                                 size="small"
                                 hoist
@@ -3107,6 +3362,7 @@ export class AgentDetailView extends LitElement {
                                 </sl-option>
                               </sl-select>
                               <sl-select
+                                aria-label="Approval workflow"
                                 id="agent-approval-workflow-select"
                                 size="small"
                                 hoist
@@ -3235,7 +3491,8 @@ export class AgentDetailView extends LitElement {
                             this.saveScopedToolRule(
                               e.detail.tool.name,
                               e.detail.existingRule || e.detail.rule,
-                              e.detail.formData
+                              e.detail.formData,
+                              e.detail
                             )}
                           @delete-rule=${(e: CustomEvent) =>
                             this.deleteScopedToolRule(
@@ -3257,7 +3514,7 @@ export class AgentDetailView extends LitElement {
                 : nothing
             }
             ${
-              this.activeTab === 'models'
+              this.activeTab === 'models' && this.editorContextReady
                 ? html`
                     <sl-card
                       style="border: none; box-shadow: 0 10px 32px rgba(19,27,46,0.03); border-radius: var(--sl-border-radius-large); width: 100%;"
@@ -3346,7 +3603,7 @@ export class AgentDetailView extends LitElement {
                                                     }
                                                   ></token-figures
                                                   ><span
-                                                    style="color: var(--sl-color-neutral-500);"
+                                                    style="color: var(--console-meta-color);"
                                                   >
                                                     ·
                                                   </span>`
@@ -3356,9 +3613,7 @@ export class AgentDetailView extends LitElement {
                                             usage || showZeroSpend
                                               ? html`<span
                                                   style="color: var(--sl-color-primary-600); font-weight: 600;"
-                                                  >${this.formatMoney(
-                                                    usage?.estimated_cost ?? 0
-                                                  )}
+                                                  >${html`<span title=${formatUsdExact(usage?.estimated_cost ?? 0)}>${formatUsd(usage?.estimated_cost ?? 0)}</span>`}
                                                   spent</span
                                                 >`
                                               : ''
@@ -3373,9 +3628,7 @@ export class AgentDetailView extends LitElement {
                                             budget.monthly_usd_limit
                                               ? html`<span
                                                   style="color: var(--sl-color-neutral-600);"
-                                                  >${this.formatMoney(
-                                                    budget.monthly_usd_limit
-                                                  )}
+                                                  >${html`<span title=${formatUsdExact(budget.monthly_usd_limit)}>${formatUsd(budget.monthly_usd_limit)}</span>`}
                                                   budget</span
                                                 >`
                                               : ''
@@ -3592,6 +3845,7 @@ export class AgentDetailView extends LitElement {
           just 'key' for boolean tags.
         </div>
         <sl-input
+          aria-label="Agent tags"
           placeholder="e.g. env=prod target=aws db"
           .value=${this.tagsDialogInput}
           @input=${(e: Event) =>

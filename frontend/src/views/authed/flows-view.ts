@@ -1,9 +1,13 @@
+import { ConsoleStatus } from '../../controllers/console-status';
+import { tableScrollStyles } from '../../styles/table-scroll';
+import { formatUsd, formatUsdExact } from '../../utils/money';
 import { LitElement, html, css, nothing, unsafeCSS } from 'lit';
 import { customElement, state } from 'lit/decorators.js';
 import { repeat } from 'lit/directives/repeat.js';
 import '@shoelace-style/shoelace/dist/components/alert/alert.js';
 import '@shoelace-style/shoelace/dist/components/badge/badge.js';
 import '@shoelace-style/shoelace/dist/components/button/button.js';
+import '@shoelace-style/shoelace/dist/components/icon-button/icon-button.js';
 import '@shoelace-style/shoelace/dist/components/option/option.js';
 import '@shoelace-style/shoelace/dist/components/select/select.js';
 import '@shoelace-style/shoelace/dist/components/spinner/spinner.js';
@@ -18,7 +22,8 @@ import { router } from '../../router';
 import { Router } from '../../router';
 import { unifiedWebSocketManager } from '../../services/unified-websocket-manager';
 import {
-  getFlows,
+  getFlowSummaries,
+  type FlowSummary,
   getFlowPresets,
   getFlowExecutions,
   getTrackers,
@@ -54,6 +59,10 @@ import {
 // same way, so the reading lives in one module.
 import { flowTriggerSummary } from '../../utils/flow-trigger';
 import {
+  executionStatusLabel,
+  executionStatusVariant,
+} from '../../utils/execution-presentation';
+import {
   executionSubjectCss,
   renderExecutionSubject,
   type ExecutionSubjectSource,
@@ -69,11 +78,26 @@ import {
   type ListViewMode,
   type NarrowViewportSubscription,
 } from '../../utils/view-mode';
+import '../../components/view-header';
 
 export { flowTriggerSummary };
 
 /** A flow row from the list endpoints, where id and name are always present. */
 type FlowListItem = Flow & { id: string; name: string };
+
+/** Normalize nullable summary metadata to the existing presentation shape. */
+function flowSummaryRow(summary: FlowSummary): FlowListItem {
+  return {
+    ...summary,
+    description: summary.description ?? undefined,
+    icon: summary.icon ?? undefined,
+    account_id: summary.account_id ?? undefined,
+    trigger_event_source: summary.trigger_event_source ?? undefined,
+    trigger_event_types: summary.trigger_event_types ?? undefined,
+    ai_model_id: summary.ai_model_id ?? undefined,
+    execution_stats: summary.execution_stats ?? undefined,
+  };
+}
 
 interface FlowExecution extends ExecutionSubjectSource {
   id: string;
@@ -313,466 +337,484 @@ export function filterFlowRows(
 
 @customElement('flows-view')
 export class FlowsView extends LitElement {
+  private readonly accessibilityStatus = new ConsoleStatus(this);
   /** Multi-select for the flow table and the card grid. */
   readonly selection = new ListSelectionController<FlowListRow>(this, {
     idOf: (row) => row.id,
   });
 
   static styles = [
-    consoleDialogStyles,
-    unsafeCSS(consoleStyles),
-    unsafeCSS(executionSubjectCss),
-    css`
-      :host {
-        display: block;
-      }
+    tableScrollStyles,
+    [
+      consoleDialogStyles,
+      unsafeCSS(consoleStyles),
+      unsafeCSS(executionSubjectCss),
+      css`
+        :host {
+          display: block;
+        }
 
-      /* --- List view --- */
-      /* Fixed layout so the columns come from the colgroup and not from the
+        /* --- List view --- */
+        /* Fixed layout so the columns come from the colgroup and not from the
          longest flow name: a flow named after a repository path used to push
          the kebab past the right edge of the card. */
-      .flows-table {
-        table-layout: fixed;
-        width: 100%;
-        min-width: 1120px;
-      }
-      .table-scroll {
-        overflow-x: auto;
-        width: 100%;
-      }
-      .flows-table th,
-      .flows-table td {
-        padding: var(--sl-spacing-small);
-        vertical-align: middle;
-        min-width: 0;
-        overflow: hidden;
-        text-overflow: ellipsis;
-        white-space: nowrap;
-      }
-      .flows-table th {
-        padding: 0;
-      }
-      /* Same measurement as the agents table: one medium sl-button is 48px
+        .flows-table {
+          table-layout: fixed;
+          width: 100%;
+          min-width: 1120px;
+        }
+        .table-scroll {
+          overflow-x: auto;
+          width: 100%;
+        }
+        .flows-table th,
+        .flows-table td {
+          padding: var(--sl-spacing-small);
+          vertical-align: middle;
+          min-width: 0;
+          overflow: hidden;
+          text-overflow: ellipsis;
+          white-space: nowrap;
+        }
+        .flows-table th {
+          padding: 0;
+        }
+        /* Same measurement as the agents table: one medium sl-button is 48px
          wide, so the column is 56px of content plus 8px of padding a side.
          Anything narrower clips the kebab off its left edge. */
-      .flows-table th.actions-cell,
-      .flows-table td.actions-cell {
-        width: 72px;
-        text-align: right;
-        padding-left: var(--sl-spacing-x-small);
-        padding-right: var(--sl-spacing-x-small);
-        overflow: visible;
-      }
-      .actions-cell resource-actions::part(container) {
-        overflow: visible;
-      }
-      /* The two columns that carry words get the room; the counters are
+        .flows-table th.actions-cell,
+        .flows-table td.actions-cell {
+          width: 72px;
+          text-align: right;
+          padding-left: var(--sl-spacing-x-small);
+          padding-right: var(--sl-spacing-x-small);
+          overflow: visible;
+        }
+        .actions-cell resource-actions::part(container) {
+          overflow: visible;
+        }
+        /* The two columns that carry words get the room; the counters are
          sized to their widest plausible number and nothing more. A flow
          called "Release Sentinel db-migration" must be readable without a
          tooltip, which is what the first screenshot round got wrong. */
-      /* The select column is fixed: the shared 40px keeps the flow name
+        /* The select column is fixed: the shared 40px keeps the flow name
          starting at the same x as on agents, keys and models. */
-      .col-select {
-        width: 40px;
-      }
-      .col-flow {
-        width: 25%;
-      }
-      .col-trigger {
-        width: 14%;
-      }
-      .col-status {
-        width: 96px;
-      }
-      .col-last-run {
-        width: 23%;
-      }
-      .col-runs,
-      .col-failed {
-        width: 84px;
-      }
-      /* One compact total ("12.4M"), the same width as the cost beside it.
+        .col-select {
+          width: 40px;
+        }
+        .col-flow {
+          width: 25%;
+        }
+        .col-trigger {
+          width: 14%;
+        }
+        .col-status {
+          width: 96px;
+        }
+        .col-last-run {
+          width: 23%;
+        }
+        .col-runs,
+        .col-failed {
+          width: 84px;
+        }
+        /* One compact total ("12.4M"), the same width as the cost beside it.
          The in/out/cache breakdown that used to need 170px here is in the
          tooltip and on the flow's own page. */
-      .col-tokens {
-        width: 96px;
-      }
-      .col-cost {
-        width: 96px;
-      }
-      .col-actions {
-        width: 72px;
-      }
-      /* First and last columns keep the card's own gutter. */
-      .flows-table th:first-child .sort-button,
-      .flows-table td:first-child {
-        padding-left: var(--sl-spacing-medium);
-      }
-      .sort-button {
-        display: flex;
-        align-items: center;
-        gap: 4px;
-        width: 100%;
-        background: none;
-        border: none;
-        cursor: pointer;
-        font: inherit;
-        font-weight: var(--sl-font-weight-semibold);
-        font-size: var(--sl-font-size-x-small);
-        letter-spacing: 0.04em;
-        text-transform: uppercase;
-        color: var(--sl-color-neutral-600);
-        padding: var(--sl-spacing-small);
-      }
-      th.numeric .sort-button {
-        justify-content: flex-end;
-      }
-      .sort-button:hover,
-      .sort-button:focus-visible {
-        color: var(--sl-color-neutral-900);
-      }
-      th.active .sort-button {
-        color: var(--sl-color-neutral-900);
-      }
-      .sort-caret {
-        font-size: 0.75em;
-        opacity: 0.55;
-      }
-      th.active .sort-caret {
-        opacity: 1;
-      }
-      .flow-row {
-        cursor: pointer;
-      }
-      .flow-row:hover td {
-        background: var(--console-hover-tint);
-      }
-      .flow-identity {
-        display: flex;
-        align-items: center;
-        gap: var(--sl-spacing-small);
-        min-width: 0;
-      }
-      .flow-identity sl-icon {
-        color: var(--sl-color-neutral-700);
-        flex-shrink: 0;
-        font-size: 18px;
-      }
-      .flow-identity-text {
-        min-width: 0;
-        overflow: hidden;
-      }
-      /* Names never wrap: one two-line name makes the whole table ragged. */
-      .row-link {
-        color: var(--console-link-color);
-        display: block;
-        font-weight: var(--sl-font-weight-semibold);
-        overflow: hidden;
-        text-decoration: none;
-        text-overflow: ellipsis;
-        white-space: nowrap;
-      }
-      .row-link:hover,
-      .row-link:focus-visible {
-        text-decoration: underline;
-      }
-      .row-subtitle {
-        color: var(--console-meta-color);
-        font-size: var(--console-text-meta);
-        overflow: hidden;
-        text-overflow: ellipsis;
-        white-space: nowrap;
-      }
-      .muted-cell {
-        color: var(--console-meta-color);
-      }
-      /* Counters read as a column of digits, so they need less air than a
+        .col-tokens {
+          width: 96px;
+        }
+        .col-cost {
+          width: 96px;
+        }
+        .col-actions {
+          width: 72px;
+        }
+        /* First and last columns keep the card's own gutter. */
+        .flows-table th:first-child .sort-button,
+        .flows-table td:first-child {
+          padding-left: var(--sl-spacing-medium);
+        }
+        .sort-button {
+          display: flex;
+          align-items: center;
+          gap: 4px;
+          width: 100%;
+          background: none;
+          border: none;
+          cursor: pointer;
+          font: inherit;
+          font-weight: var(--sl-font-weight-semibold);
+          font-size: var(--sl-font-size-x-small);
+          letter-spacing: 0.04em;
+          text-transform: uppercase;
+          color: var(--sl-color-neutral-600);
+          padding: var(--sl-spacing-small);
+        }
+        th.numeric .sort-button {
+          justify-content: flex-end;
+        }
+        .sort-button:hover,
+        .sort-button:focus-visible {
+          color: var(--sl-color-neutral-900);
+        }
+        th.active .sort-button {
+          color: var(--sl-color-neutral-900);
+        }
+        .sort-caret {
+          font-size: 0.75em;
+          opacity: 0.55;
+        }
+        th.active .sort-caret {
+          opacity: 1;
+        }
+        .flow-row {
+          cursor: pointer;
+        }
+        .flow-row:hover td {
+          background: var(--console-hover-tint);
+        }
+        .flow-identity {
+          display: flex;
+          align-items: center;
+          gap: var(--sl-spacing-small);
+          min-width: 0;
+        }
+        .flow-identity sl-icon {
+          color: var(--sl-color-neutral-700);
+          flex-shrink: 0;
+          font-size: 18px;
+        }
+        .flow-identity-text {
+          min-width: 0;
+          overflow: hidden;
+        }
+        /* Names never wrap: one two-line name makes the whole table ragged. */
+        .row-link {
+          color: var(--console-link-color);
+          display: block;
+          font-weight: var(--sl-font-weight-semibold);
+          overflow: hidden;
+          text-decoration: none;
+          text-overflow: ellipsis;
+          white-space: nowrap;
+        }
+        .row-link:hover,
+        .row-link:focus-visible {
+          text-decoration: underline;
+        }
+        /* The filter selects are named for a screen reader; the toolbar has
+         no room to print the label. */
+        .preset-filter::part(form-control-label),
+        .status-filter::part(form-control-label) {
+          position: absolute;
+          width: 1px;
+          height: 1px;
+          padding: 0;
+          margin: -1px;
+          overflow: hidden;
+          clip: rect(0 0 0 0);
+          white-space: nowrap;
+          border: 0;
+        }
+        .row-subtitle {
+          color: var(--console-meta-color);
+          font-size: var(--console-text-meta);
+          overflow: hidden;
+          text-overflow: ellipsis;
+          white-space: nowrap;
+        }
+        .muted-cell {
+          color: var(--console-meta-color);
+        }
+        /* Counters read as a column of digits, so they need less air than a
          sentence does; the width they give back goes to the names. */
-      .flows-table td.numeric,
-      .flows-table th.numeric,
-      .flows-table th.numeric .sort-button {
-        text-align: right;
-        font-variant-numeric: tabular-nums;
-        white-space: nowrap;
-        padding-left: var(--sl-spacing-x-small);
-        padding-right: var(--sl-spacing-x-small);
-      }
-      .last-run {
-        display: flex;
-        flex-direction: column;
-        gap: 2px;
-        min-width: 0;
-      }
-      .last-run-line {
-        display: flex;
-        align-items: center;
-        gap: var(--sl-spacing-x-small);
-        min-width: 0;
-      }
-      .last-run-line .status-chip {
-        flex-shrink: 0;
-      }
-      .last-run .meta {
-        color: var(--console-meta-color);
-        font-size: var(--console-text-meta);
-        white-space: nowrap;
-      }
-      .row-actions {
-        display: flex;
-        justify-content: flex-end;
-      }
-      .visually-hidden {
-        position: absolute;
-        width: 1px;
-        height: 1px;
-        overflow: hidden;
-        clip: rect(0 0 0 0);
-        white-space: nowrap;
-      }
+        .flows-table td.numeric,
+        .flows-table th.numeric,
+        .flows-table th.numeric .sort-button {
+          text-align: right;
+          font-variant-numeric: tabular-nums;
+          white-space: nowrap;
+          padding-left: var(--sl-spacing-x-small);
+          padding-right: var(--sl-spacing-x-small);
+        }
+        .last-run {
+          display: flex;
+          flex-direction: column;
+          gap: 2px;
+          min-width: 0;
+        }
+        .last-run-line {
+          display: flex;
+          align-items: center;
+          gap: var(--sl-spacing-x-small);
+          min-width: 0;
+        }
+        .last-run-line .status-chip {
+          flex-shrink: 0;
+        }
+        .last-run .meta {
+          color: var(--console-meta-color);
+          font-size: var(--console-text-meta);
+          white-space: nowrap;
+        }
+        .row-actions {
+          display: flex;
+          justify-content: flex-end;
+        }
+        .visually-hidden {
+          position: absolute;
+          width: 1px;
+          height: 1px;
+          overflow: hidden;
+          clip: rect(0 0 0 0);
+          white-space: nowrap;
+        }
 
-      /* --- Cards view --- */
-      /* auto-fill, not auto-fit: two flows stay two 320px cards rather than
+        /* --- Cards view --- */
+        /* auto-fill, not auto-fit: two flows stay two 320px cards rather than
          stretching into two half-screen banners. */
-      .flows-grid,
-      .presets-grid {
-        display: grid;
-        grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
-        gap: var(--sl-spacing-large);
-        margin-bottom: var(--sl-spacing-large);
-      }
-      .flows-grid > sl-card,
-      .presets-grid > sl-card {
-        width: 100%;
-        min-width: 0;
-        box-sizing: border-box;
-      }
-      .flow-card {
-        cursor: pointer;
-        height: 100%;
-      }
-      .flow-card::part(base) {
-        height: 100%;
-        display: flex;
-        flex-direction: column;
-      }
-      .flow-card::part(body) {
-        flex: 1;
-        display: flex;
-        flex-direction: column;
-      }
-      .flow-header {
-        display: flex;
-        justify-content: space-between;
-        align-items: center;
-        gap: var(--sl-spacing-small);
-        min-width: 0;
-      }
-      .flow-title {
-        display: flex;
-        align-items: center;
-        gap: 8px;
-        font-size: var(--console-text-card-title);
-        font-weight: 600;
-        min-width: 0;
-      }
-      .flow-title a {
-        color: inherit;
-        text-decoration: none;
-        overflow: hidden;
-        text-overflow: ellipsis;
-        white-space: nowrap;
-      }
-      .flow-title a:hover,
-      .flow-title a:focus-visible {
-        text-decoration: underline;
-      }
-      .card-actions {
-        flex-shrink: 0;
-      }
-      /* A fixed height keeps the meta rows and footers of a row of cards on
+        .flows-grid,
+        .presets-grid {
+          display: grid;
+          grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+          gap: var(--sl-spacing-large);
+          margin-bottom: var(--sl-spacing-large);
+        }
+        .flows-grid > sl-card,
+        .presets-grid > sl-card {
+          width: 100%;
+          min-width: 0;
+          box-sizing: border-box;
+        }
+        .flow-card {
+          cursor: pointer;
+          height: 100%;
+        }
+        .flow-card::part(base) {
+          height: 100%;
+          display: flex;
+          flex-direction: column;
+        }
+        .flow-card::part(body) {
+          flex: 1;
+          display: flex;
+          flex-direction: column;
+        }
+        .flow-header {
+          display: flex;
+          justify-content: space-between;
+          align-items: center;
+          gap: var(--sl-spacing-small);
+          min-width: 0;
+        }
+        .flow-title {
+          display: flex;
+          align-items: center;
+          gap: 8px;
+          font-size: var(--console-text-card-title);
+          font-weight: 600;
+          min-width: 0;
+        }
+        .flow-title a {
+          color: inherit;
+          text-decoration: none;
+          overflow: hidden;
+          text-overflow: ellipsis;
+          white-space: nowrap;
+        }
+        .flow-title a:hover,
+        .flow-title a:focus-visible {
+          text-decoration: underline;
+        }
+        .card-actions {
+          flex-shrink: 0;
+        }
+        /* A fixed height keeps the meta rows and footers of a row of cards on
          the same line. 5.75rem was cut for a three-line clamp; the clamp is
          two lines plus the toggle, so the rest was a dead band under every
          description. */
-      .flow-description {
-        color: var(--console-meta-color);
-        margin-bottom: 12px;
-        font-size: var(--console-text-meta);
-        height: 4rem;
-        overflow: hidden;
-      }
-      .flow-description-text {
-        display: -webkit-box;
-        -webkit-line-clamp: 2;
-        -webkit-box-orient: vertical;
-        overflow: hidden;
-        line-height: 1.35;
-      }
-      .flow-description-placeholder {
-        color: var(--console-meta-color);
-        font-style: italic;
-      }
-      .flow-description-action {
-        margin-top: var(--sl-spacing-2x-small);
-      }
-      .card-meta {
-        display: flex;
-        flex-wrap: wrap;
-        gap: var(--sl-spacing-x-small) var(--sl-spacing-medium);
-        margin-top: 12px;
-        padding-top: 12px;
-        border-top: 1px solid var(--console-hairline);
-        font-size: var(--console-text-meta);
-        color: var(--console-meta-color);
-      }
-      .card-meta .stat-item {
-        display: flex;
-        align-items: center;
-        gap: 4px;
-        min-width: 0;
-      }
-      .flow-footer {
-        display: flex;
-        gap: 8px;
-        justify-content: space-between;
-        align-items: center;
-      }
-      .flow-footer-actions {
-        display: flex;
-        gap: 8px;
-      }
-      /* The footer's left half: outcome, subject, when, on one line that
+        .flow-description {
+          color: var(--console-meta-color);
+          margin-bottom: 12px;
+          font-size: var(--console-text-meta);
+          height: 4rem;
+          overflow: hidden;
+        }
+        .flow-description-text {
+          display: -webkit-box;
+          -webkit-line-clamp: 2;
+          -webkit-box-orient: vertical;
+          overflow: hidden;
+          line-height: 1.35;
+        }
+        .flow-description-placeholder {
+          color: var(--console-meta-color);
+          font-style: italic;
+        }
+        .flow-description-action {
+          margin-top: var(--sl-spacing-2x-small);
+        }
+        .card-meta {
+          display: flex;
+          flex-wrap: wrap;
+          gap: var(--sl-spacing-x-small) var(--sl-spacing-medium);
+          margin-top: 12px;
+          padding-top: 12px;
+          border-top: 1px solid var(--console-hairline);
+          font-size: var(--console-text-meta);
+          color: var(--console-meta-color);
+        }
+        .card-meta .stat-item {
+          display: flex;
+          align-items: center;
+          gap: 4px;
+          min-width: 0;
+        }
+        .flow-footer {
+          display: flex;
+          gap: 8px;
+          justify-content: space-between;
+          align-items: center;
+        }
+        .flow-footer-actions {
+          display: flex;
+          gap: 8px;
+        }
+        /* The footer's left half: outcome, subject, when, on one line that
          truncates rather than pushing the buttons off the card. */
-      .card-last-run {
-        align-items: center;
-        color: inherit;
-        display: flex;
-        gap: var(--sl-spacing-x-small);
-        min-width: 0;
-        overflow: hidden;
-        text-decoration: none;
-        white-space: nowrap;
-      }
-      .card-last-run .status-chip {
-        flex-shrink: 0;
-      }
-      .card-last-run .meta {
-        color: var(--console-meta-color);
-        flex-shrink: 0;
-        font-size: var(--console-text-meta);
-      }
+        .card-last-run {
+          align-items: center;
+          color: inherit;
+          display: flex;
+          gap: var(--sl-spacing-x-small);
+          min-width: 0;
+          overflow: hidden;
+          text-decoration: none;
+          white-space: nowrap;
+        }
+        .card-last-run .status-chip {
+          flex-shrink: 0;
+        }
+        .card-last-run .meta {
+          color: var(--console-meta-color);
+          flex-shrink: 0;
+          font-size: var(--console-text-meta);
+        }
 
-      /* --- Page furniture --- */
-      .active-executions {
-        margin-bottom: var(--sl-spacing-large);
-      }
-      .executions-list {
-        display: flex;
-        flex-direction: column;
-        gap: 8px;
-        margin-top: 12px;
-      }
-      .execution-item {
-        display: flex;
-        justify-content: space-between;
-        align-items: center;
-        padding: 12px;
-        border-bottom: 1px solid var(--console-hairline);
-        cursor: pointer;
-      }
-      .execution-item:hover {
-        background: var(--console-hover-tint);
-      }
-      .execution-item-actions {
-        display: flex;
-        align-items: center;
-        gap: 4px;
-        flex-shrink: 0;
-      }
-      .execution-info {
-        display: flex;
-        align-items: center;
-        gap: 12px;
-        flex: 1;
-        min-width: 0;
-      }
-      .section-header {
-        display: flex;
-        justify-content: space-between;
-        align-items: center;
-        margin: 24px 0 16px 0;
-      }
-      .section-header h2 {
-        font-size: var(--console-text-card-title);
-        font-weight: 600;
-        margin: 0;
-      }
-      .presets-collapsed {
-        text-align: center;
-        padding: 24px 16px;
-        color: var(--console-meta-color);
-        font-size: var(--console-text-body);
-      }
-      .empty-state-wrapper {
-        display: flex;
-        justify-content: center;
-        width: 100%;
-        margin-top: var(--sl-spacing-large);
-        margin-bottom: var(--sl-spacing-large);
-      }
-      .empty-card {
-        width: 100%;
-        max-width: 580px;
-      }
-      .empty-card::part(base) {
-        border: 1px solid
-          color-mix(in srgb, var(--sl-color-primary-600) 35%, transparent);
-        box-shadow: var(--sl-shadow-large);
-        border-radius: var(--sl-border-radius-large);
-        overflow: hidden;
-      }
-      .empty-card-body {
-        display: flex;
-        flex-direction: column;
-        align-items: center;
-        text-align: center;
-        padding: var(--sl-spacing-large);
-      }
-      .empty-icon-circle {
-        width: 72px;
-        height: 72px;
-        border-radius: 50%;
-        background: color-mix(
-          in srgb,
-          var(--sl-color-primary-600) 15%,
-          transparent
-        );
-        color: var(--sl-color-primary-600);
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        margin-bottom: var(--sl-spacing-medium);
-      }
-      .empty-icon-circle sl-icon {
-        font-size: 2.5rem;
-      }
-      .empty-card-title {
-        margin: 0 0 var(--sl-spacing-2x-small);
-        font-size: 1.25rem;
-        font-weight: 700;
-        color: var(--sl-color-neutral-900);
-      }
-      .empty-card-desc {
-        margin: 0 0 var(--sl-spacing-large);
-        max-width: 440px;
-        font-size: 0.95rem;
-        line-height: 1.55;
-        color: var(--sl-color-neutral-600);
-      }
-      .empty-cta-btn {
-        width: 100%;
-        max-width: 280px;
-      }
-    `,
+        /* --- Page furniture --- */
+        .active-executions {
+          margin-bottom: var(--sl-spacing-large);
+        }
+        .executions-list {
+          display: flex;
+          flex-direction: column;
+          gap: 8px;
+          margin-top: 12px;
+        }
+        .execution-item {
+          display: flex;
+          justify-content: space-between;
+          align-items: center;
+          padding: 12px;
+          border-bottom: 1px solid var(--console-hairline);
+          cursor: pointer;
+        }
+        .execution-item:hover {
+          background: var(--console-hover-tint);
+        }
+        .execution-item-actions {
+          display: flex;
+          align-items: center;
+          gap: 4px;
+          flex-shrink: 0;
+        }
+        .execution-info {
+          display: flex;
+          align-items: center;
+          gap: 12px;
+          flex: 1;
+          min-width: 0;
+        }
+        .section-header {
+          display: flex;
+          justify-content: space-between;
+          align-items: center;
+          margin: 24px 0 16px 0;
+        }
+        .section-header h2 {
+          font-size: var(--console-text-card-title);
+          font-weight: 600;
+          margin: 0;
+        }
+        .presets-collapsed {
+          text-align: center;
+          padding: 24px 16px;
+          color: var(--console-meta-color);
+          font-size: var(--console-text-body);
+        }
+        .empty-state-wrapper {
+          display: flex;
+          justify-content: center;
+          width: 100%;
+          margin-top: var(--sl-spacing-large);
+          margin-bottom: var(--sl-spacing-large);
+        }
+        .empty-card {
+          width: 100%;
+          max-width: 580px;
+        }
+        .empty-card::part(base) {
+          border: 1px solid
+            color-mix(in srgb, var(--sl-color-primary-600) 35%, transparent);
+          box-shadow: var(--sl-shadow-large);
+          border-radius: var(--sl-border-radius-large);
+          overflow: hidden;
+        }
+        .empty-card-body {
+          display: flex;
+          flex-direction: column;
+          align-items: center;
+          text-align: center;
+          padding: var(--sl-spacing-large);
+        }
+        .empty-icon-circle {
+          width: 72px;
+          height: 72px;
+          border-radius: 50%;
+          background: color-mix(
+            in srgb,
+            var(--sl-color-primary-600) 15%,
+            transparent
+          );
+          color: var(--sl-color-primary-600);
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          margin-bottom: var(--sl-spacing-medium);
+        }
+        .empty-icon-circle sl-icon {
+          font-size: 2.5rem;
+        }
+        .empty-card-title {
+          margin: 0 0 var(--sl-spacing-2x-small);
+          font-size: 1.25rem;
+          font-weight: 700;
+          color: var(--sl-color-neutral-900);
+        }
+        .empty-card-desc {
+          margin: 0 0 var(--sl-spacing-large);
+          max-width: 440px;
+          font-size: 0.95rem;
+          line-height: 1.55;
+          color: var(--sl-color-neutral-600);
+        }
+        .empty-cta-btn {
+          width: 100%;
+          max-width: 280px;
+        }
+      `,
+    ],
   ];
 
   @state() private flows: FlowListItem[] = [];
@@ -818,6 +860,8 @@ export class FlowsView extends LitElement {
 
   disconnectedCallback() {
     super.disconnectedCallback();
+    ++this.flowsLoadGeneration;
+    ++this.statsLoadGeneration;
     this.unsubscribe?.();
     window.removeEventListener('focus', this.refreshOnReturn);
     document.removeEventListener(
@@ -896,7 +940,12 @@ export class FlowsView extends LitElement {
     return '30d';
   }
 
+  private flowsLoadGeneration = 0;
+  private statsLoadGeneration = 0;
+
   async loadData() {
+    const generation = ++this.flowsLoadGeneration;
+    const statsGeneration = ++this.statsLoadGeneration;
     this.isLoading = true;
     try {
       // Defer /flows/presets (~38KB) until the presets UI is shown or a flow
@@ -906,28 +955,44 @@ export class FlowsView extends LitElement {
       // caught and shown rather than left to become an unhandled rejection
       // that skips the socket and renders "No flows yet" over an account that
       // has flows.
-      const [flows, executions, activeExecutions] = await Promise.all([
-        getFlows({ statsSince: this.rangeStartDate() }).catch((error) => {
-          console.error('Failed to load flows:', error);
-          return null;
-        }),
-        getFlowExecutions({ limit: EXECUTIONS_SAMPLE_LIMIT }).catch(() => []),
-        getFlowExecutions({
-          limit: 20,
-          status: [...IN_FLIGHT_EXECUTION_STATUSES],
-        }).catch(() => []),
-      ]);
+      void getFlowExecutions({ limit: EXECUTIONS_SAMPLE_LIMIT })
+        .then((executions) => {
+          if (generation === this.flowsLoadGeneration)
+            this.executions = executions;
+        })
+        .catch(() => undefined);
+      void getFlowExecutions({
+        limit: 20,
+        status: [...IN_FLIGHT_EXECUTION_STATUSES],
+      })
+        .then((executions) => {
+          if (generation === this.flowsLoadGeneration)
+            this.activeExecutions = executions;
+        })
+        .catch(() => undefined);
+      let failure = '';
+      const flows = await getFlowSummaries({
+        includeStats: true,
+        statsSince: this.rangeStartDate(),
+      }).catch((error) => {
+        console.error('Failed to load flows:', error);
+        const reason =
+          error instanceof Error && error.message
+            ? error.message.trim()
+            : 'The request did not complete';
+        failure = /[.!?]$/.test(reason) ? reason : `${reason}.`;
+        return null;
+      });
+      if (generation !== this.flowsLoadGeneration) return;
       if (flows === null) {
-        this.loadError = 'Could not load your flows.';
-        this.executions = executions;
-        this.activeExecutions = activeExecutions;
+        // The card's title already says the flows could not be loaded, so
+        // this holds the reason, not a second copy of the title.
+        this.loadError = failure;
         return;
       }
       this.loadError = null;
-      this.flows = flows;
-      this.executions = executions;
-      this.activeExecutions = activeExecutions;
-
+      if (statsGeneration === this.statsLoadGeneration)
+        this.flows = flows.map(flowSummaryRow);
       if (this.flows.length === 0) {
         this.showPresets = true;
       } else if (!this.hasInitializedPresetVisibility) {
@@ -945,7 +1010,11 @@ export class FlowsView extends LitElement {
       }
       void this.loadTrackerNames();
     } finally {
-      this.isLoading = false;
+      if (
+        generation === this.flowsLoadGeneration &&
+        statsGeneration === this.statsLoadGeneration
+      )
+        this.isLoading = false;
     }
   }
 
@@ -958,12 +1027,30 @@ export class FlowsView extends LitElement {
    * range change is not a page load").
    */
   private async loadRangeStats(): Promise<void> {
+    const generation = ++this.statsLoadGeneration;
+    const lifecycle = this.flowsLoadGeneration;
+    const range = this.range;
     try {
-      const flows = await getFlows({ statsSince: this.rangeStartDate() });
-      if (Array.isArray(flows)) this.flows = flows;
+      const flows = await getFlowSummaries({
+        includeStats: true,
+        statsSince: this.rangeStartDate(),
+      });
+      if (
+        generation !== this.statsLoadGeneration ||
+        lifecycle !== this.flowsLoadGeneration ||
+        range !== this.range
+      )
+        return;
+      if (Array.isArray(flows)) this.flows = flows.map(flowSummaryRow);
     } catch (error) {
       // Keep the numbers already on screen; they name their own window.
       console.error('Failed to refresh flow stats:', error);
+    } finally {
+      if (
+        generation === this.statsLoadGeneration &&
+        lifecycle === this.flowsLoadGeneration
+      )
+        this.isLoading = false;
     }
   }
 
@@ -1636,6 +1723,7 @@ export class FlowsView extends LitElement {
       >
         <sl-select
           class="preset-filter"
+          label="Flow type"
           multiple
           clearable
           max-options-visible="1"
@@ -1663,6 +1751,7 @@ export class FlowsView extends LitElement {
 
         <sl-select
           class="status-filter"
+          label="Flow status"
           multiple
           clearable
           max-options-visible="1"
@@ -1883,7 +1972,9 @@ export class FlowsView extends LitElement {
         <td class="numeric" title=${`Estimated spend, last ${this.rangeLabel}`}>
           ${
             row.countsFromServer && row.runs > 0
-              ? this.formatMoney(row.cost)
+              ? html`<span title=${formatUsdExact(row.cost)}
+                  >${formatUsd(row.cost)}</span
+                >`
               : html`<span class="muted-cell">-</span>`
           }
         </td>
@@ -1934,13 +2025,7 @@ export class FlowsView extends LitElement {
         style="text-decoration: none; color: inherit;"
       >
         <span class="last-run-line">
-          <sl-badge
-            class="status-chip"
-            pill
-            variant=${this.getStatusVariant(run.status)}
-            >${this.statusLabel(run.status)}</sl-badge
-          >
-          ${renderExecutionSubject(run)}
+          ${this.renderRunStatusChip(run.status)} ${renderExecutionSubject(run)}
         </span>
         <span class="meta" title=${formatLocalDateTime(run.start_time)}
           >${formatRelativeTime(run.start_time, undefined, {
@@ -2064,7 +2149,8 @@ export class FlowsView extends LitElement {
           ${
             row.countsFromServer && row.runs > 0
               ? html`<span class="stat-item"
-                  >${this.formatMoney(row.cost)} est.</span
+                  >${html`<span title=${formatUsdExact(row.cost)}>${formatUsd(row.cost)}</span>`}
+                  est.</span
                 >`
               : nothing
           }
@@ -2138,13 +2224,7 @@ export class FlowsView extends LitElement {
         title=${formatLocalDateTime(run.start_time)}
         @click=${(event: Event) => event.stopPropagation()}
       >
-        <sl-badge
-          class="status-chip"
-          pill
-          variant=${this.getStatusVariant(run.status)}
-          >${this.statusLabel(run.status)}</sl-badge
-        >
-        ${renderExecutionSubject(run)}
+        ${this.renderRunStatusChip(run.status)} ${renderExecutionSubject(run)}
         <span class="meta"
           >${formatRelativeTime(run.start_time, undefined, {
             maxRelativeDays: 30,
@@ -2198,7 +2278,7 @@ export class FlowsView extends LitElement {
             </div>
             <h3 class="empty-card-title">Could not load your flows</h3>
             <p class="empty-card-desc">
-              ${this.loadError} The list below is not empty — it is unknown.
+              ${this.loadError} Try again in a moment.
             </p>
             <sl-button
               class="empty-cta-btn"
@@ -2224,7 +2304,8 @@ export class FlowsView extends LitElement {
             </div>
             <h3 class="empty-card-title">No flows yet</h3>
             <p class="empty-card-desc">
-              No flows yet. Create your first custom flow or clone a starter
+              Flows start an agent when something happens: a new issue, a
+              webhook or a schedule. Create one from scratch or start from a
               preset below.
             </p>
             <sl-button
@@ -2260,7 +2341,7 @@ export class FlowsView extends LitElement {
                       size="small"
                       variant="danger"
                       outline
-                      @click=${() => this.removePreset(preset.id)}
+                      @click=${() => this.removePreset(preset.id, preset.name)}
                     >
                       Remove
                     </sl-button>
@@ -2277,21 +2358,19 @@ export class FlowsView extends LitElement {
   renderExecutionItem(exec: FlowExecution) {
     const flow = this.flows.find((f) => f.id === exec.flow_id);
     const duration = executionDurationText(exec);
+    const href = `/console/flows/executions/${exec.id}`;
+    const name = flow?.name || exec.flow_name || 'Unknown flow';
+    // The row stays clickable as a convenience; the name is a real link
+    // (keyboard, cmd-click) and the arrow a labelled link to the same run.
     return html`
       <div
         class="execution-item"
-        @click=${() => Router.go(`/console/flows/executions/${exec.id}`)}
+        @click=${(event: MouseEvent) => this.handleExecutionItemClick(event, href)}
       >
         <div class="execution-info">
-          <sl-badge
-            class="status-chip"
-            pill
-            variant=${this.getStatusVariant(exec.status)}
-          >
-            ${this.statusLabel(exec.status)}
-          </sl-badge>
+          ${this.renderRunStatusChip(exec.status)}
           <div style="min-width: 0;">
-            <strong>${flow?.name || exec.flow_name || 'Unknown flow'}</strong>
+            <a class="row-link" href=${href}>${name}</a>
             <div class="row-subtitle">
               Started
               ${formatLocalDateTime(exec.start_time)}${
@@ -2307,12 +2386,50 @@ export class FlowsView extends LitElement {
           <resource-actions
             .actions=${this.executionActions(exec)}
           ></resource-actions>
-          <sl-button size="small">
-            <sl-icon name="arrow-right"></sl-icon>
-          </sl-button>
+          <sl-icon-button
+            name="arrow-right"
+            label=${`Open run of ${name}`}
+            href=${href}
+          ></sl-icon-button>
         </div>
       </div>
     `;
+  }
+
+  /**
+   * A click on the in-flight row opens the run, unless it was meant for a
+   * link (which navigates itself) or used a modifier to open a new tab.
+   */
+  private handleExecutionItemClick(event: MouseEvent, href: string) {
+    if (event.defaultPrevented) return;
+    if (
+      event.metaKey ||
+      event.ctrlKey ||
+      event.shiftKey ||
+      event.button !== 0
+    ) {
+      return;
+    }
+    for (const node of event.composedPath()) {
+      if (!(node instanceof HTMLElement)) continue;
+      if (node.classList.contains('execution-item')) break;
+      if (node.tagName.toLowerCase() === 'a') return;
+    }
+    Router.go(href);
+  }
+
+  /**
+   * A run's status chip, in the taxonomy the executions pages use: blue in
+   * flight, amber waiting on a person, green succeeded, solid red broken.
+   */
+  private renderRunStatusChip(status: string) {
+    const variant = executionStatusVariant(status);
+    return html`<sl-badge
+      class="status-chip ${variant === 'danger' ? 'solid' : ''}"
+      pill
+      variant=${variant}
+      >${executionStatusLabel(status)}</sl-badge
+    >`;
   }
 
   /**
@@ -2357,37 +2474,37 @@ export class FlowsView extends LitElement {
     }
   }
 
-  /** Title case, so "SUCCEEDED" and "Active now" read as the same object. */
-  private statusLabel(status: string): string {
-    const text = String(status || '').replace(/_/g, ' ');
-    return text.charAt(0).toUpperCase() + text.slice(1).toLowerCase();
-  }
-
-  getStatusVariant(status: string): 'success' | 'danger' | 'neutral' {
-    switch (status) {
-      case 'SUCCEEDED':
-        return 'success';
-      case 'FAILED':
-        return 'danger';
-      default:
-        // Running and pending are neutral: a run in flight is not a problem.
-        return 'neutral';
-    }
-  }
-
   /** Under a cent renders four decimals rather than collapsing to $0.00. */
-  private formatMoney(value: number): string {
-    if (!value) return '$0.00';
-    if (value < 0.01) return `$${value.toFixed(4)}`;
-    return `$${value.toFixed(2)}`;
-  }
 
   async clonePreset(presetId: string) {
     Router.go(`/console/flows/new?preset_id=${presetId}`);
   }
 
-  async removePreset(presetId: string) {
-    await deleteFlow(presetId);
+  /**
+   * Remove an account preset, after asking: one misclick used to delete a
+   * preset the team saved, and a failure was an unhandled rejection.
+   */
+  async removePreset(presetId: string, presetName = 'this preset') {
+    const confirmed = await confirmDialog({
+      title: 'Remove preset',
+      message: `Remove "${presetName}"?`,
+      detail: 'Flows created from it keep working. This cannot be undone.',
+      confirmLabel: 'Remove preset',
+      variant: 'danger',
+    });
+    if (!confirmed) return;
+    try {
+      await deleteFlow(presetId);
+    } catch (error) {
+      showToast(
+        error instanceof Error && error.message
+          ? `Could not remove the preset: ${error.message}`
+          : 'Could not remove the preset. Try again.',
+        'danger'
+      );
+      return;
+    }
+    showToast(`Removed "${presetName}".`, 'success');
     this.presetsLoaded = false;
     await this.ensurePresetsLoaded();
   }

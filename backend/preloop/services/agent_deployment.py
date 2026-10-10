@@ -31,6 +31,7 @@ class DeploymentResult:
     agent_id: str
     runtime_version: str
     model_alias: str
+    desktop: str = "skipped"
 
 
 def deployment_capabilities() -> dict[str, bool]:
@@ -100,7 +101,13 @@ def parse_host_key(value: str) -> asyncssh.SSHKey:
 
 
 def installation_script(
-    runtime: str, alias: str, url: str, token: str, request_id: UUID
+    runtime: str,
+    alias: str,
+    url: str,
+    token: str,
+    request_id: UUID,
+    *,
+    desktop: bool = False,
 ) -> str:
     """Build a fixed script; every variable is shell quoted and secrets use stdin."""
     cli_url = os.getenv("PRELOOP_DEPLOY_CLI_URL", "")
@@ -123,10 +130,11 @@ def installation_script(
     assignments = "\n".join(
         f"deploy_{key}={shlex.quote(value)}" for key, value in values.items()
     )
-    return (
+    script = (
         assignments
         + r"""
 set -euo pipefail
+deploy_desktop_status=skipped
 deploy_stage=PRELOOP_DEPLOY_PREREQUISITES_FAILED
 trap 'printf "%s\n" "$deploy_stage"' ERR
 umask 077
@@ -170,7 +178,7 @@ deploy_stage=PRELOOP_DEPLOY_VERSION_UNAVAILABLE
 deploy_stage=PRELOOP_DEPLOY_STATUS_FAILED
 preloop agents status "$deploy_runtime" --json </dev/null >"$work/status.json" 2>/dev/null
 deploy_stage=PRELOOP_DEPLOY_ONBOARDING_INCOMPLETE
-python3 - "$work" "$deploy_alias" <<'PRELOOP_EVIDENCE'
+python3 - "$work" "$deploy_alias" "$deploy_desktop_status" <<'PRELOOP_EVIDENCE'
 import json,pathlib,sys
 p=pathlib.Path(sys.argv[1])
 s=json.loads((p/'status.json').read_text())
@@ -187,10 +195,61 @@ version=(p/'version').read_text().strip()
 if not version or len(version)>512:
     print('PRELOOP_DEPLOY_VERSION_UNAVAILABLE')
     raise SystemExit(1)
-print(json.dumps({'agent_id':a['id'],'runtime_version':version,'model_alias':valid['live_validation_model_alias']}))
+desktop=sys.argv[3]
+if desktop not in ('installed','failed','skipped'):
+    desktop='skipped'
+print(json.dumps({'agent_id':a['id'],'runtime_version':version,'model_alias':valid['live_validation_model_alias'],'desktop':desktop}))
 PRELOOP_EVIDENCE
 """
     )
+    if desktop:
+        desktop_stage = r"""deploy_desktop_status=failed
+deploy_stage=PRELOOP_DEPLOY_DESKTOP_FAILED
+if preloop agents install-runtime "$deploy_runtime" --install-only --skip-install --desktop -y </dev/null >"$work/desktop.log" 2>&1; then
+  deploy_desktop_status=installed
+else
+  echo PRELOOP_DEPLOY_DESKTOP_FAILED
+fi
+# Keep the desktop log for diagnosis; $work is removed on exit.
+cp "$work/desktop.log" "$HOME/.local/state/preloop/desktop.log" 2>/dev/null || true
+"""
+        needle = "deploy_stage=PRELOOP_DEPLOY_VERSION_UNAVAILABLE\n"
+        script = script.replace(needle, desktop_stage + needle, 1)
+    return script
+
+
+MAX_REMOTE_OUTPUT = 65536
+
+
+async def read_bounded_output(stream: "asyncssh.SSHReader[str]", limit: int) -> str:
+    """Read to EOF, stopping once more than ``limit`` characters arrived.
+
+    ``SSHReader.read(n)`` returns as soon as any data is available, so a single
+    call can return only the first line (for example a desktop marker) and
+    drop the evidence JSON that follows.
+    """
+    chunks: list[str] = []
+    size = 0
+    while size <= limit:
+        chunk = await stream.read(limit + 1 - size)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        size += len(chunk)
+    return "".join(chunks)
+
+
+def parse_evidence(output: str) -> dict:
+    """Return the last JSON object line; stage markers may precede it."""
+    for line in reversed(output.splitlines()):
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        evidence = json.loads(line)
+        if not isinstance(evidence, dict):
+            raise ValueError("Evidence is not an object")
+        return evidence
+    raise ValueError("No evidence line in remote output")
 
 
 async def install_over_ssh(
@@ -201,6 +260,7 @@ async def install_over_ssh(
     url: str,
     token: str,
     request_id: UUID,
+    desktop: bool = False,
 ) -> DeploymentResult:
     """Install and validate without falling back to agent or known_hosts trust."""
     address = await resolve_ssh_address(ssh.host, ssh.port)
@@ -215,7 +275,9 @@ async def install_over_ssh(
             raise DeploymentError(
                 "The supplied SSH private key could not be read"
             ) from exc
-    script = installation_script(runtime, alias, url, token, request_id)
+    script = installation_script(
+        runtime, alias, url, token, request_id, desktop=desktop
+    )
     try:
         async with asyncssh.connect(
             address,
@@ -238,8 +300,8 @@ async def install_over_ssh(
                 process.stdin.write_eof()
                 # The fixed script suppresses installer output. Bound remote output
                 # anyway: a compromised target must not fill API memory.
-                output = await process.stdout.read(65537)
-                if len(output) > 65536:
+                output = await read_bounded_output(process.stdout, MAX_REMOTE_OUTPUT)
+                if len(output) > MAX_REMOTE_OUTPUT:
                     process.terminate()
                     raise DeploymentError(
                         "SSH target returned excessive deployment output"
@@ -275,7 +337,7 @@ async def install_over_ssh(
             "SSH authentication, host-key verification, or connection failed"
         ) from exc
     try:
-        evidence = json.loads(output.strip().splitlines()[-1])
+        evidence = parse_evidence(output)
         agent_id = str(UUID(evidence["agent_id"]))
         version_match = re.search(
             r"\b(v?\d+\.\d+\.\d+)\b",
@@ -283,10 +345,14 @@ async def install_over_ssh(
         )
         if not version_match:
             raise ValueError("No runtime version in verified evidence")
+        desktop_state = evidence.get("desktop", "skipped")
+        if desktop_state not in {"installed", "failed", "skipped"}:
+            desktop_state = "skipped"
         return DeploymentResult(
             agent_id,
             f"{runtime} {version_match.group(1)}",
             str(evidence["model_alias"]),
+            str(desktop_state),
         )
     except (ValueError, KeyError, IndexError, TypeError) as exc:
         raise DeploymentError(

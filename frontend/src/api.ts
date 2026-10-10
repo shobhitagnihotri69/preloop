@@ -44,6 +44,7 @@ import type {
   AccountGovernanceDefaultsResponse,
   SubjectGovernanceConfig,
   SubjectGovernanceResponse,
+  FlowGovernanceResponse,
   AccountGatewayUsageSearchResponse,
   AccountRuntimeSessionDetailResponse,
   AccountRuntimeSessionListResponse,
@@ -52,6 +53,9 @@ import type {
   RuntimeSessionSummary,
   RuntimeSessionUpdateRequest,
   RuntimeSessionActivityListResponse,
+  ArtifactSearchResponse,
+  RuntimeSessionArtifactDescriptor,
+  RuntimeSessionArtifactListResponse,
   RuntimeSessionRequestListResponse,
   RuntimeSessionSummaryInsight,
   SimilarSessionsParams,
@@ -77,7 +81,11 @@ import type {
   AIModelGatewayUsageSearchResponse,
   AIModel,
   CostAnalyticsSummaryResponse,
+  CostHealthResponse,
   CostReconciliationResponse,
+  CopilotConnection,
+  CopilotConnectionUpsert,
+  CopilotUsageSummary,
   ProviderBillingConnection,
   RepriceResponse,
   RepriceJobStatus,
@@ -254,25 +262,14 @@ async function attemptRefresh(refreshTokenValue: string): Promise<Response> {
 }
 
 function endSessionAndRedirect(): void {
-  localStorage.removeItem('accessToken');
-  localStorage.removeItem('refreshToken');
-
-  if (typeof window !== 'undefined') {
-    window.dispatchEvent(
-      new CustomEvent('auth-change', { bubbles: true, composed: true })
-    );
-    if (
-      !window.location.pathname.startsWith('/login') &&
-      !window.location.pathname.startsWith('/register')
-    ) {
-      localStorage.setItem(
-        'loginRedirect',
-        window.location.pathname + window.location.search + window.location.hash
-      );
-    }
-  }
-
-  Router.go('/login');
+  // The session is already dead (refresh rejected or missing), so there is
+  // nothing to sign out on the server.
+  void signOut({
+    destination: '/login',
+    rememberLocation: true,
+    serverSignOut: false,
+    navigate: (url) => Router.go(url),
+  });
 }
 
 async function refreshToken(): Promise<RefreshResult> {
@@ -406,25 +403,126 @@ export function coalesceKey(url: string, passive?: boolean): string {
 }
 
 /**
- * Clear local JWT credentials and return to the marketing page.
- *
- * Shared by the header Sign out control and Security "Sign out everywhere"
- * so those two paths cannot drift (tokens, auth-change, navigation, /logout).
+ * How long sign out waits for the server's next-page hint before falling
+ * back to the default destination. Local state is cleared before the wait.
  */
-export function performLocalSignOut(
-  navigate: (url: string) => void = (url) => {
-    window.location.assign(url);
+export const SIGN_OUT_SERVER_TIMEOUT_MS = 5000;
+
+/**
+ * Whether `url` is a path on this origin (`/x`, never `//x` or a scheme).
+ * Server-provided redirects are followed only when this holds.
+ */
+export function isSameOriginPath(url: unknown): url is string {
+  if (typeof url !== 'string' || !url.startsWith('/')) return false;
+  if (url.startsWith('//') || url.startsWith('/\\')) return false;
+  return !/[\\\r\n\t]/.test(url);
+}
+
+export interface SignOutOptions {
+  /** Where to go when the server names no next step. Defaults to `/`. */
+  destination?: string;
+  /** Remember the current location so login can return to it. */
+  rememberLocation?: boolean;
+  /**
+   * Ask the server to end the session first. Skipped when the session is
+   * already known to be dead (refresh rejected).
+   */
+  serverSignOut?: boolean;
+  /** Navigation for the default destination (tests, SPA routing). */
+  navigate?: (url: string) => void;
+  /**
+   * Full page load for a server-named next page, which may belong to
+   * another app on this origin. Defaults to `window.location.assign`.
+   */
+  assign?: (url: string) => void;
+}
+
+async function requestServerSignOut(token: string): Promise<string | null> {
+  const controller =
+    typeof AbortController !== 'undefined' ? new AbortController() : null;
+  const timer = controller
+    ? setTimeout(() => controller.abort(), SIGN_OUT_SERVER_TIMEOUT_MS)
+    : null;
+  try {
+    const response = await Promise.resolve(
+      fetch('/api/v1/auth/logout', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` },
+        signal: controller?.signal,
+      })
+    );
+    if (!response || !response.ok) return null;
+    const body = (await response.json()) as { redirect_url?: unknown };
+    return isSameOriginPath(body?.redirect_url) ? body.redirect_url : null;
+  } catch {
+    // Offline or timed out: local sign out still proceeds.
+    return null;
+  } finally {
+    if (timer) clearTimeout(timer);
   }
-): void {
+}
+
+/**
+ * The one sign out path of the console.
+ *
+ * Asks the server to end the current session (it may name a same-origin
+ * page to go to next), clears the local JWT credentials, tells listeners
+ * through `auth-change`, and navigates. Used by the header Sign out
+ * controls, Security "Sign out everywhere" and expired-session handling so
+ * those paths cannot drift.
+ *
+ * @returns The URL navigated to.
+ */
+export async function signOut(options: SignOutOptions = {}): Promise<string> {
+  const {
+    destination = '/',
+    rememberLocation = false,
+    serverSignOut = true,
+    navigate = (url: string) => {
+      window.location.assign(url);
+    },
+    assign = (url: string) => {
+      window.location.assign(url);
+    },
+  } = options;
+
+  // The request carries the captured token, so local state is cleared at
+  // once and the server answer is awaited only for its next-page hint.
+  const token = localStorage.getItem('accessToken');
+  const serverAnswer: Promise<string | null> =
+    serverSignOut && token
+      ? requestServerSignOut(token)
+      : Promise.resolve(null);
+
   localStorage.removeItem('accessToken');
   localStorage.removeItem('refreshToken');
+  invalidateApiCaches();
   window.dispatchEvent(
     new CustomEvent('auth-change', { bubbles: true, composed: true })
   );
-  navigate('/');
+
+  if (
+    rememberLocation &&
+    !window.location.pathname.startsWith('/login') &&
+    !window.location.pathname.startsWith('/register')
+  ) {
+    localStorage.setItem(
+      'loginRedirect',
+      window.location.pathname + window.location.search + window.location.hash
+    );
+  }
+
   void Promise.resolve(fetch('/logout', { method: 'GET' })).catch(() => {
     // Best effort: local credentials are already gone.
   });
+
+  const serverRedirect = await serverAnswer;
+  if (serverRedirect) {
+    assign(serverRedirect);
+    return serverRedirect;
+  }
+  navigate(destination);
+  return destination;
 }
 
 export async function fetchWithAuth(
@@ -462,6 +560,43 @@ export async function fetchWithAuth(
     return (await request).clone();
   }
   return performFetchWithAuth(url, options);
+}
+
+/** What a toast says when the server's 429 carries no sentence of its own. */
+export const RATE_LIMIT_FALLBACK_MESSAGE =
+  'Too many requests. Try again in a moment.';
+
+/**
+ * The sentence for a rate-limited request: the server's `detail` when it sent
+ * one, otherwise a generic line that names `Retry-After` when present. Reads
+ * a clone so the caller can still consume the body.
+ */
+async function rateLimitMessage(response: Response): Promise<string> {
+  let body: any = null;
+  try {
+    body = await response.clone().json();
+  } catch {
+    // Non-JSON 429 (a proxy page, an empty body): fall back below.
+  }
+  // Only a sentence is worth a toast: a bare `{code}` envelope is not.
+  const detail = body?.detail;
+  const fromServer =
+    typeof detail === 'string'
+      ? detail
+      : typeof detail?.message === 'string'
+        ? detail.message
+        : typeof body?.error?.message === 'string'
+          ? body.error.message
+          : '';
+  if (fromServer.trim()) return fromServer;
+  const retryAfter = Number(response.headers.get('Retry-After'));
+  if (Number.isFinite(retryAfter) && retryAfter > 0) {
+    const seconds = Math.ceil(retryAfter);
+    return `Too many requests. Try again in ${seconds} second${
+      seconds === 1 ? '' : 's'
+    }.`;
+  }
+  return RATE_LIMIT_FALLBACK_MESSAGE;
 }
 
 async function performFetchWithAuth(
@@ -511,18 +646,12 @@ async function performFetchWithAuth(
     }
 
     if (isUpstreamGatewayError) {
-      console.log(
-        'Gateway upstream returned 401, returning error directly without refreshing token'
-      );
       return response;
     }
-
-    console.log('Access token expired, attempting to refresh...');
 
     // If another tab or process already refreshed the token, use the new one directly
     const currentToken = localStorage.getItem('accessToken');
     if (currentToken && currentToken !== accessToken) {
-      console.log('Token was already refreshed, retrying request');
       headers.set('Authorization', `Bearer ${currentToken}`);
       options.headers = headers;
       return fetch(url, options);
@@ -544,13 +673,19 @@ async function performFetchWithAuth(
   }
 
   // A passive request is not a user action, so neither of the two answers
-  // below is allowed to interrupt the page with a dialog. The caller reads
-  // the status and decides what to leave out.
+  // below is allowed to interrupt the page. The caller reads the status and
+  // decides what to leave out.
   if (response.status === 429 && !passive) {
+    // A rate limit is not a paywall. Core sends 429 for ordinary limits (test
+    // pushes per minute, operator notes per hour, a full delivery queue), and
+    // on a deployment that sells nothing the upgrade dialog led to a page
+    // saying there are no plans. Say what the server said, as a toast.
     window.dispatchEvent(
-      new CustomEvent('show-upgrade-modal', {
-        bubbles: true,
-        composed: true,
+      new CustomEvent('show-toast', {
+        detail: {
+          message: await rateLimitMessage(response),
+          variant: 'warning',
+        },
       })
     );
   }
@@ -1026,6 +1161,8 @@ export interface RuntimeSessionListParams extends GatewayUsageSummaryParams {
   query?: string;
   sessionSourceType?: string;
   status?: 'all' | 'active' | 'ended';
+  /** Only sessions holding an available artifact: `any` or one kind. */
+  hasArtifacts?: string;
   limit?: number;
   offset?: number;
 }
@@ -1132,6 +1269,9 @@ function buildRuntimeSessionListQuery(
   if (params.status) {
     queryParams.set('status', params.status);
   }
+  if (params.hasArtifacts) {
+    queryParams.set('has_artifacts', params.hasArtifacts);
+  }
   if (typeof params.limit === 'number') {
     queryParams.set('limit', String(params.limit));
   }
@@ -1178,10 +1318,18 @@ function buildManagedAgentListQuery(
 }
 
 export async function getAccountGatewayUsageSummary(
-  params: GatewayUsageSummaryParams = {}
+  params: GatewayUsageSummaryParams & {
+    breakdowns?: ('models' | 'flows' | 'sessions' | 'tools' | 'days')[];
+  } = {}
 ): Promise<AccountGatewayUsageSummaryResponse> {
+  const query = new URLSearchParams(
+    buildGatewayUsageQuery(params).replace(/^\?/, '')
+  );
+  for (const section of params.breakdowns || [])
+    query.append('breakdown', section);
+  const queryString = query.size ? `?${query.toString()}` : '';
   const response = await fetchWithAuth(
-    `/api/v1/account/gateway-usage/summary${buildGatewayUsageQuery(params)}`
+    `/api/v1/account/gateway-usage/summary${queryString}`
   );
   if (!response.ok) {
     // A period outside the plan's analytics window is a plan fact, not a
@@ -1244,6 +1392,39 @@ export async function getAttentionDismissals(): Promise<
   return (body?.items || []) as AttentionDismissal[];
 }
 
+/** One notify rule's hits over the summary window (#959). */
+export interface PolicyNoticeRuleSummary {
+  rule_id: string;
+  rule_description?: string | null;
+  target: 'model.request' | 'model.response' | string;
+  count: number;
+  /** Newest hit id; a new hit changes it and brings a dismissed card back. */
+  last_hit_id: string;
+  last_hit_at: string;
+  /** Secret-redacted, at most 280 characters; null when redaction failed. */
+  last_excerpt?: string | null;
+  last_user_id?: string | null;
+  last_username?: string | null;
+}
+
+export interface PolicyNoticeSummary {
+  days: number;
+  rules: PolicyNoticeRuleSummary[];
+}
+
+/** Notify rule hits grouped by rule, for the Attention page. */
+export async function getPolicyNoticeSummary(
+  days = 7
+): Promise<PolicyNoticeSummary> {
+  const response = await fetchWithAuth(
+    `/api/v1/policies/notices/summary?days=${encodeURIComponent(String(days))}`
+  );
+  if (!response.ok) {
+    throw new Error('Failed to fetch policy notices');
+  }
+  return (await response.json()) as PolicyNoticeSummary;
+}
+
 export async function dismissAttentionItem(
   itemId: string,
   body: {
@@ -1291,6 +1472,220 @@ export async function getCostAnalyticsSummary(
     throw new Error('Failed to fetch cost analytics summary');
   }
   return response.json();
+}
+
+/** Gateway accounting self-check for the account (last `hours` hours). */
+export async function getCostHealth(hours = 24): Promise<CostHealthResponse> {
+  const response = await fetchWithAuth(
+    `/api/v1/cost/health?hours=${encodeURIComponent(String(hours))}`
+  );
+  if (!response.ok) {
+    throw new Error('Failed to fetch accounting health');
+  }
+  return response.json();
+}
+
+/** One execution that contributed to an issue's cost (#958). */
+export interface IssueCostExecution {
+  execution_id: string;
+  flow_id: string;
+  flow_name: string;
+  status: string;
+  link: string;
+  pr_url: string | null;
+  estimated_cost: number | null;
+  total_tokens: number;
+  start_time: string;
+  end_time: string | null;
+}
+
+/**
+ * How much of a cost bucket's runs carried an execution cost estimate
+ * (#1057). Coverage is about execution-cost availability, never invoice
+ * accuracy: `complete` means every run was priced (an explicit zero counts
+ * as priced), `unknown` means none was.
+ */
+export type CostCoverage = 'complete' | 'partial' | 'unknown';
+
+/** The cost-coverage fields every issue row, summary and bucket carries. */
+export interface IssueCostCoverage {
+  /** Subtotal of the priced runs only; not total spend. */
+  estimated_cost: number;
+  cost_coverage: CostCoverage;
+  known_cost_run_count: number;
+  unknown_cost_run_count: number;
+  /** estimated_cost when coverage is complete, null otherwise. */
+  attributed_cost_usd: number | null;
+}
+
+/** One tracker issue with summed cost and cycle-time milestones. */
+export interface ReadinessGateEvidence {
+  name: string;
+  state: 'pass' | 'fail' | 'unknown';
+  source: string;
+  reason: string | null;
+  retrieved_at: string;
+}
+export interface ReadinessObservation {
+  observation_id: string;
+  repository: string;
+  pr_id: number;
+  source_sha: string | null;
+  target_sha: string | null;
+  policy_version: string | null;
+  scope: string;
+  started_at: string;
+  completed_at: string;
+  state: string;
+  coverage: string;
+  gates: ReadinessGateEvidence[];
+}
+
+export interface IssueCostRow extends IssueCostCoverage {
+  id: string;
+  tracker_id: string;
+  tracker_name: string;
+  tracker_type: string;
+  issue_key: string;
+  issue_id: string | null;
+  title: string | null;
+  issue_url: string | null;
+  pr_url: string | null;
+  project_id: string | null;
+  project_name: string | null;
+  total_tokens: number;
+  run_count: number;
+  failed_run_count: number;
+  first_event_at: string | null;
+  pr_opened_at: string | null;
+  approved_at: string | null;
+  merged_at: string | null;
+  first_event_to_pr_opened_hours: number | null;
+  pr_opened_to_approved_hours: number | null;
+  approved_to_merged_hours: number | null;
+  /** forge (the PR's own created_at), bind or run_end; null without a PR. */
+  pr_opened_at_source: string | null;
+  /** The tracker's estimate; null when the tracker states none. */
+  estimate_hours: number | null;
+  estimate_hours_source: string | null;
+  estimate_points: number | null;
+  estimate_points_source: string | null;
+  ticket_created_at?: string | null;
+  first_ready_observed_at?: string | null;
+  ticket_to_observed_ready_hours?: number | null;
+  readiness_scope?: string | null;
+  readiness_policy_version?: string | null;
+  latest_readiness_state?: string;
+  latest_readiness_coverage?: string;
+  latest_readiness_observed_at?: string | null;
+  forge_coverage?: string;
+  readiness_unknown_reasons?: string[];
+  readiness_observation_started_at?: string | null;
+  readiness_observation_completed_at?: string | null;
+  readiness_observations?: ReadinessObservation[];
+  first_ready_observation_id?: string | null;
+}
+
+export interface IssueCostSummary extends IssueCostCoverage {
+  id: string | null;
+  name: string;
+  issue_count: number;
+  total_tokens: number;
+  run_count: number;
+  failed_run_count: number;
+}
+
+export interface IssueCostReport {
+  start: string | null;
+  end: string | null;
+  project_id: string | null;
+  flow_id: string | null;
+  issues: IssueCostRow[];
+  by_project: IssueCostSummary[];
+  by_flow: IssueCostSummary[];
+  unassigned: IssueCostCoverage & {
+    total_tokens: number;
+    run_count: number;
+    failed_run_count: number;
+    /** Filled by the JSON export only; the report carries the totals. */
+    executions: IssueCostExecution[];
+  };
+  truncated: boolean;
+}
+
+export interface IssueCostFilter {
+  startDate?: string | null;
+  endDate?: string | null;
+  projectId?: string | null;
+  flowId?: string | null;
+}
+
+function issueCostQuery(filter: IssueCostFilter): URLSearchParams {
+  const query = new URLSearchParams();
+  if (filter.startDate) query.set('start_date', filter.startDate);
+  if (filter.endDate) query.set('end_date', filter.endDate);
+  if (filter.projectId) query.set('project_id', filter.projectId);
+  if (filter.flowId) query.set('flow_id', filter.flowId);
+  return query;
+}
+
+/** Issue-level cost and cycle time for one filter. */
+export async function getIssueCosts(
+  filter: IssueCostFilter = {}
+): Promise<IssueCostReport> {
+  const query = issueCostQuery(filter).toString();
+  const response = await fetchWithAuth(
+    query ? `/api/v1/cost/by-issue?${query}` : '/api/v1/cost/by-issue'
+  );
+  if (!response.ok) {
+    throw new Error('Failed to fetch cost per issue');
+  }
+  return response.json();
+}
+
+/** Executions that contributed to one issue row. */
+export async function getIssueCostExecutions(
+  rollupId: string,
+  flowId?: string | null
+): Promise<IssueCostExecution[]> {
+  const query = flowId ? `?flow_id=${encodeURIComponent(flowId)}` : '';
+  const response = await fetchWithAuth(
+    `/api/v1/cost/by-issue/${encodeURIComponent(rollupId)}/executions${query}`
+  );
+  if (!response.ok) {
+    throw new Error('Failed to fetch the executions of this issue');
+  }
+  return response.json();
+}
+
+/** Executions in the unassigned bucket of the current filter. */
+export async function getUnassignedIssueCostExecutions(
+  filter: IssueCostFilter = {}
+): Promise<IssueCostExecution[]> {
+  const query = issueCostQuery(filter).toString();
+  const response = await fetchWithAuth(
+    `/api/v1/cost/by-issue/unassigned/executions${query ? `?${query}` : ''}`
+  );
+  if (!response.ok) {
+    throw new Error('Failed to fetch the unassigned executions');
+  }
+  return response.json();
+}
+
+/** CSV or JSON export of the issue rows for the current filter. */
+export async function exportIssueCosts(
+  format: 'csv' | 'json',
+  filter: IssueCostFilter = {}
+): Promise<Blob> {
+  const query = issueCostQuery(filter);
+  query.set('format', format);
+  const response = await fetchWithAuth(
+    `/api/v1/cost/by-issue/export?${query.toString()}`
+  );
+  if (!response.ok) {
+    throw new Error('Failed to export cost per issue');
+  }
+  return response.blob();
 }
 
 export async function getToolUsageStats(
@@ -1542,6 +1937,64 @@ export async function getCostReconciliation(params: {
     throw new Error('Failed to fetch cost reconciliation');
   }
   return response.json();
+}
+
+export async function getCopilotUsage(params: {
+  startDate?: string;
+  endDate?: string;
+}): Promise<CopilotUsageSummary> {
+  const query = new URLSearchParams();
+  if (params.startDate) query.set('start_date', params.startDate);
+  if (params.endDate) query.set('end_date', params.endDate);
+  const suffix = query.toString();
+  const response = await fetchWithAuth(
+    `/api/v1/cost/copilot${suffix ? `?${suffix}` : ''}`
+  );
+  if (response.status === 403) {
+    throw await permissionErrorFromResponse(response);
+  }
+  if (!response.ok) {
+    throw new Error('Failed to fetch Copilot usage');
+  }
+  return response.json();
+}
+
+export async function saveCopilotConnection(
+  payload: CopilotConnectionUpsert
+): Promise<CopilotConnection> {
+  const response = await fetchWithAuth('/api/v1/cost/copilot/connection', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  if (!response.ok) {
+    const errorData = await response.json().catch(() => ({}));
+    throw new Error(
+      extractErrorMessage(errorData, 'Failed to save the Copilot connection')
+    );
+  }
+  return response.json();
+}
+
+export async function deleteCopilotConnection(): Promise<void> {
+  const response = await fetchWithAuth('/api/v1/cost/copilot/connection', {
+    method: 'DELETE',
+  });
+  if (!response.ok) {
+    throw new Error('Failed to remove the Copilot connection');
+  }
+}
+
+export async function syncCopilotConnection(): Promise<void> {
+  const response = await fetchWithAuth('/api/v1/cost/copilot/connection/sync', {
+    method: 'POST',
+  });
+  if (!response.ok) {
+    const errorData = await response.json().catch(() => ({}));
+    throw new Error(
+      extractErrorMessage(errorData, 'Failed to queue the Copilot import')
+    );
+  }
 }
 
 /**
@@ -2155,6 +2608,48 @@ export async function updateAgentGovernance(
   return response.json();
 }
 
+function flowGovernanceUrl(flowId: string): string {
+  return `/api/v1/account/governance/flows/${encodeURIComponent(flowId)}`;
+}
+
+export async function getFlowGovernance(
+  flowId: string
+): Promise<FlowGovernanceResponse> {
+  const response = await fetchWithAuth(flowGovernanceUrl(flowId));
+  if (!response.ok) {
+    throw new Error('Failed to fetch flow governance');
+  }
+  return response.json();
+}
+
+export async function updateFlowGovernance(
+  flowId: string,
+  config: SubjectGovernanceConfig
+): Promise<FlowGovernanceResponse> {
+  const response = await fetchWithAuth(flowGovernanceUrl(flowId), {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(config),
+  });
+  if (!response.ok) {
+    throw new Error('Failed to update flow governance');
+  }
+  return response.json();
+}
+
+/** Drop the flow override so it inherits the account policy again. */
+export async function resetFlowGovernance(
+  flowId: string
+): Promise<FlowGovernanceResponse> {
+  const response = await fetchWithAuth(flowGovernanceUrl(flowId), {
+    method: 'DELETE',
+  });
+  if (!response.ok) {
+    throw new Error('Failed to reset flow governance');
+  }
+  return response.json();
+}
+
 export async function getAccountRuntimeSessionDetail(
   runtimeSessionId: string,
   _params: RuntimeSessionDetailParams = {}
@@ -2212,6 +2707,66 @@ export async function getAccountRuntimeSessionActivityTimeline(
     throw new Error('Failed to fetch session activity timeline');
   }
   return response.json();
+}
+
+/**
+ * Search the account's artifacts across sessions (`GET /api/v1/artifacts`,
+ * #1086). `params` is passed through as is, so repeated keys (`kind`,
+ * `label`) stay repeated.
+ */
+export async function searchAccountArtifacts(
+  params: URLSearchParams
+): Promise<ArtifactSearchResponse> {
+  const query = params.toString();
+  const response = await fetchWithAuth(
+    `/api/v1/artifacts${query ? `?${query}` : ''}`
+  );
+  if (response.status === 403) {
+    throw await permissionErrorFromResponse(response);
+  }
+  if (!response.ok) {
+    const errorData = await response.json().catch(() => ({}));
+    throw new Error(
+      extractErrorMessage(errorData, 'Failed to search artifacts')
+    );
+  }
+  return response.json();
+}
+
+/** Most artifacts the session header reads (5 pages of the list maximum). */
+export const SESSION_ARTIFACT_LIST_CAP = 1000;
+
+/**
+ * List a session's artifacts (descriptors only, never bytes), following
+ * `next_cursor` up to {@link SESSION_ARTIFACT_LIST_CAP} items. The list route
+ * has no total, so `truncated` says the header count is a lower bound.
+ */
+export async function listRuntimeSessionArtifacts(
+  runtimeSessionId: string
+): Promise<{ items: RuntimeSessionArtifactDescriptor[]; truncated: boolean }> {
+  const items: RuntimeSessionArtifactDescriptor[] = [];
+  let cursor: string | null | undefined = null;
+  do {
+    const query = new URLSearchParams({ limit: '200' });
+    if (cursor) query.set('cursor', cursor);
+    const response = await fetchWithAuth(
+      `/api/v1/runtime-sessions/${encodeURIComponent(
+        runtimeSessionId
+      )}/artifacts?${query.toString()}`
+    );
+    if (!response.ok) {
+      throw new Error(`Failed to list session artifacts (${response.status})`);
+    }
+    const page = (await response.json()) as RuntimeSessionArtifactListResponse;
+    const pageItems = Array.isArray(page?.items) ? page.items : [];
+    items.push(...pageItems);
+    // An empty page or a cursor that does not move ends the walk, so a
+    // misbehaving server cannot keep the console fetching.
+    const next =
+      typeof page?.next_cursor === 'string' ? page.next_cursor : null;
+    cursor = pageItems.length && next !== cursor ? next : null;
+  } while (cursor && items.length < SESSION_ARTIFACT_LIST_CAP);
+  return { items, truncated: Boolean(cursor) };
 }
 
 /**
@@ -2637,6 +3192,24 @@ export async function getTrackers() {
   return response.json();
 }
 
+/**
+ * Pick a readable message from a tracker endpoint error body. FastAPI puts
+ * it in `detail` (a string, or a list for validation errors).
+ */
+export function trackerErrorDetail(errorData: any, fallback: string): string {
+  const detail = errorData?.detail ?? errorData?.message;
+  if (typeof detail === 'string' && detail) {
+    return detail;
+  }
+  return fallback;
+}
+
+/** Extra tracker settings sent with connection tests and project listing. */
+export interface TrackerConnectionOptions {
+  connectionDetails?: Record<string, unknown>;
+  authType?: string;
+}
+
 export async function addTracker(trackerData: any) {
   const response = await fetchWithAuth('/api/v1/trackers', {
     method: 'POST',
@@ -2644,7 +3217,8 @@ export async function addTracker(trackerData: any) {
     body: JSON.stringify(trackerData),
   });
   if (!response.ok) {
-    throw new Error('Failed to add tracker');
+    const errorData = await response.json().catch(() => ({}));
+    throw new Error(trackerErrorDetail(errorData, 'Failed to add tracker'));
   }
   return response.json();
 }
@@ -2656,7 +3230,8 @@ export async function updateTracker(trackerId: string, trackerData: any) {
     body: JSON.stringify(trackerData),
   });
   if (!response.ok) {
-    throw new Error('Failed to update tracker');
+    const errorData = await response.json().catch(() => ({}));
+    throw new Error(trackerErrorDetail(errorData, 'Failed to update tracker'));
   }
   return response.json();
 }
@@ -2675,15 +3250,16 @@ export async function validateTrackerToken(
   token: string,
   url?: string,
   username?: string,
-  id?: string
+  id?: string,
+  options: TrackerConnectionOptions = {}
 ) {
-  console.log('Validating tracker token', type, token, url, username);
   const payload: {
     tracker_id?: string;
     tracker_type: string;
     api_key: string;
     url?: string;
-    connection_details?: { username?: string };
+    connection_details?: Record<string, unknown>;
+    auth_type?: string;
   } = {
     tracker_type: type,
     api_key: token,
@@ -2696,6 +3272,15 @@ export async function validateTrackerToken(
   }
   if (type.toLowerCase() === 'jira' && username) {
     payload.connection_details = { username };
+  }
+  if (options.connectionDetails) {
+    payload.connection_details = {
+      ...(payload.connection_details ?? {}),
+      ...options.connectionDetails,
+    };
+  }
+  if (options.authType) {
+    payload.auth_type = options.authType;
   }
 
   const response = await fetchWithAuth('/api/v1/trackers/test-and-list-orgs', {
@@ -2721,7 +3306,8 @@ export async function listProjectsForOrg(
   orgId: string,
   url?: string,
   username?: string,
-  trackerId?: string
+  trackerId?: string,
+  options: TrackerConnectionOptions = {}
 ) {
   const payload: any = {
     tracker_id: trackerId,
@@ -2734,6 +3320,15 @@ export async function listProjectsForOrg(
   }
   if (trackerType.toLowerCase() === 'jira' && username) {
     payload.connection_details = { username };
+  }
+  if (options.connectionDetails) {
+    payload.connection_details = {
+      ...(payload.connection_details ?? {}),
+      ...options.connectionDetails,
+    };
+  }
+  if (options.authType) {
+    payload.auth_type = options.authType;
   }
 
   const response = await fetchWithAuth(
@@ -3164,6 +3759,40 @@ export async function changePassword(passwords: {
   }
 }
 
+/** One CLI login (`preloop auth login`) of the signed-in user. */
+export interface CliSession {
+  id: string;
+  created_at: string;
+  last_seen_at: string | null;
+  user_agent: string | null;
+  hostname: string | null;
+  /** True for the session the request's own token belongs to. */
+  current: boolean;
+}
+
+/** List the signed-in user's active CLI logins. */
+export async function listCliSessions(): Promise<CliSession[]> {
+  const response = await fetchWithAuth('/api/v1/auth/sessions/cli');
+  if (!response.ok) {
+    throw new Error('Failed to load CLI sessions');
+  }
+  return response.json();
+}
+
+/** Revoke one CLI login; its access and refresh tokens stop working. */
+export async function revokeCliSession(sessionId: string): Promise<void> {
+  const response = await fetchWithAuth(
+    `/api/v1/auth/sessions/cli/${encodeURIComponent(sessionId)}`,
+    { method: 'DELETE' }
+  );
+  if (!response.ok) {
+    const errorData = await response.json().catch(() => ({}));
+    throw new Error(
+      extractErrorMessage(errorData, 'Failed to revoke CLI session')
+    );
+  }
+}
+
 // API Keys
 export async function getApiKeys(): Promise<ApiKey[]> {
   const response = await fetchWithAuth('/api/v1/auth/api-keys');
@@ -3401,6 +4030,7 @@ export interface AvailableModelsResult {
  * Carried in the POST body for the same reason as `apiKey`.
  */
 export interface AwsDiscoveryAuth {
+  bearerToken?: string;
   accessKeyId?: string;
   secretAccessKey?: string;
   sessionToken?: string;
@@ -3443,6 +4073,9 @@ export async function getAvailableModelsForProvider(
       ...(apiKey ? { api_key: apiKey } : {}),
       ...(apiEndpoint ? { api_endpoint: apiEndpoint } : {}),
       ...(aiModelId ? { ai_model_id: aiModelId } : {}),
+      ...(awsAuth?.bearerToken
+        ? { aws_bearer_token_bedrock: awsAuth.bearerToken }
+        : {}),
       ...(awsAuth?.accessKeyId
         ? { aws_access_key_id: awsAuth.accessKeyId }
         : {}),
@@ -3558,6 +4191,58 @@ export function uniqueFlowsById<T extends { id?: unknown }>(flows: T[]): T[] {
   return unique;
 }
 
+export interface FlowSummary {
+  id: string;
+  account_id: string | null;
+  name: string;
+  description: string | null;
+  icon: string | null;
+  created_at: string;
+  updated_at: string;
+  trigger_event_source: string | null;
+  trigger_event_types: string[] | null;
+  ai_model_id: string | null;
+  ai_model_name: string | null;
+  agent_type: string;
+  is_enabled: boolean;
+  is_preset: boolean;
+  source_preset_id: string | null;
+  prompt_customized: boolean;
+  tools_customized: boolean;
+  preset_update_available: boolean;
+  schedule_state: {
+    active: boolean;
+    type: string;
+    description: string;
+    timezone: string;
+    next_run_at: string | null;
+    cron?: string;
+  } | null;
+  execution_stats: Record<string, any> | null;
+}
+
+/** List presentation metadata; statistics are opt-in, configurations omitted. */
+export async function getFlowSummaries(
+  options: {
+    includeStats?: boolean;
+    statsSince?: string;
+    skip?: number;
+    limit?: number;
+  } = {}
+): Promise<FlowSummary[]> {
+  const params = new URLSearchParams();
+  if (options.includeStats !== undefined) {
+    params.set('include_stats', String(options.includeStats));
+  }
+  if (options.statsSince) params.set('stats_since', options.statsSince);
+  if (options.skip !== undefined) params.set('skip', String(options.skip));
+  if (options.limit !== undefined) params.set('limit', String(options.limit));
+  const query = params.toString() ? `?${params.toString()}` : '';
+  const response = await fetchWithAuth(`/api/v1/flows/summary${query}`);
+  if (!response.ok) throw new Error('Failed to fetch flow summaries');
+  return response.json();
+}
+
 /**
  * The account's flows.
  *
@@ -3664,7 +4349,19 @@ export function flowWriteErrorMessage(
   return fallback;
 }
 
-export async function createFlow(flow: any): Promise<any> {
+/**
+ * Flow write fields copied from the OpenAPI `FlowCreate` and `FlowUpdate`
+ * schemas (`review_instructions`, maxLength 32768).
+ *
+ * Null clears a saved policy. The reviewer prompt keeps the first 16,384
+ * characters and drops the rest.
+ */
+export interface FlowWrite {
+  review_instructions?: string | null;
+  [key: string]: unknown;
+}
+
+export async function createFlow(flow: FlowWrite): Promise<any> {
   const response = await fetchWithAuth('/api/v1/flows', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -3677,7 +4374,10 @@ export async function createFlow(flow: any): Promise<any> {
   return response.json();
 }
 
-export async function updateFlow(flowId: string, flow: any): Promise<any> {
+export async function updateFlow(
+  flowId: string,
+  flow: FlowWrite
+): Promise<any> {
   const response = await fetchWithAuth(`/api/v1/flows/${flowId}`, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
@@ -4027,14 +4727,49 @@ export async function getFlowExecutionLogs(
   return response.json();
 }
 
+/** One CLI session the runner's usage hook observed during a host run. */
+export interface HostExecSession {
+  conversation_id: string | null;
+  source: string | null;
+  runtime_session_id: string | null;
+  event_count: number;
+  event_types: Record<string, number>;
+  first_event_at: string | null;
+  last_event_at: string | null;
+  models: string[];
+}
+
+/** Hook sessions and seat usage linked to a host-exec flow execution. */
+export interface HostExecSessionsResponse {
+  execution_id: string;
+  sessions: HostExecSession[];
+  event_count: number;
+  premium_requests: number | null;
+  gateway_metered: boolean;
+}
+
+export async function getFlowExecutionHostSessions(
+  executionId: string
+): Promise<HostExecSessionsResponse> {
+  const response = await fetchWithAuth(
+    `/api/v1/flows/executions/${executionId}/host-sessions`
+  );
+  if (!response.ok) {
+    throw new Error('Failed to fetch host execution sessions');
+  }
+  return response.json();
+}
+
 export async function getFlowExecutionGatewayEvents(
   executionId: string,
   tail?: number,
-  metadataOnly: boolean = false
+  metadataOnly: boolean = false,
+  modelCallsOnly: boolean = false
 ): Promise<FlowGatewayEventsResponse> {
   const params = new URLSearchParams();
   if (tail !== undefined) params.append('tail', tail.toString());
   if (metadataOnly) params.append('metadata_only', 'true');
+  if (modelCallsOnly) params.append('model_calls_only', 'true');
   const paramsStr = params.toString() ? `?${params.toString()}` : '';
 
   const response = await fetchWithAuth(
@@ -4235,6 +4970,65 @@ export async function updateRunnerConcurrency(
     const errorData = await response.json().catch(() => ({}));
     throw new Error(
       extractErrorMessage(errorData, 'Failed to update runner concurrency')
+    );
+  }
+  return response.json();
+}
+
+/** Raised when the server refuses to delete a runner that holds leases. */
+export class RunnerHasLeasesError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'RunnerHasLeasesError';
+  }
+}
+
+export interface RunnerDeleteResult {
+  id: string;
+  deleted: boolean;
+  halted_execution_ids: string[];
+}
+
+/**
+ * Delete a persistent runner. Without ``force`` the server answers 409
+ * while the runner holds an execution; with it those executions are halted.
+ */
+export async function deleteRunner(
+  runnerId: string,
+  force = false
+): Promise<RunnerDeleteResult> {
+  const query = force ? '?force=true' : '';
+  const response = await fetchWithAuth(
+    `/api/v1/runners/${encodeURIComponent(runnerId)}${query}`,
+    { method: 'DELETE' }
+  );
+  if (!response.ok) {
+    const errorData = await response.json().catch(() => ({}));
+    const message = extractErrorMessage(errorData, 'Failed to delete runner');
+    if (response.status === 409) {
+      throw new RunnerHasLeasesError(message);
+    }
+    throw new Error(message);
+  }
+  return response.json();
+}
+
+/**
+ * Issue a new token for a runner. The old token stops working at once and
+ * the connected runner is disconnected. The response carries the new token
+ * a single time.
+ */
+export async function rotateRunnerToken(
+  runnerId: string
+): Promise<RunnerRecord & { token: string }> {
+  const response = await fetchWithAuth(
+    `/api/v1/runners/${encodeURIComponent(runnerId)}/token`,
+    { method: 'POST' }
+  );
+  if (!response.ok) {
+    const errorData = await response.json().catch(() => ({}));
+    throw new Error(
+      extractErrorMessage(errorData, 'Failed to rotate runner token')
     );
   }
   return response.json();
@@ -4481,7 +5275,6 @@ export async function getProjectDuplicateStats(options: {
   params.append('status', status);
   params.append('similarity_threshold', similarity_threshold.toString());
   const url = `/api/v1/project-duplicate-stats?${params.toString()}`;
-  console.log(url);
   const response = await fetchWithAuth(url);
   if (!response.ok) {
     throw new Error('Failed to fetch project duplicate stats');
@@ -4493,8 +5286,6 @@ export async function dismissDuplicatePair(
   issue1Id: string,
   issue2Id: string
 ): Promise<{ success: boolean }> {
-  console.log(`Dismissing duplicate pair: ${issue1Id} and ${issue2Id}`);
-
   // Simulate network delay
   await new Promise((resolve) => setTimeout(resolve, 500));
 
@@ -4645,6 +5436,40 @@ export async function getCurrentSubscription() {
 }
 
 // Tools API
+export interface ToolSummary {
+  name: string;
+  description: string;
+  source: 'builtin' | 'mcp' | 'agent';
+  source_id: string | null;
+  source_name: string;
+  is_enabled: boolean;
+  requires_tracker: boolean;
+  required_tracker_types: string[];
+  is_supported: boolean;
+  unsupported_reason: string | null;
+  approval_workflow_id: string | null;
+  config_id: string | null;
+  has_approval_condition: boolean;
+  access_rules: Omit<AccessRule, 'account_id' | 'tool_configuration_id'>[];
+  justification_mode: string | null;
+  enabled_for_agents: string[];
+  schema_tokens_estimate: number;
+  adapters: string[];
+  has_condition: boolean;
+  /** MCP tool hidden from agents: an older server owns the same name. */
+  shadowed?: boolean;
+  warnings?: string[];
+}
+
+/** List metadata and policy state; input definitions stay on the full route. */
+export async function getToolsSummary(): Promise<ToolSummary[]> {
+  const response = await fetchWithAuth('/api/v1/tools/summary');
+  if (!response.ok) {
+    throw new Error('Failed to fetch tool summaries');
+  }
+  return response.json();
+}
+
 export async function getTools(): Promise<any[]> {
   const response = await fetchWithAuth('/api/v1/tools');
   if (!response.ok) {
@@ -4841,7 +5666,8 @@ export async function deleteAccessRule(ruleId: string): Promise<void> {
 
 export interface ModelIOCondition {
   expression: string;
-  action: 'allow' | 'deny' | 'require_approval';
+  /** `notify` is model I/O only: record and tell policy owners, never block. */
+  action: 'allow' | 'deny' | 'require_approval' | 'notify';
   condition_type?: 'simple' | 'cel';
   description?: string | null;
 }
@@ -4862,6 +5688,63 @@ export interface ModelIORule {
   detector_timeout_ms?: number;
   on_detector_timeout?: 'allow' | 'deny';
   conditions: ModelIOCondition[];
+}
+
+export interface SensitiveDataTypeInfo {
+  id: string;
+  label: string;
+  description: string;
+  example: string;
+  locales: string[];
+  checksum: boolean;
+  builtin: boolean;
+}
+
+export interface SensitiveDataTypesResponse {
+  types: SensitiveDataTypeInfo[];
+  default_types: string[];
+}
+
+export interface SensitiveDataTestMatch {
+  type: string;
+  start: number;
+  end: number;
+  confidence: number;
+}
+
+export interface SensitiveDataTestResponse {
+  matches: SensitiveDataTestMatch[];
+  types_found: string[];
+  count: number;
+  redacted_preview?: string | null;
+}
+
+export async function getSensitiveDataTypes(): Promise<SensitiveDataTypesResponse> {
+  const response = await fetchWithAuth('/api/v1/policies/sensitive-data/types');
+  if (!response.ok) {
+    throw new Error('Failed to load sensitive data types');
+  }
+  return response.json();
+}
+
+/** Run the detectors on sample text. The server neither logs nor stores it. */
+export async function testSensitiveData(body: {
+  text: string;
+  types?: string[];
+  config?: Record<string, unknown>;
+}): Promise<SensitiveDataTestResponse> {
+  const response = await fetchWithAuth('/api/v1/policies/sensitive-data/test', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (!response.ok) {
+    const errorData = await response.json().catch(() => ({}));
+    throw new Error(
+      extractErrorMessage(errorData, 'Failed to test sensitive data detectors')
+    );
+  }
+  return response.json();
 }
 
 export async function listModelIORules(): Promise<ModelIORule[]> {
@@ -5445,9 +6328,17 @@ export async function getApprovalRequest(requestId: string): Promise<any> {
   return response.json();
 }
 
+/**
+ * List approval requests for the current account.
+ *
+ * `runtime_session_id` scopes the list to one agent conversation, which is what
+ * a live session view needs. It is ANDed with the account server-side; a
+ * session belonging to another account simply returns no rows.
+ */
 export async function listApprovalRequests(params?: {
   status?: string;
   execution_id?: string;
+  runtime_session_id?: string;
   limit?: number;
   skip?: number;
 }): Promise<any[]> {
@@ -5455,6 +6346,8 @@ export async function listApprovalRequests(params?: {
   if (params?.status) queryParams.append('status', params.status);
   if (params?.execution_id)
     queryParams.append('execution_id', params.execution_id);
+  if (params?.runtime_session_id)
+    queryParams.append('runtime_session_id', params.runtime_session_id);
   if (params?.limit) queryParams.append('limit', params.limit.toString());
   if (params?.skip) queryParams.append('skip', params.skip.toString());
 
@@ -5516,8 +6409,9 @@ export async function approveRequest(
   );
   if (!response.ok) {
     const errorData = await response.json().catch(() => ({}));
-    throw new Error(
-      extractErrorMessage(errorData, 'Failed to approve request')
+    throw Object.assign(
+      new Error(extractErrorMessage(errorData, 'Failed to approve request')),
+      { status: response.status, detail: errorData.detail }
     );
   }
   return response.json();
@@ -5537,8 +6431,9 @@ export async function declineRequest(
   );
   if (!response.ok) {
     const errorData = await response.json().catch(() => ({}));
-    throw new Error(
-      extractErrorMessage(errorData, 'Failed to decline request')
+    throw Object.assign(
+      new Error(extractErrorMessage(errorData, 'Failed to decline request')),
+      { status: response.status, detail: errorData.detail }
     );
   }
   return response.json();
@@ -5931,7 +6826,11 @@ export async function removeUserRole(
 }
 
 // Features API
+export type Edition = 'oss' | 'cloud' | 'enterprise';
+
 export interface FeaturesResponse {
+  edition: Edition;
+  server_version: string;
   plugins: Array<{
     name: string;
     version: string;
@@ -6006,6 +6905,249 @@ export async function updateAccountOrganization(
     throw new Error('Failed to update account organization');
   }
   return response.json();
+}
+
+// Managed Bitbucket Cloud OAuth (issue #1065). The routes are served by the
+// managed-provider plugin and advertised through `features.bitbucket_cloud_oauth`.
+// The console only ever handles an opaque completion handle: no code, token or
+// secret reaches the browser.
+export const BITBUCKET_CLOUD_OAUTH_FEATURE = 'bitbucket_cloud_oauth';
+export const BITBUCKET_CONNECT_HANDLE_PARAM = 'bitbucket_connect';
+export const BITBUCKET_CONNECT_TRACKER_PARAM = 'bitbucket_tracker';
+export const BITBUCKET_CONNECT_ERROR_PARAM = 'bitbucket_error';
+
+export type BitbucketConnectionState =
+  | 'connected'
+  | 'workspace_required'
+  | 'reconnect_required'
+  | 'disconnected'
+  | 'unavailable'
+  | 'not_managed';
+
+export interface BitbucketConnectionActor {
+  uuid?: string | null;
+  display_name?: string | null;
+  nickname?: string | null;
+}
+
+export interface BitbucketConnectionStatus {
+  tracker_id: string;
+  name: string;
+  provider: string;
+  managed: boolean;
+  state: BitbucketConnectionState;
+  consumer_configured: boolean;
+  workspace?: string | null;
+  repository?: string | null;
+  actor?: BitbucketConnectionActor | null;
+  /** Actual access-token expiry reported by the provider service (ISO). */
+  expires_at?: string | null;
+  rotation_version?: number | null;
+  grant_status?: string | null;
+  granted_scopes?: string[] | null;
+  /** true: granted, false: missing, null: unknown (never claimed as tested). */
+  capabilities: Record<string, boolean | null>;
+  capabilities_verified: boolean;
+  reconnect_reason?: string | null;
+}
+
+export interface BitbucketAuthorizationStart {
+  authorization_url: string;
+  transaction_id: string;
+  expires_at: string;
+  tracker_id?: string | null;
+}
+
+export interface BitbucketDiscovery {
+  actor?: BitbucketConnectionActor | null;
+  workspaces: Array<{
+    slug: string;
+    name?: string | null;
+    uuid?: string | null;
+  }>;
+  repositories?: Array<{
+    slug: string;
+    full_name?: string | null;
+    is_private?: boolean | null;
+  }> | null;
+}
+
+/** Human-readable text for the sanitized error codes the callback may carry. */
+export function describeBitbucketConnectError(code: string): string {
+  switch (code) {
+    case 'access_denied':
+      return 'Bitbucket access was declined. No connection was created.';
+    case 'invalid_state':
+      return 'The Bitbucket consent link expired or was already used. Start again.';
+    case 'session_mismatch':
+      return 'The Bitbucket callback arrived in a different browser session. Start again from this browser.';
+    case 'exchange_failed':
+      return 'Bitbucket did not complete the authorization. Try again in a moment.';
+    case 'not_configured':
+      return 'Managed Bitbucket connections are not configured on this deployment.';
+    default:
+      return `Bitbucket connection failed (${code}).`;
+  }
+}
+
+async function bitbucketConnectError(
+  response: Response,
+  fallback: string
+): Promise<Error> {
+  const body = await response.json().catch(() => ({}));
+  const detail = body?.detail ?? body?.message;
+  if (response.status === 501 || detail === 'not_configured') {
+    return new Error(describeBitbucketConnectError('not_configured'));
+  }
+  return new Error(typeof detail === 'string' ? detail : fallback);
+}
+
+export async function startBitbucketConnect(
+  returnPath?: string
+): Promise<BitbucketAuthorizationStart> {
+  const query = returnPath
+    ? `?return_path=${encodeURIComponent(returnPath)}`
+    : '';
+  const response = await fetchWithAuth(
+    `/api/v1/auth/bitbucket/authorize${query}`,
+    { credentials: 'include' }
+  );
+  if (!response.ok) {
+    throw await bitbucketConnectError(
+      response,
+      'Failed to start the Bitbucket connection'
+    );
+  }
+  return response.json();
+}
+
+export async function completeBitbucketConnect(body: {
+  handle: string;
+  name?: string;
+  workspace?: string;
+  repository?: string;
+}): Promise<BitbucketConnectionStatus> {
+  const response = await fetchWithAuth('/api/v1/auth/bitbucket/complete', {
+    method: 'POST',
+    credentials: 'include',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (!response.ok) {
+    throw await bitbucketConnectError(
+      response,
+      'Failed to complete the Bitbucket connection'
+    );
+  }
+  return response.json();
+}
+
+export async function getBitbucketConnectionStatus(
+  trackerId: string
+): Promise<BitbucketConnectionStatus> {
+  const response = await fetchWithAuth(
+    `/api/v1/auth/bitbucket/trackers/${encodeURIComponent(trackerId)}/status`
+  );
+  if (!response.ok) {
+    throw await bitbucketConnectError(
+      response,
+      'Failed to read the Bitbucket connection status'
+    );
+  }
+  return response.json();
+}
+
+export async function getBitbucketDiscovery(
+  trackerId: string,
+  workspace?: string
+): Promise<BitbucketDiscovery> {
+  const query = workspace ? `?workspace=${encodeURIComponent(workspace)}` : '';
+  const response = await fetchWithAuth(
+    `/api/v1/auth/bitbucket/trackers/${encodeURIComponent(trackerId)}/discovery${query}`
+  );
+  if (!response.ok) {
+    throw await bitbucketConnectError(
+      response,
+      'Failed to list accessible Bitbucket workspaces'
+    );
+  }
+  return response.json();
+}
+
+export async function bindBitbucketRepository(
+  trackerId: string,
+  body: { workspace: string; repository?: string }
+): Promise<BitbucketConnectionStatus> {
+  const response = await fetchWithAuth(
+    `/api/v1/auth/bitbucket/trackers/${encodeURIComponent(trackerId)}/binding`,
+    {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    }
+  );
+  if (!response.ok) {
+    throw await bitbucketConnectError(
+      response,
+      'Failed to select the Bitbucket workspace'
+    );
+  }
+  return response.json();
+}
+
+export async function startBitbucketReconnect(
+  trackerId: string,
+  returnPath?: string
+): Promise<BitbucketAuthorizationStart> {
+  const query = returnPath
+    ? `?return_path=${encodeURIComponent(returnPath)}`
+    : '';
+  const response = await fetchWithAuth(
+    `/api/v1/auth/bitbucket/trackers/${encodeURIComponent(trackerId)}/reconnect${query}`,
+    { method: 'POST', credentials: 'include' }
+  );
+  if (!response.ok) {
+    throw await bitbucketConnectError(
+      response,
+      'Failed to start the Bitbucket reconnect'
+    );
+  }
+  return response.json();
+}
+
+export async function completeBitbucketReconnect(
+  trackerId: string,
+  handle: string
+): Promise<BitbucketConnectionStatus> {
+  const response = await fetchWithAuth(
+    `/api/v1/auth/bitbucket/trackers/${encodeURIComponent(trackerId)}/reconnect/complete`,
+    {
+      method: 'POST',
+      credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ handle }),
+    }
+  );
+  if (!response.ok) {
+    throw await bitbucketConnectError(
+      response,
+      'Failed to complete the Bitbucket reconnect'
+    );
+  }
+  return response.json();
+}
+
+export async function disconnectBitbucket(trackerId: string): Promise<void> {
+  const response = await fetchWithAuth(
+    `/api/v1/auth/bitbucket/trackers/${encodeURIComponent(trackerId)}/disconnect`,
+    { method: 'POST' }
+  );
+  if (!response.ok) {
+    throw await bitbucketConnectError(
+      response,
+      'Failed to disconnect the Bitbucket connection'
+    );
+  }
 }
 
 // GitHub App OAuth API
@@ -6536,5 +7678,175 @@ export async function getConfigurationCapabilities(): Promise<ConfigurationCapab
   const response = await fetchWithAuth('/api/v1/configuration-capabilities');
   if (!response.ok)
     throw new Error('Configuration capabilities are unavailable');
+  return response.json();
+}
+
+export {
+  createLegalHold,
+  createPeriodExport,
+  downloadEvidence,
+  downloadEvidenceMember,
+  getAuditChainSegment,
+  getAuditChainStatus,
+  getEvidenceStatus,
+  getRetentionSettings,
+  listAuditChainCheckpoints,
+  listEvidenceMembers,
+  listLegalHolds,
+  listSigningKeys,
+  previewRetentionPurge,
+  readEvidenceMember,
+  releaseLegalHold,
+  rotateSigningKey,
+  updateRetentionSettings,
+  verifyAuditChain,
+} from './records-api';
+export type {
+  BinaryDownload,
+  ChainBreak,
+  ChainCheckpoint,
+  ChainSegment,
+  ChainStatus,
+  ChainVerifyResult,
+  EvidenceMember,
+  EvidenceMemberList,
+  EvidenceStatus,
+  LegalHold,
+  PurgePreview,
+  RetentionClass,
+  RetentionSettings,
+  SigningKey,
+  SigningKeyList,
+} from './records-api';
+
+/** One agent tool reported by opt-in workstation discovery. */
+export interface DiscoveredAgentCandidate {
+  id: string;
+  agent_kind: string;
+  agent_version: string | null;
+  workstation_fingerprint: string;
+  config_path_hash: string;
+  mcp_server_count: number;
+  enrolled: boolean;
+  os_family: string | null;
+  status: 'new' | 'onboarded' | 'ignored';
+  managed_agent_id: string | null;
+  first_seen_at: string;
+  last_seen_at: string;
+}
+
+/** Capped console list plus the full matching count. */
+export interface DiscoveryCandidatePage {
+  items: DiscoveredAgentCandidate[];
+  total: number;
+  truncated: boolean;
+}
+
+/**
+ * List candidates reported by `preloop agents discover --report`.
+ * GET /api/v1/agents/discovery-candidates
+ *
+ * `items` is at most the server cap. `total` counts every match, and
+ * `truncated` is true when the fleet is larger than `items`.
+ */
+export async function getDiscoveryCandidates(
+  statuses: Array<DiscoveredAgentCandidate['status']> = []
+): Promise<DiscoveryCandidatePage> {
+  const params = new URLSearchParams();
+  statuses.forEach((status) => params.append('status', status));
+  const query = params.toString();
+  const response = await fetchWithAuth(
+    `/api/v1/agents/discovery-candidates${query ? `?${query}` : ''}`
+  );
+  if (!response.ok) {
+    throw new Error('Failed to load discovered agents');
+  }
+  return response.json();
+}
+
+/**
+ * Mark a discovery candidate ignored, or put it back to new.
+ * PATCH /api/v1/agents/discovery-candidates/{id}
+ */
+export async function updateDiscoveryCandidate(
+  candidateId: string,
+  status: 'new' | 'ignored'
+): Promise<DiscoveredAgentCandidate> {
+  const response = await fetchWithAuth(
+    `/api/v1/agents/discovery-candidates/${encodeURIComponent(candidateId)}`,
+    {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ status }),
+    }
+  );
+  if (!response.ok) {
+    throw new Error('Failed to update discovered agent');
+  }
+  return response.json();
+}
+
+export interface HostedModelCatalog {
+  models: Array<{
+    id: string;
+    name: string;
+    provider_name: string;
+    model_identifier: string;
+    alias: string;
+    tariff: {
+      input_price_per_1k: number;
+      output_price_per_1k: number;
+      request_price: number;
+    } | null;
+    available: boolean;
+    operated_by: string;
+    billed_to: 'allowance';
+    own_alias_shadowing: boolean;
+  }>;
+  allowance: {
+    kind: 'one_time' | 'monthly';
+    included_usd: number | null;
+    spent_usd: number | null;
+    held_usd: number | null;
+    remaining_usd: number | null;
+    reset_at: string | null;
+    coverage: 'known' | 'unknown';
+  };
+}
+
+/** Account-bound, authenticated hosted inventory; absent on OSS backends. */
+export async function getHostedModels(): Promise<HostedModelCatalog> {
+  const response = await fetchWithAuth('/api/v1/account/hosted-models');
+  if (!response.ok) throw new Error('Could not load built-in hosted models.');
+  return response.json();
+}
+
+export interface PolicyEvaluationResult {
+  decision: string;
+  matched_rule: string | null;
+  description?: string;
+  checked_rules: {
+    id: string;
+    expression: string | null;
+    matched: boolean;
+    error: string | null;
+  }[];
+  also_matched_rule_ids: string[];
+}
+
+export async function evaluatePolicy(
+  body: Record<string, unknown>
+): Promise<PolicyEvaluationResult> {
+  const response = await fetchWithAuth('/api/v1/policies/evaluate', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (!response.ok) {
+    const errorData = await response.json().catch(() => ({}));
+    throw new Error(
+      extractErrorMessage(errorData, 'Failed to simulate policy')
+    );
+  }
   return response.json();
 }

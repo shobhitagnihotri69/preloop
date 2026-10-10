@@ -646,7 +646,7 @@ func TestPrintDeferredLiveValidationLine_StatusVariants(t *testing.T) {
 				},
 				Duration: 250 * time.Millisecond,
 			},
-			contains: []string{"OpenClaw", "round-trip OK", "openai/gpt-5.4", "latency="},
+			contains: []string{"OpenClaw", "direct gateway route/accounting probe passed", "openai/gpt-5.4", "latency="},
 		},
 		{
 			name: "failed_with_error",
@@ -662,7 +662,7 @@ func TestPrintDeferredLiveValidationLine_StatusVariants(t *testing.T) {
 			},
 			contains: []string{
 				"Codex CLI",
-				"round-trip FAILED",
+				"direct gateway route/accounting probe FAILED",
 				"HTTP 400 boom",
 				"preloop agents validate \"Codex CLI\" --live",
 			},
@@ -1199,8 +1199,8 @@ func TestApplyLiveValidationOutcomesToSummary(t *testing.T) {
 	if !strings.Contains(outcomes[0].Reason, "preloop agents validate") {
 		t.Fatalf("reason should include the re-verify command, got %q", outcomes[0].Reason)
 	}
-	if outcomes[1].Reason != "" {
-		t.Fatalf("passed validation must not add a Reason, got %q", outcomes[1].Reason)
+	if outcomes[1].Reason != directGatewayProbeEvidence {
+		t.Fatalf("passed validation must disclose probe evidence, got %q", outcomes[1].Reason)
 	}
 }
 
@@ -1580,5 +1580,35 @@ func TestLiveValidationRollbackError_ExitAndHintSemantics(t *testing.T) {
 	}
 	if !strings.Contains(outcome.Reason, "model routing was reverted") {
 		t.Fatalf("expected rollback reason in summary, got %q", outcome.Reason)
+	}
+}
+
+// A Preloop budget 429 (#1447) is neither an upstream rate limit nor an
+// upstream billing failure, and the probe must not retry it.
+func TestPreloopBudgetDenialIsNotUpstreamRateLimit(t *testing.T) {
+	budget := &api.APIError{
+		StatusCode: http.StatusTooManyRequests,
+		Body: `{"error":{"message":"Model gateway budget exceeded: account monthly limit reached",` +
+			`"type":"insufficient_quota","code":"insufficient_quota","preloop_code":"budget_limit_exceeded"}}`,
+	}
+	if !isPreloopBudgetDenialValidationError(budget) {
+		t.Fatal("budget 429 must be detected as a Preloop budget denial")
+	}
+	if isUpstreamRateLimitedValidationError(budget) {
+		t.Fatal("budget 429 must not be classified as an upstream rate limit")
+	}
+	if isUpstreamBillingValidationError(budget) {
+		t.Fatal("budget 429 must not be classified as upstream billing")
+	}
+	if isPreloopBudgetDenialValidationError(&api.APIError{
+		StatusCode: http.StatusTooManyRequests,
+		Body:       `{"error":{"type":"rate_limit_error","message":"slow down"}}`,
+	}) {
+		t.Fatal("a plain upstream 429 is not a budget denial")
+	}
+	calls := 0
+	attempts, err := postGatewayProbeWithRetry(func() error { calls++; return budget })
+	if err == nil || attempts != 1 || calls != 1 {
+		t.Fatalf("budget denial must not be retried: attempts=%d calls=%d err=%v", attempts, calls, err)
 	}
 }

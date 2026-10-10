@@ -9,9 +9,15 @@ import { invalidateApiCaches } from '../../api';
 
 describe('CostView', () => {
   let fetchStub: sinon.SinonStub;
+  let accountPayload: Record<string, unknown>;
+  let originalUrl: string;
+  let accountStatus = 200;
+  let membershipsPayload: unknown[] = [];
   // Per-test copy of the payload so a test can add fields (e.g. the imported
   // usage block) without leaking into the others.
   let summaryPayload: Record<string, unknown>;
+  // Per-test accounting self-check answer (GET /cost/health).
+  let healthPayload: Record<string, unknown>;
   // Per-test feature flags; banner tests enable the override UI.
   let featuresPayload: Record<string, unknown>;
   // Per-test reprice POST response; set by banner tests.
@@ -142,9 +148,17 @@ describe('CostView', () => {
   };
 
   beforeEach(() => {
+    accountStatus = 200;
+    membershipsPayload = [];
+    originalUrl = window.location.pathname + window.location.search;
+    accountPayload = {
+      id: '00000000-0000-4000-8000-000000000001',
+      organization_name: 'Example account',
+    };
     localStorage.setItem('accessToken', 'test-access-token');
     localStorage.setItem('refreshToken', 'test-refresh-token');
     summaryPayload = { ...summary };
+    healthPayload = { window_hours: 24, checks: [], status: 'skip' };
     featuresPayload = { billing: true };
     overridesGated = false;
     overridePayload = [];
@@ -173,6 +187,10 @@ describe('CostView', () => {
       async (input: RequestInfo | URL, init?: RequestInit) => {
         const url = typeof input === 'string' ? input : input.toString();
 
+        if (url.includes('/api/v1/account/details'))
+          return new Response(JSON.stringify(accountPayload), {
+            status: accountStatus,
+          });
         if (url.includes('/api/v1/billing/cost/reprice/')) {
           return new Response(JSON.stringify(jobStatus));
         }
@@ -234,6 +252,12 @@ describe('CostView', () => {
             }
           );
         }
+        if (url.includes('/api/v1/cost/health')) {
+          return new Response(JSON.stringify(healthPayload), {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' },
+          });
+        }
         if (url.includes('/api/v1/cost/summary')) {
           return new Response(JSON.stringify(summaryPayload), {
             status: 200,
@@ -249,6 +273,21 @@ describe('CostView', () => {
             status: 200,
             headers: { 'Content-Type': 'application/json' },
           });
+        }
+        if (url.includes('/api/v1/me/memberships')) {
+          return new Response(JSON.stringify(membershipsPayload), {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' },
+          });
+        }
+        if (url.includes('/api/v1/auth/switch-account')) {
+          return new Response(
+            JSON.stringify({
+              access_token: 'switched-access-token',
+              refresh_token: 'switched-refresh-token',
+            }),
+            { status: 200, headers: { 'Content-Type': 'application/json' } }
+          );
         }
         if (url.includes('/api/v1/features')) {
           return new Response(JSON.stringify({ features: featuresPayload }), {
@@ -268,6 +307,7 @@ describe('CostView', () => {
   });
 
   afterEach(() => {
+    window.history.replaceState({}, '', originalUrl);
     fetchStub.restore();
     localStorage.clear();
     sessionStorage.clear();
@@ -371,6 +411,15 @@ describe('CostView', () => {
     expect(groups.find((row) => row.flowId === 'flow-older')?.cost).to.equal(6);
     expect(groups.find((row) => row.agentId === 'agent-1')?.cost).to.equal(8.5);
     expect(groups).to.have.length(3);
+    // Summary loading completes before the lazy Agents tab has rendered.
+    await waitUntil(
+      () =>
+        !!element.shadowRoot!.querySelector(
+          'a[href="/console/flows/flow-review"]'
+        ),
+      'the complete flow total row did not render',
+      { timeout: 5000 }
+    );
     const flowLink = element.shadowRoot!.querySelector(
       'a[href="/console/flows/flow-review"]'
     )!;
@@ -727,16 +776,345 @@ describe('CostView', () => {
       ?.querySelector('view-header')
       ?.getAttribute('description');
     expect(description).to.equal(
-      'Understand gateway spend by agent, tool, session and user.'
+      'Understand gateway spend by agent, tool, session and user, plus imported GitHub Copilot spend.'
     );
 
     const tabs = Array.from(
       element.shadowRoot?.querySelectorAll('sl-tab[slot="nav"]') || []
     ).map((tab) => tab.textContent?.trim());
-    expect(tabs).to.deep.equal(['Agents', 'Tools', 'Sessions', 'Users']);
+    // Copilot appears only once a connection exists (none is mocked here).
+    expect(tabs).to.deep.equal([
+      'Agents',
+      'Models',
+      'Tools',
+      'Sessions',
+      'Users',
+    ]);
     for (const promised of ['model', 'flow', 'API key']) {
       expect(description).to.not.contain(promised);
     }
+  });
+
+  const loadedView = async () => {
+    const element = (await fixture(html`<cost-view></cost-view>`)) as CostView;
+    await waitUntil(
+      () => (element as unknown as { loading: boolean }).loading === false
+    );
+    await element.updateComplete;
+    return element;
+  };
+  const navTabs = (element: CostView) =>
+    Array.from(
+      element.shadowRoot?.querySelectorAll('sl-tab[slot="nav"]') || []
+    ).map((tab) => tab.textContent?.trim());
+
+  it('lists spend by model in a sortable Models tab', async () => {
+    summaryPayload = {
+      ...summaryPayload,
+      usage_by_model: [
+        ...(summaryPayload.usage_by_model as unknown[]),
+        {
+          ai_model_id: 'model-2',
+          model_alias: 'claude-test',
+          provider_name: 'anthropic',
+          request_count: 9,
+          token_usage: {
+            prompt_tokens: 10,
+            completion_tokens: 5,
+            total_tokens: 15,
+          },
+          estimated_cost: 1.25,
+        },
+      ],
+    };
+    const element = await loadedView();
+    await element['handleTabShow'](
+      new CustomEvent('sl-tab-show', { detail: { name: 'models' } })
+    );
+    await element.updateComplete;
+    expect(
+      fetchStub
+        .getCalls()
+        .some((call) => String(call.args[0]).includes('breakdown=models'))
+    ).to.equal(true);
+    const table = element.shadowRoot!.querySelector(
+      'table[aria-label="Spend by model"]'
+    );
+    expect(table).to.exist;
+    const names = () =>
+      Array.from(table!.querySelectorAll('tbody tr')).map((row) =>
+        row.querySelector('.model-name')?.textContent?.trim()
+      );
+    // Highest cost first, like the API usage breakdown.
+    expect(names()).to.deep.equal(['gpt-test', 'claude-test']);
+    const firstRow = table!.querySelector('tbody tr')!;
+    expect(firstRow.textContent).to.contain('openai');
+    expect(firstRow.textContent).to.contain('$8.50');
+
+    const requestsHeader = Array.from(table!.querySelectorAll('th')).find(
+      (th) => th.textContent?.trim().startsWith('Requests')
+    ) as HTMLElement;
+    requestsHeader.dispatchEvent(
+      new KeyboardEvent('keydown', { key: 'Enter' })
+    );
+    await element.updateComplete;
+    expect(names()).to.deep.equal(['claude-test', 'gpt-test']);
+  });
+
+  it('shows a daily spend strip above the tabs', async () => {
+    summaryPayload = {
+      ...summaryPayload,
+      requests_by_day: [
+        {
+          date: '2026-03-01',
+          request_count: 4,
+          estimated_cost: 2.5,
+          total_tokens: 100,
+        },
+        {
+          date: '2026-03-02',
+          request_count: 8,
+          estimated_cost: 6,
+          total_tokens: 200,
+        },
+      ],
+    };
+    const element = await loadedView();
+    await waitUntil(
+      () => element.shadowRoot!.querySelector('[data-testid="daily-spend"]'),
+      'the daily strip renders once the days breakdown lands'
+    );
+    expect(
+      fetchStub
+        .getCalls()
+        .some((call) => String(call.args[0]).includes('breakdown=days'))
+    ).to.equal(true);
+    const strip = element.shadowRoot!.querySelector(
+      '[data-testid="daily-spend"]'
+    )!;
+    const bars = strip.querySelectorAll('.daily-bar');
+    expect(bars).to.have.length(2);
+    expect(bars[1].getAttribute('aria-label')).to.contain('$6.00');
+    expect(bars[1].getAttribute('aria-label')).to.contain('8 requests');
+    expect(strip.textContent!.replace(/\s+/g, ' ')).to.contain(
+      '$8.50 across 12 requests'
+    );
+    // The strip sits above the tab group.
+    const card = element.shadowRoot!.querySelector('.analytics-card')!;
+    expect(
+      strip.compareDocumentPosition(card) & Node.DOCUMENT_POSITION_FOLLOWING
+    ).to.not.equal(0);
+  });
+
+  it('offers one Spend settings control with every destination', async () => {
+    const element = await loadedView();
+    const dropdown = element.shadowRoot!.querySelector(
+      'sl-dropdown.spend-settings'
+    );
+    expect(dropdown).to.exist;
+    const trigger = dropdown!.querySelector('sl-button[slot="trigger"]');
+    expect(trigger?.textContent).to.contain('Spend settings');
+    const items = Array.from(dropdown!.querySelectorAll('sl-menu-item'));
+    expect(items.map((item) => item.textContent?.trim())).to.deep.equal([
+      'Budget limits',
+      'Price overrides',
+      'Imports',
+      'Outlier alerts',
+    ]);
+    // Outlier alerts stay on Attention: the item links there.
+    const outlier = dropdown!.querySelector('sl-menu-item[value="outliers"]')!;
+    expect(outlier.getAttribute('data-href')).to.equal(
+      '/console/attention#spend-outliers'
+    );
+    for (const item of items) {
+      expect(item.getAttribute('value')).to.be.a('string');
+    }
+
+    // Imports reveals the Copilot setup even without a connection.
+    expect(navTabs(element)).to.not.include('Copilot');
+    element['openSpendSetting']('imports');
+    await element.updateComplete;
+    expect(navTabs(element)).to.include('Copilot');
+    expect((element as unknown as { activeTab: string }).activeTab).to.equal(
+      'copilot'
+    );
+    // The panel itself is selected, not only the tab indicator.
+    const copilotPanel = element.shadowRoot!.querySelector(
+      'sl-tab-panel[name="copilot"]'
+    ) as HTMLElement & { active: boolean };
+    await waitUntil(() => copilotPanel.active, 'the Copilot panel is shown');
+    const agentsPanel = element.shadowRoot!.querySelector(
+      'sl-tab-panel[name="agents"]'
+    ) as HTMLElement & { active: boolean };
+    expect(agentsPanel.active).to.equal(false);
+    await waitUntil(
+      () => copilotPanel.querySelector('copilot-usage-panel'),
+      'the Copilot setup panel renders'
+    );
+  });
+
+  it('moves focus to the section a Spend settings destination opens', async () => {
+    featuresPayload = { billing: true, model_price_overrides: true };
+    const element = await loadedView();
+    await waitUntil(
+      () => element.shadowRoot!.querySelector('#panel-pricing'),
+      'the pricing card renders'
+    );
+    element['openSpendSetting']('pricing');
+    expect(element.shadowRoot!.activeElement?.id).to.equal('panel-pricing');
+    await waitUntil(() => element.shadowRoot!.querySelector('#panel-budgets'));
+    element['openSpendSetting']('budgets');
+    expect(element.shadowRoot!.activeElement?.id).to.equal('panel-budgets');
+  });
+
+  it('shows the Copilot tab once a Copilot connection exists', async () => {
+    fetchStub.callsFake(async (input: RequestInfo | URL) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      if (url.includes('/api/v1/cost/copilot')) {
+        return new Response(
+          JSON.stringify({ connection: { id: 'c-1', organization: 'acme' } }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        );
+      }
+      if (url.includes('/api/v1/cost/summary')) {
+        return new Response(JSON.stringify(summaryPayload), { status: 200 });
+      }
+      return new Response('[]', { status: 200 });
+    });
+    const element = await loadedView();
+    await waitUntil(() => navTabs(element).includes('Copilot'));
+    const copilotCalls = () =>
+      fetchStub
+        .getCalls()
+        .filter((call) => String(call.args[0]).includes('/api/v1/cost/copilot'))
+        .length;
+    const before = copilotCalls();
+    // A range change reloads the summary but not the connection check.
+    await element['load']();
+    await element.updateComplete;
+    expect(copilotCalls()).to.equal(before);
+    expect(navTabs(element)).to.include('Copilot');
+  });
+
+  it('shows the Copilot tab for a Copilot provider billing connection', async () => {
+    fetchStub.callsFake(async (input: RequestInfo | URL) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      if (url.includes('/api/v1/billing/provider-billing/connections')) {
+        return new Response(
+          JSON.stringify([{ id: 'p-1', provider: 'github_copilot' }]),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        );
+      }
+      if (url.includes('/api/v1/cost/summary')) {
+        return new Response(JSON.stringify(summaryPayload), { status: 200 });
+      }
+      return new Response('[]', { status: 200 });
+    });
+    const element = await loadedView();
+    await waitUntil(() => navTabs(element).includes('Copilot'));
+  });
+
+  it('renders imported Copilot spend in its own tab for the page window', async () => {
+    const element = (await fixture(html`<cost-view></cost-view>`)) as CostView;
+    await waitUntil(
+      () => (element as unknown as { loading: boolean }).loading === false
+    );
+    await element['handleTabShow'](
+      new CustomEvent('sl-tab-show', { detail: { name: 'copilot' } })
+    );
+    await element.updateComplete;
+
+    const panel = element.shadowRoot!.querySelector('copilot-usage-panel') as
+      (HTMLElement & { startDate?: string; endDate?: string }) | null;
+    expect(panel).to.not.equal(null);
+    const period = (
+      element as unknown as {
+        currentPeriod: { startDate: string; endDate: string };
+      }
+    ).currentPeriod;
+    expect(panel!.startDate).to.equal(period.startDate);
+    expect(panel!.endDate).to.equal(period.endDate);
+    await waitUntil(() =>
+      fetchStub
+        .getCalls()
+        .some((call) => String(call.args[0]).includes('/api/v1/cost/copilot'))
+    );
+  });
+
+  it('shows a Teams tab only with team budgets on a server with teams', async () => {
+    const tabsOf = async () => {
+      const element = (await fixture(
+        html`<cost-view></cost-view>`
+      )) as CostView;
+      await waitUntil(
+        () => (element as unknown as { loading: boolean }).loading === false
+      );
+      await waitUntil(
+        () =>
+          Object.keys(
+            (element as unknown as { featureFlags: object }).featureFlags
+          ).length > 0
+      );
+      await element.updateComplete;
+      return Array.from(
+        element.shadowRoot?.querySelectorAll('sl-tab[slot="nav"]') || []
+      ).map((tab) => tab.textContent?.trim());
+    };
+    featuresPayload = { billing: true, team_budgets: true };
+    expect(await tabsOf()).to.not.include('Teams');
+    invalidateApiCaches();
+    featuresPayload = { billing: true, team_management: true };
+    expect(await tabsOf()).to.not.include('Teams');
+    invalidateApiCaches();
+    featuresPayload = {
+      billing: true,
+      team_budgets: true,
+      team_management: true,
+    };
+    expect(await tabsOf()).to.include('Teams');
+  });
+
+  it('loads team spend for the page window when the Teams tab opens', async () => {
+    featuresPayload = {
+      billing: true,
+      team_budgets: true,
+      team_management: true,
+    };
+    const element = (await fixture(html`<cost-view></cost-view>`)) as CostView;
+    await waitUntil(
+      () => (element as unknown as { loading: boolean }).loading === false
+    );
+    await element['handleTabShow'](
+      new CustomEvent('sl-tab-show', { detail: { name: 'teams' } })
+    );
+    await element.updateComplete;
+    const panel = element.shadowRoot!.querySelector('team-budgets-panel') as
+      (HTMLElement & { startDate?: string; endDate?: string }) | null;
+    expect(panel).to.not.equal(null);
+    const period = (
+      element as unknown as {
+        currentPeriod: { startDate: string; endDate: string };
+      }
+    ).currentPeriod;
+    expect(panel!.startDate).to.equal(period.startDate);
+    await waitUntil(() =>
+      fetchStub
+        .getCalls()
+        .some((call) => String(call.args[0]).includes('/usage/teams?start='))
+    );
+  });
+
+  it('never calls the team budget endpoints without the capability', async () => {
+    const element = (await fixture(html`<cost-view></cost-view>`)) as CostView;
+    await waitUntil(
+      () => (element as unknown as { loading: boolean }).loading === false
+    );
+    await element.updateComplete;
+    expect(
+      fetchStub
+        .getCalls()
+        .some((call) => /team-budgets|usage\/teams/.test(String(call.args[0])))
+    ).to.equal(false);
   });
 
   describe('imported usage section', () => {
@@ -774,6 +1152,19 @@ describe('CostView', () => {
       await waitUntil(
         () => (element as unknown as { loading: boolean }).loading === false
       );
+      if (
+        imported &&
+        typeof imported === 'object' &&
+        (imported as { event_count?: number }).event_count
+      ) {
+        await waitUntil(
+          () =>
+            (element as unknown as { sectionStates: Record<string, string> })
+              .sectionStates.imported === 'ready',
+          'the imported breakdown must finish separately from the summary',
+          { timeout: 10000 }
+        );
+      }
       await element.updateComplete;
       return element;
     }
@@ -1002,7 +1393,7 @@ describe('CostView', () => {
 
     const description = header?.shadowRoot?.querySelector('.description');
     expect(description?.textContent).to.contain(
-      'Understand gateway spend by agent, tool, session and user.'
+      'Understand gateway spend by agent, tool, session and user, plus imported GitHub Copilot spend.'
     );
   });
 
@@ -1276,6 +1667,50 @@ describe('CostView', () => {
       // "unknown" is the backend placeholder for rows with no model alias;
       // pre-filling it would create a no-op override, so the field is empty.
       expect(state.priceModelAlias).to.equal('');
+    });
+  });
+
+  describe('unpriced banner without billing or price overrides', () => {
+    beforeEach(() => {
+      featuresPayload = {};
+      summaryPayload = {
+        ...summary,
+        unpriced_requests: 2,
+        unpriced_tokens: 6000,
+        unpriced_models: [
+          { model: 'local/example-model', requests: 2, tokens: 6000 },
+        ],
+      };
+    });
+
+    it('explains the gap and links somewhere useful instead of alarming', async () => {
+      const element = (await fixture(
+        html`<cost-view></cost-view>`
+      )) as CostView;
+      await waitUntil(
+        () =>
+          element.shadowRoot
+            ?.querySelector('#panel-pricing-catalog')
+            ?.classList.contains('unpriced-explanation'),
+        'the explanation did not replace the warning'
+      );
+      const banner = element.shadowRoot!.querySelector(
+        '#panel-pricing-catalog'
+      )!;
+      expect(banner.getAttribute('variant')).to.equal('neutral');
+      expect(banner.getAttribute('role')).to.equal('status');
+      const text = banner.textContent!.replace(/\s+/g, ' ');
+      expect(text).to.contain('local/example-model');
+      expect(text).to.contain("can't be priced on this deployment");
+      expect(text).to.not.contain('understated');
+      expect(banner.querySelector('sl-button')).to.not.exist;
+      const links = [...banner.querySelectorAll('a')].map((link) =>
+        link.getAttribute('href')
+      );
+      expect(links).to.include('/console/ai-models');
+      expect(links.some((href) => href?.startsWith('https://docs.'))).to.equal(
+        true
+      );
     });
   });
 
@@ -1713,6 +2148,341 @@ describe('CostView', () => {
       expect(rows(element)[0].getAttribute('data-override-id')).to.equal(
         'override-active-1'
       );
+    });
+  });
+  const digestStart = '2026-09-17T09:00:00.123456Z';
+  const digestEnd = '2026-09-24T09:00:00.654321Z';
+  const digestAccount = '00000000-0000-4000-8000-000000000001';
+  const digestUrl = `/console/cost?account_id=${digestAccount}&start_date=${digestStart}&end_date=${digestEnd}&panel=pricing`;
+  const costUrls = () =>
+    fetchStub
+      .getCalls()
+      .map((call) => String(call.args[0]))
+      .filter((url) => url.includes('/cost/summary'));
+  const settled = async (element: CostView) => {
+    await waitUntil(
+      () => !(element as unknown as { loading: boolean }).loading
+    );
+    await element.updateComplete;
+  };
+
+  it('uses the exact digest period for headline and lazy data without saving the preset', async () => {
+    localStorage.setItem('preloop.cost.dateRange', 'this-month');
+    window.history.replaceState({}, '', digestUrl);
+    const element = await fixture<CostView>(html`<cost-view></cost-view>`);
+    await settled(element);
+    const internals = element as unknown as {
+      loadTab(tab: string): Promise<void>;
+      getProjectedPeriodCost(): number | null;
+      previousRangeSummary: unknown;
+    };
+    await internals.loadTab('sessions');
+    expect(costUrls().length).to.be.greaterThan(0);
+    for (const url of costUrls()) {
+      const params = new URL(url, window.location.origin).searchParams;
+      expect(params.get('start_date')).to.equal(digestStart);
+      expect(params.get('end_date')).to.equal(digestEnd);
+      expect(params.has('account_id')).to.equal(false);
+    }
+    expect(localStorage.getItem('preloop.cost.dateRange')).to.equal(
+      'this-month'
+    );
+    expect(element.shadowRoot?.textContent).not.to.contain('Compared to');
+    expect(element.shadowRoot?.textContent).not.to.contain('Month to date');
+    expect(element.shadowRoot?.textContent).not.to.contain('Projected month');
+    expect(element.shadowRoot?.textContent).to.contain('end exclusive');
+    expect(element.shadowRoot?.textContent).to.contain('Example account');
+    expect(internals.previousRangeSummary).to.equal(null);
+    expect(internals.getProjectedPeriodCost()).to.equal(null);
+  });
+
+  it('selecting the stored preset exits digest mode, and popstate restores it', async () => {
+    localStorage.setItem('preloop.cost.dateRange', 'last-30');
+    window.history.replaceState({}, '', digestUrl);
+    const element = await fixture<CostView>(html`<cost-view></cost-view>`);
+    await settled(element);
+    element.shadowRoot
+      ?.querySelector('time-range-select')
+      ?.dispatchEvent(
+        new CustomEvent('range-change', { detail: { value: 'last-30' } })
+      );
+    await settled(element);
+    expect(window.location.search).to.equal('?panel=pricing');
+    expect(element.shadowRoot?.textContent).not.to.contain('Digest period:');
+    window.history.replaceState({}, '', digestUrl);
+    window.dispatchEvent(new PopStateEvent('popstate'));
+    await settled(element);
+    expect(element.shadowRoot?.textContent).to.contain('Digest period:');
+    const last = new URL(
+      costUrls()[costUrls().length - 1],
+      window.location.origin
+    );
+    expect(last.searchParams.get('start_date')).to.equal(digestStart);
+  });
+
+  it('ordinary preset changes add no history entry and leaving digest mode drops the account label', async () => {
+    localStorage.setItem('preloop.cost.dateRange', 'last-30');
+    window.history.replaceState({}, '', digestUrl);
+    const element = await fixture<CostView>(html`<cost-view></cost-view>`);
+    await settled(element);
+    expect(element.shadowRoot?.textContent).to.contain('Active account:');
+    const pushSpy = sinon.spy(window.history, 'pushState');
+    try {
+      const select = element.shadowRoot?.querySelector('time-range-select');
+      select?.dispatchEvent(
+        new CustomEvent('range-change', { detail: { value: 'last-7' } })
+      );
+      await settled(element);
+      expect(pushSpy.callCount).to.equal(1);
+      expect(element.shadowRoot?.textContent).not.to.contain('Active account:');
+      select?.dispatchEvent(
+        new CustomEvent('range-change', { detail: { value: 'last-30' } })
+      );
+      await settled(element);
+      expect(pushSpy.callCount).to.equal(1);
+    } finally {
+      pushSpy.restore();
+    }
+  });
+
+  it('blocks mismatched accounts before every analytics request and rechecks after switching', async () => {
+    accountPayload.id = '00000000-0000-4000-8000-000000000002';
+    window.history.replaceState({}, '', digestUrl);
+    const element = await fixture<CostView>(html`<cost-view></cost-view>`);
+    await settled(element);
+    expect(costUrls()).to.have.length(0);
+    expect(element.shadowRoot?.textContent).to.contain(
+      'This digest belongs to a different account'
+    );
+    expect(
+      element.shadowRoot?.querySelector('[aria-label="Cost summary metrics"]')
+    ).not.to.exist;
+    expect(window.location.search).to.contain('account_id=');
+    accountPayload.id = digestAccount;
+    window.dispatchEvent(new PopStateEvent('popstate'));
+    await settled(element);
+    expect(costUrls().length).to.be.greaterThan(0);
+  });
+
+  it('invalid account links issue no analytics query; invalid dates fall back to the stored preset', async () => {
+    window.history.replaceState(
+      {},
+      '',
+      digestUrl + `&account_id=${digestAccount}`
+    );
+    const element = await fixture<CostView>(html`<cost-view></cost-view>`);
+    await settled(element);
+    expect(costUrls()).to.have.length(0);
+    expect(element.shadowRoot?.textContent).to.contain(
+      'Invalid digest account link'
+    );
+    localStorage.setItem('preloop.cost.dateRange', 'last-7');
+    window.history.replaceState(
+      {},
+      '',
+      '/console/cost?start_date=2026-02-30T00:00:00Z&end_date=' + digestEnd
+    );
+    window.dispatchEvent(new PopStateEvent('popstate'));
+    await settled(element);
+    expect(costUrls().length).to.be.greaterThan(0);
+    expect(costUrls().every((url) => !url.includes('2026-02-30'))).to.equal(
+      true
+    );
+    expect(element.shadowRoot?.textContent).to.contain(
+      'Invalid digest date range'
+    );
+  });
+  it('unauthorized account context cannot load digest figures', async () => {
+    accountStatus = 403;
+    window.history.replaceState({}, '', digestUrl);
+    const element = await fixture<CostView>(html`<cost-view></cost-view>`);
+    await settled(element);
+    expect(costUrls()).to.have.length(0);
+    expect(
+      element.shadowRoot?.querySelector('[aria-label="Cost summary metrics"]')
+    ).not.to.exist;
+    expect(element.shadowRoot?.textContent).to.contain(
+      'Failed to fetch account details'
+    );
+  });
+
+  describe('subscription workload and accounting health (#1401)', () => {
+    async function loadView(): Promise<CostView> {
+      const element = (await fixture(
+        html`<cost-view></cost-view>`
+      )) as CostView;
+      await waitUntil(
+        () => (element as unknown as { loading: boolean }).loading === false
+      );
+      await element.updateComplete;
+      return element;
+    }
+
+    it('shows subscription workload apart from spend, labelled as an estimate with coverage', async () => {
+      summaryPayload = {
+        ...summary,
+        subscription_usage: {
+          request_count: 4,
+          prompt_tokens: 300,
+          completion_tokens: 100,
+          total_tokens: 400,
+          api_equivalent_cost: 1.25,
+          api_equivalent_cost_is_estimate: true,
+          covered_requests: 3,
+          coverage: 0.75,
+          billed: null,
+          billed_available: false,
+        },
+      };
+      const element = await loadView();
+
+      const spend = element.shadowRoot?.querySelector(
+        '[aria-label="Cost summary metrics"]'
+      );
+      expect(spend?.textContent).to.contain('$8.50');
+      expect(spend?.textContent).not.to.contain('$1.25');
+
+      const block = element.shadowRoot?.querySelector(
+        '[aria-label="Subscription workload"]'
+      );
+      expect(block).to.exist;
+      const text = (block?.textContent ?? '').replace(/\s+/g, ' ');
+      expect(text).to.contain('not included in spend above');
+      expect(text).to.contain('API-equivalent cost (estimate)');
+      expect(text).to.contain('$1.25');
+      expect(text).to.contain('Coverage 75%: 3 of 4 requests');
+      const billed = block?.querySelector(
+        '[data-testid="subscription-billed"]'
+      );
+      expect(billed?.textContent).to.contain('Not tracked');
+    });
+
+    it('renders no subscription block when the window has none', async () => {
+      const element = await loadView();
+      expect(
+        element.shadowRoot?.querySelector(
+          '[aria-label="Subscription workload"]'
+        )
+      ).to.equal(null);
+      expect(
+        element.shadowRoot?.querySelector('[aria-label="Accounting health"]')
+      ).to.equal(null);
+    });
+
+    it('surfaces the subscription billing and token detail findings, not passing checks', async () => {
+      healthPayload = {
+        window_hours: 24,
+        status: 'warn',
+        checks: [
+          { key: 'costs_priced', status: 'pass', detail: 'priced fine' },
+          {
+            key: 'token_details_normalized',
+            status: 'warn',
+            detail:
+              '2 of 5 requests with provider cache/reasoning detail have normalized cache/reasoning columns that are missing or differ',
+          },
+          {
+            key: 'subscription_billing_coverage',
+            status: 'warn',
+            detail:
+              'Subscription billing coverage unavailable: API-equivalent cost is an estimate, billed subscription dollars are not tracked. 4 subscription requests in window.',
+          },
+        ],
+      };
+      const element = await loadView();
+      await waitUntil(
+        () =>
+          element.shadowRoot?.querySelector('[aria-label="Accounting health"]'),
+        'the accounting findings must render'
+      );
+      const alert = element.shadowRoot?.querySelector(
+        '[aria-label="Accounting health"]'
+      );
+      const items = Array.from(alert?.querySelectorAll('li') ?? []).map(
+        (item) => item.getAttribute('data-check')
+      );
+      expect(items).to.deep.equal([
+        'token_details_normalized',
+        'subscription_billing_coverage',
+      ]);
+      expect(alert?.textContent).to.contain(
+        'Subscription billing coverage unavailable'
+      );
+      expect(alert?.textContent).not.to.contain('priced fine');
+      // Health has its own lookback; say so next to the range-scoped block.
+      expect(alert?.textContent).to.contain('last 24 hours');
+    });
+  });
+
+  describe('digest from another account', () => {
+    const otherAccount = '00000000-0000-4000-8000-000000000002';
+
+    function notice(element: CostView): Element | null {
+      return element.shadowRoot!.querySelector('.digest-notice');
+    }
+
+    it('tells an open-source user to sign in to the other account', async () => {
+      accountPayload.id = otherAccount;
+      featuresPayload = {};
+      window.history.replaceState({}, '', digestUrl);
+      const element = await fixture<CostView>(html`<cost-view></cost-view>`);
+      await settled(element);
+      await waitUntil(() =>
+        notice(element)?.textContent?.includes('Sign in to that account')
+      );
+      expect(notice(element)?.querySelector('sl-button')).to.not.exist;
+      expect(
+        fetchStub
+          .getCalls()
+          .some((call) => String(call.args[0]).includes('/me/memberships'))
+      ).to.equal(false);
+    });
+
+    it('offers to switch when the person is a member of that account', async () => {
+      accountPayload.id = otherAccount;
+      featuresPayload = { multi_account: true };
+      membershipsPayload = [
+        { account_id: otherAccount, account_name: 'Current account' },
+        { account_id: digestAccount, account_name: 'Example subsidiary' },
+      ];
+      window.history.replaceState({}, '', digestUrl);
+      const element = await fixture<CostView>(html`<cost-view></cost-view>`);
+      await settled(element);
+      await waitUntil(() => notice(element)?.querySelector('sl-button'));
+      await element.updateComplete;
+      const button = notice(element)!.querySelector('sl-button')!;
+      expect(button.textContent?.trim()).to.equal(
+        'Switch to Example subsidiary and open'
+      );
+
+      const navigate = sinon.stub(element as any, 'navigateAfterSwitch');
+      (button as HTMLElement).click();
+      await waitUntil(() => navigate.called, 'did not navigate after switch');
+      const switchCall = fetchStub
+        .getCalls()
+        .find((call) => String(call.args[0]).includes('/auth/switch-account'));
+      expect(JSON.parse(String(switchCall!.args[1].body))).to.deep.equal({
+        account_id: digestAccount,
+      });
+      // The same digest link reopens in the switched account.
+      expect(navigate.firstCall.args[0]).to.contain(
+        `account_id=${digestAccount}`
+      );
+    });
+
+    it('says so when the person is not a member of that account', async () => {
+      accountPayload.id = otherAccount;
+      featuresPayload = { multi_account: true };
+      membershipsPayload = [
+        { account_id: otherAccount, account_name: 'Current account' },
+      ];
+      window.history.replaceState({}, '', digestUrl);
+      const element = await fixture<CostView>(html`<cost-view></cost-view>`);
+      await settled(element);
+      await waitUntil(() =>
+        notice(element)?.textContent?.includes('not a member')
+      );
+      expect(notice(element)?.querySelector('sl-button')).to.not.exist;
     });
   });
 });

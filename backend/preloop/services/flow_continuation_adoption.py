@@ -25,12 +25,19 @@ from preloop.schemas.flow_continuation import (
     ContinuationPreview,
 )
 from preloop.services.flow_artifacts import artifact_thread_id, artifact_reference
-from preloop.services.flow_feedback import feedback_policy, register_thread
+from preloop.services.flow_feedback import (
+    CODE_HOSTS,
+    _repository_identity,
+    bound_repository,
+    feedback_policy,
+    register_thread,
+)
 from preloop.services.flow_pr_binding import normalize_pr_url
 from preloop.services.flow_feedback_provider import (
     FeedbackProvider,
     feedback_tracker_options,
 )
+from preloop.services.managed_credentials import tracker_credential_source
 from preloop.sync.trackers.factory import create_tracker_client
 
 
@@ -94,22 +101,23 @@ def _load_source(
             )
         payload = details.get("payload") or {}
         repository = payload.get("repository") or payload.get("project") or {}
-        repository_id = repository.get("id")
         provider = details.get("source")
+        tracker_ref = details.get("tracker_id") or flow.trigger_event_source
+        if provider not in CODE_HOSTS:
+            # A Jira-triggered run published to its bound repository; key the
+            # adoption on that code host, as register_thread does.
+            bound = bound_repository(db, flow, details)
+            if bound is not None:
+                provider, tracker_ref, repository = bound
+        repository_id = _repository_identity(provider, repository)
         number = urlparse(pr_url).path.rstrip("/").split("/")[-1]
         try:
-            tracker_id = UUID(
-                str(details.get("tracker_id") or flow.trigger_event_source)
-            )
+            tracker_id = UUID(str(tracker_ref))
         except (ValueError, TypeError, AttributeError) as exc:
             raise ContinuationAdoptionError(
                 "Execution has no valid tracker binding"
             ) from exc
-        if (
-            provider not in {"github", "gitlab"}
-            or not repository_id
-            or not number.isdigit()
-        ):
+        if provider not in CODE_HOSTS or not repository_id or not number.isdigit():
             raise ContinuationAdoptionError(
                 "Execution has no valid provider PR binding"
             )
@@ -145,11 +153,30 @@ def _load_source(
                 native = None
         now = datetime.now(UTC)
 
+        def recoverable(artifact: Any) -> bool:
+            """True when restore can still read this row.
+
+            A clean workspace checkpoint stores no ciphertext. It is recoverable
+            when the manifest says so, matching ``get_artifact``. Any other
+            kind still needs a payload.
+            """
+            if artifact is None:
+                return False
+            if artifact.ciphertext is not None:
+                return True
+            manifest = artifact.manifest if isinstance(artifact.manifest, dict) else {}
+            metadata = manifest.get("metadata")
+            return bool(
+                getattr(artifact, "kind", None) == "workspace"
+                and getattr(artifact, "availability", None) == "available"
+                and isinstance(metadata, dict)
+                and metadata.get("metadata_only") is True
+            )
+
         def available(artifact: Any) -> bool:
             return bool(
-                artifact is not None
+                recoverable(artifact)
                 and artifact.execution_id == execution_id
-                and artifact.ciphertext is not None
                 and artifact.expires_at.replace(tzinfo=UTC) > now
             )
 
@@ -208,6 +235,7 @@ def _load_source(
             "tracker_id": tracker_id,
             "tracker_key": tracker.resolved_api_key,
             "tracker_options": feedback_tracker_options(db, tracker),
+            "credential_source": tracker_credential_source(tracker),
         }
 
 
@@ -274,6 +302,7 @@ async def _read_publication(source: dict[str, Any]) -> dict[str, Any]:
         str(source["tracker_id"]),
         source["tracker_key"],
         source["tracker_options"],
+        credential_source=source.get("credential_source"),
     )
     if client is None:
         raise ContinuationAdoptionError("Tracker cannot read the published PR")
@@ -293,6 +322,35 @@ async def _read_publication(source: dict[str, Any]) -> dict[str, Any]:
             "branch": pr.get("head", {}).get("ref"),
             "head_sha": pr.get("head", {}).get("sha"),
             "pr_url": pr.get("html_url"),
+        }
+        return await _feedback_preflight(client, source, publication)
+    if source["provider"] == "bitbucket":
+        from preloop.utils.bitbucket import (
+            looks_like_uuid,
+            normalize_uuid,
+            repository_api_path,
+        )
+
+        base = repository_api_path(source["repository_id"])
+        response = await client._request("GET", f"{base}/pullrequests/{number}")
+        pr = response.json()
+        expected = source["repository_id"].split("/", 1)[-1]
+
+        def repo_matches(repo_obj: Any) -> bool:
+            repo_obj = repo_obj or {}
+            if looks_like_uuid(expected):
+                return normalize_uuid(repo_obj.get("uuid")) == normalize_uuid(expected)
+            return str(repo_obj.get("full_name") or "") == source["repository_id"]
+
+        publication = {
+            "open": str(pr.get("state") or "").upper() == "OPEN",
+            "same_repository": all(
+                repo_matches((pr.get(side) or {}).get("repository"))
+                for side in ("source", "destination")
+            ),
+            "branch": ((pr.get("source") or {}).get("branch") or {}).get("name"),
+            "head_sha": ((pr.get("source") or {}).get("commit") or {}).get("hash"),
+            "pr_url": ((pr.get("links") or {}).get("html") or {}).get("href"),
         }
         return await _feedback_preflight(client, source, publication)
     path = f"/projects/{repository}/merge_requests/{number}"

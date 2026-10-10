@@ -146,6 +146,7 @@ const AGENT_CONTROL_SUPPORTED_KINDS = new Set([
   'opencode',
   'pi',
   'deepseek',
+  'codex',
 ]);
 
 /**
@@ -166,6 +167,22 @@ export function getAgentControlInstallHint(
   );
   const name = agent?.display_name || 'this agent';
   const state = getAgentControlState(agent);
+
+  // The CLI installer knows Codex. The copyable command is install-plugin.
+  // The npm one-liner stays available for a machine that only needs the sidecar.
+  if (kind === 'codex') {
+    const npmCommand = 'npm install -g @preloop-ai/codex-plugin';
+    const pending = state.state === 'install_pending';
+    return {
+      supported: true,
+      command: `preloop agents install-plugin ${shellQuote('Codex CLI')}`,
+      docsUrl: AGENT_CONTROL_DOCS_URL,
+      placeholder: `Install Agent Control to talk to ${name}`,
+      helptext: pending
+        ? `Agent Control config was written but the runtime plugin has not connected yet. Run this on the machine that runs Codex. To install the sidecar directly: ${npmCommand}`
+        : `This agent is not running the Agent Control plugin yet. Run this on the machine that runs Codex, then start it again. To install the sidecar directly: ${npmCommand}`,
+    };
+  }
 
   if (!agent || !AGENT_CONTROL_SUPPORTED_KINDS.has(kind)) {
     return {

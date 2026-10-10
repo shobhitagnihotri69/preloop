@@ -1,4 +1,5 @@
-import { LitElement, html, css, type PropertyValues } from 'lit';
+import { getBrandConfig } from '../brand-config';
+import { LitElement, html, css, nothing, type PropertyValues } from 'lit';
 import { customElement, state } from 'lit/decorators.js';
 import '@shoelace-style/shoelace/dist/components/dropdown/dropdown.js';
 import '@shoelace-style/shoelace/dist/components/menu/menu.js';
@@ -34,6 +35,25 @@ import {
   readAttentionSummary,
   type AttentionSummary,
 } from '../utils/attention-summary';
+import { debugLog } from '../utils/debug';
+import { showToast } from './confirm-dialog';
+
+/** The sentence for a failed bell decision: the server's words when it sent any. */
+function decisionErrorMessage(
+  error: unknown,
+  action: 'approve' | 'decline'
+): string {
+  const message = error instanceof Error ? error.message.trim() : '';
+  return message || `Could not ${action} the request. Try again.`;
+}
+
+/**
+ * Carries the header's unexpired pending-approval count to the shell, which
+ * badges the Approvals nav item. Mirrors `ATTENTION_SUMMARY_EVENT`: the
+ * header already owns the approval fetch, so the shell reads the count
+ * instead of asking a second time.
+ */
+export const PENDING_APPROVALS_EVENT = 'preloop-pending-approvals';
 
 interface UserDetails {
   username: string;
@@ -262,9 +282,10 @@ export class ConsoleHeader extends LitElement {
       background-color: var(--sl-color-danger-500);
       border-radius: 9px;
     }
+    /* Never wider than a phone: a fixed 380px overflowed 360-375px screens. */
     .notification-dropdown {
-      min-width: 380px;
-      max-width: 420px;
+      min-width: min(380px, calc(100vw - 16px));
+      max-width: min(420px, calc(100vw - 16px));
       max-height: 500px;
       overflow-y: auto;
       /* A popover is the one thing allowed on the raised rung. */
@@ -353,6 +374,22 @@ export class ConsoleHeader extends LitElement {
       margin-bottom: 0.25rem;
       font-size: 0.875rem;
     }
+    /* The tool name is the approval row's link: it reads as the title. */
+    a.approval-name {
+      display: block;
+      color: inherit;
+      text-decoration: none;
+    }
+    a.approval-name:hover {
+      text-decoration: underline;
+    }
+    .section-link:focus-visible,
+    a.approval-name:focus-visible,
+    .execution-item:focus-visible,
+    .notification-item:focus-visible {
+      outline: var(--sl-focus-ring);
+      outline-offset: calc(-1 * var(--sl-focus-ring-width));
+    }
     .execution-time,
     .approval-time,
     .notification-time {
@@ -422,15 +459,21 @@ export class ConsoleHeader extends LitElement {
     document.addEventListener('visibilitychange', this.handleVisibilityChange);
     this.pruneAndScheduleApprovalExpiry();
     this.fetchUserDetails();
+    void api
+      .getFeatures()
+      .then((features) => {
+        this.serverVersion = features.server_version || '';
+      })
+      .catch(() => {});
     this.connectToFlowUpdates();
     this.connectToApprovalUpdates();
     this.connectToNotificationUpdates();
     this.loadRunningExecutions();
     this.loadPendingApprovals();
-    this.loadUserNotifications();
-    // Request desktop notification permission when console loads.
-    // Browsers may require a user gesture; if so, user can click the bell icon.
-    this.requestNotificationPermission();
+    // No desktop-notification prompt here. A permission dialog before the
+    // person has done anything is denied out of hand (and browsers demote
+    // sites that do it), after which approval alerts can never be shown.
+    // The bell asks when it is clicked, which is a deliberate act.
   }
 
   disconnectedCallback() {
@@ -479,6 +522,7 @@ export class ConsoleHeader extends LitElement {
     if (pending.length !== this._pendingApprovals.length) {
       this._pendingApprovals = pending;
     }
+    this.publishPendingApprovalsCount(pending.length);
     const nextExpiry = pending.reduce((earliest, approval) => {
       if (!approval.expires_at) return earliest;
       return Math.min(earliest, parseUTCDate(approval.expires_at).getTime());
@@ -491,6 +535,17 @@ export class ConsoleHeader extends LitElement {
         Math.min(Math.max(nextExpiry - Date.now(), 1), 2_147_483_647)
       );
     }
+  }
+
+  /**
+   * Tell the shell how many unexpired pending approvals this tab knows about,
+   * so the Approvals nav badge tracks the same count as the bell without a
+   * second approval fetch in the shell.
+   */
+  private publishPendingApprovalsCount(count: number): void {
+    window.dispatchEvent(
+      new CustomEvent<number>(PENDING_APPROVALS_EVENT, { detail: count })
+    );
   }
 
   private async loadRunningExecutions() {
@@ -557,17 +612,6 @@ export class ConsoleHeader extends LitElement {
     }
   }
 
-  private async loadUserNotifications() {
-    // TODO: Implement when backend API is available
-    // For now, notifications will only come through WebSocket
-    try {
-      // const notifications = await api.getUserNotifications();
-      // this._userNotifications = notifications;
-    } catch (error) {
-      console.error('Failed to load user notifications:', error);
-    }
-  }
-
   private async handleApprove(approvalId: string, event: Event) {
     event.stopPropagation();
     this._processingApproval = approvalId;
@@ -576,6 +620,9 @@ export class ConsoleHeader extends LitElement {
       this.markApprovalResolved(approvalId);
     } catch (error) {
       console.error('Failed to approve request:', error);
+      // An expired request, a missing permission or a quorum rule all fail
+      // here. A row that silently stays put looks like a broken button.
+      showToast(decisionErrorMessage(error, 'approve'), 'danger');
     } finally {
       this._processingApproval = null;
     }
@@ -589,6 +636,7 @@ export class ConsoleHeader extends LitElement {
       this.markApprovalResolved(approvalId);
     } catch (error) {
       console.error('Failed to decline request:', error);
+      showToast(decisionErrorMessage(error, 'decline'), 'danger');
     } finally {
       this._processingApproval = null;
     }
@@ -639,8 +687,9 @@ export class ConsoleHeader extends LitElement {
     this._userNotifications = this._userNotifications.map((n) =>
       n.id === notificationId ? { ...n, read: true } : n
     );
-    // TODO: Call API to mark as read when backend supports it
-    // api.markNotificationRead(notificationId);
+    // Read state lives in this tab only. Bell notifications are delivered
+    // over the WebSocket for the current session and the backend keeps no
+    // notification store, so there is nothing server-side to update.
   }
 
   /**
@@ -669,7 +718,7 @@ export class ConsoleHeader extends LitElement {
     this.unsubscribeFlow = unifiedWebSocketManager.subscribe(
       'flow_executions',
       (message) => {
-        console.log('Console header received flow update:', message);
+        debugLog('Console header received flow update:', message);
 
         // Handle new execution
         if (message.type === 'execution_started') {
@@ -752,7 +801,7 @@ export class ConsoleHeader extends LitElement {
     this.unsubscribeApprovals = unifiedWebSocketManager.subscribe(
       'approvals',
       (message) => {
-        console.log('Console header received approval update:', message);
+        debugLog('Console header received approval update:', message);
 
         // Handle new approval request
         if (message.type === 'approval_created') {
@@ -801,13 +850,17 @@ export class ConsoleHeader extends LitElement {
     );
   }
 
+  /**
+   * Feed the bell from account events on the 'system' channel.
+   *
+   * These notifications are session-only: there is no endpoint that lists
+   * past ones, so the bell starts empty on every page load and fills as
+   * events arrive.
+   */
   private connectToNotificationUpdates() {
-    // TODO: Subscribe to 'notifications' WebSocket channel when backend supports it
     this.unsubscribeNotifications = unifiedWebSocketManager.subscribe(
       'system',
       (message) => {
-        console.log('Console header received system message:', message);
-
         // Handle notification-type messages
         if (
           message.type === 'team_member_added' ||
@@ -862,14 +915,14 @@ export class ConsoleHeader extends LitElement {
    */
   private async requestNotificationPermission(): Promise<void> {
     if (!('Notification' in window)) {
-      console.log('Desktop notifications not supported in this browser');
+      debugLog('Desktop notifications not supported in this browser');
       return;
     }
 
     if (Notification.permission === 'default') {
       try {
         const permission = await Notification.requestPermission();
-        console.log(`Notification permission: ${permission}`);
+        debugLog(`Notification permission: ${permission}`);
       } catch (error) {
         console.error('Failed to request notification permission:', error);
       }
@@ -881,28 +934,27 @@ export class ConsoleHeader extends LitElement {
    */
   private showExecutionNotification(execution: FlowExecution): void {
     if (!('Notification' in window)) {
-      console.log('[Notification] Browser does not support Notification API');
+      debugLog('[Notification] Browser does not support Notification API');
       return;
     }
 
+    // This runs from a websocket message, not a user gesture. Browsers
+    // ignore a permission prompt raised from one (and may hold it against
+    // the site), so permission is only ever asked for from the bell click.
     if (Notification.permission !== 'granted') {
-      console.log(
-        `[Notification] Permission not granted (current: ${Notification.permission}), requesting...`
+      debugLog(
+        `[Notification] Permission not granted (current: ${Notification.permission}); not showing`
       );
-      // Proactively request if still default
-      if (Notification.permission === 'default') {
-        Notification.requestPermission();
-      }
       return;
     }
 
     // Prevent duplicate notifications for the same execution
     if (this.shownExecutionNotifications.has(execution.id)) {
-      console.log(`[Notification] Already shown for execution ${execution.id}`);
+      debugLog(`[Notification] Already shown for execution ${execution.id}`);
       return;
     }
     this.shownExecutionNotifications.add(execution.id);
-    console.log(
+    debugLog(
       `[Notification] Showing start notification for ${execution.flow_name || 'Flow'} (${execution.id})`
     );
 
@@ -934,13 +986,13 @@ export class ConsoleHeader extends LitElement {
     status: string
   ): void {
     if (!('Notification' in window) || Notification.permission !== 'granted') {
-      console.log(
+      debugLog(
         `[Notification] Cannot show finished notification (permission: ${'Notification' in window ? Notification.permission : 'unsupported'})`
       );
       return;
     }
 
-    console.log(
+    debugLog(
       `[Notification] Showing finished notification for ${execution.flow_name || 'Flow'} (${execution.id}) — status: ${status}`
     );
 
@@ -1050,6 +1102,8 @@ export class ConsoleHeader extends LitElement {
     }
   }
 
+  @state() private serverVersion = '';
+
   async fetchUserDetails() {
     try {
       this._user = await api.getUserProfile();
@@ -1059,7 +1113,7 @@ export class ConsoleHeader extends LitElement {
   }
 
   async signOut() {
-    api.performLocalSignOut();
+    await api.signOut();
   }
 
   private isUnexpiredPendingApproval(approval: ApprovalRequest): boolean {
@@ -1089,18 +1143,24 @@ export class ConsoleHeader extends LitElement {
               >(${this._runningExecutions.length})</span
             >
           </div>
-          <a
-            class="section-link"
-            @click=${() => Router.go('/console/flow-executions')}
-            >View all</a
-          >
+          <!-- A real href: focusable, and the router intercepts it. -->
+          <a class="section-link" href="/console/flows/executions">View all</a>
         </div>
         <div class="execution-list">
           ${this._runningExecutions.slice(0, 5).map(
             (exec) => html`
               <div
                 class="execution-item"
+                role="link"
+                tabindex="0"
+                data-href="/console/flows/executions/${exec.id}"
                 @click=${() => this.navigateToExecution(exec.id)}
+                @keydown=${(event: KeyboardEvent) => {
+                  if (event.key === 'Enter' || event.key === ' ') {
+                    event.preventDefault();
+                    this.navigateToExecution(exec.id);
+                  }
+                }}
               >
                 <div class="execution-name">
                   ${exec.flow_name || 'Flow Execution'}
@@ -1129,20 +1189,28 @@ export class ConsoleHeader extends LitElement {
             Pending approvals
             <span class="section-count">(${pending.length})</span>
           </div>
-          <a
-            class="section-link"
-            @click=${() => Router.go('/console/approvals')}
-            >View all</a
-          >
+          <a class="section-link" href="/console/approvals">View all</a>
         </div>
         <div class="approval-list">
           ${pending.slice(0, 5).map(
             (approval) => html`
+              <!--
+                The row holds its own Approve and Decline buttons, so it
+                cannot be a role="link" itself (a link's children are
+                presentational, which would hide the buttons from a screen
+                reader). The tool name is the keyboard way in instead; the
+                rest of the row stays a mouse convenience.
+              -->
               <div
                 class="approval-item"
-                @click=${() => Router.go(`/console/approval/${approval.id}`)}
+                @click=${(event: Event) => {
+                  if ((event.target as Element | null)?.closest?.('a')) return;
+                  Router.go(`/console/approval/${approval.id}`);
+                }}
               >
-                <div class="approval-name">${approval.tool_name}</div>
+                <a class="approval-name" href="/console/approval/${approval.id}"
+                  >${approval.tool_name}</a
+                >
                 <div class="approval-time">
                   ${approvalRequesterName(approval)} •
                   ${formatRelativeTime(approval.requested_at)}
@@ -1276,6 +1344,58 @@ export class ConsoleHeader extends LitElement {
     `;
   }
 
+  private renderHelpMenu() {
+    let brand;
+    try {
+      brand = getBrandConfig();
+    } catch {
+      return nothing;
+    }
+    const links = [
+      ['Documentation', brand.docs_url],
+      ["What's new", brand.changelog_url],
+      ['Report an issue', brand.report_issue_url],
+    ];
+    return html`<sl-dropdown
+      class="help-menu"
+      distance="8"
+      placement="bottom-end"
+    >
+      <sl-icon-button
+        slot="trigger"
+        name="question-circle"
+        label="Help"
+      ></sl-icon-button>
+      <sl-menu
+        aria-label="Help"
+        @sl-select=${(event: CustomEvent<{ item: { value: string } }>) => {
+          window.open(event.detail.item.value, '_blank', 'noopener');
+        }}
+      >
+        ${links
+          .filter(([, url]) => url)
+          .map(
+            ([label, url]) =>
+              html`<sl-menu-item value=${url!}>
+                <a
+                  href=${url!}
+                  target="_blank"
+                  rel="noopener"
+                  tabindex="-1"
+                  @click=${(event: Event) => event.preventDefault()}
+                  >${label}</a
+                >
+              </sl-menu-item>`
+          )}
+        <sl-divider></sl-divider>
+        <div class="dropdown-footer">
+          ${brand.name}
+          ${this.serverVersion ? `v${this.serverVersion}` : 'version unavailable'}
+        </div>
+      </sl-menu>
+    </sl-dropdown>`;
+  }
+
   render() {
     const hasContent =
       this._runningExecutions.length > 0 ||
@@ -1288,9 +1408,14 @@ export class ConsoleHeader extends LitElement {
           <slot name="nav-toggle"></slot>
         </div>
         <div class="user-menu">
+          <!-- The account switcher, when the deployment reports the
+               multi_account capability (the console shell fills it). -->
+          <slot name="account-switcher"></slot>
           <!-- Open talk windows, left of the bell: they belong to the
                operator's current work, not to the notification history. -->
           <talking-indicator></talking-indicator>
+
+          ${this.renderHelpMenu()}
 
           <!-- Notification Center -->
           <sl-dropdown distance="8" placement="bottom-end">
@@ -1301,7 +1426,11 @@ export class ConsoleHeader extends LitElement {
             >
               <sl-icon-button
                 name="bell"
-                label="Notifications"
+                label=${
+                  this.totalNotificationCount > 0
+                    ? `Notifications, ${this.totalNotificationCount} pending`
+                    : 'Notifications'
+                }
               ></sl-icon-button>
               ${
                 this.totalNotificationCount > 0

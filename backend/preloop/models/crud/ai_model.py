@@ -6,7 +6,7 @@ import logging
 import uuid
 from typing import Any, Dict, Optional, Sequence
 
-from sqlalchemy import or_
+from sqlalchemy import case, or_
 from sqlalchemy.orm import Session, joinedload
 
 from preloop.models.models.ai_model import AIModel
@@ -89,6 +89,45 @@ class CRUDAIModel(CRUDBase[AIModel]):
         from preloop.services.ai_model_provider import validate_qwen_endpoint
 
         validate_qwen_endpoint(endpoint)
+
+    @staticmethod
+    def _normalize_azure_auth_fields(
+        obj_data: Dict, *, existing: Optional[AIModel] = None
+    ) -> None:
+        """Keep Azure Entra metadata on Azure models only.
+
+        A partial update that omits ``provider_name`` is normalized against
+        the stored provider. Switching a row off Azure drops an Entra flag
+        that would otherwise leave ``ambient_credentials`` set.
+        """
+        from preloop.services.azure_openai import normalize_azure_auth_meta
+
+        provider = obj_data.get("provider_name")
+        if not provider and existing is not None:
+            provider = existing.provider_name
+        provider_changed = False
+        if existing is not None and "provider_name" in obj_data:
+            old_provider = (existing.provider_name or "").strip().lower()
+            new_provider = (obj_data.get("provider_name") or "").strip().lower()
+            provider_changed = old_provider != new_provider
+
+        if "meta_data" in obj_data:
+            meta = obj_data.get("meta_data")
+        elif (
+            existing is not None
+            and provider_changed
+            and isinstance(existing.meta_data, dict)
+        ):
+            runtime = existing.meta_data.get("provider_runtime")
+            if not isinstance(runtime, dict) or "azure_auth" not in runtime:
+                return
+            meta = copy.deepcopy(existing.meta_data)
+        else:
+            return
+        provider_name = provider if isinstance(provider, str) else None
+        obj_data["meta_data"] = normalize_azure_auth_meta(
+            meta, provider_name=provider_name
+        )
 
     @staticmethod
     def _apply_secret_reference_fields(
@@ -288,13 +327,14 @@ class CRUDAIModel(CRUDBase[AIModel]):
         Raises:
             ValueError: When a non-import write would create a collision.
         """
-        if account_id is None:
-            return
         meta_data = obj_data.get("meta_data")
         alias = _effective_gateway_alias_from_fields(
             provider_name, model_identifier, meta_data
         )
         if not alias:
+            return
+        if account_id is None:
+            self._warn_system_alias_shadowed(db, alias=alias, exclude_id=exclude_id)
             return
 
         from preloop.services.model_runtime_resolver import effective_gateway_alias
@@ -343,6 +383,48 @@ class CRUDAIModel(CRUDBase[AIModel]):
             suffixed,
         )
 
+    def _warn_system_alias_shadowed(
+        self, db: Session, *, alias: str, exclude_id: Optional[uuid.UUID]
+    ) -> None:
+        """Warn when a system row takes an alias account rows already use.
+
+        A system row (``account_id`` NULL) may share an alias with account
+        rows: the gateway serves each account its own row first. The write
+        is allowed, but it is logged so an operator notices that those
+        accounts will not reach the new system row by that alias.
+        """
+        from preloop.services.model_runtime_resolver import effective_gateway_alias
+
+        shadowing = [
+            existing
+            for existing in db.query(self.model)
+            .filter(self.model.account_id.is_not(None))
+            .all()
+            if existing.id != exclude_id and effective_gateway_alias(existing) == alias
+        ]
+        if shadowing:
+            logger.warning(
+                "gateway_system_alias_shadowed alias=%r account_rows=%d "
+                "accounts=%d: those accounts keep resolving the alias to "
+                "their own model",
+                alias,
+                len(shadowing),
+                len({str(row.account_id) for row in shadowing}),
+            )
+
+    def system_alias_collision_counts(
+        self, db: Session, *, alias: str
+    ) -> dict[str, int]:
+        """Return aggregate warning counts without disclosing tenant identities."""
+        from preloop.services.model_runtime_resolver import effective_gateway_alias
+
+        rows = db.query(self.model).filter(self.model.account_id.is_not(None)).all()
+        matching = [row for row in rows if effective_gateway_alias(row) == alias]
+        return {
+            "model_count": len(matching),
+            "account_count": len({str(row.account_id) for row in matching}),
+        }
+
     def create_with_account(
         self,
         db: Session,
@@ -363,6 +445,7 @@ class CRUDAIModel(CRUDBase[AIModel]):
         """
         obj_data = self._normalize_model_kind_fields(dict(obj_in))
         self._validate_qwen_api_endpoint(obj_data)
+        self._normalize_azure_auth_fields(obj_data)
         self._enforce_unique_gateway_alias(
             db,
             obj_data=obj_data,
@@ -426,6 +509,9 @@ class CRUDAIModel(CRUDBase[AIModel]):
         second query. Returns None when the id is missing or belongs to
         another account.
         """
+        # Deliberately own-account only, even when a model is shared here
+        # (account hook H3): callers decrypt the stored credential and some
+        # send it to a caller-chosen endpoint.
         return (
             db.query(self.model)
             .options(joinedload(self.model.credentials_secret))
@@ -517,15 +603,36 @@ class CRUDAIModel(CRUDBase[AIModel]):
         tiebreak. Model resolution and therefore pricing depend on this ordering
         being stable across requests, so it must not be removed.
         """
+        from preloop.plugins.account_hooks import VISIBLE_AI_MODEL, extra_visible_ids
+
+        shared_ids = extra_visible_ids(db, account_id, VISIBLE_AI_MODEL)
+        if not shared_ids:
+            return (
+                db.query(self.model)
+                .filter(
+                    or_(
+                        self.model.account_id == account_id,
+                        self.model.account_id.is_(None),
+                    )
+                )
+                .order_by(
+                    self.model.account_id.is_(None).asc(),
+                    self.model.created_at.asc(),
+                    self.model.id.asc(),
+                )
+                .all()
+            )
+        # Models shared from another account (account hook H3) sit between
+        # the account's own models and system defaults, so an own alias
+        # shadows a shared one and a shared alias shadows a system one.
+        own = self.model.account_id == account_id
+        system = self.model.account_id.is_(None)
+        rank = case((own, 0), (system, 2), else_=1)
         return (
             db.query(self.model)
-            .filter(
-                or_(
-                    self.model.account_id == account_id, self.model.account_id.is_(None)
-                )
-            )
+            .filter(or_(own, system, self.model.id.in_(shared_ids)))
             .order_by(
-                self.model.account_id.is_(None).asc(),
+                rank.asc(),
                 self.model.created_at.asc(),
                 self.model.id.asc(),
             )
@@ -542,6 +649,7 @@ class CRUDAIModel(CRUDBase[AIModel]):
         """Update an AIModel. If setting a model as default, ensure others are not."""
         obj_data = self._normalize_model_kind_fields(dict(obj_in))
         self._validate_qwen_api_endpoint(obj_data, existing=db_obj)
+        self._normalize_azure_auth_fields(obj_data, existing=db_obj)
 
         # Preserve the gateway alias when provider_name changes so that
         # in-flight agents configured with the old alias can still resolve

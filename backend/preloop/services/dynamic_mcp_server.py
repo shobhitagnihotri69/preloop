@@ -101,7 +101,11 @@ def _log_tool_execution_async(
             account_id=account_id,
             user_id=user_uuid,
             tool_name=tool_name,
-            tool_args=tool_args,
+            tool_args={
+                key: value
+                for key, value in tool_args.items()
+                if key != "_preloop_origin"
+            },
             result=status,
             duration_ms=execution_time_ms,
             execution_id=execution_uuid,
@@ -139,6 +143,8 @@ class UserContext:
         api_key_name: Optional[str] = None,
         managed_agent_id: Optional[str] = None,
         mcp_tools_cache: Optional[List[Any]] = None,
+        flow_id: Optional[str] = None,
+        credential_type: str = "legacy",
     ):
         self.user_id = user_id
         self.account_id = account_id
@@ -158,6 +164,10 @@ class UserContext:
         self.api_key_name = api_key_name
         self.managed_agent_id = managed_agent_id
         self.mcp_tools_cache = mcp_tools_cache
+        # Set only for a flow execution's credential; selects the per-flow
+        # governance override (subject type ``flows``).
+        self.flow_id = flow_id
+        self.credential_type = credential_type
 
 
 class DynamicMCPServer:
@@ -551,13 +561,18 @@ class DynamicMCPServer:
                 decision = await evaluate_policy_async(
                     db=db,
                     tool_name=tool_name,
-                    tool_args=tool_args,
+                    tool_args={
+                        key: value
+                        for key, value in tool_args.items()
+                        if key != "_preloop_origin"
+                    },
                     account_id=user_context.account_id,
                     tool_configuration_id=config.id if config else None,
                     user_id=getattr(user_context, "user_id", None),
                     execution_id=getattr(user_context, "execution_id", None),
                     subject_context={
                         "api_key_id": getattr(user_context, "api_key_id", None),
+                        "flow_id": getattr(user_context, "flow_id", None),
                         "managed_agent_id": getattr(
                             user_context, "managed_agent_id", None
                         ),
@@ -715,7 +730,11 @@ class DynamicMCPServer:
                     tool_configuration_id=config.id if config else None,
                     approval_workflow=policy,
                     tool_name=tool_name,
-                    tool_args=tool_args,
+                    tool_args={
+                        key: value
+                        for key, value in tool_args.items()
+                        if key != "_preloop_origin"
+                    },
                     agent_reasoning=None,  # Could be extracted from context if available
                     execution_id=caller.execution_id,
                     managed_agent_id=caller.managed_agent_id,
@@ -977,10 +996,39 @@ def register_default_tools(server: DynamicMCPServer):
         handler=mcp_router.update_issue,
     )
 
-    # Tool 4: search
+    # Tool 4: search_issues
+    server.register_default_tool(
+        name="search_issues",
+        description="Search issues and comments across connected trackers using similarity or fulltext search. Read-only.",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Search query",
+                },
+                "project": {
+                    "type": "string",
+                    "description": "Project identifier or slug to narrow search scope",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Maximum number of results",
+                    "default": 10,
+                },
+            },
+            "required": ["query"],
+        },
+        handler=mcp_router.search_issues,
+    )
+
+    # Tool 4 (alias): search (deprecated alias for search_issues, removed in 0.18.0)
     server.register_default_tool(
         name="search",
-        description="Search for issues and comments using similarity or fulltext search",
+        description=(
+            "Search for issues and comments in connected trackers. "
+            "(Deprecated: use search_issues instead. Will be removed in 0.18.0.)"
+        ),
         input_schema={
             "type": "object",
             "properties": {
@@ -1000,7 +1048,7 @@ def register_default_tools(server: DynamicMCPServer):
             },
             "required": ["query"],
         },
-        handler=mcp_router.search,
+        handler=mcp_router.search_issues,
     )
 
     # Tool 5: estimate_compliance

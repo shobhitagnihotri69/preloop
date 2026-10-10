@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 
@@ -14,6 +15,22 @@ import (
 
 	"github.com/preloop/preloop/cli/internal/testenv"
 )
+
+func TestMain(m *testing.M) {
+	// PRELOOP_TOKEN, PRELOOP_URL, PRELOOP_PROFILE and PRELOOP_ACCOUNT override
+	// the login a test saved. A developer shell that exports one would make
+	// these tests call that host, or read another profile, not the fixture.
+	testenv.ScrubCredentialEnv()
+	os.Exit(m.Run())
+}
+
+func TestSuiteDoesNotInheritCredentialEnv(t *testing.T) {
+	for _, name := range testenv.CredentialEnv {
+		if value, ok := os.LookupEnv(name); ok {
+			t.Fatalf("unit tests inherited %s=%q from the parent process", name, value)
+		}
+	}
+}
 
 func TestNewClientWithToken(t *testing.T) {
 	client := NewClientWithToken("https://example.com", "test-token")
@@ -319,6 +336,9 @@ func TestClientRefreshesExpiredAccessTokenFromStoredConfig(t *testing.T) {
 			if r.Form.Get("refresh_token") != "refresh-token" {
 				t.Fatalf("expected stored refresh token, got %q", r.Form.Get("refresh_token"))
 			}
+			if got := r.Form.Get("device_name"); got != version.DeviceName() {
+				t.Fatalf("expected device_name %q, got %q", version.DeviceName(), got)
+			}
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(map[string]string{
 				"access_token":  "refreshed-token",
@@ -491,5 +511,35 @@ func TestDo_SetsPreloopCLIIdentityHeaders(t *testing.T) {
 			version.Version,
 			gotClientVersion,
 		)
+	}
+}
+
+func TestPostRaw_ReturnsNon2xxWithHeaders(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Errorf("expected POST, got %s", r.Method)
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer tok" {
+			t.Errorf("unexpected Authorization %q", got)
+		}
+		w.Header().Set("X-Preloop-Usage-Id", "usage-1")
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = w.Write([]byte(`{"error":{"message":"upstream failed"}}`))
+	}))
+	defer server.Close()
+
+	client := NewClientWithToken(server.URL, "tok")
+	resp, err := client.PostRaw("/openai/v1/chat/completions", map[string]string{"model": "m"})
+	if err != nil {
+		t.Fatalf("PostRaw returned error for a non-2xx status: %v", err)
+	}
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502", resp.StatusCode)
+	}
+	if resp.Header.Get("X-Preloop-Usage-Id") != "usage-1" {
+		t.Fatalf("usage header not returned: %v", resp.Header)
+	}
+	if !strings.Contains(string(resp.Body), "upstream failed") {
+		t.Fatalf("body not returned: %s", resp.Body)
 	}
 }

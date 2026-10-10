@@ -1,3 +1,4 @@
+import { ConsoleStatus } from '../../controllers/console-status';
 import { html, css } from 'lit';
 import { customElement, state } from 'lit/decorators.js';
 import { AuthedElement, getUserProfile } from '../../api';
@@ -14,6 +15,8 @@ import '@shoelace-style/shoelace/dist/components/spinner/spinner.js';
 import '@shoelace-style/shoelace/dist/components/qr-code/qr-code.js';
 import '@shoelace-style/shoelace/dist/components/dialog/dialog.js';
 import { consoleDialogStyles } from '../../styles/console-dialog';
+import { debugLog } from '../../utils/debug';
+import { parseUTCDate } from '../../utils/date';
 
 interface NotificationPreferences {
   id: string;
@@ -58,6 +61,7 @@ interface TestPushResult {
 
 @customElement('notification-preferences-view')
 export class NotificationPreferencesView extends AuthedElement {
+  private readonly accessibilityStatus = new ConsoleStatus(this);
   @state()
   private preferences: NotificationPreferences | null = null;
 
@@ -176,9 +180,17 @@ export class NotificationPreferencesView extends AuthedElement {
         gap: var(--sl-spacing-2x-small);
       }
 
-      .preference-title {
+      .preference-switch::part(label) {
         font-weight: var(--sl-font-weight-semibold);
         color: var(--sl-color-neutral-900);
+      }
+
+      /* The switch carries its own label (so assistive tech announces it);
+         the description lines up under that label, past the track. */
+      .preference-switch + .preference-description {
+        padding-inline-start: calc(
+          var(--sl-toggle-size-medium) * 2 + var(--sl-spacing-x-small)
+        );
       }
 
       .preference-description {
@@ -231,7 +243,7 @@ export class NotificationPreferencesView extends AuthedElement {
 
       .device-date {
         font-size: var(--sl-font-size-x-small);
-        color: var(--sl-color-neutral-500);
+        color: var(--console-meta-color);
       }
 
       .qr-container {
@@ -360,7 +372,7 @@ export class NotificationPreferencesView extends AuthedElement {
 
       .test-result-meta {
         font-size: var(--sl-font-size-x-small);
-        color: var(--sl-color-neutral-500);
+        color: var(--console-meta-color);
       }
 
       .test-result-meta code,
@@ -393,46 +405,39 @@ export class NotificationPreferencesView extends AuthedElement {
 
     // Connect to WebSocket for real-time device registration updates
     try {
-      console.debug(
-        '[NotificationPrefs] Setting up device_registered subscription'
-      );
+      debugLog('[NotificationPrefs] Setting up device_registered subscription');
 
       this.unsubscribe = unifiedWebSocketManager.subscribe(
         'device_registered',
         (message: any) => {
-          console.debug(
+          debugLog(
             '[NotificationPrefs] Received device_registered event:',
             message
           );
 
           // A registration this page asked for (the QR dialog is open) is
-          // always news. Anything else that is stamped well before this page
-          // opened is a replay of an old event and must not announce itself.
-          // "Well before" allows for clock skew between server and browser.
+          // always news. Anything else is announced only when it carries a
+          // timestamp from after this page opened ("after" allows for clock
+          // skew between server and browser). An event with no usable
+          // timestamp cannot prove it is new, so it is treated as a replay:
+          // the device list still refreshes, quietly.
           const initiatedHere = this.showQRDialog;
-          const registeredAt = Date.parse(message?.registered_at ?? '');
-          const replayCutoff =
-            this.pageOpenedAt -
-            NotificationPreferencesView.REPLAY_CLOCK_SKEW_MS;
-          if (
-            !initiatedHere &&
-            Number.isFinite(registeredAt) &&
-            registeredAt < replayCutoff
-          ) {
-            console.debug(
-              '[NotificationPrefs] Ignoring device_registered event from before page open'
+          if (!initiatedHere && !this.isFreshRegistration(message)) {
+            debugLog(
+              '[NotificationPrefs] Treating device_registered event as history'
             );
+            void this.loadPreferences({ background: true });
             return;
           }
 
           // Close QR dialog if open
           if (initiatedHere) {
-            console.debug('[NotificationPrefs] Closing QR dialog');
+            debugLog('[NotificationPrefs] Closing QR dialog');
             this.handleCloseQRDialog();
           }
 
           // Reload preferences to show new device
-          this.loadPreferences();
+          void this.loadPreferences({ background: true });
 
           // Show success message
           const platform =
@@ -451,11 +456,11 @@ export class NotificationPreferencesView extends AuthedElement {
       // Track connection state changes
       this.unsubscribeStateChange = unifiedWebSocketManager.onStateChange(
         (state) => {
-          console.debug('[NotificationPrefs] WebSocket state:', state);
+          debugLog('[NotificationPrefs] WebSocket state:', state);
         }
       );
 
-      console.debug('[NotificationPrefs] Subscription setup complete');
+      debugLog('[NotificationPrefs] Subscription setup complete');
     } catch (error) {
       console.error('Failed to setup WebSocket subscription:', error);
     }
@@ -640,9 +645,28 @@ export class NotificationPreferencesView extends AuthedElement {
     `;
   }
 
-  private async loadPreferences() {
+  /**
+   * Whether a `device_registered` event happened while this page was open.
+   * Server timestamps may lack a zone, so they are read as UTC.
+   */
+  private isFreshRegistration(message: unknown): boolean {
+    const raw = (message as { registered_at?: unknown } | null)?.registered_at;
+    if (typeof raw !== 'string' || raw.trim() === '') return false;
+    const registeredAt = parseUTCDate(raw).getTime();
+    if (!Number.isFinite(registeredAt)) return false;
+    return (
+      registeredAt >=
+      this.pageOpenedAt - NotificationPreferencesView.REPLAY_CLOCK_SKEW_MS
+    );
+  }
+
+  /**
+   * Load the caller's preferences. A background refresh keeps the page on
+   * screen instead of swapping it for the full-page spinner.
+   */
+  private async loadPreferences(options: { background?: boolean } = {}) {
     try {
-      this.isLoading = true;
+      if (!options.background) this.isLoading = true;
       const data = await this.fetchData('/api/v1/notification-preferences/me');
 
       if (!data) {
@@ -789,7 +813,7 @@ export class NotificationPreferencesView extends AuthedElement {
   }
 
   private formatDate(dateString: string): string {
-    const date = new Date(dateString);
+    const date = parseUTCDate(dateString);
     return date.toLocaleDateString() + ' ' + date.toLocaleTimeString();
   }
 
@@ -841,16 +865,17 @@ export class NotificationPreferencesView extends AuthedElement {
 
           <div class="preference-row">
             <div class="preference-label">
-              <div class="preference-title">Email Notifications</div>
+              <sl-switch
+                class="preference-switch"
+                ?checked=${this.preferences?.enable_email}
+                @sl-change=${this.handleToggleEmail}
+                ?disabled=${this.isSaving}
+                >Email notifications</sl-switch
+              >
               <div class="preference-description">
                 Receive approval requests via email
               </div>
             </div>
-            <sl-switch
-              ?checked=${this.preferences?.enable_email}
-              @sl-change=${this.handleToggleEmail}
-              ?disabled=${this.isSaving}
-            ></sl-switch>
           </div>
 
           <div
@@ -858,16 +883,17 @@ export class NotificationPreferencesView extends AuthedElement {
             style="margin-top: var(--sl-spacing-small);"
           >
             <div class="preference-label">
-              <div class="preference-title">Mobile Push Notifications</div>
+              <sl-switch
+                class="preference-switch"
+                ?checked=${this.preferences?.enable_mobile_push}
+                @sl-change=${this.handleToggleMobilePush}
+                ?disabled=${this.isSaving}
+                >Mobile push notifications</sl-switch
+              >
               <div class="preference-description">
                 Receive approval requests on your mobile device
               </div>
             </div>
-            <sl-switch
-              ?checked=${this.preferences?.enable_mobile_push}
-              @sl-change=${this.handleToggleMobilePush}
-              ?disabled=${this.isSaving}
-            ></sl-switch>
           </div>
 
           ${
@@ -879,17 +905,18 @@ export class NotificationPreferencesView extends AuthedElement {
                     data-testid="stagger-email-toggle"
                   >
                     <div class="preference-label">
-                      <div class="preference-title">Quiet duplicate alerts</div>
+                      <sl-switch
+                        class="preference-switch"
+                        ?checked=${this.preferences?.stagger_email !== false}
+                        @sl-change=${this.handleToggleStaggerEmail}
+                        ?disabled=${this.isSaving}
+                        >Quiet duplicate alerts</sl-switch
+                      >
                       <div class="preference-description">
                         When push is enabled, email me only if an approval is
                         still waiting after a minute.
                       </div>
                     </div>
-                    <sl-switch
-                      ?checked=${this.preferences?.stagger_email !== false}
-                      @sl-change=${this.handleToggleStaggerEmail}
-                      ?disabled=${this.isSaving}
-                    ></sl-switch>
                   </div>
                 `
               : ''

@@ -5,7 +5,7 @@
 # long tail after tests go green).
 #
 # PR jobs are path-filtered so a docs-only or frontend-only change does not
-# pay for eight Postgres shards. Filters are job-level, not workflow-level:
+# pay for the backend shards. Filters are job-level, not workflow-level:
 # a workflow `on.pull_request.paths` skip made stacked PRs look clean because
 # no checks ran at all. `main` and tags always run every suite.
 #
@@ -25,8 +25,13 @@ on:
   pull_request:
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  # One run per PR, or per branch on push. A newer commit cancels the older
+  # run on PRs and on main; tags, schedules and manual runs are never
+  # cancelled (each tag is its own ref, so tags never collide anyway).
+  # Cancelling a main image push can leave :edge briefly inconsistent; the
+  # superseding build republishes it.
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main') }}
 
 env:
   PYTHON_VERSION: "3.11"
@@ -49,23 +54,38 @@ jobs:
       backend: ${{ steps.out.outputs.backend }}
       frontend: ${{ steps.out.outputs.frontend }}
       cli: ${{ steps.out.outputs.cli }}
+      egress: ${{ steps.out.outputs.egress }}
+      browser: ${{ steps.out.outputs.browser }}
       plugins: ${{ steps.out.outputs.plugins }}
       helm: ${{ steps.out.outputs.helm }}
       workflow: ${{ steps.out.outputs.workflow }}
       requirements: ${{ steps.out.outputs.requirements }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
         if: github.event_name == 'pull_request'
 
       - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
         if: github.event_name == 'pull_request'
         id: filter
         with:
+          # Negated globs (`!requirements/docs.txt`) are inert under the
+          # default `some` quantifier: a negated pattern matches every other
+          # path, so the backend filter would select every non-empty PR.
+          predicate-quantifier: 'some-with-excludes'
           filters: |
             backend:
               - 'backend/**'
+              # backend/tests/test_perl_agent_image.py and
+              # test_preloop_perl_toolchain.py pin these recipes.
+              - 'environments/perl/**'
+              - 'environments/preloop/Dockerfile'
               - 'pyproject.toml'
               - 'requirements/**'
+              # mkdocs lock only. Backend shards install app-dev.txt, not this.
+              - '!requirements/docs.in'
+              - '!requirements/docs.txt'
               - '.github/requirements/app-dev.txt'
               - '.github/requirements/coverage.txt'
               - '.github/requirements/test.txt'
@@ -75,6 +95,13 @@ jobs:
               - 'frontend/**'
             cli:
               - 'cli/**'
+            egress:
+              - 'environments/egress-proxy/**'
+            browser:
+              - 'environments/preloop/**'
+              - 'environments/egress-proxy/**'
+              - 'backend/tests/services/test_flow_environment.py'
+              - 'backend/preloop/services/flow_environment.py'
             plugins:
               - 'runtime-plugins/**'
               - 'pyproject.toml'
@@ -84,6 +111,7 @@ jobs:
             helm:
               - 'helm/**'
               - 'scripts/helm-render-check.sh'
+              - 'backend/tests/helm/**'
             workflow:
               - '.github/workflows/ci.yml'
             # Anything that can change what a hash-pinned lock resolves to.
@@ -100,6 +128,8 @@ jobs:
           BACKEND: ${{ steps.filter.outputs.backend }}
           FRONTEND: ${{ steps.filter.outputs.frontend }}
           CLI: ${{ steps.filter.outputs.cli }}
+          EGRESS: ${{ steps.filter.outputs.egress }}
+          BROWSER: ${{ steps.filter.outputs.browser }}
           PLUGINS: ${{ steps.filter.outputs.plugins }}
           HELM: ${{ steps.filter.outputs.helm }}
           WORKFLOW: ${{ steps.filter.outputs.workflow }}
@@ -109,6 +139,8 @@ jobs:
             echo "backend=true" >> "$GITHUB_OUTPUT"
             echo "frontend=true" >> "$GITHUB_OUTPUT"
             echo "cli=true" >> "$GITHUB_OUTPUT"
+            echo "egress=true" >> "$GITHUB_OUTPUT"
+            echo "browser=true" >> "$GITHUB_OUTPUT"
             echo "plugins=true" >> "$GITHUB_OUTPUT"
             echo "helm=true" >> "$GITHUB_OUTPUT"
             echo "workflow=true" >> "$GITHUB_OUTPUT"
@@ -117,6 +149,8 @@ jobs:
             echo "backend=${BACKEND:-false}" >> "$GITHUB_OUTPUT"
             echo "frontend=${FRONTEND:-false}" >> "$GITHUB_OUTPUT"
             echo "cli=${CLI:-false}" >> "$GITHUB_OUTPUT"
+            echo "egress=${EGRESS:-false}" >> "$GITHUB_OUTPUT"
+            echo "browser=${BROWSER:-false}" >> "$GITHUB_OUTPUT"
             echo "plugins=${PLUGINS:-false}" >> "$GITHUB_OUTPUT"
             echo "helm=${HELM:-false}" >> "$GITHUB_OUTPUT"
             echo "workflow=false" >> "$GITHUB_OUTPUT"
@@ -133,12 +167,12 @@ jobs:
   # test job to three VMs serializes the suite and is slower than before.
   #
   # Frontend, plugins, and coverage stay on ubuntu-latest and do not wait
-  # for this job. Backend is eight shards; this job emits `backend_plan`,
-  # an array of eight {runner, container, db_host, postgres_ports} entries.
-  # The first 8-N shards stay hosted (group 1 is the long pole). The last
-  # N shards — the excess — go to idle self-hosted runners, each in a
-  # python:<PYTHON_VERSION>-bookworm container so two listeners on one VM
-  # do not collide on host 5432. N is min(idle matching runners, 8).
+  # for this job. Backend is eighteen shards; this job emits `backend_plan`,
+  # an array of eighteen {runner} entries. The first 18-N shards
+  # stay hosted. The last N shards — the excess — go to idle self-hosted
+  # runners. N is min(idle matching runners, 18). Both kinds of runner
+  # execute on the machine, not in a nested container, so 127.0.0.1:5432
+  # is that machine's Postgres. See .github/self-hosted-runners.md.
   #
   # Anything else, including every failure mode below, is N=0 (all hosted).
   # This job NEVER fails the workflow: a PR must not go red because the
@@ -163,8 +197,8 @@ jobs:
   # interpreter (needs python3.11-venv on Debian) and only then falls
   # back to setup-python. Hosted ubuntu-latest has no system 3.11, so
   # those jobs still download from the Ubuntu manifest. Self-hosted
-  # backend shards additionally run in python:<PYTHON_VERSION>-bookworm,
-  # so they see that image's interpreter rather than the VM's.
+  # backend shards use the same action, so the VM needs python3.11 and
+  # python3.11-venv. They no longer run inside python:3.11-bookworm.
   pick-runner:
     name: Pick test runner
     runs-on: ubuntu-latest
@@ -179,9 +213,15 @@ jobs:
           GH_TOKEN: ${{ secrets.CI_RUNNER_READ_TOKEN }}
           SELF_HOSTED_TESTS: ${{ vars.CI_SELF_HOSTED_TESTS }}
           REPO: ${{ github.repository }}
-          PYTHON_VERSION: ${{ env.PYTHON_VERSION }}
         run: |
           set -uo pipefail
+
+          # Eighteen shards. Measured on the green main run 37987118309:
+          # with no durations, group 2 of 8 spent 25.2m in pytest. Balanced
+          # with .github/pytest-split-durations.json, the slowest of 18
+          # chunks is about 3.3m of test time, which stays under 7m once
+          # checkout and pip are added.
+          SPLITS=18
 
           emit() {
             idle="$1"
@@ -189,24 +229,19 @@ jobs:
             case "$idle" in
               ''|*[!0-9]*) idle=0 ;;
             esac
-            if [ "$idle" -gt 8 ]; then idle=8; fi
+            if [ "$idle" -gt "$SPLITS" ]; then idle=$SPLITS; fi
 
-            plan=$(IDLE="$idle" PYVER="${PYTHON_VERSION:-3.11}" jq -cn '
-              def public:
-                {runner:"ubuntu-latest",container:null,db_host:"localhost",
-                 postgres_ports:["5432:5432"]};
-              def private:
-                {runner:["self-hosted","Linux","X64"],
-                 container:{image:("python:"+$ENV.PYVER+"-bookworm")},
-                 db_host:"postgres",postgres_ports:[]};
+            plan=$(IDLE="$idle" SPLITS="$SPLITS" jq -cn '
+              def slot($runner): {runner:$runner};
               ($ENV.IDLE|tonumber) as $idle
-              | [null] + [range(0;8) | if . >= (8 - $idle) then private else public end]
+              | ($ENV.SPLITS|tonumber) as $splits
+              | [null] + [range(0; $splits) | if . >= ($splits - $idle) then slot(["self-hosted","Linux","X64"]) else slot("ubuntu-latest") end]
             ') || plan=""
 
             if [ -z "$plan" ]; then
               idle=0
               reason="$reason (plan fallback: all public)"
-              plan='[null,{"runner":"ubuntu-latest","container":null,"db_host":"localhost","postgres_ports":["5432:5432"]},{"runner":"ubuntu-latest","container":null,"db_host":"localhost","postgres_ports":["5432:5432"]},{"runner":"ubuntu-latest","container":null,"db_host":"localhost","postgres_ports":["5432:5432"]},{"runner":"ubuntu-latest","container":null,"db_host":"localhost","postgres_ports":["5432:5432"]},{"runner":"ubuntu-latest","container":null,"db_host":"localhost","postgres_ports":["5432:5432"]},{"runner":"ubuntu-latest","container":null,"db_host":"localhost","postgres_ports":["5432:5432"]},{"runner":"ubuntu-latest","container":null,"db_host":"localhost","postgres_ports":["5432:5432"]},{"runner":"ubuntu-latest","container":null,"db_host":"localhost","postgres_ports":["5432:5432"]}]'
+              plan=$(python3 -c 'import json; print(json.dumps([None]+[{"runner":"ubuntu-latest"}]*18))')
             fi
 
             {
@@ -215,8 +250,8 @@ jobs:
               echo "EOF"
             } >> "$GITHUB_OUTPUT"
             echo "reason: $reason"
-            echo "overflow shards on self-hosted: $idle / 8"
-            echo "- overflow self-hosted backend shards: \`$idle / 8\`" >> "$GITHUB_STEP_SUMMARY"
+            echo "overflow shards on self-hosted: $idle / $SPLITS"
+            echo "- overflow self-hosted backend shards: \`$idle / $SPLITS\`" >> "$GITHUB_STEP_SUMMARY"
             echo "- reason: $reason" >> "$GITHUB_STEP_SUMMARY"
             exit 0
           }
@@ -284,6 +319,8 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Set up Python
         uses: ./.github/actions/setup-ci-python
@@ -328,6 +365,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Set up Python
         uses: ./.github/actions/setup-ci-python
@@ -360,6 +399,13 @@ jobs:
       - name: Run ruff
         run: ruff check .
 
+      # Fixture MCP server for artifact tests (#1091). Outside
+      # backend/tests, so the backend shards do not collect it.
+      - name: warehouse-sim fixture tests
+        env:
+          PRELOOP_DISABLE_TELEMETRY: 'true'
+        run: python -m pytest scripts/fixtures/warehouse_sim/tests -q
+
   helm-lint:
     name: Helm Chart Checks
     runs-on: ubuntu-latest
@@ -367,74 +413,123 @@ jobs:
     if: needs.changes.outputs.helm == 'true'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       # helm is preinstalled on ubuntu-latest runners
       - name: Helm render checks (chart lint + CNPG backup wiring)
         run: sh scripts/helm-render-check.sh
 
-  # Eight shards, each with its own Postgres. GitLab splits this suite into
-  # dozens of per-file jobs; that is a poor fit here because each GitHub
-  # runner spends ~1.5m on checkout/pip/migrations before pytest starts.
-  # Four shards left group 1 (the first duration_based_chunks slice) as the
-  # wall-clock pole: ~7-9m vs ~3-4.5m for the others. Eight shards cut that
-  # first slice in half without going back to per-file jobs.
-  # pytest-split keeps new tests in the partition automatically. Use
-  # duration_based_chunks (not least_duration): without a timings file,
-  # least_duration round-robins individual tests across shards and breaks
-  # unittest setUp isolation plus tests that share a process-wide DB
-  # session. Chunks keep collection order, so files stay together. The 60%
-  # coverage floor is applied after shards are combined -- a single shard
-  # only sees part of the tree.
+      # The chart guard tests skip when the helm binary is missing, and the
+      # backend shards may run in containers without helm. This runner has
+      # helm, so the security-relevant guards always execute somewhere.
+      - name: Set up Python
+        uses: ./.github/actions/setup-ci-python
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install Python dependencies
+        run: |
+          pip install --require-hashes -r .github/requirements/app-dev.txt
+          pip install --no-deps -e .
+
+      - name: Helm chart guard tests
+        env:
+          PRELOOP_DISABLE_TELEMETRY: 'true'
+        run: python -m pytest backend/tests/helm -q
+
+  # Eighteen shards. On the green main run 37987118309, eight count-based
+  # shards left group 2 at 26.7m (25.2m of that in pytest) while group 6
+  # was 4.8m. .github/pytest-split-durations.json makes
+  # duration_based_chunks cut on measured time; the slowest chunk is
+  # about 3.3m of tests, and hosted setup is about 1.5m, so a shard stays
+  # under 7m. least_duration is still wrong here: it round-robins
+  # individual tests and breaks unittest setUp isolation plus tests that
+  # share a process-wide DB session. Chunks keep collection order, so
+  # files stay together. The 60% coverage floor is applied after shards
+  # are combined -- a single shard only sees part of the tree.
+  #
+  # Postgres is not a service container. scripts/ci_postgres.py checks
+  # 127.0.0.1:5432 first. A server that accepts test_user gets one new
+  # database for this job. A refused connection starts
+  # pgvector/pgvector:pg16 and the drop step removes that container.
+  # Runner setup: .github/self-hosted-runners.md.
   #
   # Runner: ubuntu-latest is the default. pick-runner may send the last
-  # N shards (idle self-hosted count) to private VMs as overflow. Public
-  # shards stay on the VM with Postgres at localhost:5432. Overflow
-  # shards run in python:<version>-bookworm and reach Postgres by the
-  # service hostname, with no host port, so two listeners on one machine
-  # do not collide on 5432. The VM still needs Docker and the runner
-  # user in the docker group.
+  # N shards (idle self-hosted count) to private VMs as overflow. Shards
+  # run on the machine, not in a nested container, so that address is the
+  # VM's Postgres. The VM needs Docker for the fallback start, and the
+  # runner user in the docker group. A persistent server avoids the pull.
   test-backend:
-    name: Backend Tests (${{ matrix.group }}/8)
+    name: Backend Tests (${{ matrix.group }}/18)
     runs-on: ${{ fromJSON(needs.pick-runner.outputs.backend_plan)[matrix.group].runner }}
-    container: ${{ fromJSON(needs.pick-runner.outputs.backend_plan)[matrix.group].container }}
     needs: [changes, pick-runner]
     if: needs.changes.outputs.backend == 'true'
-    timeout-minutes: 45
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
-        group: [1, 2, 3, 4, 5, 6, 7, 8]
-    services:
-      postgres:
-        image: pgvector/pgvector:pg16
-        env:
-          POSTGRES_DB: test_db
-          POSTGRES_USER: test_user
-          POSTGRES_PASSWORD: test_password
-        ports: ${{ fromJSON(needs.pick-runner.outputs.backend_plan)[matrix.group].postgres_ports }}
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
+        group: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18]
 
     env:
-      DATABASE_URL: postgresql://test_user:test_password@${{ fromJSON(needs.pick-runner.outputs.backend_plan)[matrix.group].db_host }}:5432/test_db
-      # Explicit opt-in for isolated schema lease/crash/lifecycle fixtures.
-      FLOW_FEEDBACK_TEST_DATABASE_URL: postgresql://test_user:test_password@${{ fromJSON(needs.pick-runner.outputs.backend_plan)[matrix.group].db_host }}:5432/test_db
       OPENAI_API_KEY: mock_key
       ANTHROPIC_API_KEY: mock_key
       PRELOOP_DISABLE_TELEMETRY: "true"
       COVERAGE_FILE: coverage-data.${{ matrix.group }}
+      PRELOOP_CI_SHARD: ${{ matrix.group }}
+      # Fixture role from .github/self-hosted-runners.md. The database URL
+      # omits it; libpq reads PGPASSWORD. Not a production credential.
+      PGPASSWORD: test_password
 
     steps:
+      # Self-hosted shards once ran in a root job container (fa51a329d)
+      # with the workspace bind-mounted, which left root-owned
+      # __pycache__, egg-info, and .pytest_cache in runnerN/_work. The
+      # host runner user cannot unlink them, so checkout fails with
+      # EACCES. Give the tree back to the runner user before checkout:
+      # passwordless sudo if the VM has it, otherwise a throwaway
+      # container (the runner user is in the docker group, see
+      # .github/self-hosted-runners.md). Hosted runners skip this.
+      - name: Reclaim self-hosted workspace ownership
+        if: runner.environment == 'self-hosted'
+        shell: bash
+        run: |
+          set -u
+          # The whole runnerN/_work, not only the checkout: the old
+          # container also left a root-owned venv in _temp/preloop-python
+          # that setup-ci-python must delete.
+          ws=$(dirname "$RUNNER_TEMP")
+          [ -d "$ws" ] || exit 0
+          uid=$(id -u); gid=$(id -g)
+          foreign=$(find "$ws" ! -user "$uid" -print -quit 2>/dev/null || true)
+          if [ -z "$foreign" ]; then
+            echo "workspace already owned by $(id -un)"
+            exit 0
+          fi
+          echo "foreign-owned path found: $foreign"
+          if sudo -n true 2>/dev/null; then
+            sudo -n chown -R "$uid:$gid" "$ws"
+          else
+            # pgvector is already on every VM (ci_postgres.py), so no
+            # Docker Hub pull and no anonymous rate limit.
+            docker run --rm --user 0 --entrypoint chown -v "$ws:/w" \
+              pgvector/pgvector:pg16 -R "$uid:$gid" /w
+          fi
+          left=$(find "$ws" ! -user "$uid" -print -quit 2>/dev/null || true)
+          if [ -n "$left" ]; then
+            echo "::error::still not owned by runner user: $left (see .github/self-hosted-runners.md, Workspace ownership)"
+            exit 1
+          fi
+
       # clean: true is the default, but a self-hosted workspace is reused
       # between runs, so say it out loud.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           clean: true
 
       - name: Set up Python
+        id: setup-python
         uses: ./.github/actions/setup-ci-python
         with:
           python-version: ${{ env.PYTHON_VERSION }}
@@ -454,6 +549,9 @@ jobs:
           pip install --require-hashes -r .github/requirements/app-dev.txt
           pip install --no-deps -e .
 
+      - name: Prepare Postgres
+        run: python scripts/ci_postgres.py prepare
+
       - name: Initialize database
         run: python scripts/init_db.py --force
 
@@ -461,12 +559,19 @@ jobs:
         run: |
           pytest -v \
             -m "not integration" \
-            --splits 8 \
+            --splits 18 \
             --group ${{ matrix.group }} \
             --splitting-algorithm=duration_based_chunks \
+            --durations-path .github/pytest-split-durations.json \
             --cov=preloop \
             --cov-report= \
             --junitxml=test-results.xml
+
+      # Only once Python is set up: otherwise python is absent and an
+      # earlier failure is reported twice (exit 127).
+      - name: Drop CI database
+        if: always() && steps.setup-python.outcome == 'success'
+        run: python scripts/ci_postgres.py drop
 
       - name: Upload coverage data
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -491,6 +596,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           clean: true
 
       - name: Set up Python
@@ -524,8 +630,8 @@ jobs:
       - name: Combine coverage and enforce floor
         run: |
           mapfile -t coverage_files < <(find coverage-shards -name 'coverage-data.*' -type f | sort)
-          if [ ${#coverage_files[@]} -ne 8 ]; then
-            echo "Expected 8 shard coverage files, found ${#coverage_files[@]}"
+          if [ ${#coverage_files[@]} -ne 18 ]; then
+            echo "Expected 18 shard coverage files, found ${#coverage_files[@]}"
             find coverage-shards -type f -print
             exit 1
           fi
@@ -534,7 +640,7 @@ jobs:
           coverage report --fail-under=60
 
       - name: Upload coverage
-        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
         if: github.event_name != 'pull_request'
         with:
           files: ./coverage.xml
@@ -558,6 +664,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           clean: true
 
       - name: Set up Node.js
@@ -579,11 +686,20 @@ jobs:
       - name: Production build
         run: |
           npm run build
-          if find dist -name '*.css' -print | grep -q .; then
+          # dist/vendor holds third-party files copied verbatim (Shoelace's
+          # theme stylesheets are linked from index.html and must stay
+          # standalone); the guard is about the console's own CSS.
+          if find dist -path dist/vendor -prune -o -name '*.css' -print | grep -q .; then
             echo "standalone CSS files must not be emitted; CSS is injected into JS" >&2
-            find dist -name '*.css' -print >&2
+            find dist -path dist/vendor -prune -o -name '*.css' -print >&2
             exit 1
           fi
+          for asset in themes/light.css themes/dark.css shoelace-autoloader.js; do
+            if [ ! -f "dist/vendor/shoelace/$asset" ]; then
+              echo "vendored Shoelace asset missing from dist: $asset" >&2
+              exit 1
+            fi
+          done
           if ! grep -q 'vite-plugin-css-injected-by-js' dist/assets/main-*.js; then
             echo "CSS injection marker missing from the main JS bundle" >&2
             exit 1
@@ -650,6 +766,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           clean: true
 
       - name: Set up Python
@@ -685,10 +802,16 @@ jobs:
           pip install --no-deps -e .
 
       - name: Run runtime-plugin pytest
+        env:
+          PRELOOP_DISABLE_TELEMETRY: "true"
+          PYTHONPATH: backend:runtime-plugins/nanobot-preloop/src:runtime-plugins/browser-use-preloop/src:runtime-plugins/skyvern-preloop/src
         run: |
           pytest -v \
             runtime-plugins/tests \
-            runtime-plugins/hermes-preloop/tests
+            runtime-plugins/hermes-preloop/tests \
+            runtime-plugins/nanobot-preloop/tests \
+            runtime-plugins/browser-use-preloop/tests \
+            runtime-plugins/skyvern-preloop/tests
 
       - name: Test Pi and DeepSeek Harness plugins
         working-directory: runtime-plugins/harness-preloop
@@ -712,6 +835,14 @@ jobs:
 
       - name: Run Claude plugin tests
         working-directory: runtime-plugins/claude-preloop
+        run: npm test
+
+      - name: Install Codex plugin dependencies
+        working-directory: runtime-plugins/codex-preloop
+        run: npm ci
+
+      - name: Run Codex plugin tests
+        working-directory: runtime-plugins/codex-preloop
         run: npm test
 
   # ==========================================================================
@@ -761,6 +892,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
@@ -780,6 +913,97 @@ jobs:
         env:
           PRELOOP_DISABLE_TELEMETRY: "true"
         run: go test ./...
+
+  # ==========================================================================
+  # Egress proxy (allowlist forward proxy for sandboxed browser traffic)
+  # ==========================================================================
+  #
+  # Path-filtered like the CLI job. A change under environments/egress-proxy
+  # runs vet and the race tests; other PRs skip this job. The CI aggregator
+  # treats that skip as success and a failure here as a failed suite.
+
+  test-egress-proxy:
+    name: Egress Proxy
+    runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.egress == 'true'
+    defaults:
+      run:
+        working-directory: environments/egress-proxy
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: environments/egress-proxy/go.mod
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test -race ./...
+
+  # ==========================================================================
+  # Browser profile (Playwright MCP forced through the egress proxy)
+  # ==========================================================================
+  #
+  # Path-filtered. Installs the pinned @playwright/mcp tree, the Chromium
+  # build that tree expects, and runs the self-check against the proxy.
+  # PRELOOP_BROWSER_CI=1 makes a missing browser a failure, not a skip.
+
+  test-browser-profile:
+    name: Browser profile
+    runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.browser == 'true'
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: environments/egress-proxy/go.mod
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: environments/preloop/tools/package-lock.json
+
+      - name: Install pinned Playwright MCP and Chromium
+        working-directory: environments/preloop/tools
+        run: |
+          npm ci
+          npx playwright install --with-deps chromium
+
+      - name: Set up Python
+        uses: ./.github/actions/setup-ci-python
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install test dependencies
+        run: |
+          pip install --require-hashes -r .github/requirements/app-dev.txt
+          pip install --no-deps -e .
+
+      - name: Prove browser egress is enforced
+        env:
+          PRELOOP_DISABLE_TELEMETRY: "true"
+          PRELOOP_BROWSER_CI: "1"
+        run: |
+          pytest -q --tb=short \
+            backend/tests/services/test_flow_environment.py::test_enable_blocks_metadata_and_non_allowlisted_origin \
+            backend/tests/services/test_flow_environment.py::test_rendered_harness_config_is_isolated_and_selfcheck_fails_closed \
+            backend/tests/services/test_flow_environment.py::test_removed_proxy_env_aborts_profile_setup \
+            backend/tests/services/test_flow_environment.py::test_example_browser_profile_is_a_valid_environment_profile \
+            backend/tests/services/test_flow_environment.py::test_browser_scripts_pass_bash_n
 
   # ==========================================================================
   # CLI Vulnerability Scan
@@ -809,6 +1033,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
@@ -842,12 +1068,14 @@ jobs:
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@1f40c72289eff860ee54a304f1438e3cff362e0a # v4.3.0
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Log in to GitHub Container Registry
         if: github.event_name != 'pull_request'
@@ -880,7 +1108,7 @@ jobs:
             type=raw,value=latest,enable={{is_default_branch}}
 
       - name: Build and push backend image
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           platforms: linux/amd64,linux/arm64
@@ -906,7 +1134,7 @@ jobs:
             type=raw,value=latest,enable={{is_default_branch}}
 
       - name: Build and push frontend image
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: ./frontend
           platforms: linux/amd64,linux/arm64
@@ -936,6 +1164,8 @@ jobs:
       - test-backend-coverage
       - test-frontend
       - test-runtime-plugins
+      - test-egress-proxy
+      - test-browser-profile
       - cli-vuln-scan
     steps:
       - name: Require every suite to have passed or been skipped
@@ -949,6 +1179,8 @@ jobs:
           COVERAGE: ${{ needs.test-backend-coverage.result }}
           FRONTEND: ${{ needs.test-frontend.result }}
           PLUGINS: ${{ needs.test-runtime-plugins.result }}
+          EGRESS: ${{ needs.test-egress-proxy.result }}
+          BROWSER: ${{ needs.test-browser-profile.result }}
           CLIVULN: ${{ needs.cli-vuln-scan.result }}
         run: |
           failed=0
@@ -973,5 +1205,7 @@ jobs:
           check test-backend-coverage "$COVERAGE"
           check test-frontend "$FRONTEND"
           check test-runtime-plugins "$PLUGINS"
+          check test-egress-proxy "$EGRESS"
+          check test-browser-profile "$BROWSER"
           check cli-vuln-scan "$CLIVULN"
           exit "$failed"

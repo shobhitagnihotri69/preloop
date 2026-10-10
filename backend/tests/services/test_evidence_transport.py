@@ -26,7 +26,11 @@ from preloop.cra.evidence_pack import (
     read_pack_manifest,
     verify_pack_manifest,
 )
-from preloop.services.checkpoint_runtime import evidence_transport_env
+from preloop.services.checkpoint_runtime import (
+    checkpoint_shell,
+    evidence_shell,
+    evidence_transport_env,
+)
 from preloop.services.flow_artifacts import (
     EvidenceUnavailableError,
     evidence_receipt,
@@ -170,6 +174,27 @@ async def test_private_runner_receives_evidence_capability_not_workspace(
     assert context["evidence_env"]["PRELOOP_EVIDENCE_PUT_TOKEN"]
 
 
+def test_flow_evidence_log_plaintext_defaults_true() -> None:
+    from preloop.config import Settings
+
+    assert Settings.model_fields["flow_evidence_log_plaintext"].default is True
+    assert settings.flow_evidence_log_plaintext is True
+
+
+def test_kubernetes_job_env_sets_plaintext_switch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    executor = ContainerAgentExecutor(
+        "codex", {}, image="test-image:latest", use_kubernetes=True
+    )
+    monkeypatch.setattr(settings, "flow_evidence_log_plaintext", True)
+    enabled = executor._apply_git_credential_env({}, {})
+    assert enabled["PRELOOP_EVIDENCE_LOG_PLAINTEXT"] == "1"
+    monkeypatch.setattr(settings, "flow_evidence_log_plaintext", False)
+    disabled = executor._apply_git_credential_env({}, {})
+    assert disabled["PRELOOP_EVIDENCE_LOG_PLAINTEXT"] == "0"
+
+
 def test_kubernetes_wrapper_legacy_still_emits_base64(tmp_path: Path) -> None:
     import shutil
 
@@ -192,6 +217,84 @@ def test_kubernetes_wrapper_legacy_still_emits_base64(tmp_path: Path) -> None:
     assert proc.returncode == 0
     assert "PRELOOP_ARTIFACT_B64 " in proc.stdout
     assert "PRELOOP_ARTIFACT_BEGIN evidence present" in proc.stdout
+
+
+def test_kubernetes_plaintext_off_emits_markers_not_bytes(tmp_path: Path) -> None:
+    import shutil
+
+    if shutil.which("bash") is None or shutil.which("sh") is None:
+        pytest.skip("sh not available")
+    workspace = tmp_path / "workspace"
+    (workspace / "evidence").mkdir(parents=True)
+    secret = '{"finding":"must-not-appear-in-logs"}'
+    (workspace / "evidence" / "findings.json").write_text(secret)
+    (workspace / "result.json").write_text('{"verdict":"fail","status":"success"}')
+    (workspace / "notes.txt").write_text("workspace-secret")
+    script = K8S_ARTIFACT_WRAPPER_SCRIPT.replace("/workspace", str(workspace)).replace(
+        "/tmp/preloop-evidence.tar.gz", str(tmp_path / "ev.tar.gz")
+    )
+    proc = subprocess.run(
+        ["sh", "-c", script],
+        env={
+            "PATH": "/usr/bin:/bin",
+            "PRELOOP_INNER_SCRIPT": "true",
+            "PRELOOP_EVIDENCE_LOG_PLAINTEXT": "0",
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0
+    assert "PRELOOP_ARTIFACT_B64 " not in proc.stdout
+    assert secret not in proc.stdout
+    assert "workspace-secret" not in proc.stdout
+    assert "PRELOOP_ARTIFACT_BEGIN result unavailable plaintext_disabled" in proc.stdout
+    assert (
+        "PRELOOP_ARTIFACT_BEGIN evidence unavailable plaintext_disabled" in proc.stdout
+    )
+    assert "PRELOOP_ARTIFACT_BEGIN workspace skipped plaintext_disabled" in proc.stdout
+    assert "base64 <" not in proc.stdout
+
+
+def test_kubernetes_plaintext_off_with_token_matches_direct_path(
+    tmp_path: Path,
+) -> None:
+    import shutil
+
+    if shutil.which("bash") is None:
+        pytest.skip("bash not available")
+    workspace = tmp_path / "workspace"
+    (workspace / "evidence").mkdir(parents=True)
+    secret = '{"finding":"must-not-appear"}'
+    (workspace / "evidence" / "findings.json").write_text(secret)
+    (workspace / "result.json").write_text('{"verdict":"fail"}')
+    client = tmp_path / "client.py"
+    client.write_text("import sys\nsys.exit(1)\n")
+    script = (
+        K8S_ARTIFACT_WRAPPER_SCRIPT.replace("/workspace", str(workspace))
+        .replace("/tmp/preloop-checkpoint-client.py", str(client))
+        .replace("/tmp/preloop-evidence.tar.gz", str(tmp_path / "ev.tar.gz"))
+    )
+    proc = subprocess.run(
+        ["sh", "-c", script],
+        env={
+            "PATH": "/usr/bin:/bin:/usr/local/bin",
+            "PRELOOP_INNER_SCRIPT": "true",
+            "PRELOOP_EVIDENCE_PUT_TOKEN": "scoped-token",
+            "PRELOOP_EVIDENCE_LOG_PLAINTEXT": "0",
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0
+    assert "PRELOOP_ARTIFACT_B64 " not in proc.stdout
+    assert secret not in proc.stdout
+    assert "plaintext_disabled" not in proc.stdout
+    assert "PRELOOP_ARTIFACT_BEGIN evidence error" in proc.stdout
+    assert "PRELOOP_ARTIFACT_BEGIN result error" in proc.stdout
+    assert "PRELOOP_ARTIFACT_BEGIN result uploaded" not in proc.stdout
+    assert "PRELOOP_ARTIFACT_BEGIN evidence uploaded" not in proc.stdout
 
 
 def test_kubernetes_direct_upload_omits_evidence_bytes(tmp_path: Path) -> None:
@@ -233,6 +336,114 @@ def test_kubernetes_direct_upload_omits_evidence_bytes(tmp_path: Path) -> None:
     assert "scoped-token" not in proc.stdout
     assert "PRELOOP_ARTIFACT_BEGIN evidence uploaded" in proc.stdout
     assert "PRELOOP_ARTIFACT_BEGIN result uploaded" in proc.stdout
+
+
+def _evidence_client_stub(client: Path, calls: Path) -> None:
+    """Record each checkpoint-client argv and succeed an evidence PUT."""
+    client.write_text(
+        "import sys\n"
+        "from pathlib import Path\n"
+        f"Path({str(calls)!r}).open('a').write(sys.argv[1] + '\\n')\n"
+        "if sys.argv[1] == 'evidence':\n"
+        "    print('PRELOOP_EVIDENCE committed "
+        "00000000-0000-0000-0000-000000000001')\n"
+        "raise SystemExit(0)\n"
+    )
+
+
+def _run_wrapper_over_inner(
+    tmp_path: Path, inner: str
+) -> tuple[subprocess.CompletedProcess[str], list[str]]:
+    """Run the Kubernetes artifact wrapper over an inner agent script."""
+    import shutil
+
+    if shutil.which("bash") is None:
+        pytest.skip("bash not available")
+    calls = tmp_path / "calls"
+    client = tmp_path / "client.py"
+    _evidence_client_stub(client, calls)
+    workspace = tmp_path / "workspace"
+    (workspace / "evidence").mkdir(parents=True)
+    (workspace / "result.json").write_text('{"verdict":"fail"}')
+    script = (
+        K8S_ARTIFACT_WRAPPER_SCRIPT.replace("/workspace", str(workspace))
+        .replace("/tmp/preloop-checkpoint-client.py", str(client))
+        .replace("/tmp/preloop-evidence.tar.gz", str(tmp_path / "ev.tar.gz"))
+    )
+    proc = subprocess.run(
+        ["bash", "-c", script],
+        env={
+            "PATH": f"{Path(sys.executable).parent}:/usr/bin:/bin:/usr/local/bin",
+            "PRELOOP_INNER_SCRIPT": inner.replace(
+                "/tmp/preloop-checkpoint-client.py", str(client)
+            ),
+            "PRELOOP_EVIDENCE_PUT_TOKEN": "scoped-token",
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    recorded = calls.read_text().split() if calls.exists() else []
+    return proc, recorded
+
+
+def test_wrapper_emits_evidence_once_on_normal_exit(tmp_path: Path) -> None:
+    """The child EXIT trap and the wrapper epilogue must not both PUT."""
+    inner = checkpoint_shell({"checkpoint_env": {"present": "1"}}) + "\ntrue\n"
+    proc, recorded = _run_wrapper_over_inner(tmp_path, inner)
+    evidence = [line for line in recorded if line == "evidence"]
+    assert proc.returncode == 0, proc.stderr
+    assert evidence == ["evidence"]
+    assert proc.stdout.count("PRELOOP_ARTIFACT_BEGIN evidence uploaded") == 1
+
+
+def test_wrapper_emits_evidence_once_on_trapped_exit(tmp_path: Path) -> None:
+    """`exit` in the child fires its EXIT trap; the wrapper still emits once."""
+    inner = checkpoint_shell({"checkpoint_env": {"present": "1"}}) + "\nexit 7\n"
+    proc, recorded = _run_wrapper_over_inner(tmp_path, inner)
+    evidence = [line for line in recorded if line == "evidence"]
+    assert proc.returncode == 7, proc.stderr
+    assert evidence == ["evidence"]
+    assert proc.stdout.count("PRELOOP_ARTIFACT_BEGIN evidence uploaded") == 1
+
+
+def test_wrapper_and_evidence_shell_emit_once(tmp_path: Path) -> None:
+    """Runs without a checkpoint loop still have an evidence EXIT trap."""
+    inner = (
+        evidence_shell({"evidence_env": {"PRELOOP_EVIDENCE_PUT_TOKEN": "scoped-token"}})
+        + "\ntrue\n"
+    )
+    proc, recorded = _run_wrapper_over_inner(tmp_path, inner)
+    evidence = [line for line in recorded if line == "evidence"]
+    assert proc.returncode == 0, proc.stderr
+    assert evidence == ["evidence"]
+    assert proc.stdout.count("PRELOOP_ARTIFACT_BEGIN evidence uploaded") == 1
+
+
+def test_docker_trap_uploads_evidence_once_without_wrapper(tmp_path: Path) -> None:
+    """Hosted Docker has no artifact wrapper, so the EXIT trap is the only PUT."""
+    import shutil
+
+    if shutil.which("bash") is None:
+        pytest.skip("bash not available")
+    calls = tmp_path / "calls"
+    client = tmp_path / "client.py"
+    _evidence_client_stub(client, calls)
+    script = evidence_shell(
+        {"evidence_env": {"PRELOOP_EVIDENCE_PUT_TOKEN": "scoped-token"}}
+    ).replace("/tmp/preloop-checkpoint-client.py", str(client))
+    proc = subprocess.run(
+        ["bash", "-c", script],
+        env={
+            "PATH": f"{Path(sys.executable).parent}:/usr/bin:/bin:/usr/local/bin",
+            "PRELOOP_EVIDENCE_PUT_TOKEN": "scoped-token",
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert calls.read_text().split() == ["evidence"]
 
 
 @pytest.mark.asyncio
@@ -648,6 +859,104 @@ async def test_direct_path_ignores_injected_cleartext_on_upload_failure() -> Non
     artifact = await executor.get_result_artifact("job-123")
     assert artifact is not None
     assert artifact["error"] == "result_artifact_fetch_failed"
+
+
+@pytest.mark.asyncio
+async def test_plaintext_disabled_markers_are_an_honest_receipt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from preloop.services.flow_orchestrator import FlowExecutionOrchestrator
+
+    monkeypatch.setattr(settings, "flow_evidence_log_plaintext", False)
+    secret = b"secret-finding"
+    archive = archive_with("evidence/findings.json", secret)
+    encoded = __import__("base64").b64encode(archive).decode()
+    result_encoded = __import__("base64").b64encode(b'{"status":"success"}').decode()
+    executor = ContainerAgentExecutor(
+        "codex", {}, image="test-image:latest", use_kubernetes=True
+    )
+    executor._get_kubernetes_terminal_logs = AsyncMock(
+        return_value=[
+            "PRELOOP_ARTIFACT_BEGIN result unavailable plaintext_disabled",
+            f"PRELOOP_ARTIFACT_B64 {result_encoded}",
+            "PRELOOP_ARTIFACT_END result",
+            "PRELOOP_ARTIFACT_BEGIN evidence unavailable plaintext_disabled",
+            f"PRELOOP_ARTIFACT_B64 {encoded}",
+            "PRELOOP_ARTIFACT_END evidence",
+            "PRELOOP_ARTIFACT_BEGIN workspace skipped plaintext_disabled",
+            f"PRELOOP_ARTIFACT_B64 {encoded}",
+            "PRELOOP_ARTIFACT_END workspace",
+        ]
+    )
+    assert await executor.get_evidence_archive("job-123") is None
+    assert executor.evidence_transport_error == "plaintext_disabled"
+    assert await executor.get_result_artifact("job-123") is None
+    assert await executor.get_workspace_snapshot("job-123") is None
+
+    orchestrator = object.__new__(FlowExecutionOrchestrator)
+    orchestrator._evidence_archive = None
+    orchestrator._evidence_receipt = None
+    orchestrator.execution_log = Mock(id=uuid4(), trigger_event_details={})
+    orchestrator.flow = None
+    orchestrator.db = Mock()
+    orchestrator.execution_logger = Mock()
+    executor.evidence_transport_error = "plaintext_disabled"
+    executor.get_evidence_archive = AsyncMock(return_value=None)
+    await orchestrator._capture_evidence_archive(executor, "job-123")
+    receipt = orchestrator._evidence_receipt
+    assert receipt["status"] == "failed"
+    assert receipt["error"] == "plaintext_disabled"
+
+    execution = SimpleNamespace(
+        id=uuid4(),
+        flow_id=uuid4(),
+        status="FAILED",
+        trigger_event_details={},
+        evidence_archive=None,
+        evidence_receipt=receipt,
+    )
+    public = public_evidence_status(execution)
+    assert public["status"] == "failed"
+    assert public["error"] == "plaintext_disabled"
+    inspected = inspect_evidence(Mock(), account_id=uuid4(), execution=execution)
+    assert inspected["status"] == "failed"
+    assert inspected["error"] == "plaintext_disabled"
+    assert "secret-finding" not in str(public)
+    assert "secret-finding" not in str(inspected)
+
+
+@pytest.mark.asyncio
+async def test_plaintext_off_ignores_injected_cleartext(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "flow_evidence_log_plaintext", False)
+    executor = ContainerAgentExecutor(
+        "codex", {}, image="test-image:latest", use_kubernetes=True
+    )
+    archive = archive_with("evidence/findings.json", b"secret-finding")
+    encoded = __import__("base64").b64encode(archive).decode()
+    result_encoded = (
+        __import__("base64")
+        .b64encode(b'{"status":"success","verdict":"pass"}')
+        .decode()
+    )
+    executor._get_kubernetes_terminal_logs = AsyncMock(
+        return_value=[
+            "PRELOOP_ARTIFACT_BEGIN evidence present 12",
+            f"PRELOOP_ARTIFACT_B64 {encoded}",
+            "PRELOOP_ARTIFACT_END evidence",
+            "PRELOOP_ARTIFACT_BEGIN result present 24",
+            f"PRELOOP_ARTIFACT_B64 {result_encoded}",
+            "PRELOOP_ARTIFACT_END result",
+            "PRELOOP_ARTIFACT_BEGIN workspace present 12",
+            f"PRELOOP_ARTIFACT_B64 {encoded}",
+            "PRELOOP_ARTIFACT_END workspace",
+        ]
+    )
+    assert await executor.get_evidence_archive("job-123") is None
+    assert executor.evidence_transport_error == "plaintext_disabled"
+    assert await executor.get_result_artifact("job-123") is None
+    assert await executor.get_workspace_snapshot("job-123") is None
 
 
 def test_stale_marker_does_not_skip_repeat_upload(

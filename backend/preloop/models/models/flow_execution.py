@@ -1,5 +1,5 @@
 import uuid
-from datetime import datetime, UTC
+from datetime import UTC, datetime
 from typing import Optional
 
 from sqlalchemy import (
@@ -7,17 +7,31 @@ from sqlalchemy import (
     Column,
     DateTime,
     ForeignKey,
+    Index,
     Integer,
     LargeBinary,
     Numeric,
     String,
     Text,
-    false as sa_false,
 )
+from sqlalchemy import false as sa_false
+from sqlalchemy import text
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, query_expression, relationship
 
 from .base import Base
+
+#: SQL for the resume chain root a repair turn stores in its trigger payload.
+#: Spelled with ``->``/``->>`` and literal keys (not SQLAlchemy's JSONB
+#: subscript with bound keys) so it is textually the expression that
+#: ``ix_flow_execution_resume_root`` indexes: an expression index is only used
+#: for a query that repeats its expression exactly. Keep it in sync with
+#: alembic revision ``20261003_resume_root_idx``.
+RESUME_ROOT_SQL = (
+    "((flow_execution.trigger_event_details -> '_resume') ->> 'resume_root')"
+)
+# The same expression unqualified, as an index definition spells it.
+_RESUME_ROOT_INDEX_SQL = "((trigger_event_details -> '_resume') ->> 'resume_root')"
 
 # Reserved key under which the compact, human-readable execution subject is
 # stored inside FlowExecution.trigger_event_details. Defined here (rather than
@@ -136,8 +150,31 @@ def resolve_execution_agent_selection(
 
 class FlowExecution(Base):
     __tablename__ = "flow_execution"
+    __table_args__ = (
+        # Resume chain members (repair turns only), for the chain cost rollup
+        # on the executions list. Created by 20261003_resume_root_idx;
+        # declared here so autogenerate does not propose dropping it.
+        Index(
+            "ix_flow_execution_resume_root",
+            text(_RESUME_ROOT_INDEX_SQL),
+            postgresql_where=text(f"{_RESUME_ROOT_INDEX_SQL} IS NOT NULL"),
+        ),
+    )
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    ci_principal_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("ci_principal.id", ondelete="RESTRICT"),
+        nullable=True,
+        index=True,
+    )
+    initiating_ci_key_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("api_key.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    ci_review_binding = Column(JSONB, nullable=True)
     flow_id = Column(
         UUID(as_uuid=True), ForeignKey("flow.id"), nullable=False, index=True
     )
@@ -360,6 +397,14 @@ class FlowExecution(Base):
     trigger_subject: Mapped[Optional[str]] = query_expression()
     trigger_subject_url: Mapped[Optional[str]] = query_expression()
 
+    # Human-readable CI provider (e.g. "GitHub Actions") and the link back to
+    # the CI run that dispatched this execution, for runs a CI job triggered
+    # with a ``ci`` provenance block. Projected out of the subject the same
+    # way ``trigger_subject``/``trigger_subject_url`` are; None on runs a
+    # person or webhook started, and on any query that does not request them.
+    trigger_subject_ci: Mapped[Optional[str]] = query_expression()
+    trigger_subject_ci_url: Mapped[Optional[str]] = query_expression()
+
     # The label the caller passed to run_flow ("lint the diff"), for tree
     # views that answer "what was this child asked to do?".
     #
@@ -370,6 +415,12 @@ class FlowExecution(Base):
     # was not delegated, on a call that passed no label, and on any query that
     # does not request it.
     delegation_label: Mapped[Optional[str]] = query_expression()
+
+    # Publishing execution id for a review/CI repair turn. Stored under
+    # trigger_event_details._resume.resume_root and projected for list rows
+    # the same way subjects are. Null on a first publication and on queries
+    # that do not request it.
+    resume_of: Mapped[Optional[str]] = query_expression()
 
     # Relationships
     flow = relationship(

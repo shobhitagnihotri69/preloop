@@ -6,6 +6,7 @@ import '../../components/view-header.ts';
 import './runners-view';
 import type { RunnersView } from './runners-view';
 import { invalidateApiCaches } from '../../api';
+import { resetConfirmDialogForTests } from '../../components/confirm-dialog';
 import { unifiedWebSocketManager } from '../../services/unified-websocket-manager';
 
 describe('RunnersView', () => {
@@ -15,7 +16,7 @@ describe('RunnersView', () => {
   function createFetchStub(
     runners: unknown[] = [],
     account: { default_runner_pool?: string | null } = {},
-    options: { failPatch?: boolean } = {}
+    options: { failPatch?: boolean; deleteConflict?: boolean } = {}
   ) {
     return sinon
       .stub(window, 'fetch')
@@ -35,6 +36,29 @@ describe('RunnersView', () => {
             ...runner,
             concurrency: body.concurrency,
             capacity: body.concurrency,
+          });
+        }
+        const method = String(init?.method || 'GET').toUpperCase();
+        if (url.includes('/api/v1/runners/') && url.endsWith('/token')) {
+          const runner = (runners[0] || {}) as Record<string, unknown>;
+          return json({ ...runner, token: 'prl_runner_example' });
+        }
+        if (url.includes('/api/v1/runners/') && method === 'DELETE') {
+          if (options.deleteConflict && !url.includes('force=true')) {
+            return json(
+              {
+                detail:
+                  'Runner holds 1 active execution(s). Stop them first, or retry with force=true to halt them and delete the runner.',
+              },
+              409
+            );
+          }
+          return json({
+            id: (runners[0] as { id?: string })?.id,
+            deleted: true,
+            halted_execution_ids: url.includes('force=true')
+              ? ['22222222-2222-4222-8222-222222222222']
+              : [],
           });
         }
         if (url.includes('/api/v1/runners')) {
@@ -88,7 +112,27 @@ describe('RunnersView', () => {
     sinon.restore();
     localStorage.clear();
     invalidateApiCaches();
+    resetConfirmDialogForTests();
   });
+
+  /**
+   * Answers the console confirm dialog: clicks the button labelled `label`
+   * (the confirm label, or "Cancel"). Returns the dialog's message text.
+   */
+  async function answerConfirm(label: string): Promise<string> {
+    let button: HTMLElement | undefined;
+    let dialog: HTMLElement | null = null;
+    await waitUntil(() => {
+      dialog = document.body.querySelector('confirm-dialog');
+      button = [...(dialog?.shadowRoot?.querySelectorAll('sl-button') || [])]
+        .map((candidate) => candidate as HTMLElement)
+        .find((candidate) => candidate.textContent?.trim() === label);
+      return Boolean(button);
+    }, `confirm dialog with "${label}" did not open`);
+    const text = (dialog as HTMLElement | null)?.shadowRoot?.textContent || '';
+    button!.click();
+    return text;
+  }
 
   it('renders the runners list', async () => {
     fetchStub = createFetchStub([
@@ -533,5 +577,277 @@ describe('RunnersView', () => {
     await element.updateComplete;
     expect(element.shadowRoot?.textContent).to.contain('office-mac');
     expect(element.shadowRoot?.textContent).to.contain('ops@example.com');
+  });
+  const actionRunner = {
+    id: '11111111-1111-4111-8111-111111111111',
+    name: 'office-mac',
+    hostname: 'mac.local',
+    os: 'darwin',
+    arch: 'arm64',
+    labels: ['local'],
+    status: 'online',
+    last_heartbeat: '2026-09-27T10:00:00Z',
+    running_execution_ids: [],
+    current_execution_id: null,
+  };
+
+  async function loadedView(): Promise<RunnersView> {
+    const element = (await fixture(
+      html`<runners-view></runners-view>`
+    )) as RunnersView;
+    await waitUntil(
+      () => !(element as unknown as { loading: boolean }).loading
+    );
+    await element.updateComplete;
+    return element;
+  }
+
+  function requestsMatching(
+    predicate: (url: string, method: string) => boolean
+  ) {
+    return fetchStub
+      .getCalls()
+      .filter((call) =>
+        predicate(
+          String(call.args[0]),
+          String(
+            (call.args[1] as RequestInit | undefined)?.method || 'GET'
+          ).toUpperCase()
+        )
+      );
+  }
+
+  it('deletes a runner after confirmation and drops its row', async () => {
+    fetchStub = createFetchStub([actionRunner]);
+    const nativeConfirm = sinon.stub(window, 'confirm').returns(true);
+    const element = await loadedView();
+
+    (
+      element.shadowRoot?.querySelector('.delete-runner') as HTMLElement
+    ).click();
+    const asked = await answerConfirm('Delete runner');
+    expect(asked).to.contain('Delete runner office-mac?');
+    expect(nativeConfirm.called, 'no native confirm').to.equal(false);
+    await waitUntil(
+      () => !element.shadowRoot?.textContent?.includes('office-mac'),
+      'Deleted runner row did not disappear'
+    );
+    const deletes = requestsMatching((_url, method) => method === 'DELETE');
+    expect(deletes).to.have.length(1);
+    expect(String(deletes[0].args[0])).to.contain(
+      '/api/v1/runners/11111111-1111-4111-8111-111111111111'
+    );
+    expect(String(deletes[0].args[0])).not.to.contain('force=true');
+  });
+
+  it('does nothing when the delete is not confirmed', async () => {
+    fetchStub = createFetchStub([actionRunner]);
+    const element = await loadedView();
+
+    (
+      element.shadowRoot?.querySelector('.delete-runner') as HTMLElement
+    ).click();
+    await answerConfirm('Cancel');
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    await element.updateComplete;
+    expect(
+      requestsMatching((_url, method) => method === 'DELETE')
+    ).to.have.length(0);
+    expect(element.shadowRoot?.textContent).to.contain('office-mac');
+  });
+
+  it('surfaces the active lease refusal and offers a force delete', async () => {
+    fetchStub = createFetchStub([actionRunner], {}, { deleteConflict: true });
+    const element = await loadedView();
+
+    (
+      element.shadowRoot?.querySelector('.delete-runner') as HTMLElement
+    ).click();
+    await answerConfirm('Delete runner');
+    await waitUntil(
+      () => Boolean(element.shadowRoot?.querySelector('.force-delete')),
+      'Force delete was not offered'
+    );
+    expect(
+      element.shadowRoot?.querySelector('.action-notice-text')?.textContent
+    ).to.contain('Runner holds 1 active execution(s)');
+    expect(element.shadowRoot?.textContent).to.contain('office-mac');
+
+    (element.shadowRoot?.querySelector('.force-delete') as HTMLElement).click();
+    const forceQuestion = await answerConfirm('Halt and delete');
+    expect(forceQuestion).to.contain('Halt the executions office-mac');
+    await waitUntil(
+      () => !element.shadowRoot?.textContent?.includes('office-mac'),
+      'Force deleted runner row did not disappear'
+    );
+    const forced = requestsMatching(
+      (url, method) => method === 'DELETE' && url.includes('force=true')
+    );
+    expect(forced).to.have.length(1);
+  });
+
+  function spyOnConfirmAsks() {
+    const ctor = customElements.get('confirm-dialog') as unknown as {
+      prototype: { ask: (...args: unknown[]) => Promise<boolean> };
+    };
+    return sinon.spy(ctor.prototype, 'ask');
+  }
+
+  function actionButton(element: RunnersView, selector: string) {
+    return element.shadowRoot?.querySelector(selector) as HTMLElement & {
+      disabled: boolean;
+    };
+  }
+
+  it('asks once and deletes once on a rapid double click', async () => {
+    fetchStub = createFetchStub([actionRunner]);
+    const element = await loadedView();
+    const asks = spyOnConfirmAsks();
+
+    const remove = actionButton(element, '.delete-runner');
+    remove.click();
+    remove.click();
+    await element.updateComplete;
+    // The row is busy while its question is open: neither action can start
+    // a second ask that would cancel the first.
+    expect(actionButton(element, '.delete-runner').disabled).to.equal(true);
+    expect(actionButton(element, '.rotate-token').disabled).to.equal(true);
+    actionButton(element, '.rotate-token').click();
+
+    await answerConfirm('Delete runner');
+    await waitUntil(
+      () => !element.shadowRoot?.textContent?.includes('office-mac'),
+      'Deleted runner row did not disappear'
+    );
+    expect(asks.callCount).to.equal(1);
+    expect(
+      requestsMatching((_url, method) => method === 'DELETE')
+    ).to.have.length(1);
+    expect(
+      requestsMatching(
+        (url, method) => method === 'POST' && url.endsWith('/token')
+      )
+    ).to.have.length(0);
+  });
+
+  it('asks once and rotates once on a rapid double click', async () => {
+    fetchStub = createFetchStub([actionRunner]);
+    const element = await loadedView();
+    const asks = spyOnConfirmAsks();
+
+    const rotate = actionButton(element, '.rotate-token');
+    rotate.click();
+    rotate.click();
+    await answerConfirm('Rotate token');
+    await waitUntil(
+      () => Boolean(element.shadowRoot?.querySelector('.action-notice-text')),
+      'Rotation notice did not appear'
+    );
+    expect(asks.callCount).to.equal(1);
+    expect(
+      requestsMatching(
+        (url, method) => method === 'POST' && url.endsWith('/token')
+      )
+    ).to.have.length(1);
+  });
+
+  it('frees the row again when the question is cancelled', async () => {
+    fetchStub = createFetchStub([actionRunner]);
+    const element = await loadedView();
+
+    actionButton(element, '.delete-runner').click();
+    await answerConfirm('Cancel');
+    await waitUntil(
+      () => !actionButton(element, '.delete-runner').disabled,
+      'the row stayed busy after Cancel'
+    );
+    expect(actionButton(element, '.rotate-token').disabled).to.equal(false);
+  });
+
+  it('rotates the token without showing it', async () => {
+    fetchStub = createFetchStub([actionRunner]);
+    const element = await loadedView();
+
+    (element.shadowRoot?.querySelector('.rotate-token') as HTMLElement).click();
+    await answerConfirm('Rotate token');
+    await waitUntil(
+      () => Boolean(element.shadowRoot?.querySelector('.action-notice-text')),
+      'Rotation notice did not appear'
+    );
+    const rotations = requestsMatching(
+      (url, method) => method === 'POST' && url.endsWith('/token')
+    );
+    expect(rotations).to.have.length(1);
+    expect(String(rotations[0].args[0])).to.contain(
+      '/api/v1/runners/11111111-1111-4111-8111-111111111111/token'
+    );
+    expect(element.shadowRoot?.textContent).to.contain('Token rotated');
+    expect(element.shadowRoot?.textContent).not.to.contain(
+      'prl_runner_example'
+    );
+  });
+
+  it('removes a runner deleted elsewhere from a websocket event', async () => {
+    fetchStub = createFetchStub([actionRunner]);
+    const element = await loadedView();
+    expect(element.shadowRoot?.textContent).to.contain('office-mac');
+
+    onRunnerMessage?.({
+      type: 'runner_deleted',
+      payload: { id: '11111111-1111-4111-8111-111111111111' },
+    });
+    await element.updateComplete;
+    expect(element.shadowRoot?.textContent).not.to.contain('office-mac');
+  });
+
+  it('wraps the runners table in a horizontal scroll box', async () => {
+    fetchStub = createFetchStub([actionRunner]);
+    const element = await loadedView();
+    const table = element.shadowRoot?.querySelector('table');
+    expect(table?.parentElement?.classList.contains('table-scroll')).to.equal(
+      true
+    );
+    expect(getComputedStyle(table!.parentElement!).overflowX).to.equal('auto');
+  });
+
+  it('shows a load failure as a danger alert with Try again', async () => {
+    let fail = true;
+    fetchStub = sinon
+      .stub(window, 'fetch')
+      .callsFake(async (input: RequestInfo | URL) => {
+        const url = typeof input === 'string' ? input : input.toString();
+        const json = (data: unknown, status = 200) =>
+          new Response(JSON.stringify(data), {
+            status,
+            headers: { 'Content-Type': 'application/json' },
+          });
+        if (url.includes('/api/v1/runners')) {
+          return fail
+            ? json({ detail: 'Service unavailable' }, 503)
+            : json([actionRunner]);
+        }
+        return json({ id: 'acct-1', default_runner_pool: null });
+      });
+    const element = (await fixture(
+      html`<runners-view></runners-view>`
+    )) as RunnersView;
+    await waitUntil(
+      () => !(element as unknown as { loading: boolean }).loading,
+      'Runners view did not finish loading'
+    );
+    await element.updateComplete;
+
+    const alert = element.shadowRoot?.querySelector('sl-alert.load-error');
+    expect(alert?.getAttribute('variant')).to.equal('danger');
+    expect(alert?.textContent).to.contain('Could not load runners');
+
+    fail = false;
+    const retry = alert!.querySelector('sl-button') as HTMLElement;
+    expect(retry.textContent?.trim()).to.equal('Try again');
+    retry.click();
+    await waitUntil(
+      () => element.shadowRoot?.textContent?.includes('office-mac'),
+      'Runners did not load after Try again'
+    );
   });
 });

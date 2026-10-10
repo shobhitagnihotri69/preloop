@@ -84,6 +84,122 @@ describe('ToolRuleEditor', () => {
     expect(selected?.classList.contains('approval')).to.be.true;
   });
 
+  describe('action picker from the keyboard', () => {
+    async function mountEditor() {
+      const el = (await fixture(
+        html`<tool-rule-editor
+          .open=${true}
+          .workflows=${[]}
+          .features=${{}}
+        ></tool-rule-editor>`
+      )) as ToolRuleEditor;
+      await el.updateComplete;
+      return el;
+    }
+
+    function cards(el: ToolRuleEditor) {
+      return Array.from(
+        el.shadowRoot?.querySelectorAll('.action-card') ?? []
+      ) as HTMLElement[];
+    }
+
+    function key(target: HTMLElement, name: string) {
+      target.dispatchEvent(
+        new KeyboardEvent('keydown', {
+          key: name,
+          bubbles: true,
+          composed: true,
+        })
+      );
+    }
+
+    it('is a labelled radio group with one tab stop on the chosen card', async () => {
+      const el = await mountEditor();
+      const group = el.shadowRoot?.querySelector('[role="radiogroup"]');
+      expect(group).to.exist;
+      const labelId = group?.getAttribute('aria-labelledby');
+      expect(el.shadowRoot?.getElementById(labelId!)?.textContent).to.equal(
+        'Action'
+      );
+
+      expect(cards(el).map((c) => c.getAttribute('role'))).to.deep.equal([
+        'radio',
+        'radio',
+        'radio',
+      ]);
+      expect(
+        cards(el).map((c) => c.getAttribute('aria-checked'))
+      ).to.deep.equal(['false', 'true', 'false']);
+      expect(cards(el).map((c) => c.getAttribute('tabindex'))).to.deep.equal([
+        '-1',
+        '0',
+        '-1',
+      ]);
+    });
+
+    it('moves and chooses with the arrow keys', async () => {
+      const el = await mountEditor();
+      key(cards(el)[1], 'ArrowRight');
+      await el.updateComplete;
+      expect((el as any)._action).to.equal('allow');
+      expect(cards(el)[2].getAttribute('aria-checked')).to.equal('true');
+      await el.updateComplete;
+      expect(el.shadowRoot?.activeElement).to.equal(cards(el)[2]);
+
+      key(cards(el)[2], 'ArrowRight');
+      await el.updateComplete;
+      expect((el as any)._action).to.equal('deny');
+
+      key(cards(el)[0], 'ArrowLeft');
+      await el.updateComplete;
+      expect((el as any)._action).to.equal('allow');
+    });
+
+    it('chooses the focused card with Enter or Space', async () => {
+      const el = await mountEditor();
+      key(cards(el)[0], ' ');
+      await el.updateComplete;
+      expect((el as any)._action).to.equal('deny');
+      key(cards(el)[2], 'Enter');
+      await el.updateComplete;
+      expect((el as any)._action).to.equal('allow');
+    });
+
+    it('colours Require approval amber', async () => {
+      const el = await mountEditor();
+      const icon = cards(el)[1].querySelector('sl-icon');
+      expect(icon?.getAttribute('style')).to.contain('--sl-color-warning-600');
+    });
+  });
+
+  it('makes the AND/OR join a named button (advanced conditions)', async () => {
+    const el = (await fixture(
+      html`<tool-rule-editor
+        .open=${true}
+        .workflows=${[]}
+        .features=${{ advanced_approvals: true }}
+      ></tool-rule-editor>`
+    )) as ToolRuleEditor;
+    await el.updateComplete;
+    (el as any)._addCondition();
+    await el.updateComplete;
+
+    const join = el.shadowRoot?.querySelector(
+      'button.join-toggle'
+    ) as HTMLButtonElement;
+    expect(join, 'expected a join button').to.exist;
+    expect(join.textContent?.trim()).to.equal('AND');
+    expect(join.getAttribute('aria-label')).to.equal(
+      'Conditions joined with AND. Switch to OR'
+    );
+    join.click();
+    await el.updateComplete;
+    expect(join.textContent?.trim()).to.equal('OR');
+    expect(join.getAttribute('aria-label')).to.equal(
+      'Conditions joined with OR. Switch to AND'
+    );
+  });
+
   it('dispatches close event when Cancel is clicked', async () => {
     const el = (await fixture(
       html`<tool-rule-editor
@@ -101,7 +217,7 @@ describe('ToolRuleEditor', () => {
     });
 
     const cancelBtn = el.shadowRoot?.querySelector(
-      'sl-button[variant="default"]'
+      '.dialog-footer sl-button[variant="default"]'
     ) as HTMLElement;
     expect(cancelBtn).to.exist;
     cancelBtn.click();
@@ -417,5 +533,56 @@ describe('ToolRuleEditor', () => {
 
     expect(saveDetail).to.equal(null);
     expect((el as any)._error).to.equal('That regex does not compile.');
+  });
+});
+
+describe('rule save settlement', () => {
+  it('keeps input and dialog open on rejection and closes only after success', async () => {
+    const el = await fixture<ToolRuleEditor>(
+      html`<tool-rule-editor .open=${true} .features=${{}}></tool-rule-editor>`
+    );
+    const editor = el as any;
+    editor._description = 'Retain this input';
+    let detail: any;
+    let closes = 0;
+    el.addEventListener('save-rule', (event: Event) => {
+      detail = (event as CustomEvent).detail;
+    });
+    el.addEventListener('close', () => {
+      closes++;
+    });
+    editor._handleSave();
+    await el.updateComplete;
+    expect(editor._saving).to.equal(true);
+    editor._handleSave();
+    const close = new CustomEvent('sl-request-close', { cancelable: true });
+    editor._handleClose(close);
+    expect(close.defaultPrevented).to.equal(true);
+    expect(closes).to.equal(0);
+    detail.reject('Invalid CEL condition');
+    await el.updateComplete;
+    expect(editor._saving).to.equal(false);
+    expect(editor._description).to.equal('Retain this input');
+    expect(el.shadowRoot!.textContent).to.include('Invalid CEL condition');
+    expect(closes).to.equal(0);
+    editor._handleSave();
+    detail.resolve();
+    await el.updateComplete;
+    expect(closes).to.equal(1);
+    expect(editor._saving).to.equal(false);
+  });
+
+  it('passes the unsaved condition to the testing panel', async () => {
+    const el = await fixture<ToolRuleEditor>(
+      html`<tool-rule-editor
+        .open=${true}
+        .toolName=${'read_file'}
+        .features=${{ policy_simulation: true }}
+      ></tool-rule-editor>`
+    );
+    const panel = el.shadowRoot!.querySelector('policy-simulator') as any;
+    expect(panel.toolName).to.equal('read_file');
+    expect(panel.draftRule.action).to.equal('require_approval');
+    expect(panel.shadowRoot).to.equal(null);
   });
 });

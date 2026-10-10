@@ -44,17 +44,25 @@ MCP server config, local backups, and the agent's currently selected model
 companion to onboard, not a re-onboard.
 
 Per agent kind:
-  Claude Code   Rewrites the managed model env pins (ANTHROPIC_MODEL,
-                ANTHROPIC_CUSTOM_MODEL_OPTION(_NAME), and the
-                ANTHROPIC_DEFAULT_<FAMILY>_MODEL keys behind /model
-                switching). Each family selector resolves to the newest
-                authorized model in that family, matching stock Claude Code
-                behavior; a pinned family selection (e.g. "fable") is
-                preserved as a selector and upgrades within its family. A
-                non-family pin is preserved verbatim while it stays
-                authorized. Newly released Anthropic family models are
-                imported into the account catalog and bound to this agent
-                first, reusing the same idempotent machinery onboarding uses.
+  Claude Code   Removes the managed model env pins. By default the stock
+                opus/sonnet/haiku family pins are dropped so Claude Code
+                uses its own built-in defaults. With subscription OAuth
+                and family autoregistration enabled, new ids register on
+                first use after a Claude Code update. API-key accounts
+                should use --pin-model-families or run preloop models sync
+                before selecting newly released ids. The custom model
+                option and the Fable pair (Fable has no built-in Claude
+                Code default) are kept, and a non-family pin is preserved
+                verbatim while it stays authorized. Newly released Anthropic
+                family models are still imported into the account catalog and
+                bound to this agent. Pass --pin-model-families (or onboard
+                with it) for API-key accounts or a gateway whose family
+                autoregistration is disabled; the choice is persisted in the local enrollment
+                state and honoured by later flag-less runs.
+                With pins enabled, candidates are verified against the live
+                Anthropic model list before upgrading; an authorized current
+                pin stays when the live list is unavailable or lacks the
+                candidate. Fable uses the same verified selection.
   OpenCode      Rewrites the managed provider's models map to the full
                 authorized list; the selected model is preserved.
   OpenClaw      Rewrites models.providers.preloop.models to the full
@@ -75,6 +83,7 @@ removed aliases) plus a final summary line.
 Examples:
   preloop agents refresh
   preloop agents refresh "Claude Code"
+  preloop agents refresh "Claude Code" --pin-model-families
   preloop agents sync opencode`,
 	Args: cobra.MaximumNArgs(1),
 	RunE: runAgentsRefresh,
@@ -82,6 +91,7 @@ Examples:
 
 func init() {
 	agentsCmd.AddCommand(agentsRefreshCmd)
+	agentsRefreshCmd.Flags().Bool("pin-model-families", false, "Claude Code only: keep writing the stock opus/sonnet/haiku family pins (use for API-key accounts or when family autoregistration is disabled; persisted in the local enrollment state)")
 }
 
 // managedModelRefreshOutcome is the result of rewriting one agent config's
@@ -98,6 +108,12 @@ type managedModelRefreshOutcome struct {
 	Selected string
 	// Warnings carries selection fallbacks and other operator-visible notes.
 	Warnings []string
+	// Notes carries one-line reasons for family-pin changes (and deliberate
+	// non-changes) so the before/after diff explains itself.
+	Notes []string
+	// Notices carries one-off informational explanations (e.g. the unpinned
+	// Claude Code family pins just removed) that are not warnings.
+	Notices []string
 	// SkipReason is non-empty when the config carries no managed model
 	// section to refresh (e.g. MCP-only onboarding).
 	SkipReason string
@@ -127,6 +143,9 @@ func runAgentsRefresh(cmd *cobra.Command, args []string) error {
 	if !client.IsAuthenticated() {
 		return fmt.Errorf("not authenticated - run 'preloop login' first")
 	}
+
+	pinModelFamilies, _ := cmd.Flags().GetBool("pin-model-families")
+	pinModelFamiliesSet := cmd.Flags().Changed("pin-model-families")
 
 	discovered, err := discoverAgents(io.Discard, false)
 	if err != nil {
@@ -159,23 +178,49 @@ func runAgentsRefresh(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	return executeAgentsRefresh(client, targets, os.Stdout)
+	return executeAgentsRefresh(client, targets, os.Stdout, pinModelFamilies, pinModelFamiliesSet)
 }
 
 // executeAgentsRefresh fetches the account model list and refreshes every
 // target agent, rendering the per-agent diff report. Split from
 // runAgentsRefresh so tests can drive the full command flow against a fake
 // server and captured output.
-func executeAgentsRefresh(client *api.Client, targets []AgentConfig, w io.Writer) error {
+//
+// pinModelFamilies is the value of --pin-model-families; when
+// pinModelFamiliesSet is false the flag was not passed and each agent keeps
+// the choice persisted in its local enrollment state.
+func executeAgentsRefresh(
+	client *api.Client,
+	targets []AgentConfig,
+	w io.Writer,
+	pinModelFamilies bool,
+	pinModelFamiliesSet bool,
+) error {
 	var accountModels []aiModelResponse
 	if err := client.Get("/api/v1/ai-models", &accountModels); err != nil {
 		return fmt.Errorf("failed to list account AI models: %w", err)
 	}
 
+	// The live Anthropic list is account-wide, so one refresh run fetches it
+	// once and reuses it for every Claude Code agent.
+	live := claudeLiveModelList{}
+	for _, agent := range targets {
+		if isClaudeCodeAgent(agent) {
+			live = fetchClaudeLiveModelList()
+			break
+		}
+	}
+
 	refreshed, unchanged, skipped, failed := 0, 0, 0, 0
 	for _, agent := range targets {
 		fmt.Fprintf(w, "Refreshing %s (%s)\n", resolveAgentDisplayName(agent), agent.ConfigPath) //nolint:errcheck
-		outcome, err := refreshAgentManagedModels(client, agent, accountModels, w)
+		agentPin := pinModelFamilies
+		if !pinModelFamiliesSet {
+			if state, stateErr := loadLocalEnrollmentState(agent); stateErr == nil {
+				agentPin = state.PinModelFamilies
+			}
+		}
+		outcome, err := refreshAgentManagedModels(client, agent, accountModels, live, w, agentPin)
 		if err != nil {
 			failed++
 			fmt.Fprintf(w, "  ✗ %v\n", err) //nolint:errcheck
@@ -183,6 +228,9 @@ func executeAgentsRefresh(client *api.Client, targets []AgentConfig, w io.Writer
 		}
 		for _, warning := range outcome.Warnings {
 			fmt.Fprintf(w, "  Warning: %s\n", warning) //nolint:errcheck
+		}
+		for _, notice := range outcome.Notices {
+			fmt.Fprintf(w, "  Note: %s\n", notice) //nolint:errcheck
 		}
 		switch {
 		case outcome.Noop:
@@ -199,6 +247,9 @@ func executeAgentsRefresh(client *api.Client, targets []AgentConfig, w io.Writer
 			for _, alias := range outcome.removed() {
 				fmt.Fprintf(w, "  - %s\n", alias) //nolint:errcheck
 			}
+			for _, note := range outcome.Notes {
+				fmt.Fprintf(w, "  · %s\n", note) //nolint:errcheck
+			}
 			if outcome.Selected != "" {
 				fmt.Fprintf(w, "  Selected model: %s\n", outcome.Selected) //nolint:errcheck
 			}
@@ -211,6 +262,9 @@ func executeAgentsRefresh(client *api.Client, targets []AgentConfig, w io.Writer
 			)
 		default:
 			unchanged++
+			for _, note := range outcome.Notes {
+				fmt.Fprintf(w, "  · %s\n", note) //nolint:errcheck
+			}
 			fmt.Fprintf(w, "  ✓ Already up to date (%d managed model(s))\n", len(outcome.After)) //nolint:errcheck
 		}
 	}
@@ -235,7 +289,9 @@ func refreshAgentManagedModels(
 	client *api.Client,
 	agent AgentConfig,
 	accountModels []aiModelResponse,
+	live claudeLiveModelList,
 	output io.Writer,
+	pinModelFamilies bool,
 ) (managedModelRefreshOutcome, error) {
 	if output == nil {
 		output = io.Discard
@@ -269,7 +325,10 @@ func refreshAgentManagedModels(
 		)
 	}
 
-	outcome, err := refreshManagedModelDocument(agent, doc, accountModels, bindings)
+	// Verify candidate family pins against the provider's live model list
+	// before writing them: a catalog row that Anthropic 404s must not become
+	// the pin. executeAgentsRefresh fetches that list once per run.
+	outcome, err := refreshManagedModelDocument(agent, doc, accountModels, bindings, live, pinModelFamilies)
 	if err != nil || outcome.SkipReason != "" || outcome.Doc == nil {
 		return outcome, err
 	}
@@ -282,29 +341,31 @@ func refreshAgentManagedModels(
 			return managedModelRefreshOutcome{}, err
 		}
 	}
-	if err := updateLocalEnrollmentManagedSnapshot(agent, outcome.Doc); err != nil {
-		// The config write already succeeded; a stale snapshot only affects
-		// status displays, so warn instead of failing the refresh.
-		fmt.Fprintf(output, "  Warning: could not update the local managed-config snapshot: %v\n", err) //nolint:errcheck
+	if err := updateLocalEnrollmentManagedSnapshot(agent, outcome.Doc, pinModelFamilies); err != nil {
+		// The config write already succeeded, but the snapshot and persisted
+		// pinning choice may be stale. Warn so the operator can retry.
+		fmt.Fprintf(output, "  Warning: could not save the local managed-config snapshot and family-pinning choice; retry refresh with the same flag: %v\n", err) //nolint:errcheck
 	}
 	return outcome, nil
 }
 
 // refreshManagedModelDocument dispatches to the per-kind document rewriter.
-// It is pure (no network, no file writes) so each agent kind can be tested
-// against fixture configs.
+// It performs no network or file writes itself (the live Anthropic list is
+// passed in) so each agent kind can be tested against fixture configs.
 func refreshManagedModelDocument(
 	agent AgentConfig,
 	doc map[string]interface{},
 	accountModels []aiModelResponse,
 	bindings []managedAgentModelBindingSummary,
+	live claudeLiveModelList,
+	pinModelFamilies bool,
 ) (managedModelRefreshOutcome, error) {
 	if isExtensionHarness(agent) {
 		return refreshHarnessModelDocument(agent, doc, accountModels, bindings)
 	}
 	switch {
 	case isClaudeCodeAgent(agent):
-		return refreshClaudeManagedModelDocument(agent, doc, accountModels, bindings)
+		return refreshClaudeManagedModelDocumentWithLive(agent, doc, accountModels, bindings, live, pinModelFamilies)
 	case isOpenCodeAgent(agent):
 		return refreshOpenCodeManagedModelDocument(agent, doc, accountModels, bindings)
 	case isOpenClawAgent(agent):
@@ -435,23 +496,66 @@ func diffModelAliasSets(before, after []string) (added, removed []string) {
 	return added, removed
 }
 
-// newestAuthorizedFamilyAlias returns the newest (by version sort key)
-// authorized alias belonging to one Claude model family, or "".
+// newestAuthorizedFamilyAlias returns the newest authorized alias belonging
+// to one Claude model family, or "".
+//
+// Ranking uses the numeric version components only: an Anthropic snapshot
+// suffix (the trailing YYYYMMDD date on ids like claude-opus-5-5-20260915) is
+// not a version component and never outranks the undated form of the same
+// version. When two candidates share a version, the undated alias wins (a
+// dated snapshot of the same model is equivalent for pin purposes). Only a
+// strictly newer version replaces a candidate.
 func newestAuthorizedFamilyAlias(family claudeModelFamily, authorized []string) string {
 	best := ""
-	var bestKey []int
+	var bestVersion []int
+	bestDated := false
 	for _, alias := range authorized {
 		candidateFamily, ok := claudeFamilyForAlias(alias)
 		if !ok || candidateFamily.selector != family.selector {
 			continue
 		}
-		key := modelVersionSortKey(alias)
-		if best == "" || compareVersionSortKeys(key, bestKey) > 0 {
-			best = alias
-			bestKey = key
+		version, dated := claudeModelVersionKey(alias)
+		if best == "" {
+			best, bestVersion, bestDated = alias, version, dated
+			continue
+		}
+		switch compareVersionSortKeys(version, bestVersion) {
+		case 1:
+			best, bestVersion, bestDated = alias, version, dated
+		case 0:
+			// Same version: prefer the undated alias over a dated snapshot.
+			if bestDated && !dated {
+				best, bestVersion, bestDated = alias, version, dated
+			}
 		}
 	}
 	return best
+}
+
+// claudeModelVersionKey returns the numeric components that rank two aliases
+// in the same Claude family. A trailing snapshot date (YYYYMMDD) is stripped
+// because it is a build marker, not a version; dated reports whether such a
+// suffix was removed so callers can prefer the undated form.
+func claudeModelVersionKey(alias string) (version []int, dated bool) {
+	key := modelVersionSortKey(alias)
+	if len(key) > 0 && isAnthropicSnapshotDate(key[len(key)-1]) {
+		return key[:len(key)-1], true
+	}
+	return key, false
+}
+
+// isAnthropicSnapshotDate reports whether n looks like a YYYYMMDD snapshot
+// suffix (e.g. 20260915). Anthropic appends such dates to concrete model ids;
+// they carry no version information.
+//
+// The 8-digit range plus calendar bounds keep ordinary version components
+// (and short build numbers) from being mistaken for a snapshot date.
+func isAnthropicSnapshotDate(n int) bool {
+	if n < 10_000_000 || n > 99_999_999 {
+		return false
+	}
+	year, month, day := n/10_000, (n/100)%100, n%100
+	return year >= 2000 && year <= 2100 && month >= 1 && month <= 12 && day >= 1 && day <= 31
 }
 
 // ---------------------------------------------------------------------------
@@ -479,11 +583,162 @@ func claudeManagedModelAliasesFromEnv(env map[string]interface{}) []string {
 	return aliases
 }
 
+// claudeLiveModelList is the live Anthropic model list used to verify a
+// family-pin candidate before the refresh writes it.
+//
+// Attempted and Obtained are deliberately distinct: a refresh with no local
+// Anthropic credential cannot verify anything (Attempted=false) and keeps the
+// catalog behavior; a credential that is present but whose request fails
+// (Attempted=true, Obtained=false) is the "live list unreachable" case where
+// the current pin is kept instead of trusting the catalog blindly.
+type claudeLiveModelList struct {
+	Attempted bool
+	Obtained  bool
+	IDs       []string
+}
+
+// claudeLiveAccessToken is a seam for tests. Production resolves the local
+// Claude Code OAuth token or managed API key.
+var claudeLiveAccessToken = resolveClaudeLiveAccessToken
+
+// fetchClaudeLiveModelList fetches the live Anthropic model ids when a local
+// Anthropic credential (Claude Code OAuth bundle or managed API key) is
+// available. It never returns an error: an unreachable list is represented by
+// Attempted=true, Obtained=false so the caller can keep the current pin.
+func fetchClaudeLiveModelList() claudeLiveModelList {
+	token := claudeLiveAccessToken()
+	if token == "" {
+		return claudeLiveModelList{}
+	}
+	ids, err := fetchAnthropicModelIDs(token)
+	if err != nil {
+		return claudeLiveModelList{Attempted: true}
+	}
+	return claudeLiveModelList{Attempted: true, Obtained: true, IDs: ids}
+}
+
+// contains reports whether the live list holds the concrete model id behind a
+// gateway alias. The provider prefix is optional on either side.
+func (l claudeLiveModelList) contains(alias string) bool {
+	want := strings.TrimSpace(strings.TrimPrefix(normalizeGatewayModelAlias(alias), "anthropic/"))
+	if want == "" {
+		return false
+	}
+	for _, id := range l.IDs {
+		if strings.EqualFold(strings.TrimSpace(id), want) {
+			return true
+		}
+	}
+	return false
+}
+
+// resolveClaudeFamilyPin chooses the alias to write for one Claude family env
+// pin (ANTHROPIC_DEFAULT_<FAMILY>_MODEL).
+//
+// It starts from the newest authorized alias in the family and only moves the
+// pin when the move is safe:
+//   - the candidate equals the current pin: keep it silently;
+//   - there is no current pin: write the candidate and say it was pinned;
+//   - the current pin is no longer authorized: switch (preferring a candidate
+//     that is in the live list when one was obtained);
+//   - the live list was obtained but lacks the candidate: keep the current
+//     authorized pin and explain why;
+//   - the live list was attempted but unreachable: keep the current authorized
+//     pin and explain why;
+//   - otherwise (no live signal): switch to the newer candidate.
+//
+// The returned alias is "" when the family has no usable model; note is a
+// one-line operator explanation for any change or deliberate non-change.
+func resolveClaudeFamilyPin(
+	family claudeModelFamily,
+	current string,
+	authorized []string,
+	live claudeLiveModelList,
+) (alias, note string) {
+	candidate := newestAuthorizedFamilyAlias(family, authorized)
+	current = normalizeGatewayModelAlias(current)
+	if candidate == "" {
+		return "", ""
+	}
+	if current != "" && strings.EqualFold(current, candidate) {
+		return candidate, ""
+	}
+	if current == "" || !aliasSet(authorized)[strings.ToLower(current)] {
+		// Nothing usable to keep. Prefer a candidate that is itself in the
+		// live list when one was obtained, then fall back to the catalog's
+		// newest authorized alias.
+		if live.Obtained && !live.contains(candidate) {
+			if verified := newestLiveAuthorizedFamilyAlias(family, authorized, live); verified != "" {
+				candidate = verified
+			}
+		}
+		if current == "" {
+			return candidate, fmt.Sprintf("%s: pinned to %s", family.selector, candidate)
+		}
+		return candidate, fmt.Sprintf(
+			"%s: pin no longer authorized; using %s", family.selector, candidate,
+		)
+	}
+	switch {
+	case live.Obtained && !live.contains(candidate):
+		return current, fmt.Sprintf(
+			"%s: keeping %s (candidate %s not in live list)",
+			family.selector, current, candidate,
+		)
+	case live.Attempted && !live.Obtained:
+		return current, fmt.Sprintf(
+			"%s: kept %s (live list unavailable; candidate %s unverified)",
+			family.selector, current, candidate,
+		)
+	default:
+		return candidate, fmt.Sprintf(
+			"%s: newer version %s (was %s)", family.selector, candidate, current,
+		)
+	}
+}
+
+// newestLiveAuthorizedFamilyAlias returns the newest authorized family alias
+// that is also present in the live Anthropic list, or "".
+func newestLiveAuthorizedFamilyAlias(
+	family claudeModelFamily,
+	authorized []string,
+	live claudeLiveModelList,
+) string {
+	if !live.Obtained {
+		return ""
+	}
+	verified := make([]string, 0, len(authorized))
+	for _, alias := range authorized {
+		if live.contains(alias) {
+			verified = append(verified, alias)
+		}
+	}
+	return newestAuthorizedFamilyAlias(family, verified)
+}
+
+// refreshClaudeManagedModelDocument rewrites the Claude Code model pins
+// without a live-list check. It is kept for the pure per-kind tests; the
+// command path calls refreshClaudeManagedModelDocumentWithLive with the live
+// Anthropic list so candidate pins are verified before they are written.
 func refreshClaudeManagedModelDocument(
 	agent AgentConfig,
 	doc map[string]interface{},
 	accountModels []aiModelResponse,
 	bindings []managedAgentModelBindingSummary,
+	pinModelFamilies bool,
+) (managedModelRefreshOutcome, error) {
+	return refreshClaudeManagedModelDocumentWithLive(
+		agent, doc, accountModels, bindings, claudeLiveModelList{}, pinModelFamilies,
+	)
+}
+
+func refreshClaudeManagedModelDocumentWithLive(
+	agent AgentConfig,
+	doc map[string]interface{},
+	accountModels []aiModelResponse,
+	bindings []managedAgentModelBindingSummary,
+	live claudeLiveModelList,
+	pinModelFamilies bool,
 ) (managedModelRefreshOutcome, error) {
 	env, ok := asObjectMap(doc["env"])
 	if !ok {
@@ -514,18 +769,57 @@ func refreshClaudeManagedModelDocument(
 
 	before := claudeManagedModelAliasesFromEnv(env)
 	warnings := []string{}
+	notes := []string{}
+
+	// Resolve every family pin first, with live verification, so the
+	// selection and the ANTHROPIC_DEFAULT_*_MODEL keys always agree. The
+	// selected family's pin is what applyClaudeManagedGateway writes first
+	// (and therefore wins inside its own family).
+	familyPinBySelector := map[string]string{}
+	familyAliases := make([]string, 0, len(claudeModelFamilies))
+	for _, family := range claudeModelFamilies {
+		alias, note := resolveClaudeFamilyPin(
+			family, lookupString(env, family.envKey), authorized, live,
+		)
+		if note != "" && (pinModelFamilies || !claudeFamilyIsStock(family)) {
+			notes = append(notes, note)
+		}
+		if alias == "" {
+			continue
+		}
+		familyPinBySelector[family.selector] = alias
+		familyAliases = append(familyAliases, alias)
+	}
+	notices := []string{}
+
+	// Detect the stock family pins this refresh is about to drop so the
+	// operator gets a one-line explanation the first time; later flag-less
+	// runs have nothing left to remove and stay quiet.
+	removedStockPins := []string{}
+	if !pinModelFamilies {
+		for _, family := range claudeModelFamilies {
+			if !claudeFamilyIsStock(family) {
+				continue
+			}
+			if alias := strings.TrimSpace(lookupString(env, family.envKey)); alias != "" {
+				removedStockPins = append(removedStockPins, family.envKey)
+			}
+		}
+	}
 
 	// Current selection: a family selector ("fable") stays a selector and
-	// upgrades within its family (stock Claude Code behavior); a non-family
-	// alias is preserved verbatim while it remains authorized.
+	// resolves through its verified family pin (stock Claude Code behavior);
+	// a non-family alias is preserved verbatim while it remains authorized.
 	currentSelection := lookupString(env, "ANTHROPIC_MODEL")
+	if currentSelection == "" {
+		currentSelection = lookupString(doc, "model")
+	}
 	if currentSelection == "" {
 		currentSelection = normalizeGatewayModelAlias(lookupString(env, "ANTHROPIC_CUSTOM_MODEL_OPTION"))
 	}
 	modelAlias := ""
 	if selector := claudeSelectionFromModelRef(currentSelection); selector != "" {
-		family, _ := claudeFamilyForAlias("claude-" + selector)
-		modelAlias = newestAuthorizedFamilyAlias(family, authorized)
+		modelAlias = familyPinBySelector[selector]
 		if modelAlias == "" {
 			modelAlias = defaultGatewayModelAlias(accountModels, authorized)
 			warnings = append(warnings, fmt.Sprintf(
@@ -538,9 +832,7 @@ func refreshClaudeManagedModelDocument(
 		if family, isFamily := claudeFamilyForAlias(pinned); isFamily {
 			// A raw family alias (rather than a selector) in ANTHROPIC_MODEL:
 			// treat it like the selector form so it upgrades within family.
-			if newest := newestAuthorizedFamilyAlias(family, authorized); newest != "" {
-				modelAlias = newest
-			}
+			modelAlias = familyPinBySelector[family.selector]
 		}
 		if modelAlias == "" && pinned != "" && aliasSet(authorized)[strings.ToLower(pinned)] {
 			modelAlias = pinned
@@ -554,23 +846,27 @@ func refreshClaudeManagedModelDocument(
 		}
 	}
 
-	// Family env coverage: the newest authorized alias per family. The
-	// pinned alias goes first inside applyClaudeManagedGateway so it wins
-	// its own family.
-	familyAliases := make([]string, 0, len(claudeModelFamilies))
-	for _, family := range claudeModelFamilies {
-		if alias := newestAuthorizedFamilyAlias(family, authorized); alias != "" {
-			familyAliases = append(familyAliases, alias)
-		}
-	}
-
 	plan := managedMCPEnrollmentPlan{Agent: agent, ManagedDocument: doc}
-	plan, err := applyClaudeManagedGateway(plan, baseURL, token, modelAlias, familyAliases)
+	plan, err := applyClaudeManagedGateway(plan, baseURL, token, modelAlias, familyAliases, pinModelFamilies)
 	if err != nil {
 		return managedModelRefreshOutcome{}, err
 	}
 
 	afterEnv, _ := asObjectMap(plan.ManagedDocument["env"])
+	actualRemovedPins := removedStockPins[:0]
+	for _, key := range removedStockPins {
+		if lookupString(afterEnv, key) == "" {
+			actualRemovedPins = append(actualRemovedPins, key)
+		}
+	}
+	removedStockPins = actualRemovedPins
+	if len(removedStockPins) > 0 {
+		notices = append(notices, fmt.Sprintf(
+			"Removed the managed stock Claude Code family pins (%s); Claude Code now follows its own defaults. Automatic registration of new ids requires subscription OAuth and enabled family autoregistration. API-key accounts should pass --pin-model-families or run preloop models sync before selecting new ids; pass --pin-model-families if family autoregistration is disabled.",
+			strings.Join(removedStockPins, ", "),
+		))
+	}
+
 	after := claudeManagedModelAliasesFromEnv(afterEnv)
 	selected := modelAlias
 	if selector, _ := claudePinnedModelSelection(modelAlias); selector != "" {
@@ -582,6 +878,8 @@ func refreshClaudeManagedModelDocument(
 		After:    after,
 		Selected: selected,
 		Warnings: warnings,
+		Notes:    notes,
+		Notices:  notices,
 	}, nil
 }
 
@@ -1104,9 +1402,10 @@ func refreshSinglePinnedModelDocument(
 
 // updateLocalEnrollmentManagedSnapshot refreshes the sanitized managed-config
 // snapshot in the local enrollment state so `preloop agents status` reflects
-// the rewrite. The pre-onboarding backup (what `restore` replays) is left
-// untouched on purpose.
-func updateLocalEnrollmentManagedSnapshot(agent AgentConfig, doc map[string]interface{}) error {
+// the rewrite, and records the effective Claude Code family-pinning choice so a
+// later flag-less refresh keeps it. The pre-onboarding backup (what `restore`
+// replays) is left untouched on purpose.
+func updateLocalEnrollmentManagedSnapshot(agent AgentConfig, doc map[string]interface{}, pinModelFamilies bool) error {
 	state, err := loadLocalEnrollmentState(agent)
 	if err != nil {
 		return err
@@ -1118,6 +1417,9 @@ func updateLocalEnrollmentManagedSnapshot(agent AgentConfig, doc map[string]inte
 	sanitizeConfigSnapshot(sanitized)
 	state.ManagedConfig = sanitized
 	state.AppliedAt = time.Now().UTC()
+	if isClaudeCodeAgent(agent) {
+		state.PinModelFamilies = pinModelFamilies
+	}
 	return saveLocalEnrollmentState(state)
 }
 

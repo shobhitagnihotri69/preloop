@@ -336,11 +336,11 @@ func TestSupportLevelForAgentMatrix(t *testing.T) {
 }
 
 func TestAgentSupportListingLabel(t *testing.T) {
-	if label := agentSupportListingLabel(AgentConfig{Name: "Claude Desktop"}); label != mcpOnlySupportLabel {
-		t.Fatalf("expected mcp-only label for Claude Desktop, got %q", label)
-	}
-	if label := agentSupportListingLabel(AgentConfig{Name: "Codex CLI"}); label != fullSupportLabel {
-		t.Fatalf("expected full label for Codex CLI, got %q", label)
+	for _, name := range []string{"Claude Desktop", "Cursor", "Copilot CLI", "Codex CLI"} {
+		label := agentSupportListingLabel(AgentConfig{Name: name})
+		if !strings.Contains(label, "managed MCP: supported") || !strings.Contains(label, "application behavior unverified") {
+			t.Fatalf("expected independent adapter support for %s, got %q", name, label)
+		}
 	}
 }
 
@@ -404,7 +404,7 @@ func TestClassifySuccessfulOnboardingReflectsAuthAndSupport(t *testing.T) {
 		Name:      "Claude Desktop",
 		AuthState: string(agentAuthStateUnknown),
 	}, nil)
-	if mcpOnly.Reason != mcpOnlySupportLabel {
+	if !strings.Contains(mcpOnly.Reason, mcpOnlySupportLabel) || !strings.Contains(mcpOnly.Reason, "application behavior unverified") {
 		t.Fatalf("expected mcp-only support reason, got %q", mcpOnly.Reason)
 	}
 
@@ -412,8 +412,8 @@ func TestClassifySuccessfulOnboardingReflectsAuthAndSupport(t *testing.T) {
 		Name:      "Codex CLI",
 		AuthState: string(agentAuthStateReady),
 	}, nil)
-	if ready.Reason != "" {
-		t.Fatalf("expected empty reason for a ready full-support agent, got %q", ready.Reason)
+	if !strings.Contains(ready.Reason, "application behavior unverified") {
+		t.Fatalf("expected configuration evidence caveat, got %q", ready.Reason)
 	}
 }
 
@@ -431,7 +431,7 @@ func TestPrintAgentOnboardingSummaryShowsSupportLevelReason(t *testing.T) {
 }
 
 func TestMCPOnlyAgentModelNoteLeadsWithSupportLabel(t *testing.T) {
-	for _, name := range []string{"Cursor", "Claude Desktop", "Antigravity", "Devin", "Windsurf"} {
+	for _, name := range []string{"Cursor", "VSCode / Copilot", "Claude Desktop", "Antigravity", "Devin", "Windsurf"} {
 		note := mcpOnlyAgentModelNote(AgentConfig{Name: name})
 		if !strings.HasPrefix(note, mcpOnlySupportLabel) {
 			t.Fatalf("expected %s note to lead with the support label, got %q", name, note)

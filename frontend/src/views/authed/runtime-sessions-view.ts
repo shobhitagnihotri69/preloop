@@ -1,5 +1,13 @@
+import { ConsoleStatus } from '../../controllers/console-status';
+import { parseUTCDate } from '../../utils/date';
+import { formatUsd, formatUsdExact } from '../../utils/money';
+import { validFilterDate } from '../../utils/list-filter-url';
 import { LitElement, html, css, unsafeCSS, nothing } from 'lit';
 import { customElement, state } from 'lit/decorators.js';
+import {
+  ARTIFACT_KIND_LABELS as ARTIFACT_GROUP_LABELS,
+  type ArtifactKindGroup,
+} from '../../utils/session-artifacts';
 
 import '@shoelace-style/shoelace/dist/components/alert/alert.js';
 import '@shoelace-style/shoelace/dist/components/badge/badge.js';
@@ -12,10 +20,12 @@ import '@shoelace-style/shoelace/dist/components/option/option.js';
 import '@shoelace-style/shoelace/dist/components/select/select.js';
 import '@shoelace-style/shoelace/dist/components/spinner/spinner.js';
 import '../../components/view-header.ts';
+import '../../components/legal-hold-control';
 import '../../components/json-tree.ts';
 import '../../components/list-toolbar.ts';
 import '../../components/preloop-session-observer.ts';
 import '../../components/token-figures.ts';
+import '../../components/session-embedding-settings.ts';
 import {
   getAccountRuntimeSessionDetail,
   getAccountRuntimeSessions,
@@ -43,11 +53,13 @@ import type {
   RuntimeSessionActivityItem,
   RuntimeSessionSummary,
   SessionSearchResponse,
+  SessionSearchArtifactRef,
   SessionSearchResult,
   SessionSearchSnippet,
 } from '../../types';
 import consoleStyles from '../../styles/console-styles.css?inline';
 import { unifiedWebSocketManager } from '../../services/unified-websocket-manager';
+import '../../components/unified-session-history';
 
 type DateRangePreset = 'last-7' | 'last-30' | 'last-90' | 'all' | 'custom';
 
@@ -79,7 +91,52 @@ const MATCH_TAG_LABELS: Record<string, string> = {
   operator_note: 'Operator note',
   session_summary: 'Session summary',
   flow_log: 'Flow log',
+  artifact: 'Artifact',
 };
+
+/** Readable artifact kinds for an artifact match tag. */
+const ARTIFACT_KIND_LABELS: Record<string, string> = {
+  transcript: 'Transcript',
+  document: 'Document',
+  screenshot: 'Screenshot',
+  recording: 'Recording',
+  screencast: 'Screencast',
+  audio: 'Audio',
+  generated_file: 'Generated file',
+  trace: 'Trace',
+};
+
+/**
+ * The header lines the indexer writes at the top of an artifact chunk
+ * (`backend/preloop/services/session_search_index.py`, `_artifact_header`).
+ */
+export function artifactHeaderLines(
+  artifact: SessionSearchArtifactRef
+): string[] {
+  const labels = Object.keys(artifact.labels || {})
+    .sort()
+    .map((key) => {
+      const value = artifact.labels[key];
+      return `${key}=${Array.isArray(value) ? value.join(' ') : value}`;
+    })
+    .join(' ');
+  return [
+    'kind: artifact',
+    artifact.kind ? `artifact_kind: ${artifact.kind}` : '',
+    artifact.name ? `name: ${artifact.name}` : '',
+    artifact.tool_name ? `tool_name: ${artifact.tool_name}` : '',
+    labels ? `labels: ${labels}` : '',
+  ].filter(Boolean);
+}
+
+/** `m:ss` (or `h:mm:ss`) for a transcript cue start in seconds. */
+export function formatCueStart(seconds: number): string {
+  const whole = Math.max(0, Math.floor(seconds));
+  const h = Math.floor(whole / 3600);
+  const m = Math.floor((whole % 3600) / 60);
+  const s = String(whole % 60).padStart(2, '0');
+  return h > 0 ? `${h}:${String(m).padStart(2, '0')}:${s}` : `${m}:${s}`;
+}
 
 /**
  * Corpus kinds whose source_id names a turn the transcript can scroll to.
@@ -97,6 +154,7 @@ const TURN_JUMP_KINDS = new Set([
 
 @customElement('runtime-sessions-view')
 export class RuntimeSessionsView extends LitElement {
+  private readonly accessibilityStatus = new ConsoleStatus(this);
   @state()
   private sessions: AccountRuntimeSessionListResponse | null = null;
 
@@ -111,6 +169,12 @@ export class RuntimeSessionsView extends LitElement {
 
   @state()
   private error: string | null = null;
+
+  @state()
+  private loadingMore = false;
+
+  @state()
+  private moreError: string | null = null;
 
   @state()
   private selectedSessionId: string | null = null;
@@ -159,11 +223,19 @@ export class RuntimeSessionsView extends LitElement {
   @state()
   private focusTurnId: string | null = null;
 
+  /** Artifact row to land on (`?artifact=<id>`), kept in the location. */
+  @state()
+  private focusArtifactId: string | null = null;
+
   @state()
   private sessionSourceType = 'all';
 
   @state()
   private status = 'all';
+
+  /** "Has artifacts" list filter: `all`, `any`, or one artifact kind. */
+  @state()
+  private hasArtifacts = 'all';
 
   @state()
   private interactionQuery = '';
@@ -234,6 +306,18 @@ export class RuntimeSessionsView extends LitElement {
         gap: var(--sl-spacing-small);
       }
 
+      .more {
+        display: flex;
+        align-items: center;
+        gap: var(--sl-spacing-small);
+        justify-content: center;
+        margin-top: var(--sl-spacing-medium);
+      }
+
+      .error {
+        color: var(--sl-color-danger-700);
+      }
+
       .titles-upsell-hint {
         display: flex;
         align-items: center;
@@ -248,6 +332,22 @@ export class RuntimeSessionsView extends LitElement {
         font-size: var(--sl-font-size-x-small);
         text-align: left;
         cursor: pointer;
+      }
+
+      .embedding-settings-toggle {
+        display: block;
+        margin: 0 0 var(--sl-spacing-small) auto;
+        padding: 0;
+        border: none;
+        background: transparent;
+        color: var(--sl-color-primary-600);
+        font-size: var(--sl-font-size-x-small);
+        cursor: pointer;
+      }
+
+      .embedding-settings {
+        display: block;
+        margin-bottom: var(--sl-spacing-medium);
       }
 
       .titles-upsell-hint:hover {
@@ -597,7 +697,7 @@ export class RuntimeSessionsView extends LitElement {
       }
 
       .snippet-text.muted {
-        color: var(--sl-color-neutral-500);
+        color: var(--console-meta-color);
         font-style: italic;
       }
 
@@ -683,6 +783,26 @@ export class RuntimeSessionsView extends LitElement {
     this.selectedSessionId = params.get('sessionId');
     this.searchQuery = params.get('q') ?? '';
     this.focusTurnId = params.get('turn');
+    this.focusArtifactId = params.get('artifact');
+    const range = params.get('range');
+    this.selectedRange = [
+      'last-7',
+      'last-30',
+      'last-90',
+      'all',
+      'custom',
+    ].includes(range ?? '')
+      ? (range as DateRangePreset)
+      : 'last-30';
+    if (this.selectedRange === 'custom') {
+      this.startDate = validFilterDate(params.get('from'));
+      this.endDate = validFilterDate(params.get('to'));
+    } else {
+      this.applyPresetDates(this.selectedRange);
+    }
+    this.sessionSourceType = params.get('source_type') ?? 'all';
+    this.status = params.get('status') ?? 'all';
+    this.hasArtifacts = params.get('has_artifacts') ?? 'all';
   }
 
   /**
@@ -762,8 +882,10 @@ export class RuntimeSessionsView extends LitElement {
               !(
                 e.type === 'model_gateway_request_started' &&
                 Math.abs(
-                  new Date(e.timestamp || new Date().toISOString()).getTime() -
-                    new Date(
+                  parseUTCDate(
+                    e.timestamp || new Date().toISOString()
+                  ).getTime() -
+                    parseUTCDate(
                       payload.timestamp || new Date().toISOString()
                     ).getTime()
                 ) < 60000
@@ -872,6 +994,9 @@ export class RuntimeSessionsView extends LitElement {
     if (this.sessionSourceType !== 'all') {
       params.sessionSourceType = this.sessionSourceType;
     }
+    if (this.hasArtifacts !== 'all') {
+      params.hasArtifacts = this.hasArtifacts;
+    }
 
     return params;
   }
@@ -958,6 +1083,12 @@ export class RuntimeSessionsView extends LitElement {
   }
 
   @state() private isPremium = true;
+  /**
+   * Whether the semantic search opt in card is open. Closed by default, and
+   * the card reads its setting only once opened, so a page load does not pay
+   * for the corpus progress count nobody asked to see.
+   */
+  @state() private embeddingSettingsOpen = false;
 
   /** Open the shell upgrade modal for AI session titles (passive list hint). */
   private openTitlesUpgrade(): void {
@@ -1009,6 +1140,53 @@ export class RuntimeSessionsView extends LitElement {
       if (seq === this.loadSequence) {
         this.loading = false;
       }
+    }
+  }
+
+  /**
+   * Append the next page of the list to the rows already on screen.
+   *
+   * Offset, not cursor: the backend contract pages the session list by offset
+   * and returns the authoritative `total`, so "load more" just asks for the
+   * rows starting at the current count. Sequenced against `loadSequence` so a
+   * filter change or live refresh that replaces the list abandons the older
+   * page instead of splicing it onto a list it no longer belongs to.
+   */
+  private async loadMoreSessions(): Promise<void> {
+    const current = this.sessions;
+    if (!current || this.loadingMore) return;
+    const seq = this.loadSequence;
+    this.loadingMore = true;
+    this.moreError = null;
+    try {
+      const page = await getAccountRuntimeSessions({
+        ...this.buildListParams(),
+        offset: current.items.length,
+      });
+      if (seq !== this.loadSequence) return;
+      // The list is ordered by a mutable activity timestamp with no
+      // tiebreaker, so an offset page can repeat a row already on screen.
+      // Drop those; a live refresh replaces the window if the order moved.
+      const seen = new Set(current.items.map((item) => item.id));
+      this.sessions = {
+        ...page,
+        items: [
+          ...current.items,
+          ...(page.items ?? []).filter((item) => !seen.has(item.id)),
+        ],
+      };
+    } catch (error) {
+      if (seq !== this.loadSequence) return;
+      this.moreError =
+        error instanceof Error
+          ? error.message
+          : 'Could not load more sessions.';
+    } finally {
+      // Always clear: this flag tracks THIS request, and only one load-more
+      // can be in flight at a time. A superseding load (live refresh or
+      // filter change) bumps loadSequence and would otherwise leave the
+      // button stuck in its loading state forever.
+      this.loadingMore = false;
     }
   }
 
@@ -1148,11 +1326,29 @@ export class RuntimeSessionsView extends LitElement {
     } else {
       url.searchParams.delete('turn');
     }
-    const target = `${url.pathname}${url.search}`;
+    if (this.focusArtifactId) {
+      url.searchParams.set('artifact', this.focusArtifactId);
+    } else {
+      url.searchParams.delete('artifact');
+    }
+    const filters = {
+      range: this.selectedRange === 'last-30' ? '' : this.selectedRange,
+      source_type:
+        this.sessionSourceType === 'all' ? '' : this.sessionSourceType,
+      status: this.status === 'all' ? '' : this.status,
+      has_artifacts: this.hasArtifacts === 'all' ? '' : this.hasArtifacts,
+      from: this.selectedRange === 'custom' ? this.startDate : '',
+      to: this.selectedRange === 'custom' ? this.endDate : '',
+    };
+    for (const [key, value] of Object.entries(filters)) {
+      if (value) url.searchParams.set(key, value);
+      else url.searchParams.delete(key);
+    }
+    const target = `${url.pathname}${url.search}${url.hash}`;
     if (options.push) {
       window.history.pushState({}, '', target);
     } else {
-      window.history.replaceState({}, '', target);
+      window.history.replaceState(window.history.state, '', target);
     }
   }
 
@@ -1162,8 +1358,8 @@ export class RuntimeSessionsView extends LitElement {
     this.selectedRange = value;
     if (value !== 'custom') {
       this.applyPresetDates(value);
-      void this.loadSessions();
     }
+    void this.applyFilters();
   }
 
   private handleStartDateChange(event: Event) {
@@ -1171,11 +1367,13 @@ export class RuntimeSessionsView extends LitElement {
       event.target as HTMLInputElement & { value: string }
     ).value;
     this.selectedRange = 'custom';
+    void this.applyFilters();
   }
 
   private handleEndDateChange(event: Event) {
     this.endDate = (event.target as HTMLInputElement & { value: string }).value;
     this.selectedRange = 'custom';
+    void this.applyFilters();
   }
 
   /**
@@ -1219,10 +1417,19 @@ export class RuntimeSessionsView extends LitElement {
     this.sessionSourceType = (
       event.target as HTMLInputElement & { value: string }
     ).value;
+    void this.applyFilters();
   }
 
   private handleStatusChange(event: Event) {
     this.status = (event.target as HTMLInputElement & { value: string }).value;
+    void this.applyFilters();
+  }
+
+  private handleHasArtifactsChange(event: Event) {
+    this.hasArtifacts = (
+      event.target as HTMLInputElement & { value: string }
+    ).value;
+    void this.applyFilters();
   }
 
   private handleInteractionQueryChange(event: Event) {
@@ -1251,7 +1458,7 @@ export class RuntimeSessionsView extends LitElement {
     if (this.isSearching) {
       // The filters bound the list as well, so it stays in step for the
       // moment the query is cleared.
-      await this.loadSessions();
+      await this.loadSessions(this.sessions !== null);
     }
   }
 
@@ -1262,10 +1469,11 @@ export class RuntimeSessionsView extends LitElement {
     this.searchQuery = '';
     this.sessionSourceType = 'all';
     this.status = 'all';
+    this.hasArtifacts = 'all';
     this.interactionQuery = '';
     this.clearSearchResults();
     this.syncUrl();
-    await this.loadSessions();
+    await this.loadSessions(this.sessions !== null);
   }
 
   private applyInteractionSearch() {
@@ -1320,6 +1528,7 @@ export class RuntimeSessionsView extends LitElement {
     this.selectedSessionId = sessionId;
     // Picking another session is not landing on a turn any more.
     this.focusTurnId = null;
+    this.focusArtifactId = null;
     this.syncUrl();
     // Observer loads activity/events for the selection; avoid a duplicate
     // parent getAccountRuntimeSessionDetail fetch.
@@ -1338,14 +1547,28 @@ export class RuntimeSessionsView extends LitElement {
     return TURN_JUMP_KINDS.has(snippet.source_kind);
   }
 
+  /**
+   * The timeline row a snippet opens at. An artifact hit names its deposit
+   * row (`activity_id`), so the location is right as soon as the timeline
+   * draws artifact rows; until it does, the hit keeps the "Opens the
+   * session" hint rather than claiming a jump it cannot make.
+   */
+  private snippetTurnId(snippet: SessionSearchSnippet): string | null {
+    if (snippet.source_kind === 'artifact') {
+      return snippet.artifact?.activity_id ?? null;
+    }
+    return this.snippetJumpsToTurn(snippet) ? snippet.source_id : null;
+  }
+
   private openSnippet(
     result: SessionSearchResult,
     snippet: SessionSearchSnippet
   ) {
     this.selectedSessionId = result.runtime_session_id;
-    this.focusTurnId = this.snippetJumpsToTurn(snippet)
-      ? snippet.source_id
-      : null;
+    this.focusTurnId = this.snippetTurnId(snippet);
+    // A snippet lands on its own turn; an ?artifact= from an earlier landing
+    // (possibly of another session) must not ride along in the URL.
+    this.focusArtifactId = null;
     this.syncUrl({ push: true });
   }
 
@@ -1372,14 +1595,13 @@ export class RuntimeSessionsView extends LitElement {
       return '';
     }
     const total = this.sessions.total ?? this.sessions.items.length;
-    return `${this.formatNumber(total)} session${total === 1 ? '' : 's'}`;
-  }
-
-  private formatCost(value: number | null | undefined): string {
-    if (typeof value !== 'number' || Number.isNaN(value)) {
-      return '$0.00';
+    const shown = this.sessions.items.length;
+    // While a page is truncated the count must not claim rows it has not
+    // listed: "Showing 50 of 120", then "120 sessions" once every row is here.
+    if (shown < total) {
+      return `Showing ${this.formatNumber(shown)} of ${this.formatNumber(total)}`;
     }
-    return value >= 0.01 ? `$${value.toFixed(2)}` : `$${value.toFixed(4)}`;
+    return `${this.formatNumber(total)} session${total === 1 ? '' : 's'}`;
   }
 
   private formatDateTime(value: string | null | undefined): string {
@@ -1392,7 +1614,7 @@ export class RuntimeSessionsView extends LitElement {
       year: 'numeric',
       hour: 'numeric',
       minute: '2-digit',
-    }).format(new Date(value));
+    }).format(parseUTCDate(value));
   }
 
   private getSessionDisplayName(session: RuntimeSessionSummary): string {
@@ -1469,11 +1691,21 @@ export class RuntimeSessionsView extends LitElement {
       this.selectedRange !== 'last-30' ||
       this.searchQuery !== '' ||
       this.sessionSourceType !== 'all' ||
-      this.status !== 'all'
+      this.status !== 'all' ||
+      this.hasArtifacts !== 'all'
     );
   }
 
   private emptySessionsText(): string {
+    if (this.hasArtifacts !== 'all') {
+      const label =
+        ARTIFACT_GROUP_LABELS[this.hasArtifacts as ArtifactKindGroup];
+      const what =
+        this.hasArtifacts === 'any' || !label
+          ? 'artifacts'
+          : label.toLowerCase();
+      return `No sessions with ${what} matched. Agents save transcripts, screenshots and files with the deposit_artifact tool or the API; widen the range or reset the filters to see other sessions.`;
+    }
     return this.hasActiveFilters()
       ? 'No sessions matched the current filters.'
       : 'No sessions yet. A session is recorded automatically the first time an onboarded agent makes a model or tool call through the gateway. Onboard an agent from the Agents page to see your first one.';
@@ -1493,7 +1725,7 @@ export class RuntimeSessionsView extends LitElement {
     if (!marker) {
       return null;
     }
-    const markerTime = new Date(marker).getTime();
+    const markerTime = parseUTCDate(marker).getTime();
     if (Number.isNaN(markerTime)) {
       return null;
     }
@@ -1531,7 +1763,7 @@ export class RuntimeSessionsView extends LitElement {
     if (!marker) {
       return null;
     }
-    const markerTime = new Date(marker).getTime();
+    const markerTime = parseUTCDate(marker).getTime();
     if (Number.isNaN(markerTime)) {
       return null;
     }
@@ -1560,7 +1792,7 @@ export class RuntimeSessionsView extends LitElement {
     }
     const end = this.rangeEndIso();
     const endTime = end ? new Date(end).getTime() : Date.now();
-    return new Date(marker).getTime() > endTime;
+    return parseUTCDate(marker).getTime() > endTime;
   }
 
   /**
@@ -1578,6 +1810,54 @@ export class RuntimeSessionsView extends LitElement {
       degraded.detail ??
       'Semantic ranking did not run for this answer; these are keyword results.'
     );
+  }
+
+  /** Whether the answer was keyword-only because the account never opted in. */
+  private semanticNotEnabled(): boolean {
+    return (
+      this.searchResults?.degraded?.reasons?.includes('semantic_not_enabled') ??
+      false
+    );
+  }
+
+  private toggleEmbeddingSettings(): void {
+    this.embeddingSettingsOpen = !this.embeddingSettingsOpen;
+  }
+
+  /**
+   * A saved opt in changes what the current search can do, so ask again
+   * rather than leave a stale "not opted in" notice on screen.
+   */
+  private handleEmbeddingChanged(): void {
+    if (this.searchQuery.trim()) {
+      void this.loadSearchResults();
+    }
+  }
+
+  private renderEmbeddingSettings() {
+    return html`
+      <button
+        type="button"
+        class="embedding-settings-toggle"
+        data-testid="embedding-settings-toggle"
+        aria-expanded=${this.embeddingSettingsOpen ? 'true' : 'false'}
+        @click=${this.toggleEmbeddingSettings}
+      >
+        ${
+          this.embeddingSettingsOpen
+            ? 'Hide semantic search settings'
+            : 'Semantic search settings'
+        }
+      </button>
+      ${
+        this.embeddingSettingsOpen
+          ? html`<session-embedding-settings
+              class="embedding-settings"
+              @session-embedding-changed=${this.handleEmbeddingChanged}
+            ></session-embedding-settings>`
+          : nothing
+      }
+    `;
   }
 
   private renderSearchNotices() {
@@ -1634,6 +1914,19 @@ export class RuntimeSessionsView extends LitElement {
                 <sl-alert variant="warning" open data-testid="degraded-notice">
                   <sl-icon slot="icon" name="exclamation-triangle"></sl-icon>
                   ${degraded}
+                  ${
+                    this.semanticNotEnabled() && !this.embeddingSettingsOpen
+                      ? html`<sl-button
+                          size="small"
+                          variant="text"
+                          data-testid="open-embedding-settings"
+                          @click=${() => {
+                            this.embeddingSettingsOpen = true;
+                          }}
+                          >Turn on semantic search</sl-button
+                        >`
+                      : nothing
+                  }
                 </sl-alert>
               `
             : ''
@@ -1642,8 +1935,45 @@ export class RuntimeSessionsView extends LitElement {
     `;
   }
 
+  /**
+   * Labels and cue time of an artifact match, so a transcript hit says which
+   * site it came from and where in the recording it is.
+   */
+  private renderArtifactMeta(snippet: SessionSearchSnippet) {
+    const artifact = snippet.artifact;
+    if (snippet.source_kind !== 'artifact' || !artifact) return '';
+    const labels = Object.entries(artifact.labels || {}).map(([key, value]) =>
+      Array.isArray(value) ? `${key}: ${value.join(', ')}` : `${key}: ${value}`
+    );
+    return html`
+      ${labels.map(
+        (label) =>
+          html`<sl-badge
+            variant="primary"
+            pill
+            data-testid="snippet-artifact-label"
+            >${label}</sl-badge
+          >`
+      )}
+      ${
+        typeof artifact.cue_start === 'number'
+          ? html`<span data-testid="snippet-cue-start"
+              >from ${formatCueStart(artifact.cue_start)}</span
+            >`
+          : ''
+      }
+    `;
+  }
+
   /** The readable reason a snippet matched, with the role when there is one. */
   private matchTag(snippet: SessionSearchSnippet): string {
+    const artifact = snippet.artifact;
+    if (snippet.source_kind === 'artifact' && artifact) {
+      const kind = artifact.kind
+        ? (ARTIFACT_KIND_LABELS[artifact.kind] ?? artifact.kind)
+        : 'Artifact';
+      return artifact.name ? `${kind} · ${artifact.name}` : kind;
+    }
     const label = MATCH_TAG_LABELS[snippet.source_kind] ?? snippet.source_kind;
     return snippet.role ? `${label} · ${snippet.role}` : label;
   }
@@ -1663,12 +1993,35 @@ export class RuntimeSessionsView extends LitElement {
         session to see the turn.</span
       >`;
     }
-    const parts = snippet.text.split(/<mark>|<\/mark>/);
+    const parts = this.snippetBody(snippet).split(/<mark>|<\/mark>/);
     return html`<span class="snippet-text"
       >${parts.map((part, index) =>
         index % 2 === 1 ? html`<mark>${part}</mark>` : part
       )}</span
     >`;
+  }
+
+  /**
+   * The snippet text without the artifact header lines (kind, name, labels)
+   * that the badges already show. A header line that carries a marked term
+   * stays, since it is why the chunk matched.
+   */
+  private snippetBody(snippet: SessionSearchSnippet): string {
+    const text = snippet.text ?? '';
+    const artifact = snippet.artifact;
+    if (snippet.source_kind !== 'artifact' || !artifact) return text;
+    const header = artifactHeaderLines(artifact);
+    const lines = text.split('\n');
+    let skip = 0;
+    while (
+      skip < lines.length - 1 &&
+      !lines[skip].includes('<mark>') &&
+      lines[skip].trim() &&
+      header.some((line) => line.endsWith(lines[skip].trim()))
+    ) {
+      skip += 1;
+    }
+    return lines.slice(skip).join('\n');
   }
 
   private searchResultTitle(result: SessionSearchResult): string {
@@ -1706,6 +2059,7 @@ export class RuntimeSessionsView extends LitElement {
                   <sl-badge variant="neutral" pill
                     >${this.matchTag(snippet)}</sl-badge
                   >
+                  ${this.renderArtifactMeta(snippet)}
                   <span>${this.formatDateTime(snippet.occurred_at)}</span>
                 </div>
                 ${this.renderSnippetText(snippet)}
@@ -1808,6 +2162,7 @@ export class RuntimeSessionsView extends LitElement {
           .emptyText=${this.emptySessionsText()}
           .selectedSessionId=${this.selectedSessionId}
           .focusTurnId=${this.focusTurnId}
+          .focusArtifactId=${this.focusArtifactId}
           .syncModeToUrl=${true}
           layout="full"
           defaultReplayMode="conversation"
@@ -1829,6 +2184,36 @@ export class RuntimeSessionsView extends LitElement {
           }}
         ></preloop-session-observer>
       </sl-card>
+    `;
+  }
+
+  /**
+   * The "Load more sessions" control, shown only while the list is truncated
+   * against the server's `total`. Mirrors the Artifacts list: a single button
+   * with a loading state and an inline error that keeps the rows already
+   * loaded.
+   */
+  private renderLoadMoreSessions() {
+    if (!this.sessions) return nothing;
+    const total = this.sessions.total ?? this.sessions.items.length;
+    if (this.sessions.items.length >= total) return nothing;
+    return html`
+      <div class="more">
+        <sl-button
+          size="small"
+          ?loading=${this.loadingMore}
+          @click=${() => this.loadMoreSessions()}
+          data-testid="load-more-sessions"
+          >Load more sessions</sl-button
+        >
+        ${
+          this.moreError
+            ? html`<span class="error" role="alert" data-testid="more-error"
+                >${this.moreError}</span
+              >`
+            : nothing
+        }
+      </div>
     `;
   }
 
@@ -1871,7 +2256,7 @@ export class RuntimeSessionsView extends LitElement {
                 ></token-figures>
               </div>
               <div class="cell-numeric">
-                ${this.formatCost(model.estimated_cost)}
+                ${html`<span title=${formatUsdExact(model.estimated_cost)}>${formatUsd(model.estimated_cost)}</span>`}
               </div>
             </div>
           `
@@ -1901,13 +2286,6 @@ export class RuntimeSessionsView extends LitElement {
       .split('_')
       .map((word) => word.charAt(0).toUpperCase() + word.slice(1))
       .join(' ');
-  }
-
-  private formatGatewayCost(cost?: number | null): string {
-    if (typeof cost !== 'number' || Number.isNaN(cost)) {
-      return '$0.00';
-    }
-    return cost >= 0.01 ? `$${cost.toFixed(2)}` : `$${cost.toFixed(4)}`;
   }
 
   private formatGatewayTokens(tokens?: number | null): string {
@@ -2062,7 +2440,9 @@ export class RuntimeSessionsView extends LitElement {
           )}
           ${this.renderGatewayField(
             'Cost',
-            this.formatGatewayCost(payload.estimated_cost)
+            html`<span title=${formatUsdExact(payload.estimated_cost)}
+              >${formatUsd(payload.estimated_cost)}</span
+            >`
           )}
           ${this.renderGatewayField(
             'Tokens',
@@ -2239,6 +2619,11 @@ export class RuntimeSessionsView extends LitElement {
               <sl-badge variant=${this.getSessionVariant(session)}>
                 ${this.getSessionLabel(session)}
               </sl-badge>
+              <legal-hold-control
+                resource-type="runtime_session"
+                resource-id=${session.id}
+                ?known-held=${session.legal_hold === true}
+              ></legal-hold-control>
             </div>
           </div>
           <div class="detail-meta">
@@ -2308,7 +2693,7 @@ export class RuntimeSessionsView extends LitElement {
             <div class="summary-card">
               <div class="summary-label">Estimated spend</div>
               <div class="summary-value">
-                ${this.formatCost(session.estimated_cost)}
+                ${html`<span title=${formatUsdExact(session.estimated_cost)}>${formatUsd(session.estimated_cost)}</span>`}
               </div>
               <div class="summary-detail">
                 Last request ${this.formatDateTime(session.last_request_at)}
@@ -2344,7 +2729,7 @@ export class RuntimeSessionsView extends LitElement {
         <div class="main-column">
           <div class="page">
             <list-toolbar
-              searchPlaceholder="Search prompts, responses, and tool calls"
+              searchPlaceholder="Search prompts, responses, tool calls, and artifacts"
               searchLabel="Search session content"
               .search=${this.searchQuery}
               .views=${[]}
@@ -2361,18 +2746,24 @@ export class RuntimeSessionsView extends LitElement {
                 <sl-option value="all">All time</sl-option>
                 <sl-option value="custom">Custom</sl-option>
               </sl-select>
-              <sl-input
-                type="date"
-                label="Start date"
-                .value=${this.startDate}
-                @sl-change=${this.handleStartDateChange}
-              ></sl-input>
-              <sl-input
-                type="date"
-                label="End date"
-                .value=${this.endDate}
-                @sl-change=${this.handleEndDateChange}
-              ></sl-input>
+              ${
+                this.selectedRange === 'custom'
+                  ? html`
+                      <sl-input
+                        type="date"
+                        label="Start date"
+                        .value=${this.startDate}
+                        @sl-change=${this.handleStartDateChange}
+                      ></sl-input>
+                      <sl-input
+                        type="date"
+                        label="End date"
+                        .value=${this.endDate}
+                        @sl-change=${this.handleEndDateChange}
+                      ></sl-input>
+                    `
+                  : nothing
+              }
               <sl-select
                 label="Source type"
                 value=${this.sessionSourceType}
@@ -2396,16 +2787,27 @@ export class RuntimeSessionsView extends LitElement {
                 <sl-option value="active">Active</sl-option>
                 <sl-option value="ended">Ended</sl-option>
               </sl-select>
+              <sl-select
+                label="Has artifacts"
+                data-testid="has-artifacts-filter"
+                value=${this.hasArtifacts}
+                @sl-change=${this.handleHasArtifactsChange}
+              >
+                <sl-option value="all">Any session</sl-option>
+                <sl-option value="any">Any artifact</sl-option>
+                <sl-option value="transcript">Transcript</sl-option>
+                <sl-option value="screenshot">Screenshot</sl-option>
+                <sl-option value="document">Document</sl-option>
+                <sl-option value="audio">Audio</sl-option>
+              </sl-select>
               <div class="filter-actions">
-                <sl-button variant="primary" @click=${this.applyFilters}>
-                  Apply
-                </sl-button>
                 <sl-button variant="default" @click=${this.clearFilters}>
-                  Reset
+                  Clear filters
                 </sl-button>
               </div>
               <span slot="count">${this.sessionCountLabel}</span>
             </list-toolbar>
+            ${this.renderEmbeddingSettings()}
             ${
               this.isPremium
                 ? nothing
@@ -2452,7 +2854,10 @@ export class RuntimeSessionsView extends LitElement {
                         </div>
                       </sl-card>
                     `
-                  : this.renderObserver(this.sessions?.items || [])
+                  : html`
+                      ${this.renderObserver(this.sessions?.items || [])}
+                      ${this.renderLoadMoreSessions()}
+                    `
             }
           </div>
         </div>

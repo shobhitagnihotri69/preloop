@@ -13,6 +13,7 @@ import {
   unifiedWebSocketManager,
 } from '../services/unified-websocket-manager';
 import './console-header.ts';
+import { PENDING_APPROVALS_EVENT } from './console-header.ts';
 import type { ConsoleHeader } from './console-header.ts';
 import { publishAttentionSummary } from '../utils/attention-summary';
 import { loadShoelaceTokens } from '../utils/test-shoelace-theme';
@@ -33,9 +34,16 @@ function stubFetch(approvals: () => unknown[] = () => []): () => void {
     const url = typeof input === 'string' ? input : input.toString();
     const body = url.includes('/users/me')
       ? USER
-      : url.includes('/approval-requests')
-        ? approvals()
-        : [];
+      : url.includes('/features')
+        ? {
+            edition: 'cloud',
+            server_version: '1.2.3',
+            features: {},
+            plugins: [{ name: 'billing' }],
+          }
+        : url.includes('/approval-requests')
+          ? approvals()
+          : [];
     return new Response(JSON.stringify(body), {
       status: 200,
       headers: { 'Content-Type': 'application/json' },
@@ -555,7 +563,15 @@ describe('console-header bell approvals', () => {
     // The refresh on focus answers with the row still pending, either from a
     // read replica behind the decision or from a response prepared before it.
     window.dispatchEvent(new Event('focus'));
-    await waitUntil(() => approvalReads >= 2, 'refresh never ran');
+    // approvalReads increments when the request starts, before the list is
+    // applied. Wait until that load has finished or the assertion races it.
+    await waitUntil(
+      () =>
+        approvalReads >= 2 &&
+        !(el as unknown as { loadingPendingApprovals: boolean })
+          .loadingPendingApprovals,
+      'refresh never settled'
+    );
     await el.updateComplete;
 
     expect(names(el), 'resolved row came back').to.deep.equal([]);
@@ -611,7 +627,15 @@ describe('console-header bell approvals', () => {
 
     approvals = [];
     window.dispatchEvent(new Event('focus'));
-    await waitUntil(() => approvalReads >= 2, 'refresh never ran');
+    // approvalReads increments when the request starts, before the held id
+    // is dropped. Wait until that load has finished or the size check races it.
+    await waitUntil(
+      () =>
+        approvalReads >= 2 &&
+        !(el as unknown as { loadingPendingApprovals: boolean })
+          .loadingPendingApprovals,
+      'refresh never settled'
+    );
     await el.updateComplete;
 
     // A tab left open for a day must not accumulate one entry per approval.
@@ -696,6 +720,210 @@ describe('console-header bell approvals', () => {
       0
     );
     expect(el.shadowRoot!.querySelector('.notification-badge')).to.not.exist;
+  });
+
+  it('links "View all" to the approvals page with a real href', async () => {
+    const el = await header();
+    const link = el
+      .shadowRoot!.querySelector<HTMLAnchorElement>('.approval-list')!
+      .parentElement!.querySelector<HTMLAnchorElement>('a.section-link')!;
+    expect(link.getAttribute('href')).to.equal('/console/approvals');
+  });
+
+  it('reaches a pending approval from the keyboard through its name', async () => {
+    const el = await header();
+    const name = el.shadowRoot!.querySelector<HTMLAnchorElement>(
+      '.approval-item a.approval-name'
+    )!;
+    expect(name.getAttribute('href')).to.equal('/console/approval/ar-1');
+    // The row's own buttons stay reachable: the row is not a role="link"
+    // that would flatten them.
+    const row = el.shadowRoot!.querySelector('.approval-item')!;
+    expect(row.getAttribute('role')).to.equal(null);
+
+    // A click on the name is the router's (the href), not the row's too.
+    name.addEventListener('click', (event) => event.preventDefault(), {
+      once: true,
+    });
+    name.click();
+    expect(routes).to.deep.equal([]);
+
+    // Anywhere else on the row still opens it for a mouse.
+    (row.querySelector('.approval-time') as HTMLElement).click();
+    expect(routes).to.deep.equal(['/console/approval/ar-1']);
+  });
+
+  it('names the pending count in the bell label', async () => {
+    const el = await header();
+    const bell = el.shadowRoot!.querySelector(
+      '.notification-button sl-icon-button'
+    )!;
+    expect(bell.getAttribute('label')).to.equal('Notifications, 1 pending');
+
+    emit({ type: 'approval_approved', approval_request_id: 'ar-1' });
+    await el.updateComplete;
+    expect(bell.getAttribute('label')).to.equal('Notifications');
+  });
+
+  it('tells the operator when a decision from the bell fails', async () => {
+    restoreFetch();
+    const original = window.fetch;
+    window.fetch = (async (input: RequestInfo | URL) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      if (url.includes('/approve')) {
+        return new Response(
+          JSON.stringify({ detail: 'This approval request has expired.' }),
+          { status: 409, headers: { 'Content-Type': 'application/json' } }
+        );
+      }
+      const body = url.includes('/users/me')
+        ? USER
+        : url.includes('/features')
+          ? {
+              edition: 'cloud',
+              server_version: '1.2.3',
+              features: {},
+              plugins: [{ name: 'billing' }],
+            }
+          : url.includes('/approval-requests')
+            ? approvals
+            : [];
+      return new Response(JSON.stringify(body), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }) as typeof window.fetch;
+    restoreFetch = () => {
+      window.fetch = original;
+    };
+
+    const el = await header();
+    el.shadowRoot!.querySelector<HTMLElement>(
+      '.approval-actions sl-button[variant="success"]'
+    )!.click();
+
+    await waitUntil(
+      () =>
+        Array.from(document.querySelectorAll('sl-alert')).some((alert) =>
+          alert.textContent?.includes('This approval request has expired.')
+        ),
+      'no toast for the failed approval'
+    );
+    const alert = Array.from(document.querySelectorAll('sl-alert')).find((a) =>
+      a.textContent?.includes('This approval request has expired.')
+    ) as HTMLElement & { variant: string };
+    expect(alert.variant).to.equal('danger');
+    // The row stays: nothing was decided.
+    expect(names(el)).to.deep.equal(['write_file']);
+    document.querySelectorAll('sl-alert').forEach((a) => a.remove());
+  });
+});
+
+describe('console-header desktop notification permission', () => {
+  let restoreFetch: () => void;
+
+  beforeEach(() => {
+    localStorage.setItem('accessToken', 'test-token');
+    restoreFetch = stubFetch();
+  });
+
+  afterEach(() => {
+    restoreFetch();
+    sinon.restore();
+    localStorage.removeItem('accessToken');
+  });
+
+  it('does not prompt on load, only when the bell is clicked', async () => {
+    if (!('Notification' in window)) return;
+    sinon.stub(Notification, 'permission').get(() => 'default');
+    const request = sinon
+      .stub(Notification, 'requestPermission')
+      .resolves('default');
+
+    const el = await fixture<ConsoleHeader>(
+      html`<console-header></console-header>`
+    );
+    await el.updateComplete;
+    expect(request, 'no prompt before the person does anything').to.not.have
+      .been.called;
+
+    el.shadowRoot!.querySelector<HTMLElement>('.notification-button')!.click();
+    expect(request).to.have.been.calledOnce;
+  });
+
+  /**
+   * A websocket message is not a user gesture: browsers ignore (or count
+   * against the site) a permission prompt raised from one. An execution
+   * start only shows a notification the person already allowed.
+   */
+  describe('on a websocket execution start', () => {
+    let receiveFlowUpdate: Parameters<
+      typeof unifiedWebSocketManager.subscribe
+    >[1];
+    let FakeNotification: sinon.SinonStub & {
+      permission: NotificationPermission;
+      requestPermission: sinon.SinonStub;
+    };
+
+    beforeEach(() => {
+      sinon
+        .stub(unifiedWebSocketManager, 'subscribe')
+        .callsFake((topic, cb) => {
+          if (topic === 'flow_executions') receiveFlowUpdate = cb;
+          return () => {};
+        });
+      FakeNotification = Object.assign(sinon.stub(), {
+        permission: 'default' as NotificationPermission,
+        requestPermission: sinon.stub().resolves('default'),
+      });
+      FakeNotification.prototype.close = () => {};
+      sinon.replace(
+        window,
+        'Notification',
+        FakeNotification as unknown as typeof Notification
+      );
+    });
+
+    async function startExecution(id: string): Promise<void> {
+      const el = await fixture<ConsoleHeader>(
+        html`<console-header></console-header>`
+      );
+      await el.updateComplete;
+      receiveFlowUpdate({
+        type: 'execution_started',
+        execution_id: id,
+        flow_id: 'flow-1',
+        timestamp: '2030-01-01T12:00:00Z',
+        payload: { status: 'RUNNING', flow_name: 'Nightly sweep' },
+      } as never);
+    }
+
+    it('does not ask for permission while it is still undecided', async () => {
+      await startExecution('exec-1');
+      // Plain counts: a failing sinon-chai assertion on these stubs hangs
+      // the runner while it serialises the stub.
+      expect(FakeNotification.requestPermission.callCount).to.equal(0);
+      expect(FakeNotification.callCount, 'no notification shown').to.equal(0);
+    });
+
+    it('shows the notification once permission was granted', async () => {
+      FakeNotification.permission = 'granted';
+      await startExecution('exec-2');
+      expect(FakeNotification.requestPermission.callCount).to.equal(0);
+      expect(FakeNotification.callCount).to.equal(1);
+      expect(FakeNotification.firstCall.args[0]).to.equal(
+        'Flow Execution Started'
+      );
+    });
+  });
+
+  it('fits the dropdown on a phone', () => {
+    const cssText = (
+      customElements.get('console-header') as unknown as {
+        styles: { cssText: string };
+      }
+    ).styles.cssText;
+    expect(cssText).to.contain('min-width: min(380px, calc(100vw - 16px))');
   });
 });
 
@@ -1013,6 +1241,45 @@ describe('console-header in-flight executions', () => {
     return el;
   }
 
+  it('links "View all" to the executions list that exists', async () => {
+    const el = await header();
+    const link = el
+      .shadowRoot!.querySelector('.execution-list')!
+      .parentElement!.querySelector('a.section-link')!;
+    // /console/flow-executions was never a route; it fell through to the
+    // full-page 404 outside the console chrome.
+    expect(link.getAttribute('href')).to.equal('/console/flows/executions');
+  });
+
+  it('opens a running execution from the keyboard', async () => {
+    const routes: string[] = [];
+    const go = sinon.stub(Router, 'go').callsFake((path: any) => {
+      routes.push(String(path));
+      return true;
+    });
+    try {
+      const el = await header();
+      const row = el.shadowRoot!.querySelector<HTMLElement>('.execution-item')!;
+      expect(row.getAttribute('role')).to.equal('link');
+      expect(row.getAttribute('tabindex')).to.equal('0');
+      expect(row.getAttribute('data-href')).to.equal(
+        '/console/flows/executions/exec-0'
+      );
+      row.dispatchEvent(
+        new KeyboardEvent('keydown', { key: 'Enter', bubbles: true })
+      );
+      row.dispatchEvent(
+        new KeyboardEvent('keydown', { key: ' ', bubbles: true })
+      );
+      expect(routes).to.deep.equal([
+        '/console/flows/executions/exec-0',
+        '/console/flows/executions/exec-0',
+      ]);
+    } finally {
+      go.restore();
+    }
+  });
+
   it('recounts the runs in flight when the tab becomes visible again', async () => {
     const el = await header();
     rows = [];
@@ -1045,5 +1312,229 @@ describe('console-header in-flight executions', () => {
 
     await waitUntil(() => inFlight(el) === 1, 'the count never narrowed');
     expect(executionRequests).to.be.greaterThan(1);
+  });
+});
+
+/**
+ * Bell notifications are session-only: they come from account events on the
+ * 'system' channel, and the header makes no request for past notifications.
+ */
+describe('console-header system notifications', () => {
+  let systemListeners: Array<(message: any) => void>;
+  let urls: string[];
+  let restoreFetch: () => void;
+  let restoreSubscribe: () => void;
+  let logSpy: sinon.SinonSpy;
+
+  beforeEach(() => {
+    localStorage.setItem('accessToken', 'test-token');
+    systemListeners = [];
+    urls = [];
+    const innerRestore = stubFetch();
+    const stubbed = window.fetch;
+    window.fetch = ((input: RequestInfo | URL, init?: RequestInit) => {
+      urls.push(typeof input === 'string' ? input : input.toString());
+      return stubbed(input, init);
+    }) as typeof window.fetch;
+    restoreFetch = innerRestore;
+
+    const originalSubscribe = unifiedWebSocketManager.subscribe;
+    unifiedWebSocketManager.subscribe = ((
+      topic: string,
+      callback: (message: any) => void
+    ) => {
+      if (topic === 'system') systemListeners.push(callback);
+      return () => {};
+    }) as typeof unifiedWebSocketManager.subscribe;
+    restoreSubscribe = () => {
+      unifiedWebSocketManager.subscribe = originalSubscribe;
+    };
+    logSpy = sinon.spy(console, 'log');
+  });
+
+  afterEach(() => {
+    logSpy.restore();
+    restoreFetch();
+    restoreSubscribe();
+    localStorage.removeItem('accessToken');
+  });
+
+  function stored(el: ConsoleHeader): { title: string; read: boolean }[] {
+    return (
+      el as unknown as {
+        _userNotifications: { title: string; read: boolean }[];
+      }
+    )._userNotifications;
+  }
+
+  it('starts empty and never asks the server for past notifications', async () => {
+    const el = await fixture<ConsoleHeader>(
+      html`<console-header></console-header>`
+    );
+    await el.updateComplete;
+
+    expect(stored(el)).to.deep.equal([]);
+    expect(urls.some((url) => url.includes('notification'))).to.equal(false);
+  });
+
+  it('adds an unread notification for an account event without logging it', async () => {
+    const el = await fixture<ConsoleHeader>(
+      html`<console-header></console-header>`
+    );
+    await el.updateComplete;
+    expect(systemListeners).to.have.lengthOf(1);
+
+    systemListeners[0]({
+      type: 'role_changed',
+      id: 'n-role',
+      title: 'Your role changed',
+      message: 'You are now an admin',
+    });
+    await el.updateComplete;
+
+    expect(stored(el)).to.have.lengthOf(1);
+    expect(stored(el)[0].title).to.equal('Your role changed');
+    expect(stored(el)[0].read).to.equal(false);
+    expect(logSpy.called).to.equal(false);
+  });
+});
+
+/**
+ * The header owns the approval fetch; the shell only reads the count it
+ * publishes so the Approvals nav badge never needs a second request.
+ */
+describe('console-header pending-approvals publish', () => {
+  let restoreFetch: () => void;
+  let published: number[];
+
+  const onPending = (event: Event) => {
+    published.push((event as CustomEvent<number>).detail);
+  };
+
+  beforeEach(() => {
+    localStorage.setItem('accessToken', 'test-token');
+    published = [];
+    window.addEventListener(PENDING_APPROVALS_EVENT, onPending);
+  });
+
+  afterEach(() => {
+    window.removeEventListener(PENDING_APPROVALS_EVENT, onPending);
+    restoreFetch();
+    localStorage.removeItem('accessToken');
+  });
+
+  it('publishes the unexpired pending count after the initial load', async () => {
+    restoreFetch = stubFetch(() => [
+      {
+        id: 'ar-1',
+        tool_name: 'write_file',
+        tool_args: {},
+        status: 'pending',
+        requested_at: new Date().toISOString(),
+        expires_at: new Date(Date.now() + 600_000).toISOString(),
+        execution_id: 'exec-1',
+      },
+    ]);
+
+    const el = await fixture<ConsoleHeader>(
+      html`<console-header></console-header>`
+    );
+    await waitUntil(() => published.includes(1), 'count never published', {
+      timeout: 2000,
+    });
+    expect(published).to.include(1);
+    el.remove();
+  });
+
+  it('publishes zero once expired rows are pruned', async () => {
+    restoreFetch = stubFetch(() => [
+      {
+        id: 'ar-expired',
+        tool_name: 'write_file',
+        tool_args: {},
+        status: 'pending',
+        requested_at: new Date().toISOString(),
+        expires_at: new Date(Date.now() - 1_000).toISOString(),
+        execution_id: 'exec-1',
+      },
+    ]);
+
+    const el = await fixture<ConsoleHeader>(
+      html`<console-header></console-header>`
+    );
+    await waitUntil(() => published.length > 0, 'count never published', {
+      timeout: 2000,
+    });
+    expect(published).to.include(0);
+    expect(published).to.not.include(1);
+    el.remove();
+  });
+});
+
+describe('console header branded help', () => {
+  let restore: () => void;
+  let original: unknown;
+  beforeEach(() => {
+    localStorage.setItem('accessToken', 'test-token');
+    original = (window as any).BRAND_CONFIG;
+    (window as any).BRAND_CONFIG = {
+      name: 'Example',
+      docs_url: 'https://example.com/docs',
+      changelog_url: 'https://example.com/releases',
+      report_issue_url: 'https://example.com/support',
+    };
+    restore = stubFetch();
+  });
+  afterEach(() => {
+    restore();
+    localStorage.removeItem('accessToken');
+    (window as any).BRAND_CONFIG = original;
+  });
+  it('opens an accessible menu with branded links and the backend version', async () => {
+    const el = await fixture<ConsoleHeader>(
+      html`<console-header></console-header>`
+    );
+    await waitUntil(() => el.shadowRoot!.textContent!.includes('v1.2.3'));
+    const dropdown = el.shadowRoot!.querySelector('.help-menu') as any;
+    const trigger = dropdown.querySelector('sl-icon-button') as any;
+    expect(trigger.label).to.equal('Help');
+    await trigger.updateComplete;
+    const button = trigger.shadowRoot.querySelector('button');
+    button.focus();
+    button.click();
+    await waitUntil(() => dropdown.open);
+    const links = Array.from(
+      dropdown.querySelectorAll('sl-menu-item a')
+    ) as Element[];
+    expect(links.map((link) => link.getAttribute('href'))).to.deep.equal([
+      'https://example.com/docs',
+      'https://example.com/releases',
+      'https://example.com/support',
+    ]);
+    expect(dropdown.textContent.replace(/\s+/g, ' ')).to.contain(
+      'Example v1.2.3'
+    );
+    for (const link of links)
+      expect(link.getAttribute('rel')).to.equal('noopener');
+    const open = sinon.stub(window, 'open');
+    try {
+      const item = dropdown.querySelector('sl-menu-item');
+      dropdown.querySelector('sl-menu').setCurrentItem(item);
+      item.focus();
+      item.dispatchEvent(
+        new KeyboardEvent('keydown', {
+          key: 'Enter',
+          bubbles: true,
+          composed: true,
+        })
+      );
+      expect(open).to.have.been.calledOnceWith(
+        'https://example.com/docs',
+        '_blank',
+        'noopener'
+      );
+    } finally {
+      open.restore();
+    }
   });
 });

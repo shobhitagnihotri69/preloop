@@ -14,38 +14,47 @@ from fastapi import (
     HTTPException,
     Path,
     Query,
+    Response,
     UploadFile,
     status,
 )
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, EmailStr, Field, field_validator
 from sqlalchemy.orm import Session
 
 from preloop.api.auth.jwt import get_current_active_user
 from preloop.api.common import get_account_for_user
 from preloop.api.loop_safety import run_db_off_loop
+from preloop.config import settings
 from preloop.models.crud import (
+    crud_discovered_agent_candidate,
     crud_account,
     crud_ai_model,
     crud_api_key,
     crud_attention_dismissal,
+    crud_audit_log,
     crud_approval_workflow,
+    crud_flow,
     crud_managed_agent,
     crud_managed_agent_ai_model_binding,
     crud_managed_agent_credential,
     crud_managed_agent_enrollment,
     crud_runtime_session,
     crud_runtime_session_activity,
+    crud_runtime_session_artifact,
     crud_user,
 )
 from preloop.models.db.session import get_db_session
 from preloop.models.models.account import Account
 from preloop.models.models.attention_dismissal import AttentionDismissal
 from preloop.models.models.user import User as UserModel
+from preloop.plugins.account_hooks import VISIBLE_MANAGED_AGENT, filter_viewable
 from preloop.schemas.attention import (
     AttentionDismissalListResponse,
     AttentionDismissalResponse,
     AttentionDismissalUpsertRequest,
 )
+from preloop.schemas.resource_share import SharedResourceRead
 from preloop.schemas.gateway_usage import (
     AccountManagedAgentListResponse,
     AccountGatewayUsageSearchResponse,
@@ -90,10 +99,14 @@ from preloop.schemas.gateway_usage import (
 from preloop.schemas.subject_governance import (
     AccountGovernanceDefaults,
     AccountGovernanceDefaultsResponse,
+    FlowGovernanceResponse,
     SubjectGovernanceConfig,
     SubjectGovernanceResponse,
 )
-from preloop.services.analytics_history import history_cutoff
+from preloop.services.analytics_history import (
+    history_cutoff,
+    require_session_history,
+)
 from preloop.services.account_realtime import (
     ACCOUNT_TOPIC_MANAGED_AGENTS,
     ACCOUNT_TOPIC_AUDIT,
@@ -106,10 +119,14 @@ from preloop.services.account_governance_cache import (
     invalidate_account_governance_cache,
 )
 from preloop.services.event_webhooks.emitters import emit_session_ended
+from preloop.services.spend_outliers import (
+    record_dismissal as record_spend_outlier_dismissal,
+)
 from preloop.services.cache_accounting import (
     build_request_cache_accounting,
     summarize_session_cache,
 )
+from preloop.services.artifact_media import ARTIFACT_KINDS
 from preloop.services.aux_model_retry import call_with_aux_retry
 from preloop.services.managed_agent_identity import (
     ManagedAgentIdentityError,
@@ -125,6 +142,7 @@ from preloop.services.model_credentials import (
 from preloop.services.model_gateway_usage import ModelGatewayUsageService
 from preloop.services.runtime_session_explorer import RuntimeSessionExplorerService
 from preloop.services.subject_governance import (
+    SUBJECT_TYPE_FLOWS,
     SUBJECT_TYPE_MANAGED_AGENTS,
     get_account_governance_defaults,
     get_subject_governance,
@@ -133,6 +151,7 @@ from preloop.services.subject_governance import (
     set_subject_governance,
 )
 from preloop.utils.permissions import require_permission
+from preloop.schemas.gateway_usage import GatewayUsageBreakdown
 
 logger = logging.getLogger(__name__)
 
@@ -154,6 +173,8 @@ AGENT_CONTROL_SUPPORTED_AGENT_KINDS = {
     "opencode",
     "pi",
     "deepseek",
+    "nanobot",
+    "codex",
 }
 AGENT_CONTROL_STATE_UNSUPPORTED = "unsupported"
 AGENT_CONTROL_STATE_INSTALL_PENDING = "install_pending"
@@ -727,6 +748,17 @@ def _managed_agent_control_fields(
         "supports_existing_session": control_enabled,
         "supports_voice": control_enabled and not active_session_only,
         "supports_interrupt": supports_interrupt,
+        "desktop": (
+            snapshot.get("desktop")
+            if snapshot.get("desktop") in ("vnc", "rdp")
+            else "none"
+        ),
+        "desktop_display": (
+            snapshot.get("desktop_display")
+            if snapshot.get("desktop") in ("vnc", "rdp")
+            and isinstance(snapshot.get("desktop_display"), str)
+            else None
+        ),
         "control_session_mode": session_mode,
         "control_last_heartbeat_at": heartbeat_at,
         "supported_input_modes": (
@@ -757,8 +789,10 @@ def _enrich_managed_agent_summaries(
     Returns:
         The same summaries list with enrichment fields applied.
     """
+    all_summaries = summaries
+    summaries = [summary for summary in summaries if not summary.get("is_shared")]
     if not summaries:
-        return summaries
+        return all_summaries
 
     agent_ids = [str(summary["id"]) for summary in summaries]
     enrollments_by_agent = crud_managed_agent_enrollment.list_latest_by_agents(
@@ -920,7 +954,7 @@ def _enrich_managed_agent_summaries(
                     ai_model, "model_identifier", None
                 )
                 primary_binding["ai_model_name"] = getattr(ai_model, "name", None)
-    return summaries
+    return all_summaries
 
 
 def _enrich_managed_agent_summary(
@@ -1058,6 +1092,67 @@ class AccountDetailsResponse(BaseModel):
     updated_at: str
 
 
+class SessionArtifactUsageByKind(BaseModel):
+    """Available plaintext bytes by artifact kind (zero when unused)."""
+
+    screenshot: int = 0
+    recording: int = 0
+    screencast: int = 0
+    audio: int = 0
+    transcript: int = 0
+    document: int = 0
+    generated_file: int = 0
+    trace: int = 0
+
+
+class SessionArtifactUsageResponse(BaseModel):
+    """Account session-artifact usage against the storage budget."""
+
+    used_bytes: int
+    budget_bytes: int
+    by_kind: SessionArtifactUsageByKind
+    evicted_count_30d: int
+
+
+class FlowArtifactKindUsage(BaseModel):
+    """Retained ciphertext bytes and row count for one flow-artifact kind."""
+
+    bytes: int = 0
+    count: int = 0
+
+
+class FlowArtifactUsageResponse(BaseModel):
+    """Account flow-artifact retained bytes against the quota (#1339).
+
+    A separate pool from session artifacts: this is what a checkpoint or
+    evidence capture is admitted against.
+    """
+
+    retained_bytes: int = Field(
+        description=(
+            "Retained ciphertext bytes, the total a capture is admitted against."
+        )
+    )
+    quota_bytes: int = Field(description="Configured account flow-artifact quota.")
+    by_kind: dict[str, FlowArtifactKindUsage] = Field(
+        description="Retained bytes and row counts per kind (workspace, evidence...)."
+    )
+    expired_pending_cleanup: int = Field(
+        description=(
+            "Rows past their expiry whose payload is not cleared yet; "
+            "their bytes still count."
+        )
+    )
+    next_expiry_at: Optional[datetime] = Field(
+        default=None,
+        description=(
+            "Earliest time cleanup may clear a payload: expiry, or a later lease "
+            "end, among rows not under a legal hold. A past value means a "
+            "payload is due and awaits cleanup."
+        ),
+    )
+
+
 class AccountDetailsUpdate(BaseModel):
     """Account details update request."""
 
@@ -1111,6 +1206,148 @@ async def get_account_details(
         created_at=account.created_at.isoformat(),
         updated_at=account.updated_at.isoformat(),
     )
+
+
+@router.get(
+    "/account/session-artifacts/usage",
+    response_model=SessionArtifactUsageResponse,
+)
+def get_session_artifact_usage(
+    account: Annotated[Account, Depends(get_account_for_user)],
+    db: Session = Depends(get_db_session),
+) -> SessionArtifactUsageResponse:
+    """Return session-artifact bytes used, the budget, and recent evictions."""
+    from preloop.services.session_artifact_budget import account_usage
+
+    return SessionArtifactUsageResponse.model_validate(
+        account_usage(db, account_id=account.id)
+    )
+
+
+@router.get(
+    "/account/flow-artifacts/usage",
+    response_model=FlowArtifactUsageResponse,
+)
+def get_flow_artifact_usage(
+    account: Annotated[Account, Depends(get_account_for_user)],
+    db: Session = Depends(get_db_session),
+) -> FlowArtifactUsageResponse:
+    """Return retained flow-artifact bytes against the account quota (#1339)."""
+    from preloop.models.crud import flow_artifact
+
+    usage = flow_artifact.usage(db, account_id=account.id)
+    return FlowArtifactUsageResponse(
+        quota_bytes=settings.flow_artifact_account_quota_bytes, **usage
+    )
+
+
+class SessionArtifactSettingsResponse(BaseModel):
+    """Account artifact storage settings (#1102)."""
+
+    audio_storage_enabled: bool = Field(
+        description="Store raw audio deposited by agents. Off by default."
+    )
+    audio_retention_days: int = Field(
+        description="Days raw audio is kept before its bytes expire."
+    )
+    audio_retention_max_days: int = Field(
+        description="Longest allowed audio retention (the session retention)."
+    )
+    updated_by_user_id: Optional[str] = None
+    updated_at: Optional[str] = None
+
+
+class SessionArtifactSettingsUpdate(BaseModel):
+    """Change artifact storage settings; omitted fields are left as they are."""
+
+    audio_storage_enabled: Optional[bool] = None
+    audio_retention_days: Optional[int] = Field(default=None, ge=1)
+
+
+def _artifact_settings_response(account: Account) -> SessionArtifactSettingsResponse:
+    from preloop.services import audio_storage
+
+    resolved = audio_storage.resolve(account.meta_data)
+    return SessionArtifactSettingsResponse(**resolved.__dict__)
+
+
+@router.get(
+    "/account/session-artifacts/settings",
+    response_model=SessionArtifactSettingsResponse,
+)
+@require_permission("view_policies")
+def get_session_artifact_settings(
+    account: Annotated[Account, Depends(get_account_for_user)],
+    current_user: UserModel = Depends(get_current_active_user),
+    db: Session = Depends(get_db_session),
+) -> SessionArtifactSettingsResponse:
+    """Return whether raw audio is stored, and for how long."""
+    return _artifact_settings_response(account)
+
+
+@router.put(
+    "/account/session-artifacts/settings",
+    response_model=SessionArtifactSettingsResponse,
+    responses={
+        403: {"description": "Caller may not manage account policies"},
+        422: {"description": "audio_retention_days_invalid"},
+    },
+)
+@require_permission("manage_policies")
+def update_session_artifact_settings(
+    payload: SessionArtifactSettingsUpdate,
+    account: Annotated[Account, Depends(get_account_for_user)],
+    current_user: UserModel = Depends(get_current_active_user),
+    db: Session = Depends(get_db_session),
+) -> SessionArtifactSettingsResponse:
+    """Opt the account in or out of raw audio storage; admin only, audited.
+
+    Uses ``manage_policies`` like the retention settings: it governs what
+    the account keeps. Every change writes an ``artifact_settings_updated``
+    audit row with the before and after value of each changed field; a
+    request that changes nothing writes no row.
+    """
+    from sqlalchemy.orm.attributes import flag_modified
+
+    from preloop.services import audio_storage
+
+    before = audio_storage.resolve(account.meta_data)
+    try:
+        updated = audio_storage.apply_update(
+            account.meta_data,
+            audio_storage_enabled=payload.audio_storage_enabled,
+            audio_retention_days=payload.audio_retention_days,
+            user_id=current_user.id,
+            now=datetime.now(UTC),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    after = audio_storage.resolve(updated)
+    changed = {
+        field: {"from": getattr(before, field), "to": getattr(after, field)}
+        for field in ("audio_storage_enabled", "audio_retention_days")
+        if getattr(before, field) != getattr(after, field)
+    }
+    if not changed:
+        # A no-op request neither logs nor restamps who changed it.
+        return _artifact_settings_response(account)
+    account.meta_data = updated
+    flag_modified(account, "meta_data")
+    db.add(account)
+    crud_audit_log.log_action(
+        db,
+        account_id=account.id,
+        user_id=current_user.id,
+        action=audio_storage.AUDIT_ACTION,
+        resource_type="account_settings",
+        resource_id="artifacts",
+        status="success",
+        details={"changed": changed},
+        commit=False,
+    )
+    db.commit()
+    db.refresh(account)
+    return _artifact_settings_response(account)
 
 
 @router.patch("/account/details", response_model=AccountDetailsResponse)
@@ -1168,6 +1405,13 @@ def get_account_gateway_usage_summary(
             "false. Prefer /cost/summary for full cost analytics."
         ),
     ),
+    breakdown: Optional[list[GatewayUsageBreakdown]] = Query(
+        None,
+        description=(
+            "Selected breakdowns, repeated for multiple sections. Omitted "
+            "preserves all sections; ignored when include_breakdown=false."
+        ),
+    ),
 ):
     """Get account-scoped model gateway usage summary."""
     return ModelGatewayUsageService(db).get_account_summary(
@@ -1176,6 +1420,7 @@ def get_account_gateway_usage_summary(
         end_date=end_date,
         runtime_principal_id=runtime_principal_id,
         include_breakdown=include_breakdown,
+        breakdowns=set(breakdown) if isinstance(breakdown, list) else None,
     )
 
 
@@ -1295,7 +1540,12 @@ def list_account_managed_agents(
         items=_enrich_managed_agent_summaries(
             db,
             account_id=str(account.id),
-            summaries=[dict(item) for item in result["items"]],
+            summaries=filter_viewable(
+                db,
+                current_user,
+                VISIBLE_MANAGED_AGENT,
+                [dict(item) for item in result["items"]],
+            ),
         ),
     )
 
@@ -1326,11 +1576,11 @@ def list_account_controllable_agents(
     items = [
         item
         for item in items
-        if item["control_enabled"]
+        if item.get("control_enabled")
         or item.get("control_state") == AGENT_CONTROL_STATE_INSTALL_PENDING
     ]
     if online_only:
-        items = [item for item in items if item["control_online"]]
+        items = [item for item in items if item.get("control_online")]
     return AccountManagedAgentListResponse(
         status="active",
         total=len(items),
@@ -1421,7 +1671,9 @@ async def extract_agent_name(
     return AgentNameExtractionResponse(name=name)
 
 
-@router.get("/agents/{agent_id}", response_model=ManagedAgentDetailResponse)
+@router.get(
+    "/agents/{agent_id}", response_model=SharedResourceRead | ManagedAgentDetailResponse
+)
 @require_permission("view_agents")
 def get_account_managed_agent(
     agent_id: str,
@@ -1433,6 +1685,17 @@ def get_account_managed_agent(
     end_date: Optional[datetime] = Query(None),
 ):
     """Return one enrolled external agent for the current account."""
+    from preloop.models.crud.resource_share import crud_resource_share
+
+    shared = crud_resource_share.public_read(
+        db, account_id=account.id, resource_type="managed_agent", resource_id=agent_id
+    )
+    if shared is not None:
+        from preloop.plugins.account_hooks import VISIBLE_MANAGED_AGENT, filter_viewable
+
+        if not filter_viewable(db, current_user, VISIBLE_MANAGED_AGENT, [shared]):
+            raise HTTPException(404, "Resource not found")
+        return shared
     response = _build_managed_agent_detail_response(
         db,
         account_id=str(account.id),
@@ -1446,6 +1709,28 @@ def get_account_managed_agent(
             status_code=status.HTTP_404_NOT_FOUND, detail="Managed agent not found"
         )
     return response
+
+
+@router.get("/agents/{agent_id}/shared-sessions")
+@require_permission("view_agents")
+def list_owned_agent_shared_sessions(
+    agent_id: str,
+    account: Annotated[Account, Depends(get_account_for_user)],
+    current_user: UserModel = Depends(get_current_active_user),
+    db: Session = Depends(get_db_session),
+) -> list[dict[str, Any]]:
+    """Show the parent the sessions its shared agent ran for consumers."""
+    from preloop.models.crud.resource_share import (
+        ShareConflictError,
+        crud_resource_share,
+    )
+
+    try:
+        return crud_resource_share.owner_agent_sessions(
+            db, owner_account_id=account.id, agent_id=agent_id
+        )
+    except ShareConflictError:
+        raise HTTPException(404, "Managed agent not found") from None
 
 
 @router.get(
@@ -1590,6 +1875,134 @@ async def update_account_governance_defaults_endpoint(
     return _governance_defaults_response(account)
 
 
+def _validate_governance_workflow(
+    db: Session, account: Account, approval_workflow_id: Optional[str]
+) -> None:
+    """Reject a governance workflow pin that is malformed or foreign."""
+    if not approval_workflow_id:
+        return
+    try:
+        workflow_id = UUID(approval_workflow_id)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid approval workflow id",
+        )
+    workflow = crud_approval_workflow.get(
+        db, id=workflow_id, account_id=str(account.id)
+    )
+    if workflow is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Approval workflow not found in this account",
+        )
+
+
+def _require_account_flow(db: Session, account: Account, flow_id: str) -> None:
+    """404 unless ``flow_id`` names a flow owned by this account."""
+    try:
+        UUID(flow_id)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Flow not found"
+        )
+    if crud_flow.get(db, id=flow_id, account_id=str(account.id)) is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Flow not found"
+        )
+
+
+def _flow_governance_response(account: Account, flow_id: str) -> FlowGovernanceResponse:
+    """Build the per-flow governance response (override + inherited defaults)."""
+    meta = account.meta_data or {}
+    config = get_subject_governance(
+        meta, subject_type=SUBJECT_TYPE_FLOWS, subject_id=flow_id
+    )
+    return FlowGovernanceResponse(
+        subject_type=SUBJECT_TYPE_FLOWS,
+        subject_id=flow_id,
+        config=SubjectGovernanceConfig.model_validate(config),
+        has_override=bool(config),
+        account_defaults=AccountGovernanceDefaults.model_validate(
+            get_account_governance_defaults(meta)
+        ),
+    )
+
+
+@router.get(
+    "/account/governance/flows/{flow_id}",
+    response_model=FlowGovernanceResponse,
+)
+@require_permission("view_flows")
+def get_account_flow_governance(
+    flow_id: str,
+    account: Annotated[Account, Depends(get_account_for_user)],
+    current_user: UserModel = Depends(get_current_active_user),
+    db: Session = Depends(get_db_session),
+) -> FlowGovernanceResponse:
+    """Per-flow governance override for every execution of one flow.
+
+    Sync on purpose: FastAPI runs it in the threadpool, so the sync DB
+    session never blocks the event loop.
+    """
+    _require_account_flow(db, account, flow_id)
+    return _flow_governance_response(account, flow_id)
+
+
+@router.put(
+    "/account/governance/flows/{flow_id}",
+    response_model=FlowGovernanceResponse,
+)
+@require_permission("edit_flows")
+def update_account_flow_governance(
+    flow_id: str,
+    payload: SubjectGovernanceConfig,
+    account: Annotated[Account, Depends(get_account_for_user)],
+    current_user: UserModel = Depends(get_current_active_user),
+    db: Session = Depends(get_db_session),
+) -> FlowGovernanceResponse:
+    """Store a governance override for one flow's executions."""
+    _require_account_flow(db, account, flow_id)
+    _validate_governance_workflow(db, account, payload.approval_workflow_id)
+    account.meta_data = set_subject_governance(
+        account.meta_data or {},
+        subject_type=SUBJECT_TYPE_FLOWS,
+        subject_id=flow_id,
+        config=payload.model_dump(),
+    )
+    db.add(account)
+    db.commit()
+    db.refresh(account)
+    invalidate_account_governance_cache(str(account.id))
+    return _flow_governance_response(account, flow_id)
+
+
+@router.delete(
+    "/account/governance/flows/{flow_id}",
+    response_model=FlowGovernanceResponse,
+)
+@require_permission("edit_flows")
+def reset_account_flow_governance(
+    flow_id: str,
+    account: Annotated[Account, Depends(get_account_for_user)],
+    current_user: UserModel = Depends(get_current_active_user),
+    db: Session = Depends(get_db_session),
+) -> FlowGovernanceResponse:
+    """Drop the flow's override so it inherits the account policy again."""
+    _require_account_flow(db, account, flow_id)
+    account.meta_data = set_subject_governance(
+        account.meta_data or {},
+        subject_type=SUBJECT_TYPE_FLOWS,
+        subject_id=flow_id,
+        config=None,
+    )
+    db.add(account)
+    db.commit()
+    db.refresh(account)
+    invalidate_account_governance_cache(str(account.id))
+    return _flow_governance_response(account, flow_id)
+
+
 @router.get(
     "/agents/{agent_id}/governance",
     response_model=SubjectGovernanceResponse,
@@ -1601,7 +2014,7 @@ async def get_account_managed_agent_governance(
     current_user: UserModel = Depends(get_current_active_user),
     db: Session = Depends(get_db_session),
 ):
-    agent = crud_managed_agent.get_for_account(
+    agent = crud_managed_agent.get_visible_target(
         db, account_id=str(account.id), agent_id=agent_id
     )
     if agent is None:
@@ -1633,29 +2046,14 @@ async def update_account_managed_agent_governance(
     current_user: UserModel = Depends(get_current_active_user),
     db: Session = Depends(get_db_session),
 ):
-    agent = crud_managed_agent.get_for_account(
+    agent = crud_managed_agent.get_visible_target(
         db, account_id=str(account.id), agent_id=agent_id
     )
     if agent is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="Managed agent not found"
         )
-    if payload.approval_workflow_id:
-        try:
-            workflow_id = UUID(payload.approval_workflow_id)
-        except ValueError:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Invalid approval workflow id",
-            )
-        workflow = crud_approval_workflow.get(
-            db, id=workflow_id, account_id=str(account.id)
-        )
-        if workflow is None:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Approval workflow not found in this account",
-            )
+    _validate_governance_workflow(db, account, payload.approval_workflow_id)
     account.meta_data = set_subject_governance(
         account.meta_data or {},
         subject_type=SUBJECT_TYPE_MANAGED_AGENTS,
@@ -1991,10 +2389,31 @@ async def create_account_managed_agent_enrollment(
         validation_result=payload.validation_result,
         restore_available=payload.restore_available,
         last_applied_at=payload.last_applied_at,
-        last_validated_at=payload.last_validated_at,
+        # A row born ``validated`` carries a validation time, so it counts as
+        # a prior onboarding when the agent is re-linked later.
+        last_validated_at=(
+            payload.last_validated_at
+            or (
+                datetime.now(UTC)
+                if payload.status == ENROLLMENT_STATUS_VALIDATED
+                else None
+            )
+        ),
         last_restored_at=payload.last_restored_at,
-        commit=True,
+        commit=False,
     )
+    # A row normally arrives ``applied`` and is onboarded by the validate
+    # call. One that arrives already ``validated`` is onboarded now, or it
+    # would never emit: the validate endpoint skips an already-validated row.
+    if enrollment.status == ENROLLMENT_STATUS_VALIDATED:
+        _emit_agent_onboarded(
+            db,
+            account_id=str(account.id),
+            enrollment=enrollment,
+            actor_user_id=current_user.id,
+        )
+    db.commit()
+    db.refresh(enrollment)
     emit_account_event(
         build_account_event(
             account_id=str(account.id),
@@ -2017,6 +2436,97 @@ async def create_account_managed_agent_enrollment(
     )
 
 
+ENROLLMENT_STATUS_VALIDATED = "validated"
+
+
+def _link_discovery_candidates(
+    db: Session,
+    *,
+    account: Account,
+    agent_id: str,
+    payload: ManagedAgentEnrollmentValidateRequest,
+) -> None:
+    """Mark reported discovery candidates from this workstation onboarded.
+
+    Runs only for a successful validation that carries the salted
+    workstation fingerprint. Linking is best effort: a failure here must not
+    fail the enrollment it decorates. Call it after the enrollment transaction
+    commits so a link failure cannot roll back ``agent.onboarded``.
+    """
+    if (
+        payload.status != ENROLLMENT_STATUS_VALIDATED
+        or not payload.workstation_fingerprint
+    ):
+        return
+    agent = crud_managed_agent.get_for_account(
+        db, account_id=str(account.id), agent_id=agent_id
+    )
+    if agent is None:
+        return
+    try:
+        linked = crud_discovered_agent_candidate.link_onboarded(
+            db,
+            account_id=account.id,
+            workstation_fingerprint=payload.workstation_fingerprint,
+            agent_kind=agent.agent_kind,
+            managed_agent_id=agent.id,
+            config_path_hash=payload.config_path_hash,
+        )
+        db.commit()
+    except Exception:
+        db.rollback()
+        logger.warning(
+            "Linking discovery candidates failed for agent %s", agent_id, exc_info=True
+        )
+        return
+    if linked:
+        logger.info("Linked %s discovery candidate(s) to agent %s", linked, agent_id)
+
+
+def _emit_agent_onboarded(
+    db: Session,
+    *,
+    account_id: str,
+    enrollment: Any,
+    actor_user_id: Any,
+) -> None:
+    """Enqueue ``agent.onboarded`` for an enrollment that just validated."""
+    from preloop.services.event_webhooks.emitters import (
+        agent_onboarded_outcome,
+        emit_agent_onboarded,
+    )
+
+    agent_id = str(enrollment.managed_agent_id)
+    agent = crud_managed_agent.get_for_account(
+        db, account_id=account_id, agent_id=agent_id
+    )
+    if agent is None:
+        return
+    outcome = agent_onboarded_outcome(
+        prior_onboarding_at=crud_managed_agent_enrollment.latest_prior_onboarding_at(
+            db,
+            account_id=account_id,
+            agent_id=agent_id,
+            exclude_enrollment_id=str(enrollment.id),
+        ),
+        latest_merge_at=crud_managed_agent.latest_merge_into_at(
+            db, account_id=account_id, survivor_id=agent_id
+        ),
+    )
+    mcp_rewritten, gateway_routed, _ = _managed_agent_onboarding_flags(
+        crud_managed_agent_enrollment._to_summary(enrollment)
+    )
+    emit_agent_onboarded(
+        db,
+        agent,
+        enrollment,
+        outcome=outcome,
+        actor_user_id=actor_user_id,
+        gateway_routed=gateway_routed,
+        mcp_rewritten=mcp_rewritten,
+    )
+
+
 @router.post(
     "/agents/{agent_id}/enrollments/{enrollment_id}/validate",
     response_model=ManagedAgentEnrollmentSummary,
@@ -2030,7 +2540,20 @@ async def validate_account_managed_agent_enrollment(
     current_user: UserModel = Depends(get_current_active_user),
     db: Session = Depends(get_db_session),
 ):
-    """Persist validation state for one managed-agent enrollment."""
+    """Persist validation state for one managed-agent enrollment.
+
+    The first time an enrollment reaches ``validated`` the agent counts as
+    onboarded and ``agent.onboarded`` is enqueued in the same transaction.
+    """
+    existing = crud_managed_agent_enrollment.get_for_agent(
+        db,
+        account_id=str(account.id),
+        agent_id=agent_id,
+        enrollment_id=enrollment_id,
+    )
+    already_validated = (
+        existing is not None and existing.status == ENROLLMENT_STATUS_VALIDATED
+    )
     enrollment = crud_managed_agent_enrollment.mark_validated(
         db,
         account_id=str(account.id),
@@ -2038,13 +2561,23 @@ async def validate_account_managed_agent_enrollment(
         enrollment_id=enrollment_id,
         validation_result=payload.validation_result,
         status=payload.status,
-        commit=True,
+        commit=False,
     )
     if enrollment is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Managed agent enrollment not found",
         )
+    if enrollment.status == ENROLLMENT_STATUS_VALIDATED and not already_validated:
+        _emit_agent_onboarded(
+            db,
+            account_id=str(account.id),
+            enrollment=enrollment,
+            actor_user_id=current_user.id,
+        )
+    db.commit()
+    db.refresh(enrollment)
+    _link_discovery_candidates(db, account=account, agent_id=agent_id, payload=payload)
     emit_account_event(
         build_account_event(
             account_id=str(account.id),
@@ -2494,8 +3027,51 @@ async def list_account_runtime_sessions(
     end_date: Optional[datetime] = Query(None),
     limit: int = Query(20, ge=1, le=100),
     offset: int = Query(0, ge=0),
+    agent: Optional[str] = Query(
+        None,
+        min_length=1,
+        max_length=255,
+        description="Managed agent id or display name; only that agent's sessions",
+    ),
+    agent_kind: Optional[str] = Query(
+        None,
+        min_length=1,
+        max_length=64,
+        description=(
+            "Agent kind (claude_code, codex, cursor, hermes, ...); sessions of "
+            "managed agents of that kind or recorded from that source"
+        ),
+    ),
+    parent_session_id: Optional[UUID] = Query(
+        None, description="Only sessions this session spawned"
+    ),
+    flow_execution_id: Optional[UUID] = Query(
+        None, description="Only sessions linked to this flow execution"
+    ),
+    active_within_minutes: Optional[int] = Query(
+        None,
+        ge=1,
+        le=1440,
+        description="Only open sessions with activity in the last N minutes",
+    ),
+    has_artifacts: Optional[str] = Query(
+        None,
+        description=(
+            "Only sessions holding an available artifact: 'any', or an "
+            "artifact kind such as transcript, screenshot, document or audio"
+        ),
+    ),
 ):
     """List runtime sessions for the current account."""
+    if has_artifacts is not None and has_artifacts != "any":
+        if has_artifacts not in ARTIFACT_KINDS:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "has_artifacts must be 'any' or one of: "
+                    + ", ".join(sorted(ARTIFACT_KINDS))
+                ),
+            )
     # Off the loop on purpose: the console polls this path, and a saturated
     # pool must not stall the liveness probe. See preloop.api.loop_safety.
     return await run_db_off_loop(
@@ -2509,6 +3085,12 @@ async def list_account_runtime_sessions(
             limit=limit,
             offset=offset,
             background_tasks=background_tasks,
+            agent=agent,
+            agent_kind=agent_kind,
+            parent_session_id=str(parent_session_id) if parent_session_id else None,
+            flow_execution_id=str(flow_execution_id) if flow_execution_id else None,
+            active_within_minutes=active_within_minutes,
+            has_artifacts=has_artifacts,
         )
     )
 
@@ -2587,6 +3169,76 @@ async def get_account_session_activity_timeline(
     )
 
 
+@router.get(
+    "/runtime-sessions/{runtime_session_id}/artifacts/{artifact_id}",
+    response_class=Response,
+    responses={
+        200: {"description": "Artifact bytes in the stored media type"},
+        404: {"description": "Session or artifact not found in this account"},
+        410: {"description": "Artifact bytes were evicted or expired"},
+    },
+)
+@require_permission("view_runtime_sessions")
+def get_account_session_artifact(
+    runtime_session_id: str,
+    artifact_id: str,
+    account: Annotated[Account, Depends(get_account_for_user)],
+    current_user: UserModel = Depends(get_current_active_user),
+    db: Session = Depends(get_db_session),
+) -> Response:
+    """Return one session artifact's bytes, such as a browser-step screenshot.
+
+    The artifact must belong to this account and to the session in the path.
+    Unavailable bytes return 410 with the reason, so the console can keep
+    the step's metadata and show why the image is gone.
+    """
+    try:
+        session_uuid = UUID(runtime_session_id.strip())
+        artifact_uuid = UUID(artifact_id.strip())
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Artifact not found") from None
+    session = crud_runtime_session.get_account_session(
+        db, account_id=str(account.id), runtime_session_id=str(session_uuid)
+    )
+    if session is None:
+        raise HTTPException(status_code=404, detail="Artifact not found")
+    require_session_history(
+        db,
+        account=account,
+        summary={
+            "started_at": session.started_at,
+            "last_activity_at": session.last_activity_at,
+            "ended_at": session.ended_at,
+        },
+    )
+    artifact = crud_runtime_session_artifact.get(
+        db, account_id=account.id, artifact_id=artifact_uuid
+    )
+    if artifact is None or artifact.runtime_session_id != session_uuid:
+        raise HTTPException(status_code=404, detail="Artifact not found")
+    if artifact.availability != "available" or artifact.ciphertext is None:
+        availability = (
+            artifact.availability if artifact.availability != "available" else "expired"
+        )
+        return JSONResponse(status_code=410, content={"availability": availability})
+    try:
+        content = crud_runtime_session_artifact.decrypt(artifact)
+    except ValueError:
+        logger.exception("Could not decrypt session artifact %s", artifact.id)
+        raise HTTPException(
+            status_code=500, detail="Artifact could not be read"
+        ) from None
+    return Response(
+        content=content,
+        media_type=artifact.content_type,
+        headers={
+            "Cache-Control": "private, max-age=300",
+            "X-Content-Type-Options": "nosniff",
+            "Content-Security-Policy": "default-src 'none'; sandbox",
+        },
+    )
+
+
 def _request_row_to_item(row: Any) -> RuntimeSessionRequestItem:
     """Convert an ApiUsage row into a unified-timeline request item.
 
@@ -2635,6 +3287,7 @@ def _request_row_to_item(row: Any) -> RuntimeSessionRequestItem:
         total_tokens=int(row.total_tokens or 0),
         estimated_cost=float(row.estimated_cost or 0.0),
         endpoint=row.endpoint,
+        auth_subject_type=row.auth_subject_type,
         tools=tools,
         tools_total_schema_tokens=tools_total,
         # NULL cache columns stay NULL through the wire: the UI must say
@@ -3120,11 +3773,11 @@ async def get_dashboard_telemetry(
     db: Session = Depends(get_db_session),
 ):
     """Aggregate high-level metrics for the new global dashboard."""
-    from datetime import datetime, timedelta, timezone
+    from datetime import datetime, timedelta
     from preloop.models.crud.runtime_session import crud_runtime_session
     from preloop.models.crud.api_usage import crud_api_usage
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     day_ago = now - timedelta(days=1)
 
     def _query() -> DashboardTelemetryResponse:
@@ -3349,6 +4002,15 @@ async def upsert_attention_dismissal(
         snooze_until=snooze_until,
         dismissed_by_user_id=current_user.id,
     )
+    # Spend outlier cards (#960): remember which day's finding was dismissed,
+    # for the weekly digest. A no-op for every other kind.
+    record_spend_outlier_dismissal(
+        db,
+        account_id=account.id,
+        item_id=item_id,
+        fingerprint=payload.fingerprint,
+        dismissed_at=dismissal.created_at.replace(tzinfo=UTC),
+    )
     usernames = _resolve_dismissal_usernames(db, [dismissal])
     return _dismissal_response(dismissal, usernames)
 
@@ -3365,9 +4027,23 @@ async def delete_attention_dismissal(
     db: Session = Depends(get_db_session),
 ) -> None:
     """Restore a silenced item so it shows in the inbox again."""
+    # Read before the delete commits: the row's attributes expire with it.
+    existing = crud_attention_dismissal.get_by_item(
+        db, account_id=account.id, item_id=item_id
+    )
+    restored_fingerprint = existing.fingerprint if existing is not None else None
     removed = crud_attention_dismissal.delete_by_item(
         db, account_id=account.id, item_id=item_id
     )
+    if restored_fingerprint is not None:
+        # Spend outlier cards (#960): the digest no longer lists it dismissed.
+        record_spend_outlier_dismissal(
+            db,
+            account_id=account.id,
+            item_id=item_id,
+            fingerprint=restored_fingerprint,
+            dismissed_at=None,
+        )
     if not removed:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,

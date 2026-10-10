@@ -9,7 +9,7 @@ This module provides API endpoints for declarative policy-as-code management:
 """
 
 import logging
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Callable, Dict, List, Literal, Optional
 from uuid import UUID
 
 from fastapi import (
@@ -31,6 +31,7 @@ from preloop.api.common import get_account_for_user
 from preloop.models.db.session import get_db_session
 from preloop.models.models.account import Account
 from preloop.models.models.user import User
+from preloop.models.schemas.mcp_server import redact_snapshot_credentials
 from preloop.services.policy import (
     ModelIORule,
     PolicyApplier,
@@ -52,8 +53,89 @@ from preloop.services.model_content_policy import (
     serialize_model_io_rules,
     upsert_model_io_rule,
 )
+from preloop.services.policy.schema import (
+    PIIDetectorConfig,
+    SensitiveDataDetectorsConfig,
+)
+from preloop.services.policy_evaluator import is_simple_expression
+from preloop.services.policy_simulation import (
+    PolicyEvaluationRequest,
+    PolicyEvaluationResponse,
+    simulate_policy,
+)
+from preloop.models import models
 from preloop.services.policy_version_service import PolicyVersionService
+from preloop.services.sensitive_data.detectors import (
+    DetectorConfig,
+    DetectorTimeoutError,
+    UnsafePatternError,
+    detect,
+    list_types,
+    types_found,
+)
+from preloop.services.sensitive_data.policy_store import (
+    detector_config_from,
+    load_sensitive_data_config,
+)
+from preloop.services.sensitive_data.redact import redact_text
+from preloop.tools.utils import run_async
+from preloop.utils.audit import log_config_change
 from preloop.utils.permissions import require_permission
+
+
+POLICY_AUDIT_CONFIG_TYPE = "policy"
+
+
+def _policy_object_summary(policy: PolicyDocument) -> dict:
+    """Names of the objects a policy document configures, for the audit trail."""
+    return {
+        "mcp_servers": [s.name for s in policy.mcp_servers or []],
+        "approval_workflows": [w.name for w in policy.approval_workflows or []],
+        "tools": [f"{t.source}:{t.name}" for t in policy.tools or []],
+        "model_io_rules": (
+            None if policy.model_io is None else [r.id for r in policy.model_io]
+        ),
+        "defaults": (
+            policy.defaults.model_dump(mode="json", exclude_none=True)
+            if policy.defaults
+            else None
+        ),
+    }
+
+
+def _snapshot_audit_ref(snapshot) -> Optional[dict]:
+    if snapshot is None:
+        return None
+    return {
+        "name": f"v{snapshot.version_number}",
+        "version_id": str(snapshot.id),
+        "version_number": snapshot.version_number,
+        "tag": snapshot.tag,
+    }
+
+
+def _audit_policy_change(
+    db: Session,
+    user: User,
+    action: str,
+    build: Callable[[], Dict[str, Any]],
+) -> None:
+    """Write a policy configuration_change without risking the committed change.
+
+    ``build`` returns the ``log_config_change`` value kwargs. It runs inside
+    the guard because it may read snapshots after the change was committed;
+    an audit failure is logged and never turns a successful change into a 500.
+    """
+    try:
+        log_config_change(
+            db,
+            user=user,
+            config_type=POLICY_AUDIT_CONFIG_TYPE,
+            action=action,
+            **build(),
+        )
+    except Exception:
+        logger.warning("Failed to audit policy %s", action, exc_info=True)
 
 
 # Pydantic models for version management endpoints
@@ -146,8 +228,105 @@ class ModelIORulePatchRequest(BaseModel):
     enabled: Optional[bool] = None
 
 
+class SensitiveDataTypeInfo(BaseModel):
+    """One selectable sensitive-data type (feeds the console page)."""
+
+    id: str
+    label: str
+    description: str
+    example: str
+    locales: List[str] = Field(default_factory=list)
+    checksum: bool = False
+    builtin: bool = True
+
+
+class SensitiveDataTypesResponse(BaseModel):
+    """Built-in, registered and account-defined types."""
+
+    types: List[SensitiveDataTypeInfo]
+    default_types: List[str] = Field(
+        description="Types the pii detector scans when a rule lists none"
+    )
+
+
+class SensitiveDataTestRequest(BaseModel):
+    """Run the detectors on sample text. The text is never logged or stored."""
+
+    text: str = Field(..., max_length=20_000, description="Sample text to scan")
+    types: Optional[List[str]] = Field(
+        None, description="Types to scan; default every type in the config"
+    )
+    config: Optional[SensitiveDataDetectorsConfig] = Field(
+        None,
+        description=(
+            "Detector configuration to test; default the account's stored block"
+        ),
+    )
+
+
+class SensitiveDataHashCheckRequest(BaseModel):
+    """Equality check of a candidate payload against a stored fingerprint."""
+
+    payload: Any = Field(..., description="Candidate arguments or result")
+    args_hmac: str = Field(
+        ...,
+        min_length=16,
+        max_length=128,
+        description="Stored fingerprint (scrypt, or HMAC-SHA256 for older rows)",
+    )
+    salt_id: Optional[str] = Field(
+        None, description="Salt id from the record; omit to try every account salt"
+    )
+
+
+class SensitiveDataHashCheckResponse(BaseModel):
+    """Whether the candidate matches. The payload is never stored."""
+
+    match: bool
+    salt_id: Optional[str] = None
+
+
+class SensitiveDataMatch(BaseModel):
+    """One detected span (offsets into the submitted text)."""
+
+    type: str
+    start: int
+    end: int
+    confidence: float
+
+
+class SensitiveDataTestResponse(BaseModel):
+    """Detector output for the submitted text."""
+
+    matches: List[SensitiveDataMatch]
+    types_found: List[str]
+    count: int
+    redacted_preview: Optional[str] = Field(
+        None, description="Text with each match replaced by [REDACTED:<type>]"
+    )
+
+
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+
+@router.post("/policies/evaluate", response_model=PolicyEvaluationResponse)
+@require_permission("view_policies")
+def evaluate_policy_sample(
+    request: PolicyEvaluationRequest,
+    account: models.Account = Depends(get_account_for_user),
+    current_user: models.User = Depends(get_current_active_user),
+    db: Session = Depends(get_db_session),
+) -> PolicyEvaluationResponse:
+    """Evaluate a stored policy or unsaved draft without recording or dispatch."""
+    try:
+        return run_async(
+            simulate_policy(
+                request, db=db, account_id=account.id, user_id=current_user.id
+            )
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 @router.post(
@@ -162,8 +341,10 @@ async def validate_policy(
     check_server_references: bool = Form(
         True,
         description=(
-            "If true, validate that MCP server references exist in your account. "
-            "Set to false for standalone schema validation."
+            "If true, validate that MCP server references resolve to a server "
+            "defined in the file or configured in your account. If false, MCP "
+            "server references are not checked. Approval workflow references "
+            "are always resolved against the file and your account."
         ),
     ),
     account: Account = Depends(get_account_for_user),
@@ -176,14 +357,16 @@ async def validate_policy(
     checking for:
     - Valid YAML/JSON syntax
     - Required fields
-    - Valid references (approval workflows, MCP servers)
+    - Approval workflow references (tools, model_io rules, defaults and
+      escalation), resolved against the file and the account
     - Expression syntax
-    - MCP server availability (if check_server_references=true)
+    - MCP server references, resolved against the file and the account
+      (only if check_server_references=true)
 
     Args:
         file: The policy file to validate (YAML or JSON).
         check_server_references: If True, also validate that referenced MCP
-            servers exist in your account.
+            servers are defined in the file or configured in your account.
         account: Current user's account.
         db: Database session.
 
@@ -214,81 +397,117 @@ async def validate_policy(
     # Validate the policy schema
     policy, result = load_policy_from_string(content_str, format=format)
 
-    # If schema is valid and we should check server references, do additional validation
-    if policy and result.is_valid and check_server_references:
-        # Build set of servers defined in the policy file
-        policy_servers = set()
-        if policy.mcp_servers:
-            policy_servers = {server.name.lower() for server in policy.mcp_servers}
+    # Cross-references are resolved against the policy file plus the account.
+    # Approval workflow references are always checked; MCP server references
+    # only when check_server_references is set.
+    if policy and result.is_valid:
+        policy_servers = {s.name.lower() for s in policy.mcp_servers or []}
+        policy_approval_workflows = {w.name for w in policy.approval_workflows or []}
 
-        # Build set of policies defined in the policy file
-        policy_approval_workflows = set()
-        if policy.approval_workflows:
-            policy_approval_workflows = {w.name for w in policy.approval_workflows}
-
-        # Get existing servers from the database
-        existing_servers = crud_mcp_server.get_active_by_account(
-            db, account_id=str(account.id)
+        all_available_workflows = (
+            policy_approval_workflows
+            | crud_approval_workflow.get_names_by_account(
+                db, account_id=str(account.id)
+            )
         )
-        existing_server_names = {s.name.lower() for s in existing_servers}
-        all_available_servers = policy_servers | existing_server_names
+        all_available_servers: set[str] = set()
+        if check_server_references:
+            existing_servers = crud_mcp_server.get_active_by_account(
+                db, account_id=str(account.id)
+            )
+            all_available_servers = policy_servers | {
+                s.name.lower() for s in existing_servers
+            }
 
-        # Get existing policies from the database
-        existing_workflows = crud_approval_workflow.get_multi_by_account(
-            db, account_id=str(account.id)
-        )
-        existing_workflow_names = {w.name for w in existing_workflows}
-        all_available_workflows = policy_approval_workflows | existing_workflow_names
+        missing_server_seen = False
+        missing_workflow_seen = False
 
-        # Check tool references
-        if policy.tools:
-            for idx, tool in enumerate(policy.tools):
-                # Check MCP server references
-                source_lower = tool.source.lower()
-                if not is_known_tool_source(source_lower):
-                    if source_lower not in all_available_servers:
-                        available_list = ", ".join(sorted(all_available_servers))
-                        result.errors.append(
-                            PolicyValidationError(
-                                path=f"$.tools[{idx}].source",
-                                message=(
-                                    f"Tool '{tool.name}' references MCP server "
-                                    f"'{tool.source}' which is not configured. "
-                                    f"Either add the server to your policy file "
-                                    f"under 'mcp_servers', or configure it in the "
-                                    f"console first."
-                                ),
-                                value=tool.source,
-                            )
-                        )
-                        if all_available_servers:
-                            result.warnings.append(
-                                f"Available MCP servers: [{available_list}]"
-                            )
+        def _workflow_error(path: str, owner: str, name: str) -> None:
+            nonlocal missing_workflow_seen
+            missing_workflow_seen = True
+            result.errors.append(
+                PolicyValidationError(
+                    path=path,
+                    message=(
+                        f"{owner} references approval workflow '{name}' which "
+                        f"is not defined. Either add the workflow to your "
+                        f"policy file under 'approval_workflows', or configure "
+                        f"it in the console first."
+                    ),
+                    value=name,
+                )
+            )
 
-                # Check approval workflow references
-                if tool.approval_workflow:
-                    if tool.approval_workflow not in all_available_workflows:
-                        available_list = ", ".join(sorted(all_available_workflows))
-                        result.errors.append(
-                            PolicyValidationError(
-                                path=f"$.tools[{idx}].approval_workflow",
-                                message=(
-                                    f"Tool '{tool.name}' references approval workflow "
-                                    f"'{tool.approval_workflow}' which is not defined. "
-                                    f"Either add the workflow to your policy file "
-                                    f"under 'approval_workflows', or configure it in "
-                                    f"the console first."
-                                ),
-                                value=tool.approval_workflow,
-                            )
-                        )
-                        if all_available_workflows:
-                            result.warnings.append(
-                                f"Available approval workflows: [{available_list}]"
-                            )
+        for idx, tool in enumerate(policy.tools or []):
+            source_lower = tool.source.lower()
+            if (
+                check_server_references
+                and not is_known_tool_source(source_lower)
+                and source_lower not in all_available_servers
+            ):
+                missing_server_seen = True
+                result.errors.append(
+                    PolicyValidationError(
+                        path=f"$.tools[{idx}].source",
+                        message=(
+                            f"Tool '{tool.name}' references MCP server "
+                            f"'{tool.source}' which is not configured. "
+                            f"Either add the server to your policy file "
+                            f"under 'mcp_servers', or configure it in the "
+                            f"console first."
+                        ),
+                        value=tool.source,
+                    )
+                )
+            if (
+                tool.approval_workflow
+                and tool.approval_workflow not in all_available_workflows
+            ):
+                _workflow_error(
+                    f"$.tools[{idx}].approval_workflow",
+                    f"Tool '{tool.name}'",
+                    tool.approval_workflow,
+                )
 
-        # Update validity based on new errors
+        for idx, rule in enumerate(policy.model_io or []):
+            if (
+                rule.approval_workflow
+                and rule.approval_workflow not in all_available_workflows
+            ):
+                _workflow_error(
+                    f"$.model_io[{idx}].approval_workflow",
+                    f"model_io rule '{rule.id}'",
+                    rule.approval_workflow,
+                )
+
+        if policy.defaults and policy.defaults.default_approval_workflow:
+            name = policy.defaults.default_approval_workflow
+            if name not in all_available_workflows:
+                _workflow_error(
+                    "$.defaults.default_approval_workflow", "Defaults", name
+                )
+
+        for idx, wf in enumerate(policy.approval_workflows or []):
+            if (
+                wf.escalation_workflow
+                and wf.escalation_workflow not in all_available_workflows
+            ):
+                _workflow_error(
+                    f"$.approval_workflows[{idx}].escalation_workflow",
+                    f"Approval workflow '{wf.name}'",
+                    wf.escalation_workflow,
+                )
+
+        if missing_server_seen and all_available_servers:
+            result.warnings.append(
+                f"Available MCP servers: [{', '.join(sorted(all_available_servers))}]"
+            )
+        if missing_workflow_seen and all_available_workflows:
+            result.warnings.append(
+                "Available approval workflows: "
+                f"[{', '.join(sorted(all_available_workflows))}]"
+            )
+
         if result.errors:
             result.is_valid = False
 
@@ -425,6 +644,30 @@ async def upload_policy(
             },
         )
 
+    if not dry_run:
+
+        def _applied_payload() -> Dict[str, Any]:
+            active_snapshot = PolicyVersionService(
+                db, str(account.id)
+            ).get_active_snapshot()
+            return {
+                "new_value": {
+                    "name": policy.metadata.name,
+                    "policy_name": policy.metadata.name,
+                    "source": "upload",
+                    "filename": file.filename,
+                    "active_version": _snapshot_audit_ref(active_snapshot),
+                    "counts": result.model_dump(
+                        exclude={"success", "policy_name", "warnings", "errors"}
+                    ),
+                    "objects": _policy_object_summary(policy),
+                    "skip_missing_servers": skip_missing_servers,
+                    "warnings": result.warnings,
+                }
+            }
+
+        _audit_policy_change(db, current_user, "applied", _applied_payload)
+
     action = "validated (dry run)" if dry_run else "applied"
     logger.info(
         f"Policy '{policy.metadata.name}' {action} for account {account.id}: "
@@ -434,6 +677,131 @@ async def upload_policy(
     )
 
     return result
+
+
+@router.get(
+    "/policies/sensitive-data/types",
+    response_model=SensitiveDataTypesResponse,
+    summary="List sensitive-data detector types",
+)
+@require_permission("view_policies")
+def list_sensitive_data_types(
+    account: Account = Depends(get_account_for_user),
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db_session),
+) -> SensitiveDataTypesResponse:
+    """Type id, label, description, example and locales for every detector.
+
+    Includes the account's custom patterns and keyword lists so the console
+    can offer them next to the built-ins.
+    """
+    from preloop.services.policy.schema import SUPPORTED_PII_TYPES
+
+    config = detector_config_from(load_sensitive_data_config(db, account.id))
+    return SensitiveDataTypesResponse(
+        types=[SensitiveDataTypeInfo(**info.as_dict()) for info in list_types(config)],
+        # What a rule without its own list scans: the account default when
+        # set, else the legacy three.
+        default_types=list(config.types) if config.types else list(SUPPORTED_PII_TYPES),
+    )
+
+
+@router.post(
+    "/policies/sensitive-data/test",
+    response_model=SensitiveDataTestResponse,
+    summary="Test sensitive-data detectors on sample text",
+)
+@require_permission("view_policies")
+def test_sensitive_data_detectors(
+    request: SensitiveDataTestRequest,
+    account: Account = Depends(get_account_for_user),
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db_session),
+) -> SensitiveDataTestResponse:
+    """Return match spans for ``text``. The input is never logged or stored.
+
+    Account patterns run through the timeout-capable engine, so a
+    pathological regex ends with a 422 instead of a blocked worker.
+    """
+    if request.config is not None:
+        config = DetectorConfig.from_mapping(
+            request.config.model_dump(exclude_none=True, mode="json")
+        )
+    else:
+        config = detector_config_from(load_sensitive_data_config(db, account.id))
+    if request.types is not None:
+        try:
+            PIIDetectorConfig(types=request.types)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)
+            ) from exc
+        config = config.with_types(request.types)
+    try:
+        matches = detect(request.text, config)
+        preview, _counts = redact_text(request.text, config)
+    except DetectorTimeoutError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=f"A custom pattern exceeded its match budget: {exc}",
+        ) from exc
+    except UnsafePatternError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)
+        ) from exc
+    return SensitiveDataTestResponse(
+        matches=[
+            SensitiveDataMatch(
+                type=m.type, start=m.start, end=m.end, confidence=m.confidence
+            )
+            for m in matches
+        ],
+        types_found=types_found(matches),
+        count=len(matches),
+        redacted_preview=preview if matches else request.text,
+    )
+
+
+@router.post(
+    "/policies/sensitive-data/hash-check",
+    response_model=SensitiveDataHashCheckResponse,
+    summary="Check a candidate payload against a reference-only fingerprint",
+)
+@require_permission("manage_policies")
+def sensitive_data_hash_check(
+    request: SensitiveDataHashCheckRequest,
+    account: Account = Depends(get_account_for_user),
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db_session),
+) -> SensitiveDataHashCheckResponse:
+    """Return whether ``payload`` produces ``args_hmac`` under this account's salts.
+
+    Account scoped: only the caller's salts are tried, so a fingerprint from
+    another account never matches. Nothing is stored or logged.
+    """
+    from preloop.services.sensitive_data.reference import verify_hmac
+
+    matched, salt_id = verify_hmac(
+        account.id, request.payload, request.args_hmac, salt_id=request.salt_id, db=db
+    )
+    return SensitiveDataHashCheckResponse(match=matched, salt_id=salt_id)
+
+
+def _reject_unknown_pii_types(db: Session, account: Account, rule: ModelIORule) -> None:
+    """Standalone rule writes cannot see a YAML document; check the account."""
+    detectors = rule.detectors
+    if detectors is None or not isinstance(detectors.pii, PIIDetectorConfig):
+        return
+    known = load_sensitive_data_config(db, account.id).known_types()
+    unknown = [item for item in detectors.pii.types if item not in known]
+    if unknown:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=(
+                f"Unknown PII types {unknown}. Define custom patterns or keyword "
+                "lists under sensitive_data.detectors first."
+            ),
+        )
 
 
 @router.get(
@@ -452,6 +820,38 @@ def list_model_io_rules(
     return ModelIORuleListResponse(rules=serialize_model_io_rules(rules))
 
 
+def _reject_cel_syntax_declared_simple(rule: ModelIORule) -> None:
+    """Refuse a model I/O condition marked ``simple`` but written in CEL.
+
+    The simple evaluator raises on CEL syntax, so a mis-typed deny rule fails
+    closed and a ``notify`` rule silently never fires. Rejecting the write
+    with 422 lets the author pick ``cel``; already-stored rules are left
+    untouched because this runs only on create and update.
+
+    Args:
+        rule: Rule about to be written.
+
+    Raises:
+        HTTPException: 422 when a condition declares ``simple`` but the
+            simple parser cannot read its expression.
+    """
+    for condition in rule.conditions:
+        condition_type = getattr(condition, "condition_type", "simple")
+        if hasattr(condition_type, "value"):
+            condition_type = condition_type.value
+        if str(condition_type or "simple") == "simple" and not is_simple_expression(
+            condition.expression
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail=(
+                    "condition_type 'simple' cannot parse expression "
+                    f"{condition.expression!r}. Set condition_type to 'cel' "
+                    "for CEL functions, `in`, `&&`, `||`, or indexing."
+                ),
+            )
+
+
 @router.post(
     "/policies/model-io-rules",
     summary="Create or replace a model I/O content policy rule",
@@ -464,6 +864,8 @@ def create_model_io_rule(
     db: Session = Depends(get_db_session),
 ) -> Dict[str, Any]:
     """Save one model I/O rule from the Policies console form."""
+    _reject_cel_syntax_declared_simple(rule)
+    _reject_unknown_pii_types(db, account, rule)
     saved = upsert_model_io_rule(db, account.id, rule)
     db.commit()
     return saved.model_dump(exclude_none=True, mode="json")
@@ -484,12 +886,14 @@ def update_model_io_rule(
     """Replace an existing model I/O rule. The path id wins."""
     if rule.id != rule_id:
         rule = rule.model_copy(update={"id": rule_id})
+    _reject_cel_syntax_declared_simple(rule)
     existing = {item.id: item for item in load_model_io_rules(db, account.id)}
     if rule_id not in existing:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"model_io rule '{rule_id}' not found",
         )
+    _reject_unknown_pii_types(db, account, rule)
     saved = upsert_model_io_rule(db, account.id, rule)
     db.commit()
     return saved.model_dump(exclude_none=True, mode="json")
@@ -769,7 +1173,7 @@ def _snapshot_to_metadata(snapshot) -> PolicyVersionMetadata:
 
 
 def _snapshot_to_full(snapshot) -> PolicyVersionFull:
-    """Convert a PolicySnapshot to PolicyVersionFull."""
+    """Convert a PolicySnapshot to PolicyVersionFull with credentials masked."""
     return PolicyVersionFull(
         id=snapshot.id,
         version_number=snapshot.version_number,
@@ -781,7 +1185,7 @@ def _snapshot_to_full(snapshot) -> PolicyVersionFull:
         tools_count=snapshot.tools_count,
         created_at=snapshot.created_at.isoformat(),
         created_by_user_id=snapshot.created_by_user_id,
-        snapshot_data=snapshot.snapshot_data,
+        snapshot_data=redact_snapshot_credentials(snapshot.snapshot_data),
     )
 
 
@@ -1052,6 +1456,19 @@ async def rollback_to_version(
 
     if not request.preview_only and success:
         db.commit()
+
+        def _rollback_payload() -> Dict[str, Any]:
+            snapshot = service.get_snapshot(version_id)
+            return {
+                "new_value": {
+                    **(
+                        _snapshot_audit_ref(snapshot) or {"version_id": str(version_id)}
+                    ),
+                    "diff": diff.model_dump(mode="json") if diff else None,
+                }
+            }
+
+        _audit_policy_change(db, current_user, "rolled_back", _rollback_payload)
         logger.info(f"Rolled back to version {version_id} for account {account.id}")
 
     return RollbackResponse(success=success, diff=diff, error=error)
@@ -1083,6 +1500,11 @@ async def delete_policy_version(
         HTTPException: If version not found or is active.
     """
     service = PolicyVersionService(db, str(account.id))
+    try:
+        deleted_ref = _snapshot_audit_ref(service.get_snapshot(version_id))
+    except Exception:
+        logger.warning("Failed to read policy version for audit", exc_info=True)
+        deleted_ref = {"version_id": str(version_id)}
     success, error = service.delete_snapshot(version_id)
 
     if not success:
@@ -1098,6 +1520,9 @@ async def delete_policy_version(
             )
 
     db.commit()
+    _audit_policy_change(
+        db, current_user, "version_deleted", lambda: {"old_value": deleted_ref}
+    )
 
     logger.info(f"Deleted version {version_id} for account {account.id}")
 
@@ -1139,6 +1564,20 @@ async def prune_policy_versions(
     )
 
     db.commit()
+    if deleted_count:
+        _audit_policy_change(
+            db,
+            current_user,
+            "versions_pruned",
+            lambda: {
+                "new_value": {
+                    "deleted_count": deleted_count,
+                    "older_than_days": request.older_than_days,
+                    "keep_tagged": request.keep_tagged,
+                    "keep_count": request.keep_count,
+                }
+            },
+        )
 
     logger.info(f"Pruned {deleted_count} versions for account {account.id}")
 

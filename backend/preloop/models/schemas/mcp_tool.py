@@ -1,9 +1,10 @@
 """Pydantic schemas for MCP tool definitions."""
 
 from datetime import datetime
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
+from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_serializer
 
 
 class MCPToolBase(BaseModel):
@@ -21,7 +22,7 @@ class MCPToolCreate(MCPToolBase):
 
     name: str
     input_schema: Dict[str, Any]
-    mcp_server_id: str
+    mcp_server_id: UUID
     discovered_at: str
 
 
@@ -34,12 +35,31 @@ class MCPToolUpdate(MCPToolBase):
 class MCPToolResponse(MCPToolBase):
     """Schema for MCP tool response."""
 
-    id: str
-    mcp_server_id: str
+    id: UUID
+    mcp_server_id: UUID
     name: str
     input_schema: Dict[str, Any]
+    # ``discovered_at`` is stored as a string column on ``MCPTool`` (the
+    # discovery timestamp is recorded by the scanner), not a SQL timestamp.
     discovered_at: str
     created_at: datetime
     updated_at: datetime
+    exposed_name: Optional[str] = Field(
+        None,
+        description="Name agents see: '<tool_prefix>_<name>' or the name",
+    )
+    shadowed: bool = Field(
+        False,
+        description=(
+            "True when an older active server in the account exposes the "
+            "same name. Shadowed tools are not listed to agents or callable."
+        ),
+    )
+    warnings: List[str] = Field(default_factory=list)
 
     model_config = ConfigDict(from_attributes=True)
+
+    @field_serializer("id", "mcp_server_id")
+    def serialize_uuids(self, value: UUID) -> str:
+        """Serialize UUID fields to strings for JSON responses."""
+        return str(value)

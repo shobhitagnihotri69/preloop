@@ -9,6 +9,7 @@ import '@shoelace-style/shoelace/dist/components/option/option.js';
 import '@shoelace-style/shoelace/dist/components/textarea/textarea.js';
 import type SlInput from '@shoelace-style/shoelace/dist/components/input/input.js';
 import { consoleDialogStyles } from '../styles/console-dialog';
+import './capability-extension';
 
 @customElement('mcp-server-form')
 export class MCPServerForm extends LitElement {
@@ -39,6 +40,9 @@ export class MCPServerForm extends LitElement {
   private bearerToken = '';
 
   @state()
+  private toolPrefix = '';
+
+  @state()
   private isLoading = false;
 
   @state()
@@ -55,6 +59,14 @@ export class MCPServerForm extends LitElement {
       sl-select,
       sl-textarea {
         margin-bottom: 1rem;
+      }
+      .warnings {
+        color: var(--sl-color-warning-700);
+        background: var(--sl-color-warning-50);
+        border-radius: var(--sl-border-radius-medium);
+        padding: var(--sl-spacing-small);
+        margin-bottom: 1rem;
+        font-size: 0.875rem;
       }
       .help-text {
         font-size: 0.875rem;
@@ -76,6 +88,7 @@ export class MCPServerForm extends LitElement {
       this.transport = this.server.transport || 'http-streaming';
       this.authType = this.server.auth_type || 'none';
       this.bearerToken = this.server.auth_config?.token || '';
+      this.toolPrefix = this.server.tool_prefix || '';
     }
   }
 
@@ -113,20 +126,38 @@ export class MCPServerForm extends LitElement {
           placeholder="e.g., http://localhost:8001"
         ></sl-input>
         <div class="help-text">
-          Enter the base URL of your MCP server (e.g., http://localhost:8001)<br />
-          Phase 1B supports HTTP Streaming transport only.
+          The base URL of your MCP server. Servers that use the Streamable HTTP
+          transport are supported.
         </div>
 
+        ${
+          this.server?.warnings?.length
+            ? html`<div
+                class="warnings"
+                role="note"
+                data-testid="mcp-server-warnings"
+              >
+                <strong>Tool name collisions</strong>
+                ${this.server.warnings.map(
+                  (warning: string) => html`<div>${warning}</div>`
+                )}
+              </div>`
+            : ''
+        }
+
         <sl-input
-          label="Transport"
-          name="transport"
-          .value=${'http-streaming'}
-          disabled
-          readonly
+          label="Tool prefix (optional)"
+          name="tool_prefix"
+          .value=${this.toolPrefix}
+          @sl-input=${(e: any) => (this.toolPrefix = e.target.value)}
+          placeholder="e.g., crm"
+          maxlength="32"
         ></sl-input>
         <div class="help-text">
-          Only HTTP Streaming (streamable-http) transport is currently
-          supported.
+          When set, this server's tools are exposed to agents as prefix_tool.
+          Use it only when another server exposes the same tool names. Lowercase
+          letters, digits and underscores, at most 32 characters. Changing it
+          renames the tools agents see.
         </div>
 
         <sl-select
@@ -189,7 +220,17 @@ export class MCPServerForm extends LitElement {
         }
         ${
           this.errorMessage
-            ? html`<p class="error">${this.errorMessage}</p>`
+            ? html`<p class="error" role="alert">${this.errorMessage}</p>`
+            : ''
+        }
+        ${
+          // Sharing and tags of an existing server, where the deployment
+          // reports the capability; nothing otherwise.
+          this.server?.id
+            ? html`<capability-extension
+                name="resource-access"
+                .context=${{ kind: 'mcp_server', resourceId: this.server.id }}
+              ></capability-extension>`
             : ''
         }
 
@@ -231,6 +272,14 @@ export class MCPServerForm extends LitElement {
       return;
     }
 
+    const prefix = this.toolPrefix.trim();
+    if (prefix && !/^[a-z0-9_]{1,32}$/.test(prefix)) {
+      this.errorMessage =
+        'Tool prefix must be lowercase letters, digits and underscores, at most 32 characters';
+      this.isLoading = false;
+      return;
+    }
+
     // Build auth config
     let authConfigObj = null;
     if (this.authType === 'bearer' && this.bearerToken.trim()) {
@@ -247,6 +296,7 @@ export class MCPServerForm extends LitElement {
       auth_type: this.authType,
       auth_config: authConfigObj,
       status: 'active', // Always active when created/updated
+      tool_prefix: prefix || null,
     };
 
     try {

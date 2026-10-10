@@ -170,6 +170,31 @@ class TestAuditLogCRUD:
         )
         assert len(logs) == 1
 
+    def test_get_by_account_filters_by_resource_id(
+        self, db_session: Session, test_account, test_user_for_audit
+    ):
+        """A resource id narrows the account's rows to one resource."""
+        for resource_id in ("flow-1", "flow-2", "flow-2"):
+            crud_audit_log.log_action(
+                db_session,
+                account_id=test_account.id,
+                user_id=test_user_for_audit.id,
+                action="flow_failure_streak_alert",
+                resource_type="flow",
+                resource_id=resource_id,
+                status="success",
+            )
+
+        logs = crud_audit_log.get_by_account(
+            db_session,
+            account_id=test_account.id,
+            action="flow_failure_streak_alert",
+            resource_type="flow",
+            resource_id="flow-2",
+        )
+        assert len(logs) == 2
+        assert all(log.resource_id == "flow-2" for log in logs)
+
     def test_get_by_account_with_date_filters(
         self, db_session: Session, test_account, test_user_for_audit
     ):
@@ -363,6 +388,88 @@ class TestAuditLogCRUD:
         )
         assert count == 1
 
+    def test_consent_ref_filters_list_count_and_timeline(
+        self, db_session: Session, test_account, test_user_for_audit
+    ):
+        """``details.grant.consent_ref`` matches one account's exact reference.
+
+        A different reference, a row with no grant, and the same reference
+        on another account must all stay out of the three readers.
+        """
+        other = crud_account.create(
+            db_session,
+            obj_in={"organization_name": "Other consent org", "is_active": True},
+        )
+        match = crud_audit_log.log_action(
+            db_session,
+            account_id=test_account.id,
+            user_id=test_user_for_audit.id,
+            action="tool_call",
+            resource_type="tool",
+            resource_id="search",
+            status="success",
+            details={
+                "correlation_id": "c-match",
+                "grant": {"consent_ref": "consent-a"},
+            },
+        )
+        crud_audit_log.log_action(
+            db_session,
+            account_id=test_account.id,
+            user_id=test_user_for_audit.id,
+            action="tool_call",
+            resource_type="tool",
+            resource_id="search",
+            status="success",
+            details={
+                "correlation_id": "c-other-ref",
+                "grant": {"consent_ref": "consent-b"},
+            },
+        )
+        crud_audit_log.log_action(
+            db_session,
+            account_id=test_account.id,
+            user_id=test_user_for_audit.id,
+            action="tool_call",
+            resource_type="tool",
+            resource_id="search",
+            status="success",
+            details={"correlation_id": "c-no-grant"},
+        )
+        crud_audit_log.log_action(
+            db_session,
+            account_id=other.id,
+            user_id=test_user_for_audit.id,
+            action="tool_call",
+            resource_type="tool",
+            resource_id="search",
+            status="success",
+            details={
+                "correlation_id": "c-foreign",
+                "grant": {"consent_ref": "consent-a"},
+            },
+        )
+
+        listed = crud_audit_log.get_by_account(
+            db_session, account_id=test_account.id, consent_ref="consent-a"
+        )
+        assert [row.id for row in listed] == [match.id]
+
+        assert (
+            crud_audit_log.count_by_account(
+                db_session, account_id=test_account.id, consent_ref="consent-a"
+            )
+            == 1
+        )
+
+        groups, total = crud_audit_log.get_grouped_by_correlation(
+            db_session, account_id=test_account.id, consent_ref="consent-a"
+        )
+        assert total == 1
+        assert len(groups) == 1
+        assert groups[0]["correlation_id"] == "c-match"
+        assert groups[0]["primary_event"].id == match.id
+
     def test_account_isolation(self, db_session: Session, test_user_for_audit):
         """Test that audit logs are properly isolated by account."""
         # Create two accounts
@@ -448,3 +555,110 @@ class TestAuditLogCRUD:
         assert stats["cli_last_seen_at"] is not None
         assert stats["top_cli_versions"][0] == {"version": "0.10.0", "count": 3}
         assert {"version": "0.9.0", "count": 1} in stats["top_cli_versions"]
+
+
+class TestGroupedStandalonePolicyDecisions:
+    """Policy decisions without a tool_call row anchor their own group (#1136)."""
+
+    @staticmethod
+    def _log(db, account, action, tool, cid, status="success", **extra):
+        details = {"correlation_id": cid, "tool_name": tool, **extra}
+        if action.startswith("policy_"):
+            details["decision"] = status
+        return crud_audit_log.log_action(
+            db,
+            account_id=account.id,
+            action=action,
+            resource_type="policy" if action.startswith("policy_") else "tool",
+            resource_id=tool,
+            status=status,
+            details=details,
+        )
+
+    @pytest.fixture
+    def events(self, db_session: Session, test_account):
+        # Allowed call: tool_call plus its policy_allow sub-event.
+        self._log(db_session, test_account, "tool_call", "read_file", "c-allow")
+        self._log(
+            db_session, test_account, "policy_allow", "read_file", "c-allow", "allow"
+        )
+        # Denied call: policy_deny only, no tool_call row.
+        deny = self._log(
+            db_session, test_account, "policy_deny", "delete_repo", "c-deny", "deny"
+        )
+        # require_approval that never executed: no tool_call row.
+        approval = self._log(
+            db_session,
+            test_account,
+            "policy_require_approval",
+            "send_email",
+            "c-approval",
+            "require_approval",
+        )
+        self._log(
+            db_session,
+            test_account,
+            "approval_created",
+            "send_email",
+            "c-approval",
+            approval_id="a-1",
+        )
+        # Deny that still has a tool_call row stays a sub-event.
+        self._log(db_session, test_account, "tool_call", "rm", "c-both", "denied")
+        self._log(db_session, test_account, "policy_deny", "rm", "c-both", "deny")
+        return deny, approval
+
+    def test_standalone_deny_is_a_primary_event(
+        self, db_session: Session, test_account, events
+    ):
+        deny, approval = events
+        groups, total = crud_audit_log.get_grouped_by_correlation(
+            db_session, account_id=test_account.id
+        )
+        primaries = {(g["primary_event"].action, g["correlation_id"]) for g in groups}
+        assert ("policy_deny", "c-deny") in primaries
+        assert ("policy_require_approval", "c-approval") in primaries
+        # Correlated decisions remain sub-events of their tool_call.
+        assert ("policy_deny", "c-both") not in primaries
+        assert ("policy_allow", "c-allow") not in primaries
+        assert total == len(groups) == 4
+
+        by_cid = {g["correlation_id"]: g for g in groups}
+        assert by_cid["c-deny"]["outcome"] == "deny"
+        assert by_cid["c-deny"]["sub_events"] == []
+        assert [s.action for s in by_cid["c-approval"]["sub_events"]] == [
+            "approval_created"
+        ]
+        assert [s.action for s in by_cid["c-both"]["sub_events"]] == ["policy_deny"]
+
+    def test_tool_name_filter_matches_standalone_deny(
+        self, db_session: Session, test_account, events
+    ):
+        groups, total = crud_audit_log.get_grouped_by_correlation(
+            db_session, account_id=test_account.id, tool_name_filter="delete"
+        )
+        assert total == 1
+        assert groups[0]["primary_event"].action == "policy_deny"
+        assert groups[0]["primary_event"].resource_id == "delete_repo"
+
+    def test_standalone_outcome_comes_from_the_decision(
+        self, db_session: Session, test_account
+    ):
+        row = self._log(
+            db_session, test_account, "policy_deny", "drop_db", "c-x", "denied"
+        )
+        row.details = {**row.details, "decision": "deny"}
+        db_session.flush()
+        groups, _ = crud_audit_log.get_grouped_by_correlation(
+            db_session, account_id=test_account.id, outcome_filter=["deny"]
+        )
+        assert [g["correlation_id"] for g in groups] == ["c-x"]
+        assert groups[0]["outcome"] == "deny"
+
+    def test_outcome_filter_deny_includes_standalone(
+        self, db_session: Session, test_account, events
+    ):
+        groups, _ = crud_audit_log.get_grouped_by_correlation(
+            db_session, account_id=test_account.id, outcome_filter=["deny"]
+        )
+        assert {g["correlation_id"] for g in groups} == {"c-deny", "c-both"}

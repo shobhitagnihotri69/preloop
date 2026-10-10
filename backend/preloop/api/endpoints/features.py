@@ -15,6 +15,8 @@ from preloop.models import models
 from preloop.api.auth import get_current_active_user
 from preloop.services.configuration_gating import configuration_capabilities
 from preloop.plugins.base import get_plugin_manager
+from preloop.config import SERVER_VERSION
+from preloop.services.instance_service import instance_edition
 
 __all__ = [
     "router",
@@ -54,11 +56,17 @@ def get_features(db: Session = Depends(get_db_session)) -> Dict[str, Any]:
 
     Returns:
         Dictionary with:
+        - edition: Runtime edition (oss, cloud, enterprise)
+        - server_version: Running backend version
         - plugins: List of enabled plugin metadata
         - features: Dict of feature flags (e.g., rbac, user_management, registration, etc.)
     """
     plugin_manager = get_plugin_manager()
     result = plugin_manager.get_enabled_features()
+    # Edition is a runtime deployment property. Static plugin declarations
+    # cannot relabel Cloud as Enterprise, or depend on plugin iteration order.
+    result["edition"] = instance_edition()
+    result["server_version"] = SERVER_VERSION
 
     # Registration state comes from the SAME computed rule /register
     # enforces (preloop.api.auth.bootstrap): an unclaimed instance (zero
@@ -83,11 +91,27 @@ def get_features(db: Session = Depends(get_db_session)) -> Dict[str, Any]:
     # the optimization_gating authorizer (402), never by hiding the UI.
     # setdefault so a plugin that already set the flag keeps its value.
     result["features"].setdefault("session_optimization", True)
+    result["features"].setdefault("chat_connections", True)
+    result["features"].setdefault("policy_simulation", True)
 
     # Policies console is available by default. Operators may hide the page;
     # backend policy APIs retain their permission checks. Instance
     # admins bypass the flag in the console shell.
     result["features"].setdefault("policies_console", policies_console_enabled())
+
+    from preloop.utils.bitbucket_dc import bitbucket_dc_enabled
+
+    from preloop.config import settings
+
+    result["features"]["ticket_readiness"] = settings.ticket_readiness_enabled
+    result["features"]["bitbucket_dc"] = bitbucket_dc_enabled()
+
+    # Account capabilities (multiple accounts per person, parent and
+    # subaccount trees, tag based access rules) are provided by an extension
+    # plugin. The console and CLI gate their views and commands on these
+    # flags, so they default to off; setdefault keeps a plugin's value.
+    for capability in ("multi_account", "account_hierarchy", "abac_rules"):
+        result["features"].setdefault(capability, False)
 
     # Passkey (WebAuthn) support: PASSKEYS_ENABLED env, default true. The
     # login page uses this to decide whether to render "Sign in with passkey".

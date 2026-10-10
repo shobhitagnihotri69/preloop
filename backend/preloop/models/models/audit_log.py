@@ -4,7 +4,7 @@ import uuid
 from datetime import datetime
 from typing import TYPE_CHECKING, Optional
 
-from sqlalchemy import BigInteger, ForeignKey, Index, Text, func
+from sqlalchemy import BigInteger, ForeignKey, Index, Text, func, text
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.types import DateTime, String
@@ -47,6 +47,27 @@ class AuditLog(Base):
         # account". One composite index serves both; NULLs sort last in
         # Postgres, so the unsealed tail sits at the end of it.
         Index("ix_audit_log_account_chain_seq", "account_id", "chain_seq"),
+        Index(
+            "ix_audit_log_account_grant_consent",
+            "account_id",
+            text("(details -> 'grant' ->> 'consent_ref')"),
+            postgresql_where=text("(details -> 'grant' ->> 'consent_ref') IS NOT NULL"),
+        ),
+        # The grouped timeline resolves one page's tool calls and approval
+        # lifecycle by account and JSON identifiers, without scanning details
+        # of every audit row in that account.
+        Index(
+            "ix_audit_log_account_correlation",
+            "account_id",
+            text("(details ->> 'correlation_id')"),
+            postgresql_where=text("(details ->> 'correlation_id') IS NOT NULL"),
+        ),
+        Index(
+            "ix_audit_log_account_approval",
+            "account_id",
+            text("(details ->> 'approval_id')"),
+            postgresql_where=text("(details ->> 'approval_id') IS NOT NULL"),
+        ),
     )
 
     # Foreign keys

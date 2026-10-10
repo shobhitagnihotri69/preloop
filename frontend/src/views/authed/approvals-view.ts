@@ -1,5 +1,8 @@
+import { ConsoleStatus } from '../../controllers/console-status';
+import { replaceListFilters } from '../../utils/list-filter-url';
 import { html, css, nothing, unsafeCSS } from 'lit';
 import { customElement, state } from 'lit/decorators.js';
+import { repeat } from 'lit/directives/repeat.js';
 import { Router } from '../../router';
 import {
   AuthedElement,
@@ -17,9 +20,11 @@ import {
   parseUTCDate,
 } from '../../utils/date';
 import { approvalRequesterName } from '../../utils/approval-identity';
+import '../../components/repository-chip';
 import {
   APPROVAL_REQUESTS_PAGE_LIMIT,
   approvalStatusLabel,
+  approvalStatusVariant,
   isExpiringSoon,
   isUnexpiredPendingRequest,
   normalizeApprovalRequest,
@@ -47,6 +52,7 @@ import '../../components/list-bar-swap';
 import { unifiedWebSocketManager } from '../../services/unified-websocket-manager';
 import '../../components/approval-rule-context-block';
 import '../../components/attribution-line';
+import '@shoelace-style/shoelace/dist/components/alert/alert.js';
 import '@shoelace-style/shoelace/dist/components/card/card.js';
 import '@shoelace-style/shoelace/dist/components/button/button.js';
 import '@shoelace-style/shoelace/dist/components/spinner/spinner.js';
@@ -62,6 +68,8 @@ import '@shoelace-style/shoelace/dist/components/menu/menu.js';
 import '@shoelace-style/shoelace/dist/components/menu-item/menu-item.js';
 import '@shoelace-style/shoelace/dist/components/divider/divider.js';
 import consoleStyles from '../../styles/console-styles.css?inline';
+import { debugLog } from '../../utils/debug';
+import '../../components/view-header';
 
 /**
  * Ids the operator has already had on screen, so a request that arrived since
@@ -88,6 +96,7 @@ interface ApprovalStats {
 
 @customElement('approvals-view')
 export class ApprovalsView extends AuthedElement {
+  private readonly accessibilityStatus = new ConsoleStatus(this);
   @state()
   private approvalRequests: ApprovalRequest[] = [];
 
@@ -108,6 +117,20 @@ export class ApprovalsView extends AuthedElement {
 
   @state()
   private loading = true;
+
+  /** True while an older page of the history is in flight. */
+  @state()
+  private loadingMore = false;
+
+  /**
+   * True when the last fetched page came back full, so more rows may exist
+   * beyond the loaded window. Drives "Load older" and the honest count labels.
+   */
+  @state()
+  private hasMore = false;
+
+  @state()
+  private moreError: string | null = null;
 
   @state()
   private stats: ApprovalStats = {
@@ -138,6 +161,14 @@ export class ApprovalsView extends AuthedElement {
   private answerError: string | null = null;
 
   /**
+   * Why the list could not be loaded, if it could not. An outage must never
+   * read as "nothing is waiting", so while this is set the empty state is not
+   * shown.
+   */
+  @state()
+  private loadError: string | null = null;
+
+  /**
    * Ticks once a second while anything in "Waiting for you" can still expire,
    * so a request that times out with the list open leaves that group and
    * loses its Approve/Deny buttons instead of offering a dead decision.
@@ -146,11 +177,24 @@ export class ApprovalsView extends AuthedElement {
   private nowMs = Date.now();
 
   /**
-   * Which row the keyboard is on, as an index into `navigableRequests`. -1
-   * means the keyboard has not been used yet, so no row steals the tab stop.
+   * Which request the keyboard is on, by id. Null means the keyboard has not
+   * been used yet (so no row steals the tab stop), or the request it was on
+   * has left the list.
+   *
+   * Tracked by id and not by position: live updates insert, re-sort and drop
+   * rows, and a position would then point at a different request, so A would
+   * approve a tool call the operator never read.
    */
   @state()
-  private focusedIndex = -1;
+  private focusedId: string | null = null;
+
+  /** Position of the focused request in `navigableRequests`, or -1. */
+  private get focusedIndex(): number {
+    if (!this.focusedId) return -1;
+    return this.navigableRequests.findIndex(
+      (request) => request.id === this.focusedId
+    );
+  }
 
   /**
    * The shared console selection: the same checkbox, keys and bulk bar every
@@ -183,6 +227,18 @@ export class ApprovalsView extends AuthedElement {
   static styles = [
     unsafeCSS(consoleStyles),
     css`
+      .load-error {
+        margin-bottom: var(--sl-spacing-medium);
+      }
+
+      .load-error-body {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: var(--sl-spacing-small) var(--sl-spacing-medium);
+        justify-content: space-between;
+      }
+
       /* One hairline strip, not six boxes: these are counts, not cards. */
       .stat-strip {
         display: flex;
@@ -229,6 +285,18 @@ export class ApprovalsView extends AuthedElement {
         display: flex;
         flex-direction: column;
         gap: var(--sl-spacing-small);
+      }
+
+      .load-older {
+        display: flex;
+        align-items: center;
+        gap: var(--sl-spacing-small);
+        justify-content: center;
+        margin-top: var(--sl-spacing-medium);
+      }
+
+      .error {
+        color: var(--sl-color-danger-700);
       }
 
       .approval-item {
@@ -307,7 +375,7 @@ export class ApprovalsView extends AuthedElement {
       }
 
       .form-summary sl-icon {
-        color: var(--sl-color-neutral-500);
+        color: var(--console-meta-color);
       }
 
       .approval-item:hover {
@@ -458,6 +526,8 @@ export class ApprovalsView extends AuthedElement {
 
   async connectedCallback() {
     super.connectedCallback();
+    this.readFilterLocation();
+    window.addEventListener('popstate', this.onFilterPopState);
     this.addEventListener('keydown', this.onKeyDown);
     await this.loadApprovalRequests();
     this.connectWebSocket();
@@ -465,6 +535,9 @@ export class ApprovalsView extends AuthedElement {
 
   disconnectedCallback() {
     super.disconnectedCallback();
+    window.removeEventListener('popstate', this.onFilterPopState);
+    if (this.filterSearchTimer !== null)
+      window.clearTimeout(this.filterSearchTimer);
     this.removeEventListener('keydown', this.onKeyDown);
     this.unsubscribe?.();
     this.stopTicking();
@@ -601,7 +674,9 @@ export class ApprovalsView extends AuthedElement {
       return;
     }
 
-    const focused = requests[this.focusedIndex];
+    // Looked up by id: if the request the operator was reading has gone,
+    // nothing happens rather than a neighbour being decided.
+    const focused = requests.find((request) => request.id === this.focusedId);
     if (!focused) return;
 
     if (key === 'Enter') {
@@ -633,9 +708,11 @@ export class ApprovalsView extends AuthedElement {
   }
 
   private moveFocus(delta: number) {
-    const last = this.navigableRequests.length - 1;
-    const next = this.focusedIndex < 0 ? 0 : this.focusedIndex + delta;
-    this.focusedIndex = Math.min(Math.max(next, 0), last);
+    const requests = this.navigableRequests;
+    const last = requests.length - 1;
+    const current = this.focusedIndex;
+    const next = current < 0 ? 0 : current + delta;
+    this.focusedId = requests[Math.min(Math.max(next, 0), last)]?.id ?? null;
     this.pendingFocus = true;
   }
 
@@ -650,13 +727,19 @@ export class ApprovalsView extends AuthedElement {
    */
   protected willUpdate() {
     this.selection.setItems(this.selectableRequests);
+    // A focused request that left the list clears the focus. It never slides
+    // onto whichever request now sits at the same position.
+    if (this.focusedId && this.focusedIndex < 0) {
+      this.focusedId = null;
+    }
   }
 
   protected updated() {
     if (!this.pendingFocus) return;
     this.pendingFocus = false;
+    if (!this.focusedId) return;
     const row = this.renderRoot.querySelector<HTMLElement>(
-      `.approval-item[data-index="${this.focusedIndex}"]`
+      `.approval-item[data-request-id="${CSS.escape(this.focusedId)}"]`
     );
     row?.focus();
   }
@@ -668,8 +751,23 @@ export class ApprovalsView extends AuthedElement {
     );
   }
 
+  private newApprovalCount = 0;
+
   private handleWebSocketMessage(message: any) {
-    console.log('Approvals view received update:', message);
+    debugLog('Approvals view received update:', message);
+
+    // After a failed load the list is incomplete, so patching one row into
+    // it would leave the error up over a list that looks half right. A live
+    // message means the server is reachable again: re-read the whole list,
+    // which clears the error once it succeeds.
+    if (
+      this.loadError &&
+      typeof message?.type === 'string' &&
+      message.type.startsWith('approval_')
+    ) {
+      if (!this.loading) void this.loadApprovalRequests();
+      return;
+    }
 
     // Handle new approval request
     if (message.type === 'approval_created') {
@@ -710,6 +808,10 @@ export class ApprovalsView extends AuthedElement {
 
       // Add to the beginning of the list
       this.approvalRequests = [newApproval, ...this.approvalRequests];
+      this.newApprovalCount++;
+      this.accessibilityStatus.announce(
+        `${this.newApprovalCount} new approval ${this.newApprovalCount === 1 ? 'request' : 'requests'}.`
+      );
       this.applyFilters();
       this.calculateStats();
     }
@@ -746,11 +848,15 @@ export class ApprovalsView extends AuthedElement {
 
   private async loadApprovalRequests() {
     this.loading = true;
+    this.loadError = null;
     try {
       const data = await this.fetchData(
         `/api/v1/approval-requests?limit=${APPROVAL_REQUESTS_PAGE_LIMIT}`
       );
-      if (data && Array.isArray(data)) {
+      if (!Array.isArray(data)) {
+        // fetchData resolves null on a failed request rather than throwing.
+        this.loadError = "Couldn't load approval requests.";
+      } else {
         // Sort by requested_at descending (most recent first)
         this.approvalRequests = (data as ApprovalRequest[])
           .map((request) => normalizeApprovalRequest(request))
@@ -759,14 +865,70 @@ export class ApprovalsView extends AuthedElement {
               parseUTCDate(b.requested_at).getTime() -
               parseUTCDate(a.requested_at).getTime()
           );
+        // A full page means the window may be truncated; only a short page
+        // proves the whole account history is on screen.
+        this.hasMore =
+          (data as ApprovalRequest[]).length >= APPROVAL_REQUESTS_PAGE_LIMIT;
         this.applyFilters();
         this.markNewSinceLastVisit();
         this.calculateStats();
       }
     } catch (error) {
       console.error('Failed to load approval requests:', error);
+      const detail = error instanceof Error ? error.message : '';
+      this.loadError = detail
+        ? `Couldn't load approval requests. ${detail}`
+        : "Couldn't load approval requests.";
     } finally {
       this.loading = false;
+    }
+  }
+
+  /**
+   * Append the next (older) page of the history.
+   *
+   * The endpoint is newest-first and paged by `skip`, so the next page starts
+   * at the current loaded count. Rows are normalized and deduplicated by id
+   * before appending: a live websocket insert that arrives while this fetch is
+   * in flight changes the list length and would otherwise make a stale `skip`
+   * re-read the same boundary row.
+   */
+  private async loadOlder(): Promise<void> {
+    if (this.loadingMore || !this.hasMore) return;
+    this.loadingMore = true;
+    this.moreError = null;
+    try {
+      const data = await this.fetchData(
+        `/api/v1/approval-requests?limit=${APPROVAL_REQUESTS_PAGE_LIMIT}&skip=${this.approvalRequests.length}`
+      );
+      if (!data || !Array.isArray(data)) {
+        this.moreError = 'Failed to load older requests.';
+        return;
+      }
+      const rows = (data as ApprovalRequest[])
+        .map((request) => normalizeApprovalRequest(request))
+        .sort(
+          (a, b) =>
+            parseUTCDate(b.requested_at).getTime() -
+            parseUTCDate(a.requested_at).getTime()
+        );
+      const known = new Set(this.approvalRequests.map((request) => request.id));
+      const appended = rows.filter((request) => !known.has(request.id));
+      if (appended.length) {
+        this.approvalRequests = [...this.approvalRequests, ...appended];
+      }
+      this.hasMore =
+        (data as ApprovalRequest[]).length >= APPROVAL_REQUESTS_PAGE_LIMIT;
+      this.applyFilters();
+      this.calculateStats();
+    } catch (error) {
+      console.error('Failed to load older approval requests:', error);
+      this.moreError =
+        error instanceof Error
+          ? error.message
+          : 'Failed to load older requests.';
+    } finally {
+      this.loadingMore = false;
     }
   }
 
@@ -903,20 +1065,7 @@ export class ApprovalsView extends AuthedElement {
   private getStatusVariant(
     status: string
   ): 'primary' | 'success' | 'warning' | 'danger' | 'neutral' {
-    switch (status) {
-      case 'pending':
-        return 'warning';
-      case 'approved':
-        return 'success';
-      case 'declined':
-        return 'danger';
-      case 'expired':
-        return 'neutral';
-      case 'cancelled':
-        return 'neutral';
-      default:
-        return 'neutral';
-    }
+    return approvalStatusVariant(status);
   }
 
   private getStatusIcon(status: string): string {
@@ -936,19 +1085,46 @@ export class ApprovalsView extends AuthedElement {
     }
   }
 
+  private filterSearchTimer: number | null = null;
+  private readFilterLocation(): void {
+    const params = new URLSearchParams(window.location.search);
+    this.statusFilter = params.get('status') ?? 'all';
+    this.toolFilter = params.get('tool') ?? 'all';
+    this.searchQuery = params.get('q') ?? '';
+  }
+  private onFilterPopState = (): void => {
+    this.readFilterLocation();
+    this.applyFilters();
+  };
+  private syncFilterLocation(): void {
+    replaceListFilters({
+      status: this.statusFilter === 'all' ? '' : this.statusFilter,
+      tool: this.toolFilter === 'all' ? '' : this.toolFilter,
+      q: this.searchQuery,
+    });
+  }
+
   private handleStatusFilterChange(e: CustomEvent) {
     this.statusFilter = (e.target as HTMLSelectElement).value;
+    this.syncFilterLocation();
     this.applyFilters();
   }
 
   private handleToolFilterChange(e: CustomEvent) {
     this.toolFilter = (e.target as HTMLSelectElement).value;
+    this.syncFilterLocation();
     this.applyFilters();
   }
 
   private handleSearchInput(e: CustomEvent) {
     this.searchQuery = (e.target as HTMLInputElement).value;
-    this.applyFilters();
+    this.syncFilterLocation();
+    if (this.filterSearchTimer !== null)
+      window.clearTimeout(this.filterSearchTimer);
+    this.filterSearchTimer = window.setTimeout(() => {
+      this.filterSearchTimer = null;
+      this.applyFilters();
+    }, 250);
   }
 
   private isQuestion(request: ApprovalRequest): boolean {
@@ -1329,59 +1505,127 @@ export class ApprovalsView extends AuthedElement {
           >
             Showing ${this.filteredRequests.length} of
             ${this.approvalRequests.length} requests
+            ${
+              this.searchQuery.trim() && this.approvalRequests.length > 0
+                ? html`<span data-testid="search-scope">
+                    · Searching the latest ${this.approvalRequests.length}
+                    requests</span
+                  >`
+                : nothing
+            }
           </div>
+
+          ${
+            this.loadError
+              ? html`<sl-alert
+                  variant="danger"
+                  open
+                  class="load-error"
+                  data-testid="approvals-load-error"
+                >
+                  <sl-icon slot="icon" name="exclamation-octagon"></sl-icon>
+                  <div class="load-error-body">
+                    <span
+                      >${this.loadError} What is waiting for you is unknown
+                      until this loads.</span
+                    >
+                    <sl-button
+                      size="small"
+                      @click=${() => void this.loadApprovalRequests()}
+                      >Retry</sl-button
+                    >
+                  </div>
+                </sl-alert>`
+              : nothing
+          }
 
           <!-- Approval Requests List -->
           ${
-            this.filteredRequests.length === 0
-              ? html`
-                  <div class="empty-state">
-                    <sl-icon name="inbox"></sl-icon>
-                    <p>
+            this.loadError && this.filteredRequests.length === 0
+              ? nothing
+              : this.filteredRequests.length === 0
+                ? html`
+                    <div class="empty-state">
+                      <sl-icon name="inbox"></sl-icon>
+                      <p>
+                        ${
+                          this.approvalRequests.length === 0
+                            ? 'No approval requests yet. Configure tools to require approval in the Tools section.'
+                            : this.hasMore
+                              ? `No requests match your filters in the latest ${this.approvalRequests.length} requests.`
+                              : 'No requests match your filters.'
+                        }
+                      </p>
                       ${
                         this.approvalRequests.length === 0
-                          ? 'No approval requests yet. Configure tools to require approval in the Tools section.'
-                          : 'No requests match your filters.'
+                          ? html`<sl-button href="/console/tools">
+                              <sl-icon slot="prefix" name="gear"></sl-icon>
+                              Configure tools
+                            </sl-button>`
+                          : ''
                       }
-                    </p>
-                    ${
-                      this.approvalRequests.length === 0
-                        ? html`<sl-button href="/console/tools">
-                            <sl-icon slot="prefix" name="gear"></sl-icon>
-                            Configure tools
-                          </sl-button>`
-                        : ''
-                    }
-                  </div>
-                `
-              : html`
-                  ${this.renderGroup(
-                    'Waiting for you',
-                    this.waitingRequests,
-                    true,
-                    0
-                  )}
-                  ${this.renderGroup(
-                    'History',
-                    this.historyRequests,
-                    false,
-                    this.waitingRequests.length
-                  )}
-                `
+                    </div>
+                  `
+                : html`
+                    ${this.renderGroup(
+                      'Waiting for you',
+                      this.waitingRequests,
+                      true,
+                      0
+                    )}
+                    ${this.renderGroup(
+                      'History',
+                      this.historyRequests,
+                      false,
+                      this.waitingRequests.length
+                    )}
+                  `
           }
+          ${this.renderLoadOlder()}
         </div>
       </div>
     `;
   }
 
   /**
-   * The counts on one hairline strip. The list fetches a single page, so the
-   * total is capped: when the page came back full the strip says "last 100"
-   * rather than presenting a page count as an account total.
+   * The "Load older" control under the history. Rendered whenever the loaded
+   * window may be truncated — including when every loaded row is filtered out
+   * — so a search that misses in the window can still page toward its match.
+   */
+  private renderLoadOlder() {
+    if (!this.hasMore) return nothing;
+    return html`
+      <div class="load-older">
+        <sl-button
+          size="small"
+          ?loading=${this.loadingMore}
+          @click=${() => this.loadOlder()}
+          data-testid="load-older"
+          >Load older</sl-button
+        >
+        ${
+          this.moreError
+            ? html`<span class="error" role="alert" data-testid="more-error"
+                >${this.moreError}</span
+              >`
+            : nothing
+        }
+      </div>
+    `;
+  }
+
+  /**
+   * The counts on one hairline strip. The list may only have part of the
+   * account's history loaded, so the total is capped to that window: while
+   * more pages may exist the strip says "last N" rather than presenting a
+   * partial count as the account total.
    */
   private renderStatStrip() {
     const stats = this.stats;
-    const capped = stats.total >= APPROVAL_REQUESTS_PAGE_LIMIT;
+    // The loaded window is the honest ceiling: "Last N" while more may exist,
+    // a bare total once a short page proves everything is on screen.
+    const loaded = stats.total;
+    const capped = this.hasMore;
     const avg =
       stats.avgResponseTimeMinutes > 0
         ? stats.avgResponseTimeMinutes < 60
@@ -1390,8 +1634,8 @@ export class ApprovalsView extends AuthedElement {
         : null;
     const facts: Array<unknown> = [
       capped
-        ? html`Last <strong>${APPROVAL_REQUESTS_PAGE_LIMIT}</strong> requests`
-        : html`<strong>${stats.total}</strong> requests`,
+        ? html`Last <strong>${loaded}</strong> requests`
+        : html`<strong>${loaded}</strong> requests`,
       html`<strong>${this.waitingRequests.length}</strong> waiting`,
       html`<strong>${stats.approved}</strong> approved`,
       html`<strong>${stats.declined}</strong> denied`,
@@ -1465,8 +1709,11 @@ export class ApprovalsView extends AuthedElement {
           aria-multiselectable="true"
           aria-label=${title}
         >
-          ${requests.map((request, index) =>
-            this.renderRequest(request, waiting, indexOffset + index)
+          ${repeat(
+            requests,
+            (request) => request.id,
+            (request, index) =>
+              this.renderRequest(request, waiting, indexOffset + index)
           )}
         </div>
       </div>
@@ -1512,7 +1759,7 @@ export class ApprovalsView extends AuthedElement {
     waiting: boolean,
     index: number
   ) {
-    const focused = this.focusedIndex === index;
+    const focused = this.focusedId === request.id;
     const actions = this.requestActions(request);
     const detailsAction = actions.find((action) => action.id === 'details');
     // Only a row that can actually be decided is worth selecting: the bulk
@@ -1530,9 +1777,9 @@ export class ApprovalsView extends AuthedElement {
         data-request-id=${request.id}
         data-selection-id=${selectable ? request.id : nothing}
         aria-selected=${selected ? 'true' : 'false'}
-        tabindex=${focused || (this.focusedIndex < 0 && index === 0) ? 0 : -1}
+        tabindex=${focused || (!this.focusedId && index === 0) ? 0 : -1}
         @focus=${() => {
-          this.focusedIndex = index;
+          this.focusedId = request.id;
         }}
       >
         <div class="approval-row" role="gridcell">
@@ -1593,6 +1840,7 @@ export class ApprovalsView extends AuthedElement {
                 <sl-icon name="cpu"></sl-icon>
                 ${approvalRequesterName(request)}
               </sl-badge>
+              <repository-chip .toolArgs=${request.tool_args}></repository-chip>
               ${
                 request.auto_approved_reason
                   ? html`<sl-tooltip

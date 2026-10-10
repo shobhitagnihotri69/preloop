@@ -5,6 +5,7 @@ import './flow-execution-view';
 import type { FlowExecutionView } from './flow-execution-view';
 import {
   containerTerminationNotice,
+  hostExecCostLabel,
   liftLogfmtErrorField,
 } from './flow-execution-view';
 import { unifiedWebSocketManager } from '../../services/unified-websocket-manager';
@@ -296,6 +297,67 @@ describe('FlowExecutionView', () => {
         }
 
         if (
+          url.endsWith('/api/v1/flows/executions/exec-resume') &&
+          method === 'GET'
+        ) {
+          return new Response(
+            JSON.stringify({
+              id: 'exec-resume',
+              flow_id: 'flow-1',
+              status: 'FAILED',
+              start_time: '2026-03-09T12:00:00Z',
+              end_time: '2026-03-09T12:01:00Z',
+              estimated_cost: 0.04,
+              total_tokens: 400,
+              resume_of: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+              continuation_navigation: {
+                original_execution_id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+                issue_url: 'https://github.com/preloop/preloop/issues/77',
+                pr_url: 'https://github.com/preloop/preloop/pull/78',
+                follow_ups: [
+                  {
+                    id: 'exec-resume',
+                    status: 'FAILED',
+                    start_time: '2026-03-09T12:00:00Z',
+                  },
+                  {
+                    id: 'exec-repair',
+                    status: 'SUCCEEDED',
+                    start_time: '2026-03-09T13:00:00Z',
+                  },
+                ],
+              },
+              resume_totals: { total_tokens: 1400, estimated_cost: 0.14 },
+              trigger_subject: 'preloop/preloop #78 · Pull Request Updated',
+              trigger_subject_url: 'https://github.com/preloop/preloop/pull/78',
+              trigger_event_details: {
+                source: 'github',
+                type: 'implementation_feedback',
+              },
+            }),
+            { status: 200, headers: { 'Content-Type': 'application/json' } }
+          );
+        }
+
+        if (
+          url.includes('/api/v1/flows/executions/exec-resume/') &&
+          method === 'GET'
+        ) {
+          return new Response(
+            JSON.stringify({
+              tool_calls: 0,
+              api_requests: 0,
+              token_usage: null,
+              estimated_cost: 0.04,
+              has_pricing: true,
+              logs: [],
+              source: 'database',
+            }),
+            { status: 200, headers: { 'Content-Type': 'application/json' } }
+          );
+        }
+
+        if (
           url.includes(
             '/api/v1/flows/executions/exec-running/gateway-events'
           ) &&
@@ -446,7 +508,9 @@ describe('FlowExecutionView', () => {
     await waitUntil(
       () =>
         (element as any).execution?.id === executionId &&
-        !(element as any).isLoading,
+        !(element as any).isLoading &&
+        // The page paints before its logs land; these tests read them.
+        !(element as any).isLoadingLogs,
       `Execution view did not finish loading ${executionId}`
     );
     await element.updateComplete;
@@ -480,6 +544,60 @@ describe('FlowExecutionView', () => {
     );
     expect(link.getAttribute('target')).to.equal('_blank');
     expect(link.getAttribute('rel')).to.equal('noopener noreferrer');
+  });
+
+  it('labels continuations and links the original, follow-ups, issue and PR', async () => {
+    const element = await load('exec-resume');
+    const line = element.shadowRoot!.querySelector(
+      '[data-testid="resume-line"]'
+    ) as HTMLElement;
+    expect(line, 'resume line').to.exist;
+    expect(line.textContent).to.contain('Continuation of original execution');
+    expect(line.textContent).to.contain('1.4K');
+    expect(line.textContent).to.contain('$0.14');
+    const link = line.querySelector(
+      '[data-testid="resume-of-link"]'
+    ) as HTMLAnchorElement;
+    expect(link.getAttribute('href')).to.equal(
+      '/console/flows/executions/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+    );
+    const navigation = element.shadowRoot!.querySelector(
+      '[data-testid="continuation-navigation"]'
+    )!;
+    expect(navigation.textContent?.replace(/\s+/g, ' ')).to.contain(
+      'Continuation 1 (this execution)'
+    );
+    expect(navigation.querySelector('a')!.getAttribute('href')).to.equal(
+      '/console/flows/executions/exec-repair'
+    );
+    const links = Array.from(navigation.querySelectorAll('sl-button'));
+    expect(links.map((button) => button.getAttribute('href'))).to.deep.equal([
+      'https://github.com/preloop/preloop/issues/77',
+      'https://github.com/preloop/preloop/pull/78',
+    ]);
+  });
+
+  it('links follow-ups from the original execution', async () => {
+    const element = await load('exec-resume');
+    (element as any).execution = {
+      ...(element as any).execution,
+      id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+      resume_of: null,
+    };
+    await element.updateComplete;
+    const navigation = element.shadowRoot!.querySelector(
+      '[data-testid="continuation-navigation"]'
+    )!;
+    expect(
+      Array.from(navigation.querySelectorAll('a')).map((link) =>
+        link.getAttribute('href')
+      )
+    ).to.deep.equal([
+      '/console/flows/executions/exec-resume',
+      '/console/flows/executions/exec-repair',
+    ]);
+    expect(element.shadowRoot!.querySelector('[data-testid="resume-of-link"]'))
+      .not.to.exist;
   });
 
   it('renders execution-scoped gateway events with payload details', async () => {
@@ -598,9 +716,13 @@ describe('FlowExecutionView', () => {
     await waitUntil(
       () =>
         (element as any).execution?.id === 'exec-running' &&
-        !(element as any).isLoading,
+        !(element as any).isLoading &&
+        // The mcp_call entries are synthesized after the logs land, which
+        // is after first paint.
+        !(element as any).isLoadingLogs,
       'Running execution view did not finish loading'
     );
+    await element.updateComplete;
 
     expect((element as any).toolCalls).to.equal(3);
     expect(
@@ -726,6 +848,187 @@ describe('FlowExecutionView', () => {
       } finally {
         clearSpy.restore();
       }
+    });
+  });
+
+  describe('host execution metering', () => {
+    // Booleans, not the node: a failing chai comparison against a live
+    // element makes the runner serialize it and time out.
+    const hasHostSessionsPanel = (element: FlowExecutionView) =>
+      element.shadowRoot!.querySelector('[data-testid="host-sessions"]') !==
+      null;
+    const withResult = async (result: Record<string, unknown>) => {
+      const element = await load('exec-1');
+      (element as any).execution = {
+        ...(element as any).execution,
+        result,
+      };
+      element.requestUpdate();
+      await element.updateComplete;
+      return element;
+    };
+
+    it('says a Copilot host run is not gateway metered', async () => {
+      const element = await withResult({
+        status: 'success',
+        harness: 'copilot_cli',
+        gateway_metered: false,
+        premium_requests: 2,
+      });
+      expect(stripValue(element, 'strip-cost')).to.equal(
+        '2 premium requests, not metered by the gateway'
+      );
+      const badge = element.shadowRoot!.querySelector(
+        '[data-testid="strip-not-metered"]'
+      )!;
+      expect(badge.getAttribute('title')).to.contain('GitHub Copilot seat');
+      expect(badge.getAttribute('title')).to.contain('2 premium requests');
+    });
+
+    it('says not metered when Copilot reported no premium count', async () => {
+      const element = await withResult({
+        status: 'success',
+        harness: 'copilot_cli',
+        gateway_metered: false,
+      });
+      expect(stripValue(element, 'strip-cost')).to.equal('Not gateway metered');
+      expect(hostExecCostLabel({ premium_requests: 1 })).to.equal(
+        '1 premium request, not metered by the gateway'
+      );
+      expect(hostExecCostLabel({ premium_requests: -1 }, 4)).to.equal(
+        '4 premium requests, not metered by the gateway'
+      );
+    });
+
+    it('lists hook sessions linked to a host run', async () => {
+      const element = await withResult({
+        status: 'success',
+        harness: 'copilot_cli',
+        gateway_metered: false,
+      });
+      (element as any).hostSessions = {
+        execution_id: 'exec-1',
+        event_count: 3,
+        premium_requests: 5,
+        gateway_metered: false,
+        sessions: [
+          {
+            conversation_id: '0f8fad5b-d9cb-469f-a165-70867728950e',
+            source: 'copilot_cli',
+            runtime_session_id: null,
+            event_count: 3,
+            event_types: { session_start: 1, usage: 2 },
+            first_event_at: null,
+            last_event_at: null,
+            models: ['claude-sonnet-4.5'],
+          },
+        ],
+      };
+      element.requestUpdate();
+      await element.updateComplete;
+      expect(stripValue(element, 'strip-cost')).to.equal(
+        '5 premium requests, not metered by the gateway'
+      );
+      const panel = stripValue(element, 'host-sessions');
+      expect(panel).to.contain('Host CLI sessions');
+      expect(panel).to.contain('3 hook events');
+      expect(panel).to.contain('claude-sonnet-4.5');
+    });
+
+    it('drops the previous host sessions when the view moves to another execution', async () => {
+      const element = await withResult({
+        status: 'success',
+        harness: 'copilot_cli',
+        gateway_metered: false,
+      });
+      (element as any).hostSessions = {
+        execution_id: 'exec-1',
+        event_count: 1,
+        premium_requests: 7,
+        gateway_metered: false,
+        sessions: [
+          {
+            conversation_id: '0f8fad5b-d9cb-469f-a165-70867728950e',
+            source: 'copilot_cli',
+            runtime_session_id: null,
+            event_count: 1,
+            event_types: { usage: 1 },
+            first_event_at: null,
+            last_event_at: null,
+            models: [],
+          },
+        ],
+      };
+      element.requestUpdate();
+      await element.updateComplete;
+      expect(hasHostSessionsPanel(element)).to.equal(true);
+
+      element.executionId = 'exec-running';
+      await element.updateComplete;
+      await waitUntil(
+        () =>
+          (element as any).execution?.id === 'exec-running' &&
+          !(element as any).isLoading,
+        'Execution view did not move to exec-running'
+      );
+      await element.updateComplete;
+
+      expect((element as any).hostSessions === null).to.equal(true);
+      expect(hasHostSessionsPanel(element)).to.equal(false);
+      expect(pageText(element)).to.not.contain('7 premium requests');
+    });
+
+    it('never renders host sessions that belong to another execution', async () => {
+      const element = await withResult({
+        status: 'success',
+        harness: 'cursor_cli',
+        gateway_metered: false,
+      });
+      (element as any).hostSessions = {
+        execution_id: 'exec-other',
+        event_count: 1,
+        premium_requests: 3,
+        gateway_metered: false,
+        sessions: [
+          {
+            conversation_id: 'c2',
+            source: 'cursor',
+            runtime_session_id: null,
+            event_count: 1,
+            event_types: { usage: 1 },
+            first_event_at: null,
+            last_event_at: null,
+            models: [],
+          },
+        ],
+      };
+      element.requestUpdate();
+      await element.updateComplete;
+      expect(hasHostSessionsPanel(element)).to.equal(false);
+      expect(stripValue(element, 'strip-cost')).to.equal('Not gateway metered');
+    });
+
+    it('fetches host sessions only for Copilot and Cursor flows', async () => {
+      const element = await load('exec-1');
+      expect(
+        fetchStub
+          .getCalls()
+          .some((call) => String(call.args[0]).includes('/host-sessions'))
+      ).to.equal(false);
+      expect(
+        element.shadowRoot!.querySelector('[data-testid="host-sessions"]')
+      ).to.equal(null);
+    });
+
+    it('ignores the marker on container results', async () => {
+      const element = await withResult({
+        status: 'success',
+        harness: 'codex',
+        gateway_metered: false,
+      });
+      expect(
+        element.shadowRoot!.querySelector('[data-testid="strip-not-metered"]')
+      ).to.equal(null);
     });
   });
 
@@ -918,6 +1221,57 @@ describe('FlowExecutionView', () => {
           .textContent!.trim()
       ).to.equal('Running');
       expect(running.shadowRoot!.querySelector('.status-dot')).to.exist;
+    });
+
+    it('hides the Report tab when the run has no evidence pack', async () => {
+      const element = await load('exec-1');
+      await element.updateComplete;
+      expect(
+        element.shadowRoot!.querySelector('[data-testid="report-tab"]')
+      ).to.equal(null);
+      expect(
+        element.shadowRoot!.querySelector('[data-testid="strip-verdict"]')
+      ).to.equal(null);
+    });
+
+    it('links a verdict and findings count to the Report tab', async () => {
+      const element = await load('exec-1');
+      await waitUntil(() =>
+        fetchStub
+          .getCalls()
+          .some((call) => String(call.args[0]).includes('/evidence-status'))
+      );
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      await element.updateComplete;
+      (element as any).evidenceStatus = {
+        status: 'available',
+        sha256: 'abc123',
+        integrity: 'not_checked',
+        integrity_note: 'Availability only.',
+        legal_hold: false,
+        object_lock: false,
+      };
+      (element as any).execution = {
+        ...(element as any).execution,
+        result: {
+          verdict: 'pass_with_findings',
+          findings_summary: {
+            counts_by_severity: { medium: 1, low: 9, high: 0 },
+          },
+        },
+      };
+      await element.updateComplete;
+      expect(element.shadowRoot!.querySelector('[data-testid="report-tab"]')).to
+        .exist;
+      const findings = element.shadowRoot!.querySelector(
+        '[data-testid="strip-findings"]'
+      ) as HTMLButtonElement;
+      expect(findings.textContent!.replace(/\s+/g, ' ').trim()).to.equal(
+        '10 findings: 1 medium, 9 low'
+      );
+      findings.click();
+      await element.updateComplete;
+      expect((element as any).activeTab).to.equal('report');
     });
 
     it('offers the five tabs with Timeline first', async () => {
@@ -1311,6 +1665,107 @@ describe('FlowExecutionView', () => {
       );
     });
 
+    it('puts the error right after the summary and records after the tabs', async () => {
+      const element = await load('exec-1');
+      (element as any).execution = {
+        ...(element as any).execution,
+        status: 'FAILED',
+        error_message: 'Agent exited with code 1\nTraceback (most recent call)',
+      };
+      await element.updateComplete;
+
+      const root = element.shadowRoot!;
+      const strip = root.querySelector('[data-testid="summary-strip"]')!;
+      const line = root.querySelector('[data-testid="error-line"]')!;
+      const tree = root.querySelector('preloop-execution-tree')!;
+      const tabs = root.querySelector('sl-tab-group')!;
+      const records = root.querySelector('execution-records-card')!;
+      const follows = (a: Node, b: Node) =>
+        Boolean(
+          a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING
+        );
+
+      expect(follows(strip, line), 'error after the summary').to.equal(true);
+      expect(follows(line, tree), 'error before the tree').to.equal(true);
+      expect(follows(line, tabs), 'error before the tabs').to.equal(true);
+      expect(follows(tabs, records), 'records after the tabs').to.equal(true);
+      expect(line.getAttribute('role')).to.equal('alert');
+    });
+
+    it('opens the Output tab from "Show full error"', async () => {
+      const element = await load('exec-1');
+      (element as any).execution = {
+        ...(element as any).execution,
+        status: 'FAILED',
+        error_message: 'Agent exited with code 1\nTraceback (most recent call)',
+      };
+      await element.updateComplete;
+
+      const button = element.shadowRoot!.querySelector(
+        '[data-testid="show-full-error"]'
+      ) as HTMLElement;
+      expect(button.textContent?.trim()).to.equal('Show full error');
+      button.click();
+      await waitUntil(() => (element as any).activeTab === 'output');
+      await element.updateComplete;
+      expect(new URL(window.location.href).searchParams.get('tab')).to.equal(
+        'output'
+      );
+      const panel = element.shadowRoot!.querySelector(
+        'sl-tab-panel[name="output"]'
+      )!;
+      expect(panel.hasAttribute('active')).to.equal(true);
+    });
+
+    it('says why the server stopped a run on its own', async () => {
+      const element = await load('exec-1');
+      const reason =
+        'Stopped because pull request example-org/widgets#12 was merged';
+      (element as any).execution = {
+        ...(element as any).execution,
+        status: 'STOPPED',
+        stop_reason: reason,
+        stop_source: 'pr_merged',
+        // What the orchestrator writes once the container is gone.
+        error_message: 'Execution stopped by user request after 42 seconds',
+      };
+      await element.updateComplete;
+
+      const line = element.shadowRoot!.querySelector(
+        '[data-testid="stop-line"]'
+      )!;
+      expect(line.textContent!.trim()).to.equal(reason);
+      expect(
+        element.shadowRoot!.querySelector('[data-testid="error-line"]') === null
+      ).to.equal(true, 'a stopped run shows no error line');
+
+      const output = element.shadowRoot!.querySelector(
+        'sl-tab-panel[name="output"]'
+      )!;
+      const section = output.querySelector('[data-testid="stop-reason"]')!;
+      expect(section.textContent).to.contain(reason);
+      expect(output.textContent).to.not.contain('by user request');
+    });
+
+    it('shows no stop reason on a run an operator stopped', async () => {
+      const element = await load('exec-1');
+      (element as any).execution = {
+        ...(element as any).execution,
+        status: 'STOPPED',
+        stop_reason: null,
+        error_message: 'Manually stopped by user',
+      };
+      await element.updateComplete;
+
+      expect(element.shadowRoot!.querySelector('[data-testid="stop-line"]')).to
+        .not.exist;
+      const output = element.shadowRoot!.querySelector(
+        'sl-tab-panel[name="output"]'
+      )!;
+      expect(output.querySelector('[data-testid="stop-reason"]')).to.not.exist;
+      expect(output.textContent).to.contain('Manually stopped by user');
+    });
+
     it('explains an OOMKilled container in the failure summary', async () => {
       const element = await load('exec-1');
       (element as any).execution = {
@@ -1612,18 +2067,26 @@ describe('FlowExecutionView', () => {
     });
 
     it('drops the connection-state listener when the view goes away', async () => {
-      const unsubscribeState = sinon.spy();
+      const unsubscribers: sinon.SinonSpy[] = [];
       const stateStub = sinon
         .stub(unifiedWebSocketManager, 'onStateChange')
-        .returns(unsubscribeState);
+        .callsFake(() => {
+          const unsubscribe = sinon.spy();
+          unsubscribers.push(unsubscribe);
+          return unsubscribe;
+        });
 
       try {
         const element = await load('exec-running');
-        expect(unsubscribeState.called).to.be.false;
+        expect(unsubscribers.length).to.be.at.least(1);
+        expect(unsubscribers.every((unsubscribe) => !unsubscribe.called)).to.be
+          .true;
 
         element.remove();
-        expect(unsubscribeState.calledOnce, 'state listener released').to.be
-          .true;
+        expect(
+          unsubscribers.every((unsubscribe) => unsubscribe.calledOnce),
+          'every view and nested session listener released'
+        ).to.be.true;
       } finally {
         stateStub.restore();
       }
@@ -1925,6 +2388,82 @@ describe('FlowExecutionView', () => {
     await stopping;
     expect((element as any).execution.status).to.equal('STOPPED');
   });
+  it('shows the server cost for a finished run, matching the list and chain total (#1275)', async () => {
+    // The per-call event snapshots sum to twice the server figure. A finished
+    // run's header must show the server's estimated_cost, which is what the
+    // executions list and the chain total read.
+    const gatewayEvent = (id: string) => ({
+      id,
+      execution_id: 'exec-cost',
+      timestamp: '2026-03-09T10:01:00Z',
+      type: 'model_gateway_call',
+      payload: {
+        api_usage_id: id,
+        model_alias: 'openai/gpt-5',
+        outcome: 'success',
+        estimated_cost: 0.37,
+        total_tokens: 1000,
+      },
+    });
+    fetchStub.callsFake(async (input: RequestInfo | URL) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      const json = (body: unknown) =>
+        new Response(JSON.stringify(body), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      if (url.includes('/flows/executions/exec-cost/gateway-events')) {
+        return json({
+          logs: [gatewayEvent('usage-a'), gatewayEvent('usage-b')],
+          source: 'database',
+          has_more: false,
+        });
+      }
+      if (url.includes('/flows/executions/exec-cost/metrics')) {
+        return json({
+          tool_calls: 0,
+          api_requests: 2,
+          token_usage: { total_tokens: 2000 },
+          estimated_cost: 0.37,
+          has_pricing: true,
+        });
+      }
+      if (url.endsWith('/flows/executions/exec-cost')) {
+        return json({
+          id: 'exec-cost',
+          flow_id: 'flow-1',
+          status: 'SUCCEEDED',
+          start_time: '2026-03-09T10:00:00Z',
+          end_time: '2026-03-09T10:02:00Z',
+          estimated_cost: 0.37,
+          cost_priced_at: '2026-03-10T00:00:00Z',
+          resume_of: 'exec-root-0000',
+          resume_totals: { total_tokens: 4000, estimated_cost: 0.78 },
+        });
+      }
+      if (url.endsWith('/api/v1/flows/flow-1')) {
+        return json({ id: 'flow-1', name: 'Cost Flow', agent_type: 'codex' });
+      }
+      return json({ logs: [], items: [], total: 0 });
+    });
+
+    const element = await load('exec-cost');
+    await waitUntil(
+      () => (element as any).gatewayEventsLoaded,
+      'gateway events did not load'
+    );
+    await element.updateComplete;
+    expect(stripValue(element, 'strip-cost')).to.contain('$0.37');
+    expect(stripValue(element, 'strip-cost')).to.not.contain('$0.74');
+    expect(
+      element.shadowRoot!.querySelector('[data-testid="strip-cost-priced-at"]')
+    ).to.exist;
+    const line = element.shadowRoot!.querySelector(
+      '[data-testid="resume-line"]'
+    ) as HTMLElement;
+    expect(line.textContent).to.contain('$0.78');
+  });
+
   describe('delegation tree', () => {
     const treePanel = (element: FlowExecutionView) =>
       element.shadowRoot!.querySelector('preloop-execution-tree') as any;
@@ -1944,10 +2483,11 @@ describe('FlowExecutionView', () => {
       await waitUntil(() => !panel.loading);
       await panel.updateComplete;
 
-      // The empty state, and no tree section.
+      // No empty-state line and no tree section.
       expect(
         panel.shadowRoot.querySelector('[data-testid="execution-tree-empty"]')
-      ).to.exist;
+      ).to.not.exist;
+      expect(panel.shadowRoot.textContent.trim()).to.equal('');
       expect(panel.shadowRoot.querySelector('[data-testid="execution-tree"]'))
         .to.not.exist;
 
@@ -1960,5 +2500,39 @@ describe('FlowExecutionView', () => {
         element.shadowRoot!.querySelectorAll('sl-tab-group sl-tab').length
       ).to.equal(5);
     });
+  });
+
+  it('tells the operator when stopping a run fails', async () => {
+    const element = (await fixture(
+      html`<flow-execution-view></flow-execution-view>`
+    )) as FlowExecutionView;
+    (element as any).executionId = 'exec-pending';
+    (element as any).execution = {
+      id: 'exec-pending',
+      flow_id: 'flow-1',
+      status: 'RUNNING',
+    };
+    await element.updateComplete;
+    fetchStub.callsFake(
+      async () =>
+        new Response(JSON.stringify({ detail: 'no' }), { status: 500 })
+    );
+    try {
+      await (element as any).stopExecution();
+      const alert = document.body.querySelector('sl-alert');
+      expect(alert?.textContent).to.contain(
+        'Failed to send command to execution'
+      );
+      expect((element as any).execution.status).to.equal('RUNNING');
+    } finally {
+      // Hide rather than remove: a toast takes itself out of the toast stack
+      // once hidden, and removing it first makes that cleanup throw in
+      // whichever test is running when its timer fires.
+      await Promise.all(
+        [...document.body.querySelectorAll('sl-alert')].map((node) =>
+          (node as HTMLElement & { hide: () => Promise<void> }).hide()
+        )
+      );
+    }
   });
 });

@@ -5,6 +5,7 @@ import sinon from 'sinon';
 import './tools-view';
 import type { ToolsView } from './tools-view';
 import { invalidateApiCaches } from '../../api';
+import { resetConfirmDialogForTests } from '../../components/confirm-dialog';
 
 describe('ToolsView (approvals + conditions)', () => {
   let fetchStub: sinon.SinonStub;
@@ -61,7 +62,11 @@ describe('ToolsView (approvals + conditions)', () => {
         const method = (init?.method || 'GET').toUpperCase();
 
         // Initial ToolsView.loadData() requests
-        if (url.endsWith('/api/v1/tools') && method === 'GET') {
+        if (
+          (url.endsWith('/api/v1/tools') ||
+            url.endsWith('/api/v1/tools/summary')) &&
+          method === 'GET'
+        ) {
           return new Response(JSON.stringify([tool]), {
             status: 200,
             headers: { 'Content-Type': 'application/json' },
@@ -197,6 +202,192 @@ describe('ToolsView (approvals + conditions)', () => {
     invalidateApiCaches();
   });
 
+  it('renders summary rows while catalogs are pending and loads schemas only on expansion', async () => {
+    let release!: () => void;
+    const pending = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    fetchStub.callsFake(async (input: RequestInfo | URL) => {
+      const url = input.toString();
+      if (url === '/api/v1/mcp-servers') await pending;
+      let data: unknown = [];
+      if (url.includes('/tools'))
+        data = [
+          {
+            name: 'example_tool',
+            description: 'Example',
+            source: 'builtin',
+            source_id: null,
+            source_name: 'Built-in',
+            is_enabled: true,
+            is_supported: true,
+            access_rules: [],
+            schema: { properties: { name: { type: 'string' } } },
+          },
+        ];
+      else if (url === '/api/v1/features') data = { features: {} };
+      else if (url === '/api/v1/auth/users/me') data = { id: 'user-1' };
+      return new Response(JSON.stringify(data), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    });
+    const el = await fixture<ToolsView>(html`<tools-view></tools-view>`);
+    try {
+      await waitUntil(
+        () => !(el as any).loading && (el as any).tools.length === 1
+      );
+      await el.updateComplete;
+      const editor = el.shadowRoot!.querySelector('tools-editor-component')!;
+      expect(editor).to.exist;
+      expect(editor.hasAttribute('inert')).to.equal(true);
+      expect(
+        fetchStub
+          .getCalls()
+          .filter((call) => call.args[0].toString() === '/api/v1/tools')
+      ).to.have.length(0);
+    } finally {
+      release();
+    }
+    await waitUntil(() => !(el as any).toolsContextLoading);
+    const editor = el.shadowRoot!.querySelector('tools-editor-component')!;
+    editor.dispatchEvent(
+      new CustomEvent('toggle-expand', { bubbles: true, composed: true })
+    );
+    await waitUntil(() => (el as any).toolsSchemasReady);
+    expect((el as any).tools[0].schema.properties.name.type).to.equal('string');
+    editor.dispatchEvent(
+      new CustomEvent('toggle-expand', { bubbles: true, composed: true })
+    );
+    expect(
+      fetchStub
+        .getCalls()
+        .filter((call) => call.args[0].toString() === '/api/v1/tools')
+    ).to.have.length(1);
+  });
+
+  it('hydrates same-name native and builtin tools from their own source', async () => {
+    const el = await fixture<ToolsView>(html`<tools-view></tools-view>`);
+    await waitUntil(() => !(el as any).toolsContextLoading);
+    const base = (el as any).tools[0];
+    (el as any).tools = [
+      { ...base, name: 'same_tool', source: 'builtin', source_id: null },
+      { ...base, name: 'same_tool', source: 'native', source_id: null },
+    ];
+    fetchStub.withArgs('/api/v1/tools').resolves(
+      new Response(
+        JSON.stringify([
+          {
+            ...base,
+            name: 'same_tool',
+            source: 'native',
+            source_id: null,
+            schema: { properties: { native_arg: { type: 'number' } } },
+          },
+          {
+            ...base,
+            name: 'same_tool',
+            source: 'builtin',
+            source_id: null,
+            schema: { properties: { builtin_arg: { type: 'string' } } },
+          },
+        ]),
+        { headers: { 'Content-Type': 'application/json' } }
+      )
+    );
+    await (el as any).loadToolSchemas();
+    expect((el as any).tools[0].schema.properties).to.deep.equal({
+      builtin_arg: { type: 'string' },
+    });
+    expect((el as any).tools[1].schema.properties).to.deep.equal({
+      native_arg: { type: 'number' },
+    });
+  });
+
+  it('keeps a new schema request active when a prior refresh response finishes', async () => {
+    const el = await fixture<ToolsView>(html`<tools-view></tools-view>`);
+    await waitUntil(() => !(el as any).toolsContextLoading);
+    const base = (el as any).tools[0];
+    let releaseOld!: (response: Response) => void;
+    let releaseNew!: (response: Response) => void;
+    const oldResponse = new Promise<Response>((resolve) => {
+      releaseOld = resolve;
+    });
+    const newResponse = new Promise<Response>((resolve) => {
+      releaseNew = resolve;
+    });
+    const schemas = fetchStub.withArgs('/api/v1/tools');
+    schemas.onFirstCall().returns(oldResponse);
+    schemas.onSecondCall().returns(newResponse);
+    const response = (field: string) =>
+      new Response(
+        JSON.stringify([
+          { ...base, schema: { properties: { [field]: { type: 'string' } } } },
+        ]),
+        { headers: { 'Content-Type': 'application/json' } }
+      );
+    const oldLoad = (el as any).loadToolSchemas();
+    await (el as any).loadData();
+    expect((el as any).toolsSchemasLoading).to.equal(false);
+    // Give the new generation its own transport wave rather than the API
+    // client's shared GET promise, so stale view cleanup runs while it waits.
+    invalidateApiCaches();
+    const newLoad = (el as any).loadToolSchemas();
+    const activeRequest = (el as any).toolsSchemaRequest;
+    try {
+      releaseOld(response('stale'));
+      await oldLoad;
+      expect((el as any).toolsSchemasLoading).to.equal(true);
+      expect((el as any).toolsSchemaRequest).to.equal(activeRequest);
+      expect((el as any).tools[0].schema).to.deep.equal({});
+    } finally {
+      releaseOld(response('stale'));
+      releaseNew(response('current'));
+      await newLoad;
+    }
+    expect((el as any).toolsSchemasLoading).to.equal(false);
+    expect((el as any).toolsSchemasReady).to.equal(true);
+    expect((el as any).tools[0].schema.properties).to.deep.equal({
+      current: { type: 'string' },
+    });
+    expect(schemas.callCount).to.equal(2);
+  });
+
+  it('does not save a rule if full tool schemas cannot be loaded', async () => {
+    const el = await fixture<ToolsView>(html`<tools-view></tools-view>`);
+    await waitUntil(() => !(el as any).toolsContextLoading);
+    const reject = sinon.spy();
+    const previous = (el as any).tools;
+    fetchStub
+      .withArgs('/api/v1/tools')
+      .resolves(new Response('{}', { status: 500 }));
+    fetchStub.resetHistory();
+    await (el as any)._handleSaveRule(
+      new CustomEvent('save-rule', {
+        detail: {
+          reject,
+          tool: previous[0],
+          existingRule: null,
+          formData: {
+            action: 'allow',
+            condition_expression: '',
+            description: '',
+            is_enabled: true,
+          },
+        },
+      })
+    );
+    expect((el as any).tools).to.equal(previous);
+    expect(
+      fetchStub
+        .getCalls()
+        .filter((call) => (call.args[1]?.method || 'GET') !== 'GET')
+    ).to.have.length(0);
+    expect((el as any).error).to.include('Could not load tool schemas');
+    expect(reject.calledOnce).to.equal(true);
+    expect(reject.firstCall.args[0]).to.include('Could not load tool schemas');
+  });
+
   it('renders the summary strip counts and the unavailable count', async () => {
     const availableTool = {
       name: 'example_tool',
@@ -247,7 +438,10 @@ describe('ToolsView (approvals + conditions)', () => {
 
     fetchStub.callsFake(async (input: RequestInfo | URL) => {
       const url = typeof input === 'string' ? input : input.toString();
-      if (url.endsWith('/api/v1/tools')) {
+      if (
+        url.endsWith('/api/v1/tools') ||
+        url.endsWith('/api/v1/tools/summary')
+      ) {
         return new Response(
           JSON.stringify([availableTool, unavailableTool, agentTool]),
           {
@@ -653,6 +847,46 @@ describe('ToolsView (approvals + conditions)', () => {
     expect(toolConfigCreateCalls.length).to.equal(1);
     expect((element as any).error).to.equal(null);
   });
+  it('settles successful saves with a toast and surfaces server failures to the dialog', async () => {
+    const el = await fixture<ToolsView>(html`<tools-view></tools-view>`);
+    await waitUntil(() => !(el as any).toolsContextLoading);
+    const view = el as any;
+    view.toolsSchemasReady = true;
+    const tool = { ...view.tools[0], config_id: 'cfg-1' };
+    const resolve = sinon.spy();
+    const reject = sinon.spy();
+    const toast = sinon.spy();
+    el.addEventListener('show-toast', toast);
+    const detail = {
+      tool,
+      existingRule: null,
+      resolve,
+      reject,
+      formData: {
+        action: 'deny',
+        condition_expression: null,
+        condition_type: 'simple',
+        description: '',
+        is_enabled: true,
+      },
+    };
+    await view._handleSaveRule(new CustomEvent('save-rule', { detail }));
+    expect(resolve.calledOnce).to.equal(true);
+    expect(reject.called).to.equal(false);
+    expect(toast.firstCall.args[0].detail.message).to.equal('Rule saved.');
+    fetchStub
+      .withArgs('/api/v1/tool-configurations/cfg-1/access-rules')
+      .resolves(
+        new Response(JSON.stringify({ detail: 'Invalid CEL condition' }), {
+          status: 422,
+          headers: { 'Content-Type': 'application/json' },
+        })
+      );
+    await view._handleSaveRule(new CustomEvent('save-rule', { detail }));
+    expect(resolve.calledOnce).to.equal(true);
+    expect(reject.calledOnce).to.equal(true);
+    expect(reject.firstCall.args[0]).to.include('Invalid CEL condition');
+  });
 });
 
 describe('ToolsView – tabs and toolbar', () => {
@@ -690,7 +924,11 @@ describe('ToolsView – tabs and toolbar', () => {
         const url = typeof input === 'string' ? input : input.toString();
         const method = (init?.method || 'GET').toUpperCase();
 
-        if (url.endsWith('/api/v1/tools') && method === 'GET') {
+        if (
+          (url.endsWith('/api/v1/tools') ||
+            url.endsWith('/api/v1/tools/summary')) &&
+          method === 'GET'
+        ) {
           return new Response(JSON.stringify(tools), {
             status: 200,
             headers: { 'Content-Type': 'application/json' },
@@ -933,6 +1171,8 @@ describe('ToolsView – tabs and toolbar', () => {
         composed: true,
       })
     );
+    expect((el as any)._getFilteredTools()).to.have.lengthOf(2);
+    await waitUntil(() => (el as any).filters.query === 'alpha');
     await el.updateComplete;
 
     const names = ((el as any)._getFilteredTools() as { name: string }[]).map(
@@ -1544,7 +1784,9 @@ describe('ToolsView – tabs and toolbar', () => {
     expect(blockedSwitch).to.exist;
     // B-T1: the switch is labelled with the verb, not with a state that read
     // as "this tool is blocked" beside an off switch.
-    expect(blockedSwitch!.textContent?.trim()).to.equal('Block');
+    expect(
+      blockedSwitch!.querySelector('.switch-label')?.textContent?.trim()
+    ).to.equal('Block');
     expect(blockedSwitch!.checked).to.equal(false);
 
     blockedSwitch!.checked = true;
@@ -1692,7 +1934,11 @@ describe('ToolsView – starter policy suggestions', () => {
         const url = typeof input === 'string' ? input : input.toString();
         const method = (init?.method || 'GET').toUpperCase();
 
-        if (url.endsWith('/api/v1/tools') && method === 'GET') {
+        if (
+          (url.endsWith('/api/v1/tools') ||
+            url.endsWith('/api/v1/tools/summary')) &&
+          method === 'GET'
+        ) {
           return new Response(JSON.stringify(tools), {
             status: 200,
             headers: { 'Content-Type': 'application/json' },
@@ -2025,5 +2271,175 @@ describe('ToolsView – starter policy suggestions', () => {
         String(call.args[0]).endsWith('/api/v1/policies/generate')
       );
     expect(generateCall).to.equal(undefined);
+  });
+
+  describe('import', () => {
+    const uploadCalls = () =>
+      fetchStub
+        .getCalls()
+        .filter(
+          (call) =>
+            String(call.args[0]).endsWith('/api/v1/policies/upload') &&
+            String(
+              (call.args[1] as RequestInit | undefined)?.method || 'GET'
+            ).toUpperCase() === 'POST'
+        );
+
+    function confirmButton(testId: string) {
+      return document
+        .querySelector('confirm-dialog')
+        ?.shadowRoot?.querySelector(`[data-testid="${testId}"]`) as
+        HTMLElement | undefined;
+    }
+
+    async function startImport() {
+      const el = (await fixture(html`<tools-view></tools-view>`)) as ToolsView;
+      await waitUntil(
+        () => !(el as any).loading,
+        'Initial load did not finish'
+      );
+      const file = new File(['version: 1\n'], 'example-policy.yaml', {
+        type: 'application/x-yaml',
+      });
+      const done = (el as any)._importFile(file) as Promise<void>;
+      await waitUntil(
+        () => !!confirmButton('confirm-dialog-confirm'),
+        'no confirm dialog before import'
+      );
+      return { el, done };
+    }
+
+    afterEach(() => {
+      resetConfirmDialogForTests();
+      document
+        .querySelectorAll('sl-alert[variant]')
+        .forEach((alert) => alert.remove());
+    });
+
+    it('explains the replacement and uploads nothing until confirmed', async () => {
+      const { done } = await startImport();
+
+      const dialog = document.querySelector('confirm-dialog')!;
+      const text = dialog.shadowRoot?.textContent ?? '';
+      expect(text).to.contain('example-policy.yaml');
+      expect(text).to.contain('replaces');
+      expect(text).to.contain('Policies');
+      expect(uploadCalls()).to.have.length(0);
+
+      confirmButton('confirm-dialog-confirm')!.click();
+      await done;
+      expect(uploadCalls()).to.have.length(1);
+      const toast = Array.from(document.querySelectorAll('sl-alert')).find(
+        (alert) => alert.textContent?.includes('Imported example-policy.yaml')
+      );
+      expect(toast, 'expected a success toast').to.exist;
+      expect(toast?.getAttribute('variant')).to.equal('success');
+    });
+
+    const deleteCalls = (fragment: string) =>
+      fetchStub
+        .getCalls()
+        .filter(
+          (call) =>
+            String(call.args[0]).includes(fragment) &&
+            String(
+              (call.args[1] as RequestInit | undefined)?.method || 'GET'
+            ).toUpperCase() === 'DELETE'
+        );
+
+    it('confirms a rule delete in the console dialog, naming the rule', async () => {
+      const el = (await fixture(html`<tools-view></tools-view>`)) as ToolsView;
+      await waitUntil(
+        () => !(el as any).loading,
+        'Initial load did not finish'
+      );
+      const nativeConfirm = sinon.stub(window, 'confirm').returns(true);
+      try {
+        const done = (el as any)._handleDeleteRule(
+          new CustomEvent('delete-rule', {
+            detail: {
+              tool: { name: 'list_issues' },
+              rule: { id: 'rule-1', action: 'require_approval' },
+            },
+          })
+        ) as Promise<void>;
+        await waitUntil(
+          () => !!confirmButton('confirm-dialog-confirm'),
+          'no confirm dialog'
+        );
+        expect(nativeConfirm.called).to.equal(false);
+        const text =
+          document.querySelector('confirm-dialog')?.shadowRoot?.textContent ??
+          '';
+        expect(text).to.contain('require approval rule on list_issues');
+        expect(deleteCalls('/api/v1/access-rules/rule-1')).to.have.length(0);
+
+        confirmButton('confirm-dialog-confirm')!.click();
+        await done;
+        expect(deleteCalls('/api/v1/access-rules/rule-1')).to.have.length(1);
+      } finally {
+        nativeConfirm.restore();
+      }
+    });
+
+    it('confirms a workflow delete and says how many tools use it', async () => {
+      tools = [{ ...makeTool('srv-1'), approval_workflow_id: 'wf-1' }];
+      const el = (await fixture(html`<tools-view></tools-view>`)) as ToolsView;
+      await waitUntil(
+        () => !(el as any).loading,
+        'Initial load did not finish'
+      );
+      const nativeConfirm = sinon.stub(window, 'confirm').returns(true);
+      try {
+        const done = (el as any)._handleDeletePolicy({
+          id: 'wf-1',
+          name: 'Example workflow',
+        }) as Promise<void>;
+        await waitUntil(
+          () => !!confirmButton('confirm-dialog-confirm'),
+          'no confirm dialog'
+        );
+        expect(nativeConfirm.called).to.equal(false);
+        const text =
+          document.querySelector('confirm-dialog')?.shadowRoot?.textContent ??
+          '';
+        expect(text).to.contain('Example workflow');
+        expect(text).to.contain('1 tool uses it');
+
+        (
+          document
+            .querySelector('confirm-dialog')
+            ?.shadowRoot?.querySelector(
+              'sl-button:not([data-testid])'
+            ) as HTMLElement
+        ).click();
+        await done;
+        expect(deleteCalls('/api/v1/approval-workflows/wf-1')).to.have.length(
+          0
+        );
+      } finally {
+        nativeConfirm.restore();
+      }
+    });
+
+    it('uploads nothing when cancelled and offers the Policies preview', async () => {
+      const { done } = await startImport();
+
+      (
+        document
+          .querySelector('confirm-dialog')
+          ?.shadowRoot?.querySelector(
+            'sl-button:not([data-testid])'
+          ) as HTMLElement
+      ).click();
+      await done;
+      expect(uploadCalls()).to.have.length(0);
+      const toast = Array.from(document.querySelectorAll('sl-alert')).find(
+        (alert) => alert.querySelector('[data-toast-action]')
+      );
+      expect(
+        toast?.querySelector('[data-toast-action]')?.textContent
+      ).to.contain('Preview on Policies');
+    });
   });
 });

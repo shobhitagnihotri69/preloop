@@ -351,7 +351,7 @@ def test_jira_issue_payload_is_rejected():
     with pytest.raises(PresetRunnerError) as exc:
         build_issue_trigger_payload(issue, project, tracker)
     assert exc.value.status_code == 400
-    assert "GitHub and GitLab" in str(exc.value.detail)
+    assert "GitHub, GitLab and Bitbucket" in str(exc.value.detail)
 
 
 def test_jira_triage_payload_uses_object_attributes():
@@ -390,6 +390,98 @@ def test_jira_triage_payload_uses_object_attributes():
     assert event["payload"]["object_attributes"]["title"] == "Broken search"
     assert event["payload"]["object_attributes"]["labels"] == ["bug"]
     assert event["payload"]["object_attributes"]["updated_at"] == "2026-01-04T00:00:00Z"
+
+
+def _jira_issue_project_tracker(settings):
+    issue = MagicMock()
+    issue.id = uuid.uuid4()
+    issue.key = "JMR-1"
+    issue.title = "Add tonnes_to_kg"
+    issue.description = "Perl 5.10"
+    issue.status = "Backlog"
+    issue.updated_at = "2026-10-09T00:00:00Z"
+    issue.meta_data = {"url": "https://example.atlassian.net/browse/JMR-1"}
+    issue.external_url = None
+    project = MagicMock()
+    project.id = uuid.uuid4()
+    project.name = "Jonas Metals Rehearsal"
+    project.slug = "jmr"
+    project.identifier = "10000"
+    project.settings = settings
+    project.meta_data = {}
+    tracker = MagicMock()
+    tracker.id = uuid.uuid4()
+    tracker.account_id = uuid.uuid4()
+    tracker.tracker_type = "jira"
+    tracker.url = "https://example.atlassian.net"
+    return issue, project, tracker
+
+
+def test_jira_implementer_run_allowed_for_a_bound_project():
+    """Live rehearsal 2026-10-09: "Run implementer" on a Jira issue of a
+    project bound to a Bitbucket repository answered 400 "only available for
+    GitHub, GitLab and Bitbucket issues"; the orchestrator already applies the
+    binding for Jira-sourced runs."""
+    issue, project, tracker = _jira_issue_project_tracker(
+        {
+            "repository_bindings": [
+                {"tracker_id": str(uuid.uuid4()), "repository": "ws/repo"}
+            ]
+        }
+    )
+    event = build_issue_trigger_payload(issue, project, tracker)
+    assert event["source"] == "jira"
+    assert event["project_id"] == str(project.id)
+    assert "repository" not in event["payload"]
+    assert event["payload"]["issue"]["key"] == "JMR-1"
+    assert event["payload"]["object_attributes"]["title"] == "Add tonnes_to_kg"
+
+
+def test_jira_implementer_run_allowed_for_a_flow_level_binding():
+    """Review on #1437: a flow-level binding overrides the project and must
+    qualify too, as resolve_repository_binding honours both."""
+    issue, project, tracker = _jira_issue_project_tracker({})
+    event = build_issue_trigger_payload(
+        issue,
+        project,
+        tracker,
+        flow_git_clone_config={
+            "enabled": True,
+            "repository_bindings": [{"tracker_id": "t", "repository": "ws/repo"}],
+        },
+    )
+    assert event["source"] == "jira"
+
+
+def test_jira_manual_and_webhook_runs_share_a_resource_key():
+    """Review on #1437: without a Jira resource key the coalescing guard was
+    a no-op, so a second manual run on the same issue started a duplicate."""
+    from preloop.services.flow_trigger_service import FlowTriggerService
+
+    issue, project, tracker = _jira_issue_project_tracker(
+        {"repository_bindings": [{"tracker_id": "t", "repository": "ws/repo"}]}
+    )
+    manual = build_issue_trigger_payload(issue, project, tracker)
+    webhook = {
+        "source": "jira",
+        "tracker_id": str(tracker.id),
+        "project_id": str(project.id),
+        "payload": {"issue": {"key": "JMR-1", "fields": {"summary": "x"}}},
+    }
+    key = FlowTriggerService._extract_resource_key(manual)
+    assert key == "jira:JMR:issue:JMR-1"
+    assert FlowTriggerService._extract_resource_key(webhook) == key
+    # The guard rebuilds event data from the stored execution with only
+    # source and payload (review on #1437); the key must survive that.
+    stored = {"source": manual["source"], "payload": manual["payload"]}
+    assert FlowTriggerService._extract_resource_key(stored) == key
+
+
+def test_jira_implementer_run_refused_without_binding():
+    issue, project, tracker = _jira_issue_project_tracker({})
+    with pytest.raises(PresetRunnerError) as exc:
+        build_issue_trigger_payload(issue, project, tracker)
+    assert "bound to a repository" in str(exc.value.detail)
 
 
 @pytest.mark.asyncio
@@ -1563,3 +1655,45 @@ async def test_batch_item_errors_carry_the_issue_key_when_it_is_known() -> None:
     item = response["results"][0]
     assert item["issue_key"] == "example/repo#42"
     assert item["error"] == "Flow is unavailable"
+
+
+@pytest.mark.parametrize("operation", ["clone", "issue", "triage", "pull_request"])
+def test_dc_execution_never_falls_back_to_cloud(operation):
+    from preloop.services.preset_runner import _repository_clone_fields
+
+    tracker = _Simple(tracker_type="bitbucket_dc")
+    project = _Simple(slug="PRJ/repo", name="repo", meta_data={})
+    with pytest.raises(
+        PresetRunnerError,
+        match="Data Center execution/publication routing is unsupported",
+    ):
+        if operation == "clone":
+            _repository_clone_fields(project, tracker)
+        elif operation == "pull_request":
+            build_pull_request_trigger_payload({"id": 1}, project, tracker)
+        else:
+            build_issue_trigger_payload(
+                _Simple(), project, tracker, git_only=operation != "triage"
+            )
+
+
+@pytest.mark.asyncio
+async def test_dc_preset_fetch_refused_before_provider_io():
+    from preloop.services.preset_runner import _fetch_pull_request_detail
+
+    with patch(
+        "preloop.api.common.get_tracker_client", new_callable=AsyncMock
+    ) as create:
+        with pytest.raises(
+            PresetRunnerError,
+            match="Data Center execution/publication routing is unsupported",
+        ):
+            await _fetch_pull_request_detail(
+                MagicMock(),
+                current_user=_Simple(),
+                project=_Simple(),
+                tracker=_Simple(tracker_type="bitbucket_dc"),
+                organization=_Simple(),
+                number=1,
+            )
+        create.assert_not_called()

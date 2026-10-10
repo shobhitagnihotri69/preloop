@@ -1539,3 +1539,496 @@ describe('AddAIModelModal dialog copy and state (D7)', () => {
     expect(fetchButton?.getAttribute('style') || '').to.not.contain('width');
   });
 });
+
+describe('AddAIModelModal Azure OpenAI provider', () => {
+  let element: AddAIModelModal;
+  let sandbox: SinonSandbox;
+  let fetchStub: SinonStub;
+
+  beforeEach(async () => {
+    localStorage.setItem('accessToken', 'test-access-token');
+    localStorage.setItem('refreshToken', 'test-refresh-token');
+    sandbox = sinon.createSandbox();
+    fetchStub = sandbox.stub(window, 'fetch');
+    fetchStub.callsFake(async (url: any, init: any) => {
+      if (String(url).includes('/api/v1/ai-models') && init?.method) {
+        const body = init.body ? JSON.parse(String(init.body)) : {};
+        return new Response(JSON.stringify({ id: 'azure-id', ...body }), {
+          status: 201,
+        });
+      }
+      return new Response(JSON.stringify([]));
+    });
+    element = await fixture(html`<add-ai-model-modal></add-ai-model-modal>`);
+  });
+
+  afterEach(() => {
+    sandbox.restore();
+    localStorage.clear();
+  });
+
+  it('offers Azure OpenAI for LLMs only', async () => {
+    const llm = (element as any)._availableProviders.map(
+      (p: { value: string }) => p.value
+    );
+    expect(llm).to.contain('azure');
+    (element as any)._currentModel = { model_kind: 'stt' };
+    const stt = (element as any)._availableProviders.map(
+      (p: { value: string }) => p.value
+    );
+    expect(stt).to.not.contain('azure');
+  });
+
+  it('asks for the deployment name instead of fetching models', async () => {
+    element.open = true;
+    await element.updateComplete;
+    await (element as any)._handleProviderChange({
+      target: { value: 'azure' },
+    } as unknown as Event);
+    await element.updateComplete;
+
+    const root = element.shadowRoot!;
+    const deployment = root.querySelector(
+      'sl-input[data-field="model_identifier"]'
+    );
+    expect(deployment?.getAttribute('label')).to.equal('Deployment name');
+    expect(root.querySelector('sl-input[data-field="azure_api_version"]')).to
+      .exist;
+    expect(root.querySelector('sl-input[data-field="azure_base_model"]')).to
+      .exist;
+    const fetchButtonWrapper = Array.from(
+      root.querySelectorAll('div.full-width')
+    ).find((el) => el.querySelector('sl-button'));
+    expect(fetchButtonWrapper?.hasAttribute('hidden')).to.equal(true);
+  });
+
+  it('submits api-version and base model in provider_runtime', async () => {
+    (element as any)._currentModel = {
+      name: 'Chat on Azure',
+      provider_name: 'azure',
+      model_identifier: 'team-chat-prod',
+      model_kind: 'llm',
+      api_endpoint: 'https://example-resource.openai.azure.com',
+      api_key: 'azure-key',
+    };
+    (element as any)._azureApiVersion = ' 2024-10-21 ';
+    (element as any)._azureBaseModel = 'gpt-4o-mini';
+    (element as any)._syncFormFromDom = () => {};
+
+    await (element as any)._handleFormSubmit(new Event('submit'));
+
+    expect((element as any)._formError).to.equal(null);
+    const payload = createdModelPayloads(fetchStub)[0];
+    expect(payload.provider_name).to.equal('azure');
+    expect(payload.api_key).to.equal('azure-key');
+    expect(payload.api_endpoint).to.equal(
+      'https://example-resource.openai.azure.com'
+    );
+    expect(payload.meta_data.provider_runtime).to.deep.equal({
+      api_version: '2024-10-21',
+      base_model: 'gpt-4o-mini',
+    });
+    expect(payload.meta_data.gateway.model_alias).to.equal(
+      'azure/team-chat-prod'
+    );
+  });
+
+  it('omits blank Azure fields so the server defaults apply', async () => {
+    (element as any)._currentModel = {
+      name: 'Chat on Azure',
+      provider_name: 'azure',
+      model_identifier: 'gpt-4o-mini',
+      model_kind: 'llm',
+      api_endpoint: 'https://example-resource.openai.azure.com',
+      api_key: 'azure-key',
+    };
+    (element as any)._syncFormFromDom = () => {};
+
+    await (element as any)._handleFormSubmit(new Event('submit'));
+
+    const payload = createdModelPayloads(fetchStub)[0];
+    expect(payload.meta_data.provider_runtime).to.deep.equal({});
+  });
+
+  it('submits Entra ID auth without a key', async () => {
+    (element as any)._currentModel = {
+      name: 'Chat on Azure',
+      provider_name: 'azure',
+      model_identifier: 'team-chat-prod',
+      model_kind: 'llm',
+      api_endpoint: 'https://example-resource.openai.azure.com',
+      api_key: 'typed-then-switched',
+    };
+    (element as any)._azureAuth = 'entra';
+    (element as any)._azureClientId = ' 00000000-0000-0000-0000-000000000001 ';
+    (element as any)._preloopGatewayEnabled = true;
+    (element as any)._syncFormFromDom = () => {};
+
+    await (element as any)._handleFormSubmit(new Event('submit'));
+
+    expect((element as any)._formError).to.equal(null);
+    const payload = createdModelPayloads(fetchStub)[0];
+    expect(payload.api_key).to.be.undefined;
+    expect(payload.meta_data.provider_runtime).to.deep.equal({
+      azure_auth: 'entra',
+      ambient_credentials: true,
+      azure_client_id: '00000000-0000-0000-0000-000000000001',
+    });
+    expect(payload.meta_data.gateway.enabled).to.equal(true);
+  });
+
+  it('hides the key input and shows the identity field for Entra ID', async () => {
+    element.open = true;
+    await element.updateComplete;
+    await (element as any)._handleProviderChange({
+      target: { value: 'azure' },
+    } as unknown as Event);
+    await element.updateComplete;
+    const root = element.shadowRoot!;
+    expect(root.querySelector('sl-radio-group[data-testid="azure-auth"]')).to
+      .exist;
+    const keyInput = () => root.querySelector('sl-input[data-field="api_key"]');
+    expect(keyInput()?.hasAttribute('hidden')).to.equal(false);
+    expect(root.querySelector('sl-input[data-field="azure_client_id"]')).to.not
+      .exist;
+
+    (element as any)._azureAuth = 'entra';
+    await element.updateComplete;
+    expect(keyInput()?.hasAttribute('hidden')).to.equal(true);
+    expect(root.querySelector('sl-input[data-field="azure_client_id"]')).to
+      .exist;
+  });
+
+  it('loads Entra ID on edit and clears it when switched back to key', async () => {
+    element.model = {
+      id: 'azure-id',
+      name: 'Chat on Azure',
+      provider_name: 'azure',
+      model_identifier: 'team-chat-prod',
+      model_kind: 'llm',
+      api_endpoint: 'https://example-resource.openai.azure.com',
+      has_api_key: true,
+      meta_data: {
+        provider_runtime: {
+          api_version: 'v1',
+          azure_auth: 'entra',
+          ambient_credentials: true,
+          azure_client_id: 'client-1',
+        },
+      },
+    } as unknown as AIModel;
+    element.open = true;
+    await element.updateComplete;
+    expect((element as any)._azureAuth).to.equal('entra');
+    expect((element as any)._azureClientId).to.equal('client-1');
+
+    (element as any)._azureAuth = 'key';
+    (element as any)._currentModel.api_key = 'azure-key';
+    (element as any)._syncFormFromDom = () => {};
+    await (element as any)._handleFormSubmit(new Event('submit'));
+
+    const putCall = fetchStub
+      .getCalls()
+      .find(
+        (call) =>
+          String(call.args[0]).includes('/api/v1/ai-models/azure-id') &&
+          call.args[1]?.method === 'PUT'
+      );
+    const body = JSON.parse(String(putCall!.args[1].body));
+    expect(body.meta_data.provider_runtime).to.deep.equal({
+      api_version: 'v1',
+    });
+    expect(body.api_key).to.equal('azure-key');
+  });
+
+  it('keeps the stored api-version and base model when editing', async () => {
+    element.model = {
+      id: 'azure-id',
+      name: 'Chat on Azure',
+      provider_name: 'azure',
+      model_identifier: 'team-chat-prod',
+      model_kind: 'llm',
+      api_endpoint: 'https://example-resource.openai.azure.com',
+      has_api_key: true,
+      meta_data: {
+        provider_runtime: { api_version: 'v1', base_model: 'gpt-4o' },
+      },
+    } as unknown as AIModel;
+    element.open = true;
+    await element.updateComplete;
+    expect((element as any)._azureApiVersion).to.equal('v1');
+    expect((element as any)._azureBaseModel).to.equal('gpt-4o');
+
+    (element as any)._syncFormFromDom = () => {};
+    await (element as any)._handleFormSubmit(new Event('submit'));
+
+    const putCall = fetchStub
+      .getCalls()
+      .find(
+        (call) =>
+          String(call.args[0]).includes('/api/v1/ai-models/azure-id') &&
+          call.args[1]?.method === 'PUT'
+      );
+    const body = JSON.parse(String(putCall!.args[1].body));
+    expect(body.meta_data.provider_runtime).to.deep.equal({
+      api_version: 'v1',
+      base_model: 'gpt-4o',
+    });
+    expect(body.api_key).to.be.undefined;
+  });
+
+  function lastPutBody(): any {
+    const putCall = fetchStub
+      .getCalls()
+      .filter((call) => call.args[1]?.method === 'PUT')
+      .pop();
+    return JSON.parse(String(putCall!.args[1].body));
+  }
+
+  it('drops the Azure fields when an Azure model switches provider', async () => {
+    element.model = {
+      id: 'azure-id',
+      name: 'Chat on Azure',
+      provider_name: 'azure',
+      model_identifier: 'team-chat-prod',
+      model_kind: 'llm',
+      api_endpoint: 'https://example-resource.openai.azure.com',
+      has_api_key: true,
+      meta_data: {
+        provider_runtime: {
+          api_version: 'v1',
+          base_model: 'gpt-4o',
+          other: 'kept',
+        },
+      },
+    } as unknown as AIModel;
+    element.open = true;
+    await element.updateComplete;
+    (element as any)._currentModel = {
+      ...(element as any)._currentModel,
+      provider_name: 'openai',
+      model_identifier: 'gpt-4o-mini',
+      api_endpoint: 'https://api.openai.com/v1',
+    };
+    (element as any)._syncFormFromDom = () => {};
+    await (element as any)._handleFormSubmit(new Event('submit'));
+
+    expect((element as any)._formError).to.equal(null);
+    // A stale base_model would price the OpenAI model at the old rate.
+    expect(lastPutBody().meta_data.provider_runtime).to.deep.equal({
+      other: 'kept',
+    });
+  });
+
+  it('keeps an API-set base model on a non-Azure model when editing', async () => {
+    element.model = {
+      id: 'openai-id',
+      name: 'Pinned',
+      provider_name: 'openai',
+      model_identifier: 'team-alias',
+      model_kind: 'llm',
+      api_endpoint: 'https://api.openai.com/v1',
+      has_api_key: true,
+      meta_data: { provider_runtime: { base_model: 'gpt-4o-mini' } },
+    } as unknown as AIModel;
+    element.open = true;
+    await element.updateComplete;
+    (element as any)._syncFormFromDom = () => {};
+    await (element as any)._handleFormSubmit(new Event('submit'));
+
+    expect(lastPutBody().meta_data.provider_runtime).to.deep.equal({
+      base_model: 'gpt-4o-mini',
+    });
+  });
+});
+
+describe('AddAIModelModal secret fields', () => {
+  let sandbox: SinonSandbox;
+
+  beforeEach(() => {
+    localStorage.setItem('accessToken', 'test-access-token');
+    sandbox = sinon.createSandbox();
+    sandbox.stub(window, 'fetch').resolves(new Response(JSON.stringify([])));
+  });
+
+  afterEach(() => {
+    sandbox.restore();
+    localStorage.clear();
+  });
+
+  const secretInputs = (element: AddAIModelModal) =>
+    [
+      ...element.shadowRoot!.querySelectorAll('sl-input[type="password"]'),
+    ] as HTMLElement[];
+
+  it('lets every secret be revealed to check a pasted value', async () => {
+    const element = await fixture<AddAIModelModal>(
+      html`<add-ai-model-modal></add-ai-model-modal>`
+    );
+    element.open = true;
+    await element.updateComplete;
+    const apiKey = secretInputs(element).find(
+      (input) => input.getAttribute('label') === 'API key'
+    );
+    expect(apiKey, 'API key field').to.exist;
+    expect(apiKey!.hasAttribute('password-toggle')).to.equal(true);
+
+    (element as any)._currentModel = {
+      ...(element as any)._currentModel,
+      provider_name: 'bedrock',
+    };
+    element.requestUpdate();
+    await element.updateComplete;
+    const labels = secretInputs(element).map((input) =>
+      input.getAttribute('label')
+    );
+    expect(labels).to.include.members([
+      'AWS Secret Access Key',
+      'AWS Session Token',
+    ]);
+    for (const input of secretInputs(element)) {
+      expect(
+        input.hasAttribute('password-toggle'),
+        `${input.getAttribute('label')} has a show/hide toggle`
+      ).to.equal(true);
+    }
+  });
+});
+
+describe('Bedrock API key authentication', () => {
+  let element: AddAIModelModal;
+  let fetchStub: SinonStub;
+  afterEach(() => {
+    sinon.restore();
+    localStorage.clear();
+  });
+  beforeEach(async () => {
+    localStorage.setItem('accessToken', 'synthetic-token');
+    fetchStub = sinon
+      .stub(window, 'fetch')
+      .resolves(
+        new Response(
+          JSON.stringify({ models: ['amazon.nova-pro-v1:0'], source: 'live' })
+        )
+      );
+    element = await fixture(html`<add-ai-model-modal></add-ai-model-modal>`);
+    element.open = true;
+    await element.updateComplete;
+    (element as any)._currentModel = { provider_name: 'bedrock' };
+    (element as any)._bedrockAuth = 'api_key';
+    element.requestUpdate();
+    await element.updateComplete;
+  });
+
+  it('stores only the bearer credential and enables listing without IAM keys', async () => {
+    (element as any)._bedrockApiKey = ' synthetic-bedrock-key ';
+    (element as any)._bedrockAccessKeyId = 'stale-iam-key';
+    (element as any)._bedrockSecretAccessKey = 'stale-secret';
+    (element as any)._syncBedrockApiKey();
+    expect(JSON.parse((element as any)._currentModel.api_key)).to.deep.equal({
+      aws_bearer_token_bedrock: 'synthetic-bedrock-key',
+    });
+    expect((element as any)._bedrockCredsComplete).to.equal(true);
+    await element.updateComplete;
+    expect(element.shadowRoot!.querySelector('[data-field="bedrock_api_key"]'))
+      .to.exist;
+    expect(
+      element.shadowRoot!.querySelector('[data-field="bedrock_access_key_id"]')
+    ).not.to.exist;
+  });
+  it('lists with the key only in the POST body and preserves the selected auth on submit', async () => {
+    (element as any)._bedrockApiKey = 'synthetic-bedrock-key';
+    (element as any)._currentModel.model_identifier = 'amazon.nova-pro-v1:0';
+    (element as any)._syncBedrockApiKey();
+    await (element as any)._fetchModelsForCurrentProvider();
+    const call = fetchStub
+      .getCalls()
+      .find((call) => String(call.args[0]).includes('available-models'))!;
+    expect(String(call.args[0])).not.to.contain('synthetic-bedrock-key');
+    expect(JSON.parse(call.args[1]!.body as string)).to.deep.equal({
+      model_kind: 'llm',
+      aws_bearer_token_bedrock: 'synthetic-bedrock-key',
+      aws_region_name: 'us-east-1',
+    });
+    expect(
+      (element as any)._buildMetaDataForSubmit().provider_runtime
+    ).to.include({ auth_method: 'api_key', region: 'us-east-1' });
+  });
+  it('requires a replacement credential when switching an existing IAM model to an API key', async () => {
+    element.model = {
+      id: 'synthetic-model',
+      has_api_key: true,
+      provider_name: 'bedrock',
+      meta_data: { provider_runtime: { region: 'us-east-1' } },
+    } as unknown as AIModel;
+    expect((element as any)._hasStoredBedrockCredentials).to.equal(false);
+    await (element as any)._fetchModelsForCurrentProvider();
+    expect((element as any)._modelsFetchError).to.contain('API key');
+    expect(
+      fetchStub
+        .getCalls()
+        .filter((call) => String(call.args[0]).includes('available-models'))
+    ).to.have.length(0);
+  });
+  it('restores a saved API key model and retains its encrypted key when saved with blank inputs', async () => {
+    fetchStub.callsFake(
+      async () =>
+        new Response(
+          JSON.stringify({ models: ['amazon.nova-pro-v1:0'], source: 'live' })
+        )
+    );
+    element.open = false;
+    await element.updateComplete;
+    element.model = {
+      id: 'existing-api-key-model',
+      name: 'Bedrock Nova',
+      model_kind: 'llm',
+      provider_name: 'bedrock',
+      model_identifier: 'amazon.nova-pro-v1:0',
+      has_api_key: true,
+      meta_data: {
+        provider_runtime: { region: 'eu-west-1', auth_method: 'api_key' },
+      },
+    } as unknown as AIModel;
+    element.open = true;
+    await element.updateComplete;
+    await element.updateComplete;
+    expect((element as any)._bedrockAuth).to.equal('api_key');
+    expect((element as any)._bedrockApiKey).to.equal('');
+    expect((element as any)._hasStoredBedrockCredentials).to.equal(true);
+    expect((element as any)._canEnablePreloopGateway).to.equal(true);
+    await (element as any)._fetchModelsForCurrentProvider();
+    const discovery = fetchStub
+      .getCalls()
+      .find((call) => String(call.args[0]).includes('available-models'))!;
+    expect(JSON.parse(discovery.args[1]!.body as string)).to.deep.equal({
+      model_kind: 'llm',
+      ai_model_id: 'existing-api-key-model',
+    });
+    (element as any)._syncFormFromDom = () => {};
+    await (element as any)._handleFormSubmit(new Event('submit'));
+    expect((element as any)._formError).to.equal(null);
+    const update = fetchStub
+      .getCalls()
+      .find((call) => call.args[1]?.method === 'PUT')!;
+    const body = JSON.parse(update.args[1]!.body as string);
+    expect(body).not.to.have.property('api_key');
+    expect(body.meta_data.provider_runtime).to.deep.equal({
+      region: 'eu-west-1',
+      auth_method: 'api_key',
+    });
+  });
+
+  it('does not invent auth metadata when preserving a legacy/API-created encrypted secret', () => {
+    element.model = {
+      id: 'existing-model',
+      has_api_key: true,
+      meta_data: { provider_runtime: { region: 'us-east-1' } },
+    } as unknown as AIModel;
+    (element as any)._currentModel.model_identifier = 'amazon.nova-pro-v1:0';
+    (element as any)._bedrockAuth = 'iam';
+    expect(
+      (element as any)._buildMetaDataForSubmit().provider_runtime
+    ).not.to.have.property('auth_method');
+  });
+});

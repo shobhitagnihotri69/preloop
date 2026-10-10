@@ -1,5 +1,7 @@
 # Evidence storage and retention
 
+Editions: OSS, Cloud, Enterprise. Unless stated otherwise, everything on this page ships in OSS.
+
 Audit-style flows write a human-readable pack under `/workspace/evidence/`
 plus `/workspace/result.json`. This page is the operator runbook for how
 that pack is transported, stored, retrieved and retained. It does **not**
@@ -10,15 +12,38 @@ exactly what that does and does not mean. Cross-link the
 [security audit presets](security-audit-presets.md) guide for the JSON
 contracts themselves.
 
-## Two transports
+## Transports
 
-**Legacy (default).** `FLOW_ARTIFACT_DIRECT_UPLOAD` is off. Hosted Docker
-copies the directory through the engine API. Kubernetes still emits a
-size-capped base64 block on the pod log channel
-(`MAX_EVIDENCE_ARCHIVE_BYTES`, 2 MiB compressed). The control plane stores
-the bytes on `flow_execution.evidence_archive`. Failed persist is visible as
-`evidence-status: failed` or `missing`; it must not look like a successful
-receipt. Existing downloads keep working.
+**Legacy log channel (default).** `FLOW_ARTIFACT_DIRECT_UPLOAD` is off and
+`FLOW_EVIDENCE_LOG_PLAINTEXT` is on (the default). Hosted Docker copies the
+directory through the engine API and does not put the pack on container
+logs, so the plaintext switch does not change Docker capture. Kubernetes
+still emits a size-capped base64 block on the pod log channel
+(`MAX_EVIDENCE_ARCHIVE_BYTES`, 2 MiB compressed) for `result.json`, the
+evidence pack, and the workspace snapshot. Base64 is not encryption. Anyone
+who can read retained pod logs can read those bytes. The control plane
+stores the evidence bytes on `flow_execution.evidence_archive`. Failed
+persist is visible as `evidence-status: failed` or `missing`; it must not
+look like a successful receipt. Existing downloads keep working.
+
+**Plaintext log channel off.** Set `FLOW_EVIDENCE_LOG_PLAINTEXT=false`
+(`flow_evidence_log_plaintext`) when a deployment must not put evidence in
+pod logs. Use it together with direct upload. The Kubernetes job receives
+`PRELOOP_EVIDENCE_LOG_PLAINTEXT=0`. If that job also has an upload token,
+the wrapper follows the direct path and still does not fall back to
+plaintext when the upload fails. If the token is absent, the wrapper fails
+closed: it does not base64 `result.json`, the evidence pack, or the
+workspace snapshot. The pod log gets three markers instead:
+`result unavailable plaintext_disabled`, `evidence unavailable
+plaintext_disabled`, and `workspace skipped plaintext_disabled`. The
+control plane records an evidence receipt with status `failed` and error
+`plaintext_disabled`, and it treats the result as missing (the same outcome
+as no `result.json`). It does not decode a payload that someone injects
+into the log. **Unavailable: plaintext disabled** means the pack was
+refused by policy, not that the agent forgot to write `/workspace/evidence`.
+Turning the switch off without direct upload makes evidence unavailable by
+design. Encrypted log transport (per-execution keys) is a separate decision
+tracked in issue #268 and is not this switch.
 
 **Direct upload (configured path).** Set `FLOW_ARTIFACT_DIRECT_UPLOAD=true`
 when the runner can reach `PRELOOP_URL`. Hosted containers and private
@@ -27,7 +52,7 @@ Docker runners receive an execution-bound JWT (`aud=flow-artifact`,
 `result.json` when present) and PUT it to
 `/api/v1/flows/executions/{id}/artifacts`. Kubernetes logs then carry only
 `PRELOOP_ARTIFACT_*` status markers and `PRELOOP_EVIDENCE committed|failed|absent`
-lines — never the pack bytes. Hosted Docker uses the same EXIT-trap PUT;
+lines: never the pack bytes. Hosted Docker uses the same EXIT-trap PUT;
 after exit the control plane reads those `PRELOOP_EVIDENCE` lines and binds
 the stored artifact instead of copying `/workspace/evidence` a second time.
 Workspace checkpoints stay on the separate `workspace` / `native_session`
@@ -52,6 +77,25 @@ That field is runner bootstrap metadata and is emitted even when
 `result.json` is missing or invalid; agent `result` JSON cannot set it.
 A failed or missing final PUT is stored as `failed`/`missing` even
 when an earlier trap artifact exists.
+
+## Reading a pack in the console
+
+The execution page adds a Report tab when the pack is present, expired, or
+failed. A missing pack hides the tab. The tab reads one manifest member at a
+time through `GET /api/v1/flows/executions/{id}/evidence/members?path=...`
+(the same account check, decryption, digest check and legal hold as
+`GET .../evidence`). Omit `path` to list members with size, sha256 and
+content type. A path that is not in the manifest, or that contains `..`, is
+refused. A member larger than 8 MiB is refused; download the pack for that
+file. Markdown, JSON and plain text are returned with those content types.
+
+The tab shows the report named by `artifacts.report`, a findings table from
+`artifacts.findings`, and the register from `result.register` items (gap and
+partial rows first). When the result has no register items, the tab renders
+the `artifacts.register` markdown instead. The integrity word and sha256 on
+that tab are the ones
+`GET .../evidence-status` already shows on the Records card. An expired or
+failed pack stays on the tab as that status, with the same explanation.
 
 ## What is in a pack
 
@@ -102,16 +146,82 @@ counts, expiry) atomically with the ciphertext.
 
 | Setting | Default | Role |
 | --- | --- | --- |
+| `FLOW_EVIDENCE_LOG_PLAINTEXT` | true | Kubernetes pod-log base64 channel. Default keeps today's emission. False refuses it |
 | `FLOW_EVIDENCE_MAX_BYTES` | 32 MiB | Compressed evidence cap on the direct path |
 | `FLOW_ARTIFACT_EXPANDED_MAX_BYTES` | 2 GiB | Extraction bomb limit (shared) |
 | `FLOW_ARTIFACT_ACCOUNT_QUOTA_BYTES` | 4 GiB | Retained encrypted payload per account |
 | `FLOW_EVIDENCE_RETENTION_HOURS` | 720 (30 days) | Evidence expiry; `0` expires on the next janitor pass |
-| `WORKSPACE_SNAPSHOT_TTL_HOURS` | 24 | Workspace checkpoints only |
+| `WORKSPACE_SNAPSHOT_TTL_HOURS` | 24 (hosted: 168) | Workspace checkpoints only |
 | `FLOW_NATIVE_SESSION_RETENTION_HOURS` | 168 | Native session artifacts only |
 
 Evidence retention is independent of workspace checkpoint TTL. Cleanup
 nulls ciphertext after expiry once any restore/download lease has lapsed,
 and records `availability=expired`. It does not cross account rows.
+
+A run captures its workspace periodically and again before publication. When
+a capture's checkpoint metadata has the same `file_state_sha256` and the same
+repository `head_sha` list as the newest available workspace snapshot of the
+same execution and thread, nothing new is stored: the existing row's expiry
+moves to the new capture's expiry (never earlier), and the receipt names the
+existing artifact with `deduplicated: true`. A duplicate therefore never
+counts against the quota. Snapshots are never shared across executions,
+threads or accounts, because recovery looks a snapshot up by execution.
+The archive still crosses the wire: the runner cannot prove to the API that
+an earlier upload committed, so the API decides.
+A second evidence upload reuses the newest available evidence row for the
+same account, flow, thread and execution when the archive sha256 matches, or
+when the pack manifest's `members_digest` matches (a repack of the same files
+whose gzip timestamp differs): expiry moves forward and never earlier, the
+receipt sets `deduplicated: true`, and no second ciphertext or signature is
+stored.
+
+A clean checkout whose `HEAD` is still the cloned commit, with no stash and no
+commit that exists only on a local branch, skips the payload.
+The stored row keeps the checkpoint metadata and counts zero ciphertext bytes
+toward `FLOW_ARTIFACT_ACCOUNT_QUOTA_BYTES`. The marker is
+`PRELOOP_CHECKPOINT skipped clean_checkout`. Open source defaults
+`WORKSPACE_SNAPSHOT_TTL_HOURS` to 24; hosted Preloop sets 168. With the
+default `when_dirty` policy, clean reviews no longer fill that window with
+workspace payloads. See
+[Environments and recovery](environments-and-recovery.md).
+
+### When a capture is refused for quota
+
+Admission sums the account's retained ciphertext (every row whose payload
+is not yet cleared, whatever its kind) and refuses the upload when that
+total plus the incoming ciphertext exceeds `FLOW_ARTIFACT_ACCOUNT_QUOTA_BYTES`.
+Bytes are counted after encryption, so they are slightly larger than the
+compressed archive. The refusal is an HTTP 422 whose body carries the
+numbers it compared, and nothing else:
+
+```json
+{"detail": {"error": "artifact_quota_exceeded",
+            "retained_bytes": 4250000000,
+            "quota_bytes": 4294967296,
+            "incoming_bytes": 41000000}}
+```
+
+The same three fields are added to the `flow_artifact_rejected` audit row,
+and the runner marker appends them after the stable code:
+`PRELOOP_CHECKPOINT failed HTTPError status=422 detail=artifact_quota_exceeded op=capture retained=4250000000 quota=4294967296 incoming=41000000`.
+A large `incoming` against a small `retained` points at one oversized
+checkpoint; a `retained` close to `quota` points at accumulated artifacts.
+
+To see the position before a capture is refused, read
+`GET /api/v1/account/flow-artifacts/usage` (any account member, like
+`/account/session-artifacts/usage`, which reports a separate pool):
+
+| Field | Meaning |
+| --- | --- |
+| `retained_bytes` | The total admission compares, all kinds |
+| `quota_bytes` | The configured `FLOW_ARTIFACT_ACCOUNT_QUOTA_BYTES` |
+| `by_kind` | `{"workspace": {"bytes": n, "count": n}, ...}`; cleared rows count with zero bytes |
+| `expired_pending_cleanup` | Rows past `expires_at` whose payload the janitor has not cleared yet; their bytes still count. A persistent non-zero value with no legal hold or lease points at cleanup lag |
+| `next_expiry_at` | When space can next free: the earliest `expires_at` (or a later `lease_until`) among available rows not under a legal hold. A past value means a payload is due and waits for the janitor. Null when every retained row is held |
+
+Space frees only by expiry: workspace checkpoints after
+`WORKSPACE_SNAPSHOT_TTL_HOURS`, evidence after `FLOW_EVIDENCE_RETENTION_HOURS`.
+Rows under a legal hold or a live lease are not cleared until it ends.
 
 ## Receipts and retrieval
 
@@ -173,7 +283,7 @@ A local `/tmp/preloop-evidence-reference.json` marker is not proof of
 upload. The server verifies capability scope (account, flow, thread,
 execution, `kind=evidence`) and the archive digest on PUT and GET.
 Direct-upload failure emits `evidence error` / `result error` markers
-and a `failed` or `missing` receipt — never cleartext pack bytes on the
+and a `failed` or `missing` receipt: never cleartext pack bytes on the
 log channel.
 
 ## Retention and legal hold
@@ -205,7 +315,7 @@ specific pack has to survive, place a legal hold on it or export the period.
 | `audit` | Audit log rows |
 | `approvals` | Approval requests and their events |
 | `evidence` | Evidence pack records (manifest and digest), not the payload |
-| `runtime_sessions` | Runtime sessions, session activity and the session search chunks derived from them |
+| `runtime_sessions` | Runtime sessions, session activity, session artifacts (removed with the session), and the session search chunks derived from them |
 | `usage` | API and gateway usage rows, and the search chunks quoting them |
 
 ```
@@ -213,6 +323,13 @@ GET  /api/v1/retention/settings        # resolved days per class, plus the floor
 PUT  /api/v1/retention/settings        # {"classes": {"audit": 400}}; below the floor is a 422
 GET  /api/v1/retention/purge-preview   # what today's purge would remove, per class
 ```
+
+### In the console
+
+Settings > Records edits days per class, never below the floor, and previews
+what a purge would remove. Purge itself stays a deployment setting. The page
+says when the sweeper is off, so a stated policy is not mistaken for a
+deletion that already happened.
 
 ### The purge
 
@@ -237,7 +354,9 @@ Every pass that removed anything writes an audit row per record class with the
 cutoff and the count, so the deletion of records is itself a record. The audit
 row also carries `derived_deleted`: rows removed from tables that quote the
 records, counted separately so a report says how many sessions went without
-inflating the number by their search chunks.
+inflating the number by their search chunks. A runtime-session purge also
+names `runtime_session_artifact`, the artifact rows the session delete
+cascades.
 
 ### Legal hold
 
@@ -253,12 +372,21 @@ POST /api/v1/retention/holds                  # {"resource_type": "execution", "
 POST /api/v1/retention/holds/{id}/release     # {"reason": "..."}
 ```
 
+### In the console
+
+Settings > Records lists legal holds, and the same page is where retention
+days are edited. A flow execution, an approval, and a runtime session each
+offer place and release for that one record. A hold is still not object lock:
+the execution page shows `object_lock` as false.
+
 A hold on an execution also covers that execution's evidence packs. Holds
 overlap safely: releasing an execution hold does not unfreeze a pack that
 carries its own hold. A hold on a runtime session covers that session's
 activity rows, which the purge only ever removes with the session itself, and
 the session reads back with `legal_hold: true` so a frozen session looks
-frozen wherever it is listed.
+frozen wherever it is listed. The same hold flags the session's artifacts,
+including artifacts stored after the hold is placed, and the expiry janitor
+leaves their ciphertext alone past `expires_at`.
 
 **What a legal hold is not.** It is a Preloop control, enforced by Preloop
 code against the Preloop database. It is not WORM, and it is not S3 Object
@@ -326,7 +454,38 @@ approvals/approval_request.jsonl
 audit/audit_log.jsonl
 evidence/receipts.jsonl          receipts, not payloads: artifact id and digest
 holds/legal_hold.jsonl
+artifacts/manifest.json          A2A Artifact list, one per session artifact
+artifacts/<session_id>/<artifact_id>-<name>   decrypted artifact bytes
 ```
+
+Session artifacts created in the period (transcripts, screenshots, documents,
+generated files) are exported with their bytes. Add
+`&runtime_session_id=<id>` to limit the artifact members to one session; the
+other record classes still cover the whole period. In the console, the
+session toolbar's **Add to evidence export** opens this export on
+Settings > Records with the session and its dates filled in.
+
+`artifacts/manifest.json` is a JSON list of A2A v1 `Artifact` objects built
+with the same mapping the rest of the artifact surface uses
+(`artifact_shapes.to_a2a_artifact`): `artifact_id`, `name`, one `Part`
+`{url: "artifact:<member path>", filename, media_type}`, and `metadata`
+`{kind, labels, sha256, size_bytes, producer, runtime_session_id, created_at,
+legal_hold, availability}`. Each member's sha256 is the one stored when the
+artifact was deposited and is also listed in `manifest.json`, so
+`preloop evidence verify` checks it like any other member. An artifact whose
+bytes are gone (`evicted` or `expired`) is listed with that `availability`
+and has no member. A held artifact keeps its bytes past retention and is
+exported.
+
+Artifact bytes are streamed into the archive one at a time. Above
+`RETENTION_EXPORT_MAX_ARTIFACT_BYTES` (2 GiB) the export is refused with 413
+`export_too_large`, naming the artifact count and bytes; narrow the dates or
+export one session.
+`preloop evidence verify` streams a period export from disk and digests each
+member as it passes, so it checks a bundle up to that cap without holding it
+in memory. `manifest.json` records `artifact_scope.runtime_session_id` (null
+for the whole period) under the signature, and the export's audit row repeats
+it, so a session-limited bundle cannot pass for a complete one.
 
 `manifest.json` carries `members` with a `sha256` and `size_bytes` per member
 and a `members_digest` over that list, the same shape and the same computation
@@ -372,7 +531,18 @@ GET  /api/v1/audit/chain/checkpoints   signed anchors over the chain head
 recomputes every hash on your machine, checks the checkpoint signatures, and
 reports the first break with its sequence and row id. Exit status is 1 on a
 break, so CI can gate on it. When Preloop's verdict and the local walk
-disagree, the CLI prints both and tells you to trust the walk.
+disagree, the CLI prints both and tells you to trust the walk. If that CLI
+is older than the server version reported by `/api/v1/version`, it also
+suggests `preloop update` before you treat the disagreement as tampering.
+
+A row hash is `sha256` of the domain separator `preloop.audit.chain/v1\n`
+followed by the canonical JSON of the row. Canonical JSON sorts object keys
+by UTF-8 byte order, uses `,` and `:` with no space, and writes strings as
+UTF-8 (`ensure_ascii` off), escaping only quotes, backslashes, and control
+characters. Numbers keep the exact decimal spelling Python's `json.dumps`
+produces: `0.0` stays `0.0`, `1.0` stays `1.0`, and a value such as `1e-05`
+keeps that exponent form. A verifier that reparses numbers as IEEE floats
+and reprints them will not match rows that were already sealed.
 
 ```
 preloop audit verify
@@ -384,6 +554,15 @@ than glossed over. Rows below `pruned_below_seq` were removed by the retention
 purge under a stated policy: the purge raises that floor as it deletes, so
 enforcing retention does not read as tampering. Rows written since the last
 sealing pass are not chained yet (`unsealed_rows`).
+
+### In the console
+
+Settings > Records, under Audit integrity, shows sealed and unsealed counts,
+the seal lag, and the latest checkpoint. Verify chain runs on the server.
+Verify offline shows `preloop audit verify` and the account key id, with a
+download of the public key. The audit timeline links there. A clean result
+shows the rows were not reordered, removed or edited after sealing; not that
+they were true when written.
 
 Every `AUDIT_CHAIN_CHECKPOINT_INTERVAL` sealed rows, Preloop signs a
 checkpoint over the chain head. A checkpoint you copied off the platform is
@@ -444,6 +623,14 @@ verification time only shows that the bundle matches whatever key we serve you
 today; a key you copied when the bundle was issued does not depend on us at
 all. `preloop audit keys` prints them for that purpose.
 
+### In the console
+
+Settings > Records lists the active key and retired keys, and can rotate a
+key. Period exports are on the same page: the download names the signing key
+from the response headers and shows `preloop evidence verify` with that key
+file. The execution page downloads an evidence pack and shows the integrity
+header from that download.
+
 Packs captured before signing existed, and accounts whose key could not be
 minted, have no signature. The receipt says `signature: null` rather than
 pretending, and signing is never a precondition for storing evidence: bytes
@@ -497,19 +684,31 @@ the storage layer.
    consumer accepts a pack. A 404/409/410 is a release blocker, not a
    skippable warning.
 5. Keep Kubernetes RBAC for pod logs tight on clusters that still run the
-   legacy log channel (`FLOW_ARTIFACT_DIRECT_UPLOAD=false`).
-6. Decide record retention per class and set `RETENTION_PURGE_ENABLED`
+   legacy log channel (`FLOW_ARTIFACT_DIRECT_UPLOAD=false` and
+   `FLOW_EVIDENCE_LOG_PLAINTEXT=true`). To keep evidence bytes out of pod
+   logs, set `FLOW_EVIDENCE_LOG_PLAINTEXT=false` and enable direct upload.
+   `evidence-status` `failed` with error `plaintext_disabled` means the log
+   channel was refused and no upload token was available. That is not a
+   successful empty pack.
+6. This switch only governs the artifact wrapper. It does not hide the pod
+   spec (environment and tokens) from someone who can read the Job, and it
+   does not stop the agent from printing sensitive prose on ordinary stdout.
+7. Decide record retention per class and set `RETENTION_PURGE_ENABLED`
    deliberately. Until it is on, nothing is deleted and the stated retention
-   is not enforced. Run `GET /api/v1/retention/purge-preview` before the
-   first enabled pass.
-7. Place a legal hold before an incident review starts, not after the
+   is not enforced. Run `GET /api/v1/retention/purge-preview`, or Preview
+   purge on Settings > Records, before the first enabled pass.
+8. Place a legal hold before an incident review starts, not after the
    payload window has closed. A hold pins bytes that are still there; it
-   cannot bring back bytes already cleared.
-8. Copy signed checkpoints (`GET /api/v1/audit/chain/checkpoints`) and the
-   public keys (`preloop audit keys`) somewhere Preloop cannot write. Held
+   cannot bring back bytes already cleared. Place it from Settings > Records
+   or from the execution, approval, or session page, or with
+   `POST /api/v1/retention/holds`.
+9. Copy signed checkpoints (`GET /api/v1/audit/chain/checkpoints`, or the
+   table on Settings > Records) and the public keys (`preloop audit keys`,
+   or Download public key on that page) somewhere Preloop cannot write. Held
    only here, they prove consistency between two things under the same
    control. Run `preloop audit verify` on a schedule and treat a break as an
-   incident.
+   incident. The console Verify chain button is the server's own walk, not a
+   substitute for that command.
 
 ### Cloud analytics history and stored records
 

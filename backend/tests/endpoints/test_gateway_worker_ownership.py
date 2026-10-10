@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from collections.abc import Generator, Mapping
 from dataclasses import fields, is_dataclass
-from threading import Event, Lock, get_ident
+from threading import Barrier, Event, Lock, get_ident
 from typing import Any
 from unittest.mock import patch
 
@@ -307,6 +308,90 @@ async def test_three_streams_keep_two_slot_pool_and_worker_sessions_independent(
         event.remove(Session, "before_flush", flushing)
 
 
+#: How long the first two streams keep their slots before releasing them. Twice
+#: the 0.5s checkout timeout this rig used to have, and well inside the 5s
+#: production timeout the third stream now queues for.
+SLOW_PREPARATION_SECONDS = 1.0
+
+
+@pytest.mark.asyncio
+async def test_third_stream_queues_while_both_slots_are_held_through_slow_prep(
+    worker_pool: tuple[GatewayPoolFixture, list[Session]],
+) -> None:
+    """A slow runner's auth/prep must delay the third stream, never fail it.
+
+    The three-stream test above used to fail on CI with an opaque HTTP 500
+    when auth/prep outlasted the rig's checkout timeout. Rather than rely on
+    host speed, this holds the pool saturated for a fixed time: the first two
+    slot holders meet at a barrier (so both slots are provably checked out),
+    then keep their slots for ``SLOW_PREPARATION_SECONDS`` before releasing.
+    """
+    rig, _request_sessions = worker_pool
+    provider = HeldProvider()
+    provider.release_handshakes.set()
+    provider.release_streams.set()
+    path, payload = _request("responses")
+    headers = {"Authorization": f"Bearer {rig.token}"}
+    both_slots_held = Barrier(2, timeout=10)
+    held_lock = Lock()
+    held_checkouts: list[int] = []
+    original_release = OpenAIGatewayService.release_db_for_wait
+
+    def slow_release(service: OpenAIGatewayService, *args: Any) -> None:
+        # Worker threads only (never the event loop), so this blocks one slot.
+        with held_lock:
+            stall = len(held_checkouts) < 2
+            if stall:
+                held_checkouts.append(-1)
+        if stall:
+            both_slots_held.wait()
+            with held_lock:
+                held_checkouts[held_checkouts.index(-1)] = rig.engine.pool.checkedout()
+            time.sleep(SLOW_PREPARATION_SECONDS)
+        original_release(service, *args)
+
+    with (
+        patch.object(OpenAIGatewayService, "release_db_for_wait", slow_release),
+        patch(
+            "preloop.services.openai_gateway.litellm.completion",
+            side_effect=provider.completion,
+        ),
+        patch("preloop.services.openai_gateway.emit_account_event"),
+        patch("preloop.services.openai_gateway._emit_account_event_nonblocking"),
+        patch(
+            "preloop.services.openai_gateway.ModelGatewayEventEmitter.emit_for_usage"
+        ),
+        patch(
+            "preloop.services.openai_gateway.GatewayUsageSearchService.build_index_document"
+        ),
+        patch("preloop.services.openai_gateway.get_gateway_usage_index_queue"),
+    ):
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=rig.app, raise_app_exceptions=False),
+            base_url="http://test",
+        ) as client:
+            started = time.monotonic()
+            responses = await asyncio.wait_for(
+                asyncio.gather(
+                    *(
+                        client.post(path, json=payload, headers=headers)
+                        for _ in range(3)
+                    )
+                ),
+                timeout=30,
+            )
+            elapsed = time.monotonic() - started
+
+    assert [response.status_code for response in responses] == [200, 200, 200], [
+        response.text[:200] for response in responses
+    ]
+    # Both slots were checked out while the stall ran, so the third stream
+    # really did queue for at least the stall rather than slipping past it.
+    assert held_checkouts == [2, 2]
+    assert elapsed >= SLOW_PREPARATION_SECONDS
+    assert rig.engine.pool.checkedout() == 0
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("accounting_failure", [False, True])
 async def test_repeated_cancellation_drains_accounting_owned_session(
@@ -434,7 +519,7 @@ async def test_http_failure_closes_every_owned_database_phase(
     worker_pool: tuple[GatewayPoolFixture, list[Session]], failure: str
 ) -> None:
     """Failures before streaming starts close fresh workers and preserve capacity."""
-    from preloop.services.model_content_policy import load_model_io_rules
+    from preloop.services.model_content_policy import load_gateway_policy_blocks
 
     rig, request_sessions = worker_pool
     observed: set[Session] = set()
@@ -460,11 +545,11 @@ async def test_http_failure_closes_every_owned_database_phase(
 
     def policy(db: Session, account_id: Any) -> Any:
         policy_sessions.append(db)
-        rules = load_model_io_rules(db, account_id)
+        blocks = load_gateway_policy_blocks(db, account_id)
         if failure == "initial_policy":
             assert db.in_transaction()
             raise SQLAlchemyError("synthetic policy store unavailable")
-        return rules
+        return blocks
 
     def timeout(**kwargs: Any) -> Any:
         assert rig.engine.pool.checkedout() == 0
@@ -479,7 +564,7 @@ async def test_http_failure_closes_every_owned_database_phase(
             patch.object(Session, "close", close),
             patch("preloop.services.openai_gateway.enqueue_gateway_5xx_alert"),
             patch(
-                "preloop.services.model_content_policy.load_model_io_rules",
+                "preloop.services.model_content_policy.load_gateway_policy_blocks",
                 side_effect=policy,
             ),
             patch(

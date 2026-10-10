@@ -1,12 +1,16 @@
 """ORM model definitions."""
 
+from .oauth_connection import OAuthProviderConfiguration, OAuthConnectionTransaction
 from .account import Account
 from .account_halt import AccountHalt, HALT_SCOPES
 from .agent_control_command import AgentControlCommand
 from .api_key import ApiKey
+from .gateway_subject import GatewaySubject
+from .ci_principal import CiPrincipal
 from .api_usage import ApiUsage
 from .audit_log import AuditLog
 from .base import Base
+from .chat import ChatConnection, ChatIdentity, ChatLinkCode, ChatWork
 from .comment import Comment
 from .issue import EmbeddingModel, Issue, IssueEmbedding
 from .issue_duplicate import IssueDuplicate
@@ -56,12 +60,18 @@ from .legal_hold import (
     HOLD_RESOURCE_TYPES,
     LegalHold,
 )
+from .discovery_observation import DiscoveryObservation
+from .discovered_agent_candidate import (
+    AccountDiscoverySalt,
+    DiscoveredAgentCandidate,
+)
 from .managed_agent import ManagedAgent
 from .managed_agent_ai_model_binding import ManagedAgentAIModelBinding
 from .managed_agent_credential import ManagedAgentCredential
 from .managed_agent_enrollment import ManagedAgentEnrollment
 from .model_price_override import ModelPriceOverride
 from .provider_billing import ProviderBillingConnection, ProviderBillingSnapshot
+from .copilot_import import CopilotImportConnection, CopilotUserMapping
 from .tool_configuration import ToolConfiguration, ApprovalWorkflow
 from .mcp_server import MCPServer
 from .mcp_tool import MCPTool
@@ -82,13 +92,21 @@ from .notification_preferences import NotificationPreferences
 from .registration_token import RegistrationToken
 from .team import Team, TeamMembership
 from .user import User, UserSource
+from .person import Person
+from .account_access_grant import AccountAccessGrant, account_access_grant_target
+from .access_rule import AccessRule
+from .resource_share import ResourceShare, ResourceShareRecipient
+from .resource_tag import ResourceTag, TagKeyPolicy
+from . import hierarchy  # noqa: F401  (registers the before_flush defaults)
 from .permission import Permission, Role, RolePermission, UserRole, TeamRole
 from .user_invitation import UserInvitation, UserInvitationStatus
 from .event import Event
 from .visitor import Visitor
 from .identity_link import IdentityLink
+from .policy_notice_hit import PolicyNoticeHit
 from .account_milestone import AccountMilestone
 from .attention_dismissal import AttentionDismissal
+from .spend_outlier import SpendOutlierFinding, SpendOutlierSettings
 from .instance import Instance
 from .cli_client import CliClient
 from .github_app_installation import OAuthAppInstallation, GitHubAppInstallation
@@ -98,6 +116,7 @@ from .repricing_job import RepricingJob
 from .policy_snapshot import PolicySnapshot
 from .runtime_session import RuntimeSession
 from .runtime_session_activity import RuntimeSessionActivity
+from .runtime_session_artifact import RuntimeSessionArtifact
 from .runtime_session_optimization_action import RuntimeSessionOptimizationAction
 from .runtime_session_optimization_result import RuntimeSessionOptimizationResult
 from .runtime_session_replay_run import RuntimeSessionReplayRun
@@ -109,6 +128,7 @@ from .session_search_document import SessionSearchDocument
 from .tool_cost_flag import ToolCostFlag
 from .tool_output_filter import ToolOutputFilter
 from .oauth_mcp_client import OAuthMCPClient
+from .cli_session import CliSession
 from .oauth_mcp_token import (
     OAuthMCPAuthorizationCode,
     OAuthMCPAccessToken,
@@ -118,6 +138,7 @@ from .budget import BudgetPolicy, BudgetSpendActivity, BudgetPeriod
 from .billing_operation import BillingOperation
 from .hosted_spend import HostedSpendAccount, HostedSpendMonth, HostedSpendReservation
 
+from .issue_cost import IssueCostExecution, IssueCostPullRequest, IssueCostRollup
 from .issue_lifecycle import IssueLifecycle
 from .security_maintenance import (
     SecurityMaintenanceBaseline,
@@ -127,13 +148,26 @@ from .security_maintenance import (
     SecurityMaintenanceSweep,
 )
 
+from .callback_receipt import CallbackKeyBinding, CallbackReceipt
+
 __all__ = [
+    "CallbackKeyBinding",
+    "CallbackReceipt",
+    "ChatConnection",
+    "ChatIdentity",
+    "ChatLinkCode",
+    "ChatWork",
+    "OAuthProviderConfiguration",
+    "OAuthConnectionTransaction",
     "BillingOperation",
     "HostedSpendAccount",
     "HostedSpendMonth",
     "HostedSpendReservation",
     "FlowFeedback",
     "FlowThread",
+    "IssueCostExecution",
+    "IssueCostPullRequest",
+    "IssueCostRollup",
     "IssueLifecycle",
     "SecurityMaintenanceRelease",
     "SecurityMaintenanceItem",
@@ -154,6 +188,8 @@ __all__ = [
     "IssueEmbedding",
     "IssueDuplicate",
     "ApiKey",
+    "GatewaySubject",
+    "CiPrincipal",
     "ApiUsage",
     "AuditLog",
     "ClientVersionLog",
@@ -192,6 +228,9 @@ __all__ = [
     "HOLD_RESOURCE_EVIDENCE_PACK",
     "HOLD_RESOURCE_EXECUTION",
     "HOLD_RESOURCE_TYPES",
+    "AccountDiscoverySalt",
+    "DiscoveredAgentCandidate",
+    "DiscoveryObservation",
     "ManagedAgent",
     "ManagedAgentAIModelBinding",
     "ManagedAgentCredential",
@@ -199,6 +238,8 @@ __all__ = [
     "ModelPriceOverride",
     "ProviderBillingConnection",
     "ProviderBillingSnapshot",
+    "CopilotImportConnection",
+    "CopilotUserMapping",
     "ToolConfiguration",
     "ApprovalWorkflow",
     "MCPServer",
@@ -217,6 +258,14 @@ __all__ = [
     "Team",
     "TeamMembership",
     "User",
+    "Person",
+    "AccountAccessGrant",
+    "account_access_grant_target",
+    "AccessRule",
+    "ResourceShare",
+    "ResourceShareRecipient",
+    "ResourceTag",
+    "TagKeyPolicy",
     "UserSource",
     "Permission",
     "Role",
@@ -228,8 +277,11 @@ __all__ = [
     "Event",
     "Visitor",
     "IdentityLink",
+    "PolicyNoticeHit",
     "AccountMilestone",
     "AttentionDismissal",
+    "SpendOutlierFinding",
+    "SpendOutlierSettings",
     "Instance",
     "CliClient",
     "OAuthAppInstallation",
@@ -241,6 +293,7 @@ __all__ = [
     "PolicySnapshot",
     "RuntimeSession",
     "RuntimeSessionActivity",
+    "RuntimeSessionArtifact",
     "RuntimeSessionOptimizationAction",
     "RuntimeSessionReplayRun",
     "RuntimeSessionOptimizationResult",
@@ -255,7 +308,23 @@ __all__ = [
     "BudgetSpendActivity",
     "BudgetPeriod",
     "OAuthMCPClient",
+    "CliSession",
     "OAuthMCPAuthorizationCode",
     "OAuthMCPAccessToken",
     "OAuthMCPRefreshToken",
+    "ReadinessCursor",
+    "ReadinessJob",
+    "ReadinessObservationRecord",
+    "ReadinessPolicyRecord",
+    "ReadinessSeries",
+    "TicketCreationRecord",
 ]
+
+from .readiness import (
+    ReadinessCursor,
+    ReadinessJob,
+    ReadinessObservationRecord,
+    ReadinessPolicyRecord,
+    ReadinessSeries,
+    TicketCreationRecord,
+)

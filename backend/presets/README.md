@@ -36,9 +36,16 @@ allowed_mcp_servers: []
 allowed_mcp_tools:
   - name: "search_issues"
   - name: "get_issue"
-# Codex/Gemini/OpenCode always attach Preloop MCP. Tool enablement is
-# the allowlist. Name-only entries are the legacy shape and mean
-# Preloop builtins on preloop-mcp.
+# Codex attaches Preloop MCP only when allowed_mcp_servers or
+# allowed_mcp_tools is non-empty. An empty allowlist does not open an
+# MCP session. Gemini and OpenCode still add the Preloop MCP server.
+# Tool enablement is the allowlist. Name-only entries are the legacy
+# shape and mean Preloop builtins on preloop-mcp.
+# sandbox_type: exec (the preset default) launches Codex with --yolo.
+# sandbox_type: read-only launches with --sandbox read-only, disables
+# the shell_tool feature, and does not pass --yolo. config.toml pins
+# approval_policy = "never", which is already the codex exec default,
+# so the run does not wait for a person. That is the platform shell lock.
 git_clone_config: null
 timeout_seconds: 1800          # Optional per-flow wall-clock budget
 is_preset: true
@@ -103,3 +110,12 @@ the exact revision that closed an issue through a verified merged PR. Both use t
 public lifecycle controller; neither requires private presets or plugins. Configure
 project policy, scoped repository checkout and approved test environments as
 explained in [the lifecycle guide](../../docs/guide/flows/issue-lifecycle.md).
+
+## Control-plane presets
+
+`018-release-backport.yaml` runs no agent. When `git_clone_config.backport`
+is enabled, the orchestrator cherry-picks the merged pull request onto each
+target branch itself and opens the backport pull requests. `agent_type` and
+`prompt_template` are still present because a flow requires them, but the
+prompt is never sent to a model. See
+[the backport guide](../../docs/guide/flows/release-backport.md).

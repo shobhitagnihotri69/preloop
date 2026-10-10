@@ -2,8 +2,10 @@ import { playwrightLauncher } from '@web/test-runner-playwright';
 import { esbuildPlugin } from '@web/dev-server-esbuild';
 import fs from 'fs/promises';
 import path from 'path';
+import { testConcurrency } from './scripts/test-concurrency.mjs';
 
 const headed = process.env.HEADED === 'true';
+const concurrency = testConcurrency();
 
 const cssInlinePlugin = {
   name: 'css-inline-plugin',
@@ -22,6 +24,7 @@ const cssInlinePlugin = {
 };
 
 export default {
+  ...(concurrency === undefined ? {} : { concurrency }),
   plugins: [
     cssInlinePlugin,
     esbuildPlugin({
@@ -33,7 +36,12 @@ export default {
       // `process.env.NODE_ENV` (table-core's debug logging) threw
       // "process is not defined" in the browser. Substituting the same value
       // the build uses keeps the two environments on one code path.
-      define: { 'process.env.NODE_ENV': '"production"' },
+      define: {
+        'process.env.NODE_ENV': '"production"',
+        // Production builds constant-fold this to false. Tests load the
+        // same modules, so the dev-only logger must not throw or print.
+        'import.meta.env.DEV': 'false',
+      },
     }),
   ],
   browsers: [playwrightLauncher({

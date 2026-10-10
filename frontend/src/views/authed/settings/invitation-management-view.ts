@@ -1,3 +1,7 @@
+import { ConsoleStatus } from '../../../controllers/console-status';
+import { parseUTCDate } from '../../../utils/date';
+import '@shoelace-style/shoelace/dist/components/tooltip/tooltip.js';
+import { EditPermissions } from '../../../controllers/edit-permissions';
 import { LitElement, html, css, unsafeCSS } from 'lit';
 import { customElement, state } from 'lit/decorators.js';
 import { repeat } from 'lit/directives/repeat.js';
@@ -24,10 +28,14 @@ import '@shoelace-style/shoelace/dist/components/tab-panel/tab-panel.js';
 import '@shoelace-style/shoelace/dist/components/select/select.js';
 import '@shoelace-style/shoelace/dist/components/option/option.js';
 import '../../../components/preloop-invite-dialog';
+import '../../../components/view-header.ts';
+import { confirmDialog, showToast } from '../../../components/confirm-dialog';
 import consoleStyles from '../../../styles/console-styles.css?inline';
 
 @customElement('invitation-management-view')
 export class InvitationManagementView extends LitElement {
+  private readonly accessibilityStatus = new ConsoleStatus(this);
+  private readonly editPermissions = new EditPermissions(this);
   @state()
   private invitations: UserInvitation[] = [];
 
@@ -59,19 +67,6 @@ export class InvitationManagementView extends LitElement {
          (styles/console-styles.css, "The page box"). */
       :host {
         display: block;
-      }
-
-      .header {
-        display: flex;
-        justify-content: space-between;
-        align-items: center;
-        margin-bottom: 2rem;
-      }
-
-      h1 {
-        margin: 0;
-        font-size: 1.5rem;
-        font-weight: 600;
       }
 
       .invitations-grid {
@@ -215,6 +210,7 @@ export class InvitationManagementView extends LitElement {
   }
 
   async handleCreateInvitation() {
+    if (!this.editPermissions.allows('invite_users')) return;
     if (!this.newInvitation.email) {
       return;
     }
@@ -231,9 +227,10 @@ export class InvitationManagementView extends LitElement {
   }
 
   async handleResendInvitation(invitation: UserInvitation) {
+    if (!this.editPermissions.allows('invite_users')) return;
     try {
       await resendInvitation(invitation.id);
-      alert('Invitation resent successfully');
+      showToast(`Invitation resent to ${invitation.email}.`, 'success');
     } catch (error) {
       this.error =
         error instanceof Error ? error.message : 'Failed to resend invitation';
@@ -241,11 +238,17 @@ export class InvitationManagementView extends LitElement {
   }
 
   async handleCancelInvitation(invitation: UserInvitation) {
-    if (
-      !confirm(
-        `Are you sure you want to cancel the invitation to ${invitation.email}?`
-      )
-    ) {
+    if (!this.editPermissions.allows('invite_users')) return;
+    const confirmed = await confirmDialog({
+      title: 'Cancel invitation?',
+      message: `Cancel the invitation to ${invitation.email}?`,
+      detail:
+        'The link in their email stops working. You can send a new invitation later.',
+      confirmLabel: 'Cancel invitation',
+      cancelLabel: 'Keep invitation',
+      variant: 'danger',
+    });
+    if (!confirmed) {
       return;
     }
 
@@ -259,7 +262,7 @@ export class InvitationManagementView extends LitElement {
   }
 
   formatDate(dateString: string): string {
-    const date = new Date(dateString);
+    const date = parseUTCDate(dateString);
     return (
       date.toLocaleDateString() +
       ' ' +
@@ -302,18 +305,27 @@ export class InvitationManagementView extends LitElement {
     }
 
     return html`
-      <div class="header">
-        <h1>Invitations</h1>
-        <sl-button
-          variant="primary"
-          @click=${() => (this.isCreateModalOpen = true)}
-        >
-          <sl-icon slot="prefix" name="envelope-plus"></sl-icon>
-          Send invitation
-        </sl-button>
-      </div>
+      <view-header headerText="Invitations" width="narrow">
+        <div slot="main-column">
+          <sl-tooltip
+            content=${!this.editPermissions.allows('invite_users') ? 'Requires invite_users' : ''}
+            ><sl-button
+              ?disabled=${!this.editPermissions.allows('invite_users')}
+              variant="primary"
+              @click=${() => (this.isCreateModalOpen = true)}
+            >
+              <sl-icon slot="prefix" name="envelope-plus"></sl-icon>
+              Send invitation
+            </sl-button></sl-tooltip
+          >
+        </div>
+      </view-header>
 
-      ${this.error ? html`<div class="error">${this.error}</div>` : ''}
+      ${
+        this.error
+          ? html`<div class="error" role="alert">${this.error}</div>`
+          : ''
+      }
 
       <sl-tab-group
         @sl-tab-show=${(e: CustomEvent) => {
@@ -346,8 +358,10 @@ export class InvitationManagementView extends LitElement {
         @close=${() => {
           this.isCreateModalOpen = false;
         }}
-        @invitations-sent=${() => {
-          this.isCreateModalOpen = false;
+        @invitations-sent=${(e: CustomEvent) => {
+          if (!e.detail?.partial) {
+            this.isCreateModalOpen = false;
+          }
           this.fetchInvitations();
         }}
       ></preloop-invite-dialog>
@@ -415,27 +429,39 @@ export class InvitationManagementView extends LitElement {
                   ${
                     invitation.status === 'pending'
                       ? html`
-                          <sl-button
-                            size="small"
-                            @click=${() =>
-                              this.handleResendInvitation(invitation)}
-                            title="Resend invitation"
-                          >
-                            <sl-icon name="arrow-repeat"></sl-icon>
-                          </sl-button>
+                          <sl-tooltip
+                            content=${!this.editPermissions.allows('invite_users') ? 'Requires invite_users' : ''}
+                            ><sl-button
+                              ?disabled=${!this.editPermissions.allows('invite_users')}
+                              size="small"
+                              @click=${() =>
+                                this.handleResendInvitation(invitation)}
+                              title="Resend invitation"
+                            >
+                              <sl-icon
+                                name="arrow-repeat"
+                                label="Resend invitation"
+                              ></sl-icon> </sl-button
+                          ></sl-tooltip>
                           <!-- Outline, last, after a gap (DESIGN.md
                                "Destructive actions"). -->
-                          <sl-button
-                            class="danger-action"
-                            size="small"
-                            variant="danger"
-                            outline
-                            @click=${() =>
-                              this.handleCancelInvitation(invitation)}
-                            title="Cancel invitation"
-                          >
-                            <sl-icon name="x-lg"></sl-icon>
-                          </sl-button>
+                          <sl-tooltip
+                            content=${!this.editPermissions.allows('invite_users') ? 'Requires invite_users' : ''}
+                            ><sl-button
+                              ?disabled=${!this.editPermissions.allows('invite_users')}
+                              class="danger-action"
+                              size="small"
+                              variant="danger"
+                              outline
+                              @click=${() =>
+                                this.handleCancelInvitation(invitation)}
+                              title="Cancel invitation"
+                            >
+                              <sl-icon
+                                name="x-lg"
+                                label="Cancel invitation"
+                              ></sl-icon> </sl-button
+                          ></sl-tooltip>
                         `
                       : ''
                   }

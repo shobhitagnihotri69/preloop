@@ -77,7 +77,7 @@ PRELOOP_URL=https://review.preloop.ai preloop login --headless
 # Check authentication status
 preloop auth status
 
-# List policies
+# List policy versions, newest first
 preloop policy list
 
 # Validate a policy file
@@ -105,8 +105,10 @@ preloop login --loopback             # Force local loopback OAuth
 preloop signup                       # Open the sign-up page, then authenticate the CLI
 preloop auth login                   # Same as preloop login
 preloop auth signup                  # Same as preloop signup
-preloop auth logout                  # Clear local credentials
+preloop auth logout                  # Revoke this login on the server, then clear local credentials
 preloop auth logout --all            # Revoke every session, then clear local credentials
+preloop auth sessions list           # List active CLI logins (this one is marked)
+preloop auth sessions revoke <id>    # Revoke one CLI login
 preloop auth status                  # Show authentication status
 preloop auth token                   # Print token for scripting
 ```
@@ -115,10 +117,21 @@ The login flow resolves the API URL in this order: `--url`, `PRELOOP_URL`, confi
 
 ### Signing out and revoking a login
 
-`preloop auth logout` only deletes the tokens stored on this machine. Other
-CLI hosts and the console stay signed in. To revoke every JWT session for
-the signed-in user (this host, other hosts, and the console), run
-`preloop auth logout --all`. That calls `POST /auth/sessions/revoke-all`,
+`preloop auth logout` posts the stored refresh token to `POST /oauth/revoke`,
+which revokes this login's server-side session (its access and refresh
+token both stop working), then deletes the tokens stored on this machine.
+Other CLI hosts and the console stay signed in. A login made before
+per-login sessions existed cannot be revoked on its own; logout says so and
+points at `--all`. If the server cannot be reached, the local file is still
+cleared and logout warns that this login stays valid.
+
+`preloop auth sessions list` shows every active CLI login of your user with
+its host name (sent as `device_name` at login), client and last use.
+`preloop auth sessions revoke <id>` revokes one of them, for example a
+laptop you no longer have.
+
+To revoke every JWT session for the signed-in user (this host, other hosts,
+and the console), run `preloop auth logout --all`. That calls `POST /auth/sessions/revoke-all`,
 which increments the user's `auth_generation` so every outstanding access
 and refresh token fails the next time it is used. API keys and runner
 tokens are not affected.
@@ -130,7 +143,7 @@ has the same control as **Sign out everywhere**.
 ### Policy Management
 
 ```bash
-preloop policy list                    # List all policies
+preloop policy list                    # List policy versions, newest first
 preloop policy validate <file>         # Validate a policy file
 preloop policy apply <file>            # Apply a policy
 preloop policy apply <file> --dry-run  # Preview changes without applying
@@ -149,6 +162,22 @@ preloop tools exec <tool-name> --args-file ./input.json
 
 `preloop tools` talks directly to the MCP endpoint, so the visible and executable tools are automatically filtered by the current token's policy. Agent tokens only see the tools they are allowed to use.
 
+### Codex CLI Agent Control
+
+```bash
+preloop agents onboard "Codex CLI"
+preloop agents validate "Codex CLI"
+preloop codex sidecar enable
+preloop codex sidecar status
+preloop codex sidecar disable
+```
+
+Onboarding installs `@preloop-ai/codex-plugin` (`preloop-codex-plugin`) and
+writes `~/.codex/preloop-control.json`. `~/.codex/config.toml` stays
+Codex's own file. `preloop codex sidecar run` execs
+`preloop-codex-plugin run`. See
+[docs/guide/codex-cli.md](../docs/guide/codex-cli.md).
+
 ### Cursor Agent CLI
 
 ```bash
@@ -163,6 +192,22 @@ output in `--print` mode. `preloop cursor run` injects
 usage to `/api/v1/usage/ingest`. Runs bill the user's own Cursor account;
 Preloop records estimates, not Cursor billing. See
 [docs/guide/cursor-cli.md](../docs/guide/cursor-cli.md).
+
+### Copilot CLI
+
+```bash
+preloop copilot --model openai/gpt-5
+preloop copilot --model anthropic/claude-sonnet-4-5 --provider anthropic
+```
+
+`preloop copilot` starts the GitHub Copilot CLI with BYOK environment
+variables pointed at the Preloop gateway. A missing binary, credential, or
+model alias exits without launching Copilot. `--token` and `PRELOOP_TOKEN`
+override the enrolled agent credential. See
+[docs/guide/copilot-cli.md](../docs/guide/copilot-cli.md). What Preloop
+governs and meters on each Copilot surface (VS Code Chat, this launcher,
+private-runner flows, the cloud agent, inline completions) is in
+[docs/guide/copilot.md](../docs/guide/copilot.md).
 
 ### Usage
 
@@ -202,9 +247,11 @@ preloop approvals deny <id>            # Deny a request
 
 ```bash
 preloop agents discover                 # Interactive discovery; can prompt to onboard
-preloop agents discover --json          # Emit discovery results as JSON
+preloop agents discover --json          # Emit safe discovery summaries as JSON
+preloop agents discover --inventory     # Offline known-app inventory JSON
 preloop agents discover --no-onboard-prompt
 preloop agents discover --yes           # Auto-onboard newly discovered agents
+preloop agents discover --report        # Opt in: report salted hashes to Preloop (or PRELOOP_DISCOVERY_REPORT=1)
 preloop agents enroll openclaw        # Apply managed enrollment for OpenClaw
 preloop agents enroll openclaw --dry-run
 preloop agents enroll openclaw --yes   # Skip the confirmation prompt
@@ -229,6 +276,47 @@ preloop agents sync                     # Alias for agents refresh
 
 `preloop agents discover` is the starting point for agent onboarding. In interactive terminals it can prompt to onboard newly discovered agents one by one. Use `--no-onboard-prompt` to keep discovery read-only in scripts/CI, or `--yes` to auto-onboard all new candidates. `preloop agents enroll openclaw` remains the explicit mutating command.
 
+Discovery JSON intentionally uses an allowlist: the array retains registered app
+`name` values and adds stable `app_id` and `mcp_server_count` fields. Raw
+`mcp_servers`, config paths, user-defined names and identities, auth/runtime
+details, and drift messages are no longer emitted because they can contain
+credentials or personal information. This is a security correction for JSON
+consumers; use the count instead of inspecting raw server definitions. `--json`
+still skips onboarding prompts, but can perform authenticated enrollment
+lookups and local telemetry counting. Root update checks are skipped so they
+cannot add an update prompt or notification to the JSON stream.
+
+`preloop agents status <agent> --json` uses the same agent allowlist (`name`,
+`app_id`, `mcp_server_count`, and the fixed auth, runtime, onboarding, and
+support enums). Local state keeps registered agent name, enrollment id, whether
+a config existed, the managed server name, and apply timestamps. Remote state
+keeps lifecycle, activity, gateway flags, credential status, and an allowlisted
+validation result. Model rows keep identifier and credential status. Env,
+headers, auth, config paths, tokens, raw local config, and raw remote config
+are omitted. The text status command is unchanged.
+
+Use `preloop agents discover --inventory` for an explicitly offline collection.
+The `preloop.inventory.v1` envelope contains a UTC `observed_at`, collector and
+detector versions, the fixed scope (`user=current`, `coverage=known-registry`),
+`completeness`, per-app `probe_results`, and `apps`. App IDs, evidence kinds,
+probe statuses and error codes are fixed values; MCP data consists only of
+aggregate config and server declaration counts. Counts are summed across the
+supported config files, so alternate files can declare the same server more
+than once. Authentication and usage always remain `unknown`.
+
+Inventory inspects supported app config structure and filesystem/runtime
+markers. Credential artifacts can be checked with metadata-only stat, but are
+never parsed; it performs no auth/keychain queries, provider or enrollment
+calls, telemetry, update checks, executable launches, prompts, or file writes.
+It requires no Preloop login. It rejects `--report`, `--add`, `--yes`, `--force`,
+`--skip-live-validate` and an enabled `PRELOOP_DISCOVERY_REPORT` setting; unset,
+`0`, or `false` reporting settings are accepted. `--json` and
+`--no-onboard-prompt` are redundant but accepted alongside `--inventory`.
+Malformed, unreadable, unknown, or platform-inconclusive probes mark the
+inventory `partial` and use safe error codes. Even `complete` describes only
+the known registry and supported locations: an empty app list never asserts
+that a person or machine does not use AI.
+
 Managed OpenClaw and Hermes onboarding creates a durable managed credential, backs up the local config, adds or replaces the local MCP config with a managed `preloop` entry, writes a `preloop.control.control_ws_url` contract plus the standalone runtime plugin package name (`preloop-hermes-plugin` or `@preloop-ai/openclaw-plugin`), and may also import existing MCP servers plus rewrite supported model settings to Preloop's OpenAI-compatible gateway. Use `--dry-run` to preview changes first. `preloop agents onboard --all -y` also ensures every discovered OpenClaw/Hermes runtime plugin available to the CLI is installed and verified, including agents that were already onboarded locally and would otherwise be skipped by the config rewrite step.
 
 `install-runtime hermes` and `install-runtime openclaw` use their official
@@ -241,7 +329,7 @@ Installation may need permission to install operating system dependencies.
 
 The CLI provisions credentials and configuration, and `preloop agents install-plugin <agent>` delegates to the runtime's own plugin marketplace installer. The runtime plugin, not the CLI, owns the long-lived WebSocket connection to `/api/v1/agents/control/ws`, reconnect/backoff, heartbeat and status events, capability advertisement, command receipt, and command execution or message injection into the active agent session. Runtime builds that have not loaded the native Agent Control plugin can ignore the control block safely; MCP firewall and gateway routing can still work, but Agent Control is not enabled. `preloop agents validate` reports `control_config_written`, `control_plugin_installed`, `control_plugin_verified`, and `control_channel_configured` separately so a metadata block is not mistaken for a live control channel.
 
-`preloop agents offboard` restores the last local backup and removes the managed agent from Preloop. Cleanup of account-level resources is controlled separately:
+`preloop agents offboard` restores the last local backup and archives the managed agent in Preloop. For Claude Code and Codex subscription OAuth bindings, it first restores the current login to the active local credential store. If required credential recovery fails, offboarding stops and keeps the remote credentials and local enrollment state for retry. A failure during later cleanup also keeps a retry checkpoint; success is reported only when all requested steps finish. Cleanup of account-level resources is controlled separately:
 
 - `--remove-model ask|yes|no` controls whether an eligible AI model should also be removed from Preloop
 - `--remove-mcp-servers ask|yes|no` controls whether eligible MCP servers should also be removed from Preloop
@@ -252,7 +340,7 @@ Both flags default to `ask`. With `--yes` alone, the CLI skips the main offboard
 - MCP servers are kept if they are still referenced by another managed agent
 - Recently active shared resources are also skipped
 
-`preloop agents refresh` (alias `sync`) re-fetches the authorized model list and rewrites only the managed model sections of onboarded agent configs. Selection, credentials, MCP config, and local backups are preserved.
+`preloop agents refresh` (alias `sync`) re-fetches the authorized model list and rewrites only the managed model sections of onboarded agent configs. Selection, credentials, MCP config, and local backups are preserved. Claude Code family pins are only moved to a newer alias when the provider's live model list confirms it; when the list cannot be fetched, the current authorized pin is kept and the refresh diff explains why.
 
 ### Operator notes
 
@@ -330,9 +418,12 @@ needs the `view_runtime_sessions` permission.
 preloop models sync                     # Pull newly released provider models into the catalog
 preloop models sync --provider anthropic
 preloop models sync --dry-run           # Report what would be added without writing
+preloop models smoke azure/chat-prod    # Send one tiny chat completion through the gateway
 ```
 
 `preloop models sync` calls `POST /api/v1/ai-models/sync` so newly released provider models enter the account catalog from credentials already stored on existing models. Then run `preloop agents refresh` to push those models into onboarded agent configs.
+
+`preloop models smoke <model-alias>` sends one small chat completion to `/openai/v1/chat/completions` and prints the HTTP status, latency, prompt/completion/total tokens and the usage row id the Cost page counts (from the `X-Preloop-Usage-Id` response header). It exits non-zero on an error status. Flags: `--prompt`, `--max-tokens`, `--timeout`, `--json`. Provider setup guides: [Amazon Bedrock](../docs/guide/providers/bedrock.md), [Azure OpenAI](../docs/guide/providers/azure-openai.md).
 
 ### Flows
 
@@ -379,7 +470,9 @@ release.
 preloop runner fg --labels local     # Foreground: register, heartbeat, lease jobs
 preloop runner fg --concurrency 4    # Hold four executions at once (default 2)
 preloop runner enable                # Install launchd / systemd / scheduled task
-preloop runner disable
+preloop runner disable                  # Remove the service
+preloop runner disable --delete [--force]   # ...and delete the runner on the server
+preloop runner rotate-token             # New runner token, service restarted
 preloop runner start|stop|restart|status
 ```
 
@@ -439,6 +532,8 @@ A shorter budget can deny before a longer workflow completes. Host-enforced
 limits and proxy timeouts can still cut a request short. OpenCode plugin
 onboarding retains its separate account-workflow timeout configuration.
 
+**Repository context.** When the hook event's cwd is inside a git work tree, the hook resolves the toplevel, the `origin` remote, and the path of cwd relative to the toplevel, within 500 ms, and sends that as `repository`. A timeout or any git error omits the field. No `origin` remote is recorded as `no_remote`. A directory outside a work tree records nothing. The value is an observation of the hook cwd, not of tool arguments, and it does not change policy evaluation. Linked worktrees report the worktree toplevel. Only `origin` is read. Strings are bounded to 512 bytes, and the remote is normalized to `host/owner/repo` with credentials removed. See [Tool configuration and approval workflow](../docs/architecture/approvals.md).
+
 Coverage follows the host's actual hook events: Claude Code uses `PreToolUse`;
 Cursor uses `beforeShellExecution`, `beforeMCPExecution`, and `preToolUse`, with
 deduplication only while the corresponding dedicated hook is installed. Cursor
@@ -482,12 +577,16 @@ All commands accept these flags:
 
 - `--token <token>` - Override the access token for this invocation
 - `--url <url>` - Override the API base URL for this invocation
+- `--profile <name>` - Use a named profile from the config file
+- `--account <slug>` - Act in one of the profile's stored accounts
 - `--verbose` / `-v` - Enable verbose output
 
 ### Environment Variables
 
 - `PRELOOP_TOKEN` - Override the access token
 - `PRELOOP_URL` - Override the API base URL
+- `PRELOOP_PROFILE` - Profile to use when `--profile` is not given
+- `PRELOOP_ACCOUNT` - Account to use when `--account` is not given
 
 ### Resolution Priority
 
@@ -495,6 +594,10 @@ Authentication and URL resolution use these rules:
 
 1. Token: `--token`, then `PRELOOP_TOKEN`, then the config file.
 2. API URL: `--url`, then `PRELOOP_URL`, then the config file, then `https://preloop.ai`.
+
+Profiles, per-account sessions, `preloop accounts` and the commands gated on
+server capabilities (`subaccounts`, `share`, `tags`, `access`) are described in
+[docs/guide/accounts-and-profiles.md](../docs/guide/accounts-and-profiles.md).
 
 ## Development
 
@@ -589,6 +692,15 @@ cli/
 ├── Makefile
 └── README.md
 ```
+
+## Offline managed hook export
+
+`preloop agents managed-config claude-code --output ./review-bundle --platform linux --cli-path /opt/preloop/bin/preloop --timeout 300`
+exports a secret-free Claude Code PreToolUse overlay, versioned manifest and
+preview. It supports macOS, Windows and Linux targets and performs no enrollment,
+installation, credential/config discovery, telemetry or network work. Per-device
+credentials are a separate prerequisite and app behavior remains unverified.
+See the [Claude Code rollout guide](../docs/guide/clients/claude-code.md#export-a-managed-hook-overlay).
 
 ## License
 

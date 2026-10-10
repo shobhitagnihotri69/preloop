@@ -4,6 +4,7 @@ import sinon from 'sinon';
 
 import './runtime-sessions-view';
 import type { RuntimeSessionsView } from './runtime-sessions-view';
+import { formatCueStart } from './runtime-sessions-view';
 
 describe('RuntimeSessionsView', () => {
   let fetchStub: sinon.SinonStub;
@@ -154,86 +155,105 @@ describe('RuntimeSessionsView', () => {
       }
 
       if (url.startsWith('/api/v1/runtime-sessions?')) {
-        return new Response(
-          JSON.stringify({
-            period_start: '2026-02-08T00:00:00Z',
-            period_end: '2026-03-09T23:59:59Z',
-            query: null,
-            session_source_type: null,
-            status: 'all',
-            total: 2,
-            limit: 50,
-            offset: 0,
-            items: [
-              {
-                id: 'runtime-session-1',
-                session_source_type: 'claude_code',
-                session_source_id: 'workspace-42',
-                session_reference: 'claude-session-42',
-                runtime_principal_type: 'claude_code',
-                runtime_principal_id: 'workspace-42',
-                runtime_principal_name: 'Claude Workspace',
-                started_at: '2026-03-09T18:00:00Z',
-                last_activity_at: '2026-03-09T20:00:00Z',
-                ended_at: null,
-                flow_id: null,
-                flow_name: null,
-                flow_execution_id: null,
-                latest_model_alias: 'anthropic/claude-sonnet-4',
-                latest_provider_name: 'Anthropic',
-                is_active_now: true,
-                activity_status: 'active_now',
-                total_requests: 4,
-                successful_requests: 3,
-                failed_requests: 1,
-                token_usage: {
-                  prompt_tokens: 1200,
-                  completion_tokens: 450,
-                  total_tokens: 1650,
-                },
-                estimated_cost: 0.42,
-                last_request_at: '2026-03-09T20:00:00Z',
-                note_count: 2,
-                latest_note_author_display: 'Reviewer',
-                latest_note_author_auth_method: 'agent',
-                latest_note_at: '2026-03-09T19:55:00Z',
+        const hasArtifacts = new URL(
+          url,
+          window.location.origin
+        ).searchParams.get('has_artifacts');
+        const page = {
+          period_start: '2026-02-08T00:00:00Z',
+          period_end: '2026-03-09T23:59:59Z',
+          query: null,
+          session_source_type: null,
+          status: 'all',
+          total: 2,
+          limit: 50,
+          offset: 0,
+          items: [
+            {
+              id: 'runtime-session-1',
+              session_source_type: 'claude_code',
+              session_source_id: 'workspace-42',
+              session_reference: 'claude-session-42',
+              runtime_principal_type: 'claude_code',
+              runtime_principal_id: 'workspace-42',
+              runtime_principal_name: 'Claude Workspace',
+              started_at: '2026-03-09T18:00:00Z',
+              last_activity_at: '2026-03-09T20:00:00Z',
+              ended_at: null,
+              flow_id: null,
+              flow_name: null,
+              flow_execution_id: null,
+              latest_model_alias: 'anthropic/claude-sonnet-4',
+              latest_provider_name: 'Anthropic',
+              is_active_now: true,
+              activity_status: 'active_now',
+              total_requests: 4,
+              successful_requests: 3,
+              failed_requests: 1,
+              token_usage: {
+                prompt_tokens: 1200,
+                completion_tokens: 450,
+                total_tokens: 1650,
               },
-              {
-                id: 'runtime-session-2',
-                session_source_type: 'flow_execution',
-                session_source_id: 'execution-1',
-                session_reference: 'session-abc123',
-                runtime_principal_type: 'flow_execution',
-                runtime_principal_id: 'execution-1',
-                runtime_principal_name: 'Triage Assistant',
-                started_at: '2026-03-09T19:00:00Z',
-                last_activity_at: '2026-03-09T19:15:00Z',
-                ended_at: '2026-03-09T19:20:00Z',
-                flow_id: 'flow-1',
-                flow_name: 'Triage Assistant',
-                flow_execution_id: 'execution-1',
-                latest_model_alias: 'openai/gpt-5',
-                latest_provider_name: 'OpenAI',
-                is_active_now: false,
-                activity_status: 'ended',
-                total_requests: 2,
-                successful_requests: 2,
-                failed_requests: 0,
-                token_usage: {
-                  prompt_tokens: 500,
-                  completion_tokens: 200,
-                  total_tokens: 700,
-                },
-                estimated_cost: 0.11,
-                last_request_at: '2026-03-09T19:15:00Z',
+              estimated_cost: 0.42,
+              last_request_at: '2026-03-09T20:00:00Z',
+              note_count: 2,
+              latest_note_author_display: 'Reviewer',
+              latest_note_author_auth_method: 'agent',
+              latest_note_at: '2026-03-09T19:55:00Z',
+              artifact_counts: {
+                screenshot: 3,
+                trace: 2,
+                transcript: 1,
+                document: 1,
+                recording: 1,
               },
-            ],
-          }),
-          {
-            status: 200,
-            headers: { 'Content-Type': 'application/json' },
-          }
-        );
+            },
+            {
+              id: 'runtime-session-2',
+              session_source_type: 'flow_execution',
+              session_source_id: 'execution-1',
+              session_reference: 'session-abc123',
+              runtime_principal_type: 'flow_execution',
+              runtime_principal_id: 'execution-1',
+              runtime_principal_name: 'Triage Assistant',
+              started_at: '2026-03-09T19:00:00Z',
+              last_activity_at: '2026-03-09T19:15:00Z',
+              ended_at: '2026-03-09T19:20:00Z',
+              flow_id: 'flow-1',
+              flow_name: 'Triage Assistant',
+              flow_execution_id: 'execution-1',
+              latest_model_alias: 'openai/gpt-5',
+              latest_provider_name: 'OpenAI',
+              is_active_now: false,
+              activity_status: 'ended',
+              total_requests: 2,
+              successful_requests: 2,
+              failed_requests: 0,
+              token_usage: {
+                prompt_tokens: 500,
+                completion_tokens: 200,
+                total_tokens: 700,
+              },
+              estimated_cost: 0.11,
+              last_request_at: '2026-03-09T19:15:00Z',
+            },
+          ],
+        };
+        if (hasArtifacts) {
+          // The server filter, mirrored: only rows holding that kind.
+          page.items = page.items.filter((item: any) => {
+            const counts = item.artifact_counts ?? {};
+            return hasArtifacts === 'any'
+              ? Object.keys(counts).length > 0
+              : (counts[hasArtifacts] ?? 0) > 0;
+          });
+          page.total = page.items.length;
+        }
+        return new Response(JSON.stringify(page), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
       }
 
       if (
@@ -742,6 +762,7 @@ describe('RuntimeSessionsView', () => {
         url.startsWith('/api/v1/runtime-sessions/runtime-session-1') &&
         !url.includes('/gateway-events') &&
         !url.includes('/activity') &&
+        !url.includes('/artifacts') &&
         !url.includes('/requests')
       );
     });
@@ -809,6 +830,141 @@ describe('RuntimeSessionsView', () => {
     expect(
       urls.filter((url) => url.startsWith('/api/v1/runtime-sessions?'))
     ).to.have.length(1);
+  });
+
+  describe('artifact counts on the list (#1084)', () => {
+    async function listPanelOf(element: RuntimeSessionsView) {
+      await waitUntil(
+        () => !(element as any).loading,
+        'Runtime sessions view did not finish loading'
+      );
+      await element.updateComplete;
+      const observer = element.shadowRoot!.querySelector(
+        'preloop-session-observer'
+      ) as any;
+      await observer.updateComplete;
+      const panel = observer.shadowRoot!.querySelector(
+        'session-list-panel'
+      ) as any;
+      await panel.updateComplete;
+      return { observer, panel };
+    }
+
+    it('renders kind icons with counts, three at most then +N, and a tooltip of every kind', async () => {
+      const element = (await fixture(
+        html`<runtime-sessions-view></runtime-sessions-view>`
+      )) as RuntimeSessionsView;
+      const { panel } = await listPanelOf(element);
+      await waitUntil(() =>
+        panel.shadowRoot!.querySelector(
+          '[data-testid="session-artifacts-runtime-session-1"]'
+        )
+      );
+      const cell = panel.shadowRoot!.querySelector(
+        '[data-testid="session-artifacts-runtime-session-1"]'
+      )!;
+      const kinds = Array.from(cell.querySelectorAll('.artifact-kind')).map(
+        (node) => [
+          node.getAttribute('data-kind'),
+          node.textContent!.replace(/\s+/g, ''),
+        ]
+      );
+      expect(kinds).to.deep.equal([
+        ['screenshot', '3'],
+        ['other', '3'],
+        ['transcript', '1'],
+        ['more', '+1'],
+      ]);
+      const tooltip = cell.getAttribute('title')!;
+      for (const part of [
+        'screenshot: 3',
+        'trace: 2',
+        'transcript: 1',
+        'document: 1',
+        'recording: 1',
+      ]) {
+        expect(tooltip).to.contain(part);
+      }
+      // A session without artifacts carries no cell at all.
+      expect(
+        panel.shadowRoot!.querySelector(
+          '[data-testid="session-artifacts-runtime-session-2"]'
+        )
+      ).to.equal(null);
+    });
+
+    it('narrows the list with the "Has artifacts: transcript" filter', async () => {
+      const element = (await fixture(
+        html`<runtime-sessions-view></runtime-sessions-view>`
+      )) as RuntimeSessionsView;
+      const { panel } = await listPanelOf(element);
+      expect(panel.sessions).to.have.length(2);
+
+      const select = element.shadowRoot!.querySelector(
+        '[data-testid="has-artifacts-filter"]'
+      ) as any;
+      expect(select, 'filter is on the toolbar').to.exist;
+      select.value = 'transcript';
+      select.dispatchEvent(new Event('sl-change'));
+      await (element as any).applyFilters();
+      await element.updateComplete;
+
+      const urls = fetchStub.getCalls().map((call) => String(call.args[0]));
+      expect(
+        urls.some(
+          (url) =>
+            url.startsWith('/api/v1/runtime-sessions?') &&
+            url.includes('has_artifacts=transcript')
+        )
+      ).to.equal(true);
+      const { panel: narrowed } = await listPanelOf(element);
+      await waitUntil(() => narrowed.sessions.length === 1);
+      expect(narrowed.sessions[0].id).to.equal('runtime-session-1');
+    });
+
+    it('says what to do next when no session holds that kind', async () => {
+      const element = (await fixture(
+        html`<runtime-sessions-view></runtime-sessions-view>`
+      )) as RuntimeSessionsView;
+      await listPanelOf(element);
+      (element as any).hasArtifacts = 'audio';
+      await (element as any).applyFilters();
+      await waitUntil(
+        () => getDeepText(element).includes('No sessions with audio matched.'),
+        'Empty state for the artifact filter did not render'
+      );
+      const text = getDeepText(element);
+      expect(text).to.contain('deposit_artifact');
+    });
+
+    it('opens the session filtered to the kind whose icon was clicked', async () => {
+      const element = (await fixture(
+        html`<runtime-sessions-view></runtime-sessions-view>`
+      )) as RuntimeSessionsView;
+      const { observer, panel } = await listPanelOf(element);
+      await waitUntil(() =>
+        panel.shadowRoot!.querySelector(
+          '[data-testid="session-artifacts-runtime-session-1"] [data-kind="transcript"]'
+        )
+      );
+      (
+        panel.shadowRoot!.querySelector(
+          '[data-testid="session-artifacts-runtime-session-1"] [data-kind="transcript"]'
+        ) as HTMLButtonElement
+      ).click();
+
+      await waitUntil(
+        () =>
+          observer.activeSessionId === 'runtime-session-1' &&
+          observer.artifactKindFilter === 'transcript',
+        'Session did not open with the transcript filter'
+      );
+      await observer.updateComplete;
+      const summary = observer.shadowRoot!.querySelector(
+        'session-artifact-summary'
+      ) as any;
+      if (summary) expect(summary.activeKind).to.equal('transcript');
+    });
   });
 
   it('shows flow-backed session content from execution gateway events', async () => {
@@ -1047,7 +1203,7 @@ describe('RuntimeSessionsView', () => {
       await (toolbar as any).updateComplete;
       const input = toolbar.shadowRoot!.querySelector('sl-input.search-input')!;
       expect(input.getAttribute('placeholder')).to.equal(
-        'Search prompts, responses, and tool calls'
+        'Search prompts, responses, tool calls, and artifacts'
       );
       expect(input.getAttribute('label')).to.equal('Search session content');
     });
@@ -1145,6 +1301,111 @@ describe('RuntimeSessionsView', () => {
       );
     });
 
+    it('shows an artifact hit with its kind, name, labels and cue time, and opens the session with its deposit row in the location', async () => {
+      fetchStub.withArgs(SEARCH_URL, sinon.match.any).callsFake(async () => {
+        const body = searchResponse();
+        body.results[0].snippets = [
+          {
+            document_id: 'doc-artifact',
+            runtime_session_id: 'runtime-session-2',
+            source_kind: 'artifact',
+            source_id: 'artifact-1',
+            chunk_index: 0,
+            occurred_at: '2026-03-09T19:00:00Z',
+            role: 'artifact',
+            rank: 0.5,
+            redaction_state: 'clear',
+            text: 'nord-late.vtt\nlabels: site=nord tags=handover dock\nReceiving Lead: Reporting a <mark>damaged</mark> <mark>pallet</mark>',
+            artifact: {
+              artifact_id: 'artifact-1',
+              activity_id: 'activity-artifact-1',
+              kind: 'transcript',
+              name: 'nord-late.vtt',
+              content_type: 'text/vtt',
+              labels: { site: 'nord', tags: ['handover', 'dock'] },
+              cue_start: 65.5,
+              text_truncated: false,
+            },
+          },
+        ];
+        return new Response(JSON.stringify(body), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      });
+
+      const element = await renderedSearch();
+      const button = snippetButtons(element)[0];
+      expect(button.textContent).to.contain('Transcript · nord-late.vtt');
+      const labels = Array.from(
+        button.querySelectorAll('[data-testid="snippet-artifact-label"]')
+      ).map((node) => node.textContent!.trim());
+      expect(labels).to.deep.equal(['site: nord', 'tags: handover, dock']);
+      expect(
+        button.querySelector('[data-testid="snippet-cue-start"]')!.textContent
+      ).to.contain('from 1:05');
+      // The timeline does not draw artifact rows yet, so no jump is claimed.
+      expect(button.textContent).to.contain('Opens the session');
+      // The header lines the badges already show are not repeated.
+      const body = button.querySelector('.snippet-text')!.textContent!;
+      expect(body.trim()).to.equal(
+        'Receiving Lead: Reporting a damaged pallet'
+      );
+
+      button.click();
+      await element.updateComplete;
+      expect((element as any).selectedSessionId).to.equal('runtime-session-2');
+      expect((element as any).focusTurnId).to.equal('activity-artifact-1');
+      expect(new URLSearchParams(window.location.search).get('turn')).to.equal(
+        'activity-artifact-1'
+      );
+    });
+
+    it('does not repeat the tool_name and labels header lines of an artifact hit', async () => {
+      fetchStub.withArgs(SEARCH_URL, sinon.match.any).callsFake(async () => {
+        const body = searchResponse();
+        body.results[0].snippets = [
+          {
+            document_id: 'doc-artifact-tool',
+            runtime_session_id: 'runtime-session-2',
+            source_kind: 'artifact',
+            source_id: 'artifact-2',
+            chunk_index: 0,
+            occurred_at: '2026-03-09T19:00:00Z',
+            role: 'artifact',
+            rank: 0.5,
+            redaction_state: 'clear',
+            text: 'name: dock-call.vtt\ntool_name: record_call\nlabels: site=nord\nReceiving Lead: a <mark>damaged</mark> pallet',
+            artifact: {
+              artifact_id: 'artifact-2',
+              activity_id: 'activity-artifact-2',
+              kind: 'transcript',
+              name: 'dock-call.vtt',
+              content_type: 'text/vtt',
+              tool_name: 'record_call',
+              labels: { site: 'nord' },
+              cue_start: null,
+              text_truncated: false,
+            },
+          },
+        ];
+        return new Response(JSON.stringify(body), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      });
+
+      const element = await renderedSearch();
+      const body =
+        snippetButtons(element)[0].querySelector('.snippet-text')!.textContent!;
+      expect(body.trim()).to.equal('Receiving Lead: a damaged pallet');
+    });
+
+    it('formats cue starts past an hour', () => {
+      expect(formatCueStart(0)).to.equal('0:00');
+      expect(formatCueStart(3725.9)).to.equal('1:02:05');
+    });
+
     it('does not claim nothing matched before a search has run', async () => {
       const element = (await fixture(
         html`<runtime-sessions-view></runtime-sessions-view>`
@@ -1169,6 +1430,25 @@ describe('RuntimeSessionsView', () => {
       );
       expect(loadingState).to.not.equal(null);
       expect(loadingState!.textContent).to.contain('Searching session content');
+    });
+
+    it('drops a stale ?artifact= when a snippet opens another session', async () => {
+      const element = await renderedSearch();
+      // An earlier landing on an artifact of some other session.
+      (element as any).focusArtifactId = 'artifact-of-session-1';
+      (element as any).syncUrl();
+      expect(
+        new URLSearchParams(window.location.search).get('artifact')
+      ).to.equal('artifact-of-session-1');
+
+      snippetButtons(element)[1].click();
+      await element.updateComplete;
+
+      expect((element as any).selectedSessionId).to.equal('runtime-session-2');
+      expect((element as any).focusArtifactId).to.equal(null);
+      const params = new URLSearchParams(window.location.search);
+      expect(params.get('artifact')).to.equal(null);
+      expect(params.get('turn')).to.equal('tool-7');
     });
 
     it('opens the session at the matching turn, and the location reproduces it', async () => {
@@ -1467,6 +1747,113 @@ describe('RuntimeSessionsView', () => {
       expect(notice!.textContent).to.contain('Semantic ranking is not enabled');
     });
 
+    it('keeps the semantic search settings closed and unread until asked', async () => {
+      const element = await renderedSearch();
+
+      expect(
+        element.shadowRoot!.querySelector('session-embedding-settings')
+      ).to.equal(null);
+      expect(
+        fetchStub
+          .getCalls()
+          .some((call) => String(call.args[0]).includes('/settings/embedding'))
+      ).to.equal(false);
+      expect(
+        element.shadowRoot!.querySelector(
+          '[data-testid="embedding-settings-toggle"]'
+        )
+      ).to.not.equal(null);
+    });
+
+    it('offers the opt in from the semantic_not_enabled notice', async () => {
+      fetchStub.withArgs(SEARCH_URL, sinon.match.any).callsFake(
+        async () =>
+          new Response(
+            JSON.stringify(
+              searchResponse({
+                mode: 'hybrid',
+                degraded: {
+                  keyword: true,
+                  semantic: false,
+                  reasons: ['semantic_not_enabled'],
+                  detail:
+                    'This account has not opted in to embedding its session content, so these are keyword results.',
+                },
+              })
+            ),
+            { status: 200, headers: { 'Content-Type': 'application/json' } }
+          )
+      );
+
+      const element = await renderedSearch();
+      const open = element.shadowRoot!.querySelector(
+        '[data-testid="degraded-notice"] [data-testid="open-embedding-settings"]'
+      ) as HTMLElement | null;
+      expect(open).to.not.equal(null);
+
+      open!.click();
+      await element.updateComplete;
+
+      expect(
+        element.shadowRoot!.querySelector('session-embedding-settings')
+      ).to.not.equal(null);
+    });
+
+    it('does not offer the opt in for a degraded reason it cannot fix', async () => {
+      fetchStub.withArgs(SEARCH_URL, sinon.match.any).callsFake(
+        async () =>
+          new Response(
+            JSON.stringify(
+              searchResponse({
+                mode: 'hybrid',
+                degraded: {
+                  keyword: true,
+                  semantic: false,
+                  reasons: ['semantic_disabled'],
+                  detail:
+                    'Semantic ranking is switched off on this deployment.',
+                },
+              })
+            ),
+            { status: 200, headers: { 'Content-Type': 'application/json' } }
+          )
+      );
+
+      const element = await renderedSearch();
+
+      expect(
+        element.shadowRoot!.querySelector(
+          '[data-testid="open-embedding-settings"]'
+        )
+      ).to.equal(null);
+    });
+
+    it('re-runs the current search after the embedding setting is saved', async () => {
+      const element = await renderedSearch();
+      const before = searchCalls().length;
+
+      element
+        .shadowRoot!.querySelector('[data-testid="embedding-settings-toggle"]')!
+        .dispatchEvent(new Event('click'));
+      await element.updateComplete;
+      const card = element.shadowRoot!.querySelector(
+        'session-embedding-settings'
+      )!;
+      card.dispatchEvent(
+        new CustomEvent('session-embedding-changed', {
+          bubbles: true,
+          composed: true,
+          detail: { setting: { enabled: true } },
+        })
+      );
+
+      await waitUntil(
+        () => searchCalls().length > before,
+        'the search was not re-run after the opt in',
+        { timeout: 3000 }
+      );
+    });
+
     it('issues one request after the debounce, not one per keystroke', async () => {
       const element = (await fixture(
         html`<runtime-sessions-view></runtime-sessions-view>`
@@ -1587,6 +1974,263 @@ describe('RuntimeSessionsView', () => {
       expect(description).to.contain(
         'Everything your agents did, as it happened'
       );
+    });
+  });
+
+  describe('paging', () => {
+    function sessionItem(id: string) {
+      return {
+        id,
+        session_source_type: 'flow_execution',
+        session_source_id: id,
+        session_reference: id,
+        started_at: '2026-03-09T18:00:00Z',
+        last_activity_at: '2026-03-09T20:00:00Z',
+        ended_at: null,
+        activity_status: 'ended',
+      };
+    }
+
+    function listPage(total: number, offset: number, limit: number) {
+      const items = Array.from({ length: Math.max(0, total - offset) })
+        .slice(0, limit)
+        .map((_unused, index) =>
+          sessionItem(`runtime-session-${offset + index}`)
+        );
+      return new Response(
+        JSON.stringify({
+          period_start: '2026-02-08T00:00:00Z',
+          period_end: '2026-03-09T23:59:59Z',
+          query: null,
+          session_source_type: null,
+          status: 'all',
+          total,
+          limit,
+          offset,
+          items,
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } }
+      );
+    }
+
+    function stubPagedSessions(total: number) {
+      fetchStub.callsFake(async (input: RequestInfo | URL) => {
+        const url = typeof input === 'string' ? input : input.toString();
+        if (url.startsWith('/api/v1/runtime-sessions?')) {
+          const params = new URL(url, window.location.origin).searchParams;
+          const offset = Number(params.get('offset') ?? 0);
+          const limit = Number(params.get('limit') ?? 50);
+          return listPage(total, offset, limit);
+        }
+        return new Response('{}', {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      });
+    }
+
+    function countLabel(element: RuntimeSessionsView): string {
+      return element
+        .shadowRoot!.querySelector('list-toolbar')!
+        .querySelector('[slot="count"]')!
+        .textContent!.trim();
+    }
+
+    function loadMoreButton(element: RuntimeSessionsView): HTMLElement | null {
+      return element.shadowRoot!.querySelector(
+        '[data-testid="load-more-sessions"]'
+      );
+    }
+
+    it('pages the list with Load more and keeps the count label honest', async () => {
+      stubPagedSessions(120);
+      const element = (await fixture(
+        html`<runtime-sessions-view></runtime-sessions-view>`
+      )) as RuntimeSessionsView;
+
+      await waitUntil(
+        () => !(element as any).loading,
+        'Runtime sessions view did not finish loading'
+      );
+      await element.updateComplete;
+
+      expect(countLabel(element)).to.equal('Showing 50 of 120');
+      expect(loadMoreButton(element)).to.not.equal(null);
+
+      loadMoreButton(element)!.click();
+      await waitUntil(
+        () => (element as any).sessions.items.length === 100,
+        'Second page did not append'
+      );
+      await element.updateComplete;
+      expect(countLabel(element)).to.equal('Showing 100 of 120');
+
+      loadMoreButton(element)!.click();
+      await waitUntil(
+        () => (element as any).sessions.items.length === 120,
+        'Final page did not append'
+      );
+      await element.updateComplete;
+      expect(countLabel(element)).to.equal('120 sessions');
+      expect(loadMoreButton(element)).to.equal(null);
+    });
+
+    it('keeps the loaded rows when loading more fails', async () => {
+      let failMore = false;
+      fetchStub.callsFake(async (input: RequestInfo | URL) => {
+        const url = typeof input === 'string' ? input : input.toString();
+        if (url.startsWith('/api/v1/runtime-sessions?')) {
+          const params = new URL(url, window.location.origin).searchParams;
+          const offset = Number(params.get('offset') ?? 0);
+          if (offset > 0 && failMore) {
+            return new Response(JSON.stringify({ detail: 'boom' }), {
+              status: 500,
+              headers: { 'Content-Type': 'application/json' },
+            });
+          }
+          return listPage(60, offset, 50);
+        }
+        return new Response('{}', {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      });
+
+      const element = (await fixture(
+        html`<runtime-sessions-view></runtime-sessions-view>`
+      )) as RuntimeSessionsView;
+      await waitUntil(
+        () => !(element as any).loading,
+        'Runtime sessions view did not finish loading'
+      );
+      await element.updateComplete;
+
+      failMore = true;
+      loadMoreButton(element)!.click();
+      await waitUntil(
+        () => element.shadowRoot!.querySelector('[data-testid="more-error"]'),
+        'No load-more error rendered'
+      );
+      await element.updateComplete;
+      expect((element as any).sessions.items.length).to.equal(50);
+      expect(loadMoreButton(element)).to.not.equal(null);
+
+      failMore = false;
+      loadMoreButton(element)!.click();
+      await waitUntil(
+        () => (element as any).sessions.items.length === 60,
+        'Rows did not append after the error cleared'
+      );
+      await element.updateComplete;
+      expect(loadMoreButton(element)).to.equal(null);
+      expect(
+        element.shadowRoot!.querySelector('[data-testid="more-error"]')
+      ).to.equal(null);
+    });
+
+    it('does not append a session the next page repeats', async () => {
+      fetchStub.callsFake(async (input: RequestInfo | URL) => {
+        const url = typeof input === 'string' ? input : input.toString();
+        if (url.startsWith('/api/v1/runtime-sessions?')) {
+          const params = new URL(url, window.location.origin).searchParams;
+          const offset = Number(params.get('offset') ?? 0);
+          if (offset > 0) {
+            const repeated = sessionItem('runtime-session-49');
+            const fresh = sessionItem('runtime-session-50');
+            return new Response(
+              JSON.stringify({
+                period_start: '2026-02-08T00:00:00Z',
+                period_end: '2026-03-09T23:59:59Z',
+                query: null,
+                session_source_type: null,
+                status: 'all',
+                total: 51,
+                limit: 50,
+                offset,
+                items: [repeated, fresh],
+              }),
+              { status: 200, headers: { 'Content-Type': 'application/json' } }
+            );
+          }
+          return listPage(51, 0, 50);
+        }
+        return new Response('{}', {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      });
+
+      const element = (await fixture(
+        html`<runtime-sessions-view></runtime-sessions-view>`
+      )) as RuntimeSessionsView;
+      await waitUntil(
+        () => !(element as any).loading,
+        'Runtime sessions view did not finish loading'
+      );
+      await element.updateComplete;
+
+      loadMoreButton(element)!.click();
+      await waitUntil(
+        () => (element as any).sessions.items.length === 51,
+        'Load more did not settle'
+      );
+      await element.updateComplete;
+
+      const ids = (element as any).sessions.items.map(
+        (item: { id: string }) => item.id
+      );
+      expect(ids).to.have.length(51);
+      expect(new Set(ids).size).to.equal(51);
+      expect(ids[ids.length - 1]).to.equal('runtime-session-50');
+    });
+
+    it('clears the loading flag when a refresh supersedes a load-more', async () => {
+      let resolveMore: ((response: Response) => void) | null = null;
+      fetchStub.callsFake(async (input: RequestInfo | URL) => {
+        const url = typeof input === 'string' ? input : input.toString();
+        if (url.startsWith('/api/v1/runtime-sessions?')) {
+          const params = new URL(url, window.location.origin).searchParams;
+          const offset = Number(params.get('offset') ?? 0);
+          if (offset > 0) {
+            // Hold the "load more" page open so a refresh can supersede it
+            // while it is still in flight.
+            return new Promise<Response>((resolve) => {
+              resolveMore = resolve;
+            });
+          }
+          return listPage(120, 0, 50);
+        }
+        return new Response('{}', {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      });
+
+      const element = (await fixture(
+        html`<runtime-sessions-view></runtime-sessions-view>`
+      )) as RuntimeSessionsView;
+      await waitUntil(
+        () => !(element as any).loading,
+        'Runtime sessions view did not finish loading'
+      );
+      await element.updateComplete;
+
+      const pending = (element as any).loadMoreSessions();
+      await waitUntil(() => resolveMore !== null, 'Load more did not start');
+      expect((element as any).loadingMore).to.equal(true);
+
+      // A live refresh supersedes the in-flight page and bumps loadSequence.
+      await (element as any).loadSessions(true);
+      await element.updateComplete;
+
+      resolveMore!(listPage(120, 50, 50));
+      await pending;
+      await element.updateComplete;
+
+      expect((element as any).loadingMore).to.equal(false);
+      const button = loadMoreButton(element);
+      expect(button).to.not.equal(null);
+      expect(button!.hasAttribute('loading')).to.equal(false);
     });
   });
 });

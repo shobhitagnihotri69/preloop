@@ -27,6 +27,11 @@ describe('PreloopFlowForm host execution profile', () => {
     expect(source).to.include('renderHostExecProfileField()');
     expect(source).to.include('composedAgentConfig()');
   });
+
+  it('offers Copilot CLI as a private-runner host profile', () => {
+    expect(source).to.include('value="copilot"');
+    expect(source).to.include('Copilot CLI (private runner host profile)');
+  });
 });
 
 describe('PreloopFlowForm host execution submit', () => {
@@ -51,6 +56,10 @@ describe('PreloopFlowForm host execution submit', () => {
                   {
                     name: 'cursor-ask',
                     capabilities: ['host_exec', 'cursor_cli'],
+                  },
+                  {
+                    name: 'copilot-review',
+                    capabilities: ['host_exec', 'copilot_cli'],
                   },
                 ],
               },
@@ -136,14 +145,30 @@ describe('PreloopFlowForm host execution submit', () => {
     void (element as any).handleFormSubmit(new Event('submit'));
     const event = await submitted;
     expect(event.detail.flow.ai_model_id ?? '').to.equal('');
-    expect(element.shadowRoot?.textContent).to.include(
-      'These flow tool settings do not apply.'
-    );
     expect(
-      element.shadowRoot
-        ?.querySelector('sl-select[label="Requested AI Model"]')
-        ?.getAttribute('help-text')
-    ).to.include('local profile');
+      element.shadowRoot?.querySelector('[data-host-exec-mcp-note]')
+        ?.textContent
+    ).to.include('preloop-flow');
+    expect(
+      element.shadowRoot?.querySelector('sl-select[label="AI model"]')
+    ).to.equal(null);
+    // Generic guidance on pinning a model, not a note about one model.
+    const help = (element.shadowRoot?.textContent || '').replace(/\s+/g, ' ');
+    expect(help).to.include('To pin a model, enter its Cursor model id');
+    expect(help).to.not.include('Grok');
+    const model = element.shadowRoot?.querySelector(
+      '[data-cursor-model]'
+    ) as HTMLInputElement;
+    expect(model).to.exist;
+    model.value = 'grok-4.7-high';
+    model.dispatchEvent(new CustomEvent('sl-input'));
+    await element.updateComplete;
+    const pinned = oneEvent(element, 'flow-submit');
+    void (element as any).handleFormSubmit(new Event('submit'));
+    const pinnedEvent = await pinned;
+    expect(pinnedEvent.detail.flow.agent_config.cursor_model).to.equal(
+      'grok-4.7-high'
+    );
   });
 
   it('omits host_exec_profile when saving a Docker harness', async () => {
@@ -164,6 +189,121 @@ describe('PreloopFlowForm host execution submit', () => {
     );
     expect(event.detail.flow.agent_config.image).to.equal(
       'registry.example.com/team/project:release'
+    );
+  });
+
+  it('explains the host checkout opt-in and refuses pull requests', async () => {
+    const element = await mount({
+      name: 'Review locally',
+      prompt_template: 'review',
+      agent_type: 'copilot',
+      runner_pool: 'office-mac',
+      agent_config: { host_exec_profile: 'copilot-review' },
+      git_clone_config: { enabled: true },
+    });
+    const notice = element.shadowRoot?.querySelector(
+      '[data-host-exec-clone-notice]'
+    );
+    expect(notice?.getAttribute('data-host-exec-clone-notice')).to.equal(
+      'checkout'
+    );
+    expect(notice?.textContent).to.include('allow_checkout');
+
+    element.flow = {
+      ...element.flow,
+      agent_type: 'cursor',
+      git_clone_config: { enabled: true, create_pull_request: true },
+    } as any;
+    await element.updateComplete;
+    const refused = element.shadowRoot?.querySelector(
+      '[data-host-exec-clone-notice]'
+    );
+    expect(refused?.getAttribute('data-host-exec-clone-notice')).to.equal(
+      'refused'
+    );
+    expect(refused?.textContent).to.include('Cursor runner will refuse');
+  });
+
+  it('explains the Copilot publication opt-in', async () => {
+    const element = await mount({
+      name: 'Implement locally',
+      prompt_template: 'implement',
+      agent_type: 'copilot',
+      runner_pool: 'office-mac',
+      agent_config: { host_exec_profile: 'copilot-publish' },
+      git_clone_config: { enabled: true, create_pull_request: true },
+    });
+    const notice = element.shadowRoot?.querySelector(
+      '[data-host-exec-clone-notice]'
+    );
+    expect(notice?.getAttribute('data-host-exec-clone-notice')).to.equal(
+      'publish'
+    );
+    expect(notice?.textContent).to.include('allow_publish');
+    expect(notice?.textContent).to.not.include('refuse the run');
+  });
+
+  it('saves a Copilot host profile with copilot_model only', async () => {
+    const element = await mount({
+      name: 'Review locally',
+      prompt_template: 'review',
+      agent_type: 'copilot',
+      runner_pool: 'office-mac',
+      agent_config: { cursor_model: 'composer-2.5' },
+    });
+    const input = element.shadowRoot?.querySelector(
+      'sl-input[label="Host execution profile"]'
+    ) as SlInput;
+    expect(input).to.exist;
+    // Only profiles that advertise the Copilot harness are suggested.
+    expect(input.placeholder).to.equal('copilot-review');
+    input.value = 'copilot-review';
+    input.dispatchEvent(new CustomEvent('sl-input'));
+    const model = element.shadowRoot?.querySelector(
+      '[data-copilot-model]'
+    ) as HTMLInputElement;
+    expect(model).to.exist;
+    model.value = ' team-default ';
+    model.dispatchEvent(new CustomEvent('sl-input'));
+    await element.updateComplete;
+    expect(
+      element.shadowRoot?.querySelector('sl-select[label="AI model"]')
+    ).to.equal(null);
+    const text = element.shadowRoot?.textContent || '';
+    expect(text).to.include('not metered by the Preloop gateway');
+    expect(text).to.include('preloop-flow');
+    expect(text).to.include('scoped to this execution');
+
+    const submitted = oneEvent(element, 'flow-submit');
+    void (element as any).handleFormSubmit(new Event('submit'));
+    const event = await submitted;
+    expect(event.detail.flow.agent_type).to.equal('copilot');
+    expect(event.detail.flow.ai_model_id ?? '').to.equal('');
+    expect(event.detail.flow.agent_config.host_exec_profile).to.equal(
+      'copilot-review'
+    );
+    expect(event.detail.flow.agent_config.copilot_model).to.equal(
+      'team-default'
+    );
+    expect(event.detail.flow.agent_config.cursor_model).to.equal(undefined);
+  });
+
+  it('drops copilot_model when the flow switches to a Docker harness', async () => {
+    const element = await mount({
+      name: 'Review',
+      prompt_template: 'review',
+      agent_type: 'codex',
+      agent_config: {
+        host_exec_profile: 'copilot-review',
+        copilot_model: 'team-default',
+      },
+    });
+    const submitted = oneEvent(element, 'flow-submit');
+    void (element as any).handleFormSubmit(new Event('submit'));
+    const event = await submitted;
+    expect(event.detail.flow.agent_config.copilot_model).to.equal(undefined);
+    expect(event.detail.flow.agent_config.host_exec_profile).to.equal(
+      undefined
     );
   });
 });

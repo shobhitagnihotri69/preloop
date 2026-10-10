@@ -1,3 +1,8 @@
+import { ConsoleStatus } from '../../controllers/console-status';
+import { tableScrollStyles } from '../../styles/table-scroll';
+import { formatUsd, formatUsdExact } from '../../utils/money';
+import { editionOf } from '../../capabilities';
+import type { Edition } from '../../api';
 import { LitElement, css, html, unsafeCSS, nothing } from 'lit';
 import { Router } from '../../router';
 import { styleMap } from 'lit/directives/style-map.js';
@@ -26,6 +31,7 @@ import '../../components/resource-actions.ts';
 import '../../components/list-selection.ts';
 import '../../components/talk-button.ts';
 import '../../components/confirm-dialog.ts';
+import '../../components/discovered-agents-panel.ts';
 import { totalTokensOf } from '../../components/token-figures';
 import { confirmDialog, showToast } from '../../components/confirm-dialog';
 import type { ResourceAction } from '../../components/resource-actions.ts';
@@ -46,7 +52,7 @@ import {
   getAccountAgents,
   removeAccountAgent,
   getAccountGatewayUsageSummary,
-  getFlows,
+  getFlowSummaries,
   getAIModels,
   getFeatures,
   updateAccountAgent,
@@ -73,7 +79,7 @@ import {
   getSystemAgentTags,
   getVisibleAgentTags,
 } from '../../utils/agent-display';
-import { formatRelativeTime } from '../../utils/date';
+import { formatRelativeTime, parseUTCDate } from '../../utils/date';
 import { consoleDialogStyles } from '../../styles/console-dialog';
 import {
   AGENTS_VIEW_MODES,
@@ -83,6 +89,7 @@ import {
   type ListViewMode,
   type NarrowViewportSubscription,
 } from '../../utils/view-mode';
+import { debugLog } from '../../utils/debug';
 
 const AVAILABLE_AGENT_KINDS = [
   { value: 'openclaw', label: 'OpenClaw' },
@@ -104,6 +111,9 @@ const AVAILABLE_AGENT_KINDS = [
 const AGENT_KIND_VALUES = AVAILABLE_AGENT_KINDS.map((k) => k.value);
 
 const DEFAULT_AGENT_KINDS = AGENT_KIND_VALUES.filter((k) => k !== 'flows');
+
+/** The agents list endpoint's largest page (`limit` is capped at 100). */
+const AGENT_PAGE_CAP = 100;
 
 // Filter selections persist as a *hidden* list so agent kinds added in later
 // releases stay visible by default — a kind absent from storage means
@@ -336,6 +346,7 @@ function gatewaySummaryDays(
 
 @customElement('agents-view')
 export class AgentsView extends LitElement {
+  private readonly accessibilityStatus = new ConsoleStatus(this);
   /**
    * Multi-select for the agent table and cards. Flow rows share this list but
    * carry no agent actions, so they are not selectable.
@@ -386,6 +397,14 @@ export class AgentsView extends LitElement {
   // Tracks if the onboarding dialog was automatically opened at least once upon page load
   private hasAutoOpenedOnboarding = false;
 
+  /** The query the current page of agents was fetched with, for Load more. */
+  private lastAgentListParams: ManagedAgentListParams | null = null;
+
+  /** The filters behind the current list, to tell a refresh from a new query. */
+  private lastAgentQueryKey: string | null = null;
+
+  @state() private loadingMoreAgents = false;
+
   // Switcher state
   @state() private currentView: AgentsViewMode = loadViewMode(
     VIEW_MODE_KEY,
@@ -399,7 +418,7 @@ export class AgentsView extends LitElement {
 
   // VM Provisioning state variables
   @state() private computeFeatureEnabled = false;
-  @state() private isEnterprise = false;
+  @state() private edition: Edition = 'oss';
   @state() private isAdmin = false;
   @state() private showDeployDialog = false;
 
@@ -446,63 +465,65 @@ export class AgentsView extends LitElement {
   private refreshTimer: number | null = null;
 
   static styles = [
-    consoleDialogStyles,
-    reducedMotionStyles,
-    unsafeCSS(consoleStyles),
-    css`
-      :host {
-        display: block;
-        height: 100%;
-      }
-      .canvas-bubbles-overlay {
-        position: absolute;
-        inset: 0;
-        pointer-events: none;
-        z-index: 1000;
-        overflow: visible;
-      }
-      .canvas-bubbles-overlay .agent-speech-bubble {
-        bottom: 107px;
-        left: 0;
-        transform: translateX(-50%);
-        z-index: 1000;
-      }
-      .page {
-        display: flex;
-        flex-direction: column;
-        gap: var(--sl-spacing-large);
-        height: 100%;
-        overflow-y: auto;
-      }
-      .cards {
-        display: grid;
-        /* auto-fill, not auto-fit: two agents should stay two 320px cards, not
+    tableScrollStyles,
+    [
+      consoleDialogStyles,
+      reducedMotionStyles,
+      unsafeCSS(consoleStyles),
+      css`
+        :host {
+          display: block;
+          height: 100%;
+        }
+        .canvas-bubbles-overlay {
+          position: absolute;
+          inset: 0;
+          pointer-events: none;
+          z-index: 1000;
+          overflow: visible;
+        }
+        .canvas-bubbles-overlay .agent-speech-bubble {
+          bottom: 107px;
+          left: 0;
+          transform: translateX(-50%);
+          z-index: 1000;
+        }
+        .page {
+          display: flex;
+          flex-direction: column;
+          gap: var(--sl-spacing-large);
+          height: 100%;
+          overflow-y: auto;
+        }
+        .cards {
+          display: grid;
+          /* auto-fill, not auto-fit: two agents should stay two 320px cards, not
            stretch into two half-screen banners. */
-        grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
-        gap: var(--sl-spacing-large);
-        /* No side inset of its own: the header band above it has none
+          grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+          gap: var(--sl-spacing-large);
+          /* No side inset of its own: the header band above it has none
            either, because outside the canvas the shell pays it. */
-        padding: 1rem 0 0;
-      }
-      /* --- List view --- */
-      /* Side insets are the shell's (styles/console-styles.css, "The page
+          padding: 1rem 0 0;
+        }
+        /* --- List view --- */
+        /* Side insets are the shell's (styles/console-styles.css, "The page
          box"), so these wrappers add block padding and nothing else. Only
          the canvas is full bleed, and only there does the header band add
          .console-page for itself: carrying it in every mode paid the inset
          twice and left the list 64px narrower than Flows. */
-      .list-bounds {
-        padding-block: 0 2rem;
-      }
-      .content-bounds {
-        padding-block: 1rem 0;
-      }
-      /* The table sizes itself from the colgroup, not from its content: an
+        .list-bounds {
+          padding-block: 0 2rem;
+        }
+        .content-bounds {
+          padding-block: 1rem 0;
+        }
+        /* The table sizes itself from the colgroup, not from its content: an
          agent named after a container hash used to push the kebab column past
          the right edge of the card, where it was clipped and unclickable. */
-      .agents-table {
-        table-layout: fixed;
-        width: 100%;
-        /* Below this the columns cannot hold their content, so the card
+        .agents-table {
+          table-layout: fixed;
+          width: 100%;
+          /* Below this the columns cannot hold their content, so the card
            scrolls sideways instead of hiding anything. The number is derived,
            not guessed: the pixel columns sum to 720px (select 40, status 150,
            requests 110, tokens 110, spend 110, last seen 128, actions 72) and
@@ -515,25 +536,25 @@ export class AgentsView extends LitElement {
            "Agent" became "AGE") at zoomed or laptop widths. 1340px was the
            same arithmetic while tokens still spent 190px on a breakdown.
            The list falls back to cards under 640px. */
-        min-width: 1260px;
-      }
-      .table-scroll {
-        overflow-x: auto;
-        width: 100%;
-      }
-      .agents-table th,
-      .agents-table td {
-        padding: var(--sl-spacing-small) var(--sl-spacing-medium);
-        vertical-align: middle;
-        min-width: 0;
-        overflow: hidden;
-        text-overflow: ellipsis;
-        white-space: nowrap;
-      }
-      .agents-table th {
-        padding: 0;
-      }
-      /* The kebab column is measured from the button it holds, not guessed.
+          min-width: 1260px;
+        }
+        .table-scroll {
+          overflow-x: auto;
+          width: 100%;
+        }
+        .agents-table th,
+        .agents-table td {
+          padding: var(--sl-spacing-small) var(--sl-spacing-medium);
+          vertical-align: middle;
+          min-width: 0;
+          overflow: hidden;
+          text-overflow: ellipsis;
+          white-space: nowrap;
+        }
+        .agents-table th {
+          padding: 0;
+        }
+        /* The kebab column is measured from the button it holds, not guessed.
          resource-actions renders one medium sl-button whose width is two
          --sl-spacing-medium of label padding + a 1rem icon + a 1px border on
          each side = 48px at the default tokens. The old column was 56px wide
@@ -543,663 +564,702 @@ export class AgentsView extends LitElement {
          the "dotted actions button cut from the left" bug. 56px of content
          plus 8px of padding on each side leaves the button its 48px and room
          to grow before anything clips again. */
-      .agents-table th.actions-cell,
-      .agents-table td.actions-cell {
-        width: 72px;
-        text-align: right;
-        padding-left: var(--sl-spacing-x-small);
-        padding-right: var(--sl-spacing-x-small);
-        overflow: visible;
-      }
-      /* Belt and braces: even if a future token change makes the button wider
+        .agents-table th.actions-cell,
+        .agents-table td.actions-cell {
+          width: 72px;
+          text-align: right;
+          padding-left: var(--sl-spacing-x-small);
+          padding-right: var(--sl-spacing-x-small);
+          overflow: visible;
+        }
+        /* Belt and braces: even if a future token change makes the button wider
          than its column, it stays whole and clickable by spilling into the
          padding rather than being cut in half. */
-      .actions-cell resource-actions::part(container) {
-        overflow: visible;
-      }
-      /* Percentages for the text columns so wide screens give them the space,
+        .actions-cell resource-actions::part(container) {
+          overflow: visible;
+        }
+        /* Percentages for the text columns so wide screens give them the space,
          pixels for the ones whose content has a known width. Agent takes what
          is left. */
-      /* The shared 40px select column, so the agent name starts at the same
+        /* The shared 40px select column, so the agent name starts at the same
          x as the key, model and flow names. */
-      .col-select {
-        width: 40px;
-      }
-      .agents-table th.select-cell,
-      .agents-table td.select-cell {
-        overflow: visible;
-      }
-      .col-status {
-        width: 150px;
-      }
-      /* Owner and model are the two other text columns. Their percentages
+        .col-select {
+          width: 40px;
+        }
+        .agents-table th.select-cell,
+        .agents-table td.select-cell {
+          overflow: visible;
+        }
+        .col-status {
+          width: 150px;
+        }
+        /* Owner and model are the two other text columns. Their percentages
          and the table min-width above are one budget: raise these and the
          Agent column shrinks first, because it is the only auto column. */
-      .col-owner {
-        width: 9%;
-      }
-      .col-model {
-        width: 15%;
-      }
-      .col-requests {
-        width: 110px;
-      }
-      /* Tokens read before cost, so the pair sits together. The column
+        .col-owner {
+          width: 9%;
+        }
+        .col-model {
+          width: 15%;
+        }
+        .col-requests {
+          width: 110px;
+        }
+        /* Tokens read before cost, so the pair sits together. The column
          holds one compact total ("12.4M"), not the in/out/cache breakdown
          that used to be clipped mid-word here, so it needs no more room
          than the requests count beside it. */
-      .col-tokens {
-        width: 110px;
-      }
-      .col-spend {
-        width: 110px;
-      }
-      .col-last-seen {
-        width: 128px;
-      }
-      .col-actions {
-        width: 72px;
-      }
-      .sort-button {
-        display: flex;
-        align-items: center;
-        gap: 4px;
-        width: 100%;
-        background: none;
-        border: none;
-        cursor: pointer;
-        font: inherit;
-        font-weight: var(--sl-font-weight-semibold);
-        font-size: var(--sl-font-size-x-small);
-        letter-spacing: 0.04em;
-        text-transform: uppercase;
-        color: var(--sl-color-neutral-600);
-        padding: var(--sl-spacing-small) var(--sl-spacing-medium);
-      }
-      th.numeric .sort-button {
-        justify-content: flex-end;
-      }
-      .sort-button:hover,
-      .sort-button:focus-visible {
-        color: var(--sl-color-neutral-900);
-      }
-      th.active .sort-button {
-        color: var(--sl-color-neutral-900);
-      }
-      .sort-caret {
-        font-size: 0.75em;
-        opacity: 0.55;
-      }
-      th.active .sort-caret {
-        opacity: 1;
-      }
-      .agent-row {
-        cursor: pointer;
-      }
-      .agent-row:hover td {
-        background: var(--console-hover-tint);
-      }
-      .agent-identity {
-        display: flex;
-        align-items: center;
-        gap: var(--sl-spacing-small);
-        min-width: 180px;
-      }
-      .agent-identity-text {
-        min-width: 0;
-        overflow: hidden;
-      }
-      .row-icon {
-        width: 20px;
-        height: 20px;
-        flex-shrink: 0;
-      }
-      /* Names never wrap: a two-line name in one row and a one-line name in
+        .col-tokens {
+          width: 110px;
+        }
+        .col-spend {
+          width: 110px;
+        }
+        .col-last-seen {
+          width: 128px;
+        }
+        .col-actions {
+          width: 72px;
+        }
+        .sort-button {
+          display: flex;
+          align-items: center;
+          gap: 4px;
+          width: 100%;
+          background: none;
+          border: none;
+          cursor: pointer;
+          font: inherit;
+          font-weight: var(--sl-font-weight-semibold);
+          font-size: var(--sl-font-size-x-small);
+          letter-spacing: 0.04em;
+          text-transform: uppercase;
+          color: var(--sl-color-neutral-600);
+          padding: var(--sl-spacing-small) var(--sl-spacing-medium);
+        }
+        th.numeric .sort-button {
+          justify-content: flex-end;
+        }
+        .sort-button:hover,
+        .sort-button:focus-visible {
+          color: var(--sl-color-neutral-900);
+        }
+        th.active .sort-button {
+          color: var(--sl-color-neutral-900);
+        }
+        .sort-caret {
+          font-size: 0.75em;
+          opacity: 0.55;
+        }
+        th.active .sort-caret {
+          opacity: 1;
+        }
+        .agent-row {
+          cursor: pointer;
+        }
+        .agent-row:hover td {
+          background: var(--console-hover-tint);
+        }
+        .agent-identity {
+          display: flex;
+          align-items: center;
+          gap: var(--sl-spacing-small);
+          min-width: 180px;
+        }
+        .agent-identity-text {
+          min-width: 0;
+          overflow: hidden;
+        }
+        .row-icon {
+          width: 20px;
+          height: 20px;
+          flex-shrink: 0;
+        }
+        /* Names never wrap: a two-line name in one row and a one-line name in
          the next made the whole table look ragged. */
-      .row-link {
-        color: var(--sl-color-primary-700);
-        display: block;
-        font-weight: var(--sl-font-weight-semibold);
-        overflow: hidden;
-        text-decoration: none;
-        text-overflow: ellipsis;
-        white-space: nowrap;
-      }
-      .row-link:hover,
-      .row-link:focus-visible {
-        text-decoration: underline;
-      }
-      .row-subtitle {
-        color: var(--console-meta-color);
-        font-size: var(--sl-font-size-small);
-        overflow: hidden;
-        text-overflow: ellipsis;
-        white-space: nowrap;
-      }
-      .muted-cell {
-        color: var(--console-meta-color);
-      }
-      .agents-table td.numeric,
-      .agents-table th.numeric {
-        text-align: right;
-        font-variant-numeric: tabular-nums;
-        white-space: nowrap;
-      }
-      .model-cell {
-        overflow: hidden;
-        text-overflow: ellipsis;
-        white-space: nowrap;
-      }
-      .row-actions {
-        display: flex;
-        justify-content: flex-end;
-      }
-      /* "Recently active" is real but not live: a fainter tint of the same
+        .row-link {
+          color: var(--sl-color-primary-700);
+          display: block;
+          font-weight: var(--sl-font-weight-semibold);
+          overflow: hidden;
+          text-decoration: none;
+          text-overflow: ellipsis;
+          white-space: nowrap;
+        }
+        .row-link:hover,
+        .row-link:focus-visible {
+          text-decoration: underline;
+        }
+        .row-subtitle {
+          color: var(--console-meta-color);
+          font-size: var(--sl-font-size-small);
+          overflow: hidden;
+          text-overflow: ellipsis;
+          white-space: nowrap;
+        }
+        .muted-cell {
+          color: var(--console-meta-color);
+        }
+        .agents-table td.numeric,
+        .agents-table th.numeric {
+          text-align: right;
+          font-variant-numeric: tabular-nums;
+          white-space: nowrap;
+        }
+        .model-cell {
+          overflow: hidden;
+          text-overflow: ellipsis;
+          white-space: nowrap;
+        }
+        .row-actions {
+          display: flex;
+          justify-content: flex-end;
+        }
+        /* "Recently active" is real but not live: a fainter tint of the same
          tone. No border, because nothing inside a card gets a box (wave 4);
          the -700 ink reads on both themes because Shoelace inverts the
          scale in dark. */
-      .status-chip.outline::part(base) {
-        background-color: color-mix(
-          in srgb,
-          var(--sl-color-success-500) 8%,
-          transparent
-        );
-        color: var(--sl-color-success-800);
-        border-width: 0;
-      }
-      .canvas-last-seen {
-        font-weight: 600;
-      }
-      .metric-row .value.numeric {
-        font-variant-numeric: tabular-nums;
-      }
-      .visually-hidden {
-        position: absolute;
-        width: 1px;
-        height: 1px;
-        overflow: hidden;
-        clip: rect(0 0 0 0);
-        white-space: nowrap;
-      }
-      .deploy-grid {
-        display: grid;
-        grid-template-columns: 1fr 1fr;
-        gap: var(--sl-spacing-large);
-        margin-bottom: var(--sl-spacing-large);
-      }
-      @media (max-width: 768px) {
+        .status-chip.outline::part(base) {
+          background-color: color-mix(
+            in srgb,
+            var(--sl-color-success-500) 8%,
+            transparent
+          );
+          color: var(--sl-color-success-800);
+          border-width: 0;
+        }
+        .canvas-last-seen {
+          font-weight: 600;
+        }
+        .metric-row .value.numeric {
+          font-variant-numeric: tabular-nums;
+        }
+        .visually-hidden {
+          position: absolute;
+          width: 1px;
+          height: 1px;
+          overflow: hidden;
+          clip: rect(0 0 0 0);
+          white-space: nowrap;
+        }
         .deploy-grid {
-          grid-template-columns: 1fr;
+          display: grid;
+          grid-template-columns: 1fr 1fr;
+          gap: var(--sl-spacing-large);
+          margin-bottom: var(--sl-spacing-large);
         }
-      }
-      .agent-card::part(base) {
-        height: 100%;
-      }
-      .agent-card {
-        max-width: 400px;
-        cursor: pointer;
-      }
-      .agent-card:focus-visible::part(base) {
-        outline: 2px solid var(--sl-color-primary-500);
-        outline-offset: 2px;
-      }
-      .agent-card.live::part(base) {
-        border-color: var(--sl-color-primary-500);
-        box-shadow: 0 0 15px rgba(var(--sl-color-primary-500-rgb), 0.2);
-      }
-      @keyframes glow-pulse {
-        0% {
-          box-shadow: 0 0 25px 5px rgba(var(--sl-color-success-500-rgb), 0.6);
-          border-color: var(--sl-color-success-500);
+        @media (max-width: 768px) {
+          .deploy-grid {
+            grid-template-columns: 1fr;
+          }
         }
-        100% {
-          box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
-          border-color: var(--sl-color-neutral-200);
+        .agent-card::part(base) {
+          height: 100%;
         }
-      }
-      .agent-card.glowing::part(base) {
-        animation: glow-pulse 1.5s ease-out;
-      }
-      .card-stack {
-        display: flex;
-        flex-direction: column;
-        gap: var(--sl-spacing-medium);
-        position: relative;
-      }
-      .title-row,
-      .metric-row {
-        display: flex;
-        justify-content: space-between;
-        gap: var(--sl-spacing-small);
-        align-items: center;
-      }
-      .title-row {
-        align-items: start;
-        border-bottom: 1px solid var(--sl-color-neutral-200);
-        padding-bottom: var(--sl-spacing-small);
-        padding-right: 44px;
-      }
-      .agent-name {
-        font-weight: 700;
-        font-size: 1.15rem;
-        letter-spacing: -0.01em;
-      }
-      /* The card is clickable, but the title is a real anchor so cmd-click
+        .agent-card {
+          max-width: 400px;
+          cursor: pointer;
+        }
+        .agent-card:focus-visible::part(base) {
+          outline: 2px solid var(--sl-color-primary-500);
+          outline-offset: 2px;
+        }
+        .agent-card.live::part(base) {
+          border-color: var(--sl-color-primary-500);
+          box-shadow: 0 0 15px rgba(var(--sl-color-primary-500-rgb), 0.2);
+        }
+        @keyframes glow-pulse {
+          0% {
+            box-shadow: 0 0 25px 5px rgba(var(--sl-color-success-500-rgb), 0.6);
+            border-color: var(--sl-color-success-500);
+          }
+          100% {
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
+            border-color: var(--sl-color-neutral-200);
+          }
+        }
+        .agent-card.glowing::part(base) {
+          animation: glow-pulse 1.5s ease-out;
+        }
+        .card-stack {
+          display: flex;
+          flex-direction: column;
+          gap: var(--sl-spacing-medium);
+          position: relative;
+        }
+        .title-row,
+        .metric-row {
+          display: flex;
+          justify-content: space-between;
+          gap: var(--sl-spacing-small);
+          align-items: center;
+        }
+        .title-row {
+          align-items: start;
+          border-bottom: 1px solid var(--sl-color-neutral-200);
+          padding-bottom: var(--sl-spacing-small);
+          padding-right: 44px;
+        }
+        .agent-name {
+          font-weight: 700;
+          font-size: 1.15rem;
+          letter-spacing: -0.01em;
+        }
+        /* The card is clickable, but the title is a real anchor so cmd-click
          and middle-click open the agent in a new tab (AG-B). */
-      a.agent-name {
-        color: inherit;
-        text-decoration: none;
-      }
-      a.agent-name:hover,
-      a.agent-name:focus-visible {
-        text-decoration: underline;
-      }
-      .agent-meta {
-        opacity: 0.7;
-        font-size: var(--sl-font-size-small);
-        margin-top: var(--sl-spacing-3x-small);
-        overflow-wrap: anywhere;
-        display: -webkit-box;
-        -webkit-line-clamp: 2;
-        -webkit-box-orient: vertical;
-        overflow: hidden;
-        text-overflow: ellipsis;
-      }
-      .label {
-        opacity: 0.7;
-        font-size: 0.85rem;
-        font-weight: 500;
-      }
-      .value {
-        font-weight: 600;
-        font-size: 0.95rem;
-        text-align: right;
-      }
-      .card-actions {
-        position: absolute;
-        top: -8px;
-        right: -8px;
-        z-index: 2;
-      }
-      /* The checkbox is the first thing in the title row, beside the icon,
+        a.agent-name {
+          color: inherit;
+          text-decoration: none;
+        }
+        a.agent-name:hover,
+        a.agent-name:focus-visible {
+          text-decoration: underline;
+        }
+        .agent-meta {
+          opacity: 0.7;
+          font-size: var(--sl-font-size-small);
+          margin-top: var(--sl-spacing-3x-small);
+          overflow-wrap: anywhere;
+          display: -webkit-box;
+          -webkit-line-clamp: 2;
+          -webkit-box-orient: vertical;
+          overflow: hidden;
+          text-overflow: ellipsis;
+        }
+        .label {
+          opacity: 0.7;
+          font-size: 0.85rem;
+          font-weight: 500;
+        }
+        .value {
+          font-weight: 600;
+          font-size: 0.95rem;
+          text-align: right;
+        }
+        .card-actions {
+          position: absolute;
+          top: -8px;
+          right: -8px;
+          z-index: 2;
+        }
+        /* The checkbox is the first thing in the title row, beside the icon,
          the way flow cards do it. It used to float over the card's top-left
          corner, where it landed on the agent icon. 6px of top margin centres
          a 16px box on the 24px icon (which itself sits 2px down). */
-      .card-select {
-        flex-shrink: 0;
-        margin-top: 6px;
-        display: inline-flex;
-      }
-      .identity-stack {
-        min-width: 0;
-      }
-      .identity-badges {
-        display: flex;
-        flex-wrap: wrap;
-        gap: var(--sl-spacing-2x-small);
-        margin-top: var(--sl-spacing-x-small);
-      }
-      .identity-badges sl-badge {
-        max-width: 100%;
-      }
-      .model-traffic-failing {
-        background: var(--sl-color-danger-50);
-        border-left: 3px solid var(--sl-color-danger-600);
-        border-radius: 4px;
-        color: var(--sl-color-danger-700);
-        font-size: 0.85rem;
-        margin-bottom: 12px;
-        padding: 6px 10px;
-      }
-      .model-traffic-failing a {
-        color: inherit;
-        text-decoration: underline;
-      }
-      .top-action {
-        display: flex;
-        align-items: center;
-        justify-content: flex-end;
-        flex-shrink: 0;
-      }
-      /* One tinted band, mixed from a single token so it is a pale tint in
+        .card-select {
+          flex-shrink: 0;
+          margin-top: 6px;
+          display: inline-flex;
+        }
+        .identity-stack {
+          min-width: 0;
+        }
+        .identity-badges {
+          display: flex;
+          flex-wrap: wrap;
+          gap: var(--sl-spacing-2x-small);
+          margin-top: var(--sl-spacing-x-small);
+        }
+        .identity-badges sl-badge {
+          max-width: 100%;
+        }
+        .model-traffic-failing {
+          background: var(--sl-color-danger-50);
+          border-left: 3px solid var(--sl-color-danger-600);
+          border-radius: 4px;
+          color: var(--sl-color-danger-700);
+          font-size: 0.85rem;
+          margin-bottom: 12px;
+          padding: 6px 10px;
+        }
+        .model-traffic-failing a {
+          color: inherit;
+          text-decoration: underline;
+        }
+        .top-action {
+          display: flex;
+          align-items: center;
+          justify-content: flex-end;
+          flex-shrink: 0;
+        }
+        /* One tinted band, mixed from a single token so it is a pale tint in
          light and a dim one in dark instead of an inverted solid block. */
-      .agent-control-strip {
-        border: 1px solid
-          color-mix(in srgb, var(--sl-color-primary-500) 25%, transparent);
-        border-radius: var(--sl-border-radius-medium);
-        padding: var(--sl-spacing-small);
-        background: color-mix(
-          in srgb,
-          var(--sl-color-primary-500) 8%,
-          transparent
-        );
-        display: flex;
-        justify-content: space-between;
-        gap: var(--sl-spacing-small);
-        align-items: center;
-      }
-      .agent-control-copy {
-        display: flex;
-        flex-direction: column;
-        gap: var(--sl-spacing-2x-small);
-        min-width: 0;
-      }
-      .agent-control-title {
-        color: var(--sl-color-neutral-900);
-        font-size: var(--sl-font-size-small);
-        font-weight: var(--sl-font-weight-semibold);
-      }
-      .agent-control-detail {
-        color: var(--sl-color-neutral-600);
-        font-size: var(--sl-font-size-small);
-        display: -webkit-box;
-        -webkit-line-clamp: 2;
-        -webkit-box-orient: vertical;
-        overflow: hidden;
-      }
-      .empty-state {
-        padding: var(--sl-spacing-large);
-        color: var(--sl-color-neutral-600);
-        background: transparent;
-      }
-      :host(:host-context(.sl-theme-dark)) .title-row {
-        border-color: var(--sl-color-neutral-800);
-      }
-
-      .agent-speech-bubble {
-        position: absolute;
-        bottom: calc(100% + 12px);
-        left: 50%;
-        transform: translateX(-50%);
-        background: var(--sl-color-neutral-900);
-        color: var(--sl-color-neutral-0);
-        padding: 8px 12px;
-        border-radius: var(--sl-border-radius-medium);
-        font-size: var(--sl-font-size-small);
-        width: max-content;
-        max-width: 280px;
-        box-shadow: var(--sl-shadow-large);
-        pointer-events: none;
-        opacity: 0;
-        transition: opacity 0.5s ease;
-        z-index: 250;
-      }
-      .agent-speech-bubble::after {
-        content: '';
-        position: absolute;
-        top: 100%;
-        left: 50%;
-        margin-left: -6px;
-        border-width: 6px;
-        border-style: solid;
-        border-color: var(--sl-color-neutral-900) transparent transparent
-          transparent;
-      }
-      .agent-speech-bubble.visible {
-        opacity: 1;
-        animation: bubble-bounce 0.4s cubic-bezier(0.175, 0.885, 0.32, 1.275);
-      }
-      @media (prefers-color-scheme: dark) {
-        .flow-icon {
-          filter: invert(0.8) hue-rotate(180deg);
+        .agent-control-strip {
+          border: 1px solid
+            color-mix(in srgb, var(--sl-color-primary-500) 25%, transparent);
+          border-radius: var(--sl-border-radius-medium);
+          padding: var(--sl-spacing-small);
+          background: color-mix(
+            in srgb,
+            var(--sl-color-primary-500) 8%,
+            transparent
+          );
+          display: flex;
+          justify-content: space-between;
+          gap: var(--sl-spacing-small);
+          align-items: center;
         }
-      }
-
-      @keyframes bubble-bounce {
-        0% {
-          transform: translateX(-50%) translateY(10px) scale(0.9);
-          opacity: 0;
+        .agent-control-copy {
+          display: flex;
+          flex-direction: column;
+          gap: var(--sl-spacing-2x-small);
+          min-width: 0;
         }
-        100% {
-          transform: translateX(-50%) translateY(0) scale(1);
-          opacity: 1;
+        .agent-control-title {
+          color: var(--sl-color-neutral-900);
+          font-size: var(--sl-font-size-small);
+          font-weight: var(--sl-font-weight-semibold);
         }
-      }
-      .speech-source {
-        font-size: 0.7rem;
-        font-weight: 700;
-        text-transform: uppercase;
-        letter-spacing: 0.05em;
-        opacity: 0.7;
-        margin-bottom: 2px;
-      }
-      .speech-text {
-        overflow: hidden;
-        text-overflow: ellipsis;
-        display: -webkit-box;
-        -webkit-line-clamp: 3;
-        -webkit-box-orient: vertical;
-        line-height: 1.4;
-      }
-      .agent-speech-bubble.tool-bubble {
-        background: var(--sl-color-neutral-100);
-        color: var(--sl-color-neutral-800);
-        border: 1px solid var(--sl-color-neutral-300);
-        box-shadow: 0 4px 12px rgba(var(--sl-color-warning-500-rgb), 0.15);
-      }
-      .agent-speech-bubble.tool-bubble::after {
-        border-color: var(--sl-color-neutral-300) transparent transparent
-          transparent;
-      }
-      .agent-speech-bubble.tool-bubble .speech-source {
-        color: var(--sl-color-warning-600);
-      }
-
-      /* Canvas specific styles */
-      .section-container {
-        max-width: 1400px;
-        margin: 0 auto;
-        padding: 0 2rem;
-      }
-      /* .content-bounds is the page box, declared with .list-bounds above. */
-      .page-canvas-wrapper .content-bounds {
-        /* Any overrides for canvas wrapper */
-      }
-      .page-canvas-wrapper {
-        display: flex;
-        flex-direction: column;
-        height: 100%;
-        width: 100%;
-        position: relative;
-        overflow: hidden;
-      }
-      .canvas-container {
-        flex: 1;
-        min-height: 500px;
-        position: relative;
-        overflow: hidden;
-        background-color: transparent;
-        border-radius: var(--sl-border-radius-medium);
-      }
-      .canvas-viewport {
-        width: 100%;
-        height: 100%;
-        touch-action: none;
-        user-select: none;
-        position: absolute;
-        inset: 0;
-        cursor: grab;
-      }
-      .canvas-viewport:active {
-        cursor: grabbing;
-      }
-      .canvas-content {
-        position: absolute;
-        inset: 0;
-        transform-origin: 0 0;
-        will-change: transform;
-      }
-      .gateway-node {
-        position: absolute;
-        left: 0;
-        top: 0;
-        transform: translate(-50%, -50%);
-        display: flex;
-        flex-direction: column;
-        align-items: center;
-        z-index: 10;
-        pointer-events: none;
-      }
-      .gateway-icon {
-        width: 80px;
-        height: 80px;
-        border-radius: 50%;
-        background-color: var(--sl-color-primary-600);
-        color: white;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        font-size: 40px;
-        box-shadow: var(--sl-shadow-large);
-        position: relative;
-      }
-      .gateway-icon.pulsing::after {
-        content: '';
-        position: absolute;
-        inset: -10px;
-        border-radius: 50%;
-        border: 2px solid var(--sl-color-primary-500);
-        animation: gateway-pulse 2s infinite;
-      }
-      @keyframes gateway-pulse {
-        0% {
-          transform: scale(0.8);
-          opacity: 0.8;
+        .agent-control-detail {
+          color: var(--sl-color-neutral-600);
+          font-size: var(--sl-font-size-small);
+          display: -webkit-box;
+          -webkit-line-clamp: 2;
+          -webkit-box-orient: vertical;
+          overflow: hidden;
         }
-        100% {
-          transform: scale(1.5);
-          opacity: 0;
+        .empty-state {
+          padding: var(--sl-spacing-large);
+          color: var(--sl-color-neutral-600);
+          background: transparent;
         }
-      }
-      .gateway-label {
-        position: absolute;
-        top: calc(100% + 12px);
-        background-color: var(--console-surface);
-        padding: 4px 12px;
-        border-radius: 20px;
-        font-weight: bold;
-        color: var(--sl-color-primary-600);
-        box-shadow: var(--sl-shadow-medium);
-        border: 1px solid var(--sl-color-neutral-200);
-        letter-spacing: 1px;
-        width: max-content;
-      }
-      .agent-node {
-        position: absolute;
-        transform: translate(-50%, -50%);
-        z-index: 5;
-        width: 300px;
-        touch-action: none;
-        cursor: pointer;
-        opacity: 1;
-        transition: opacity 220ms ease;
-      }
-      .agent-node.has-bubble {
-        z-index: 150;
-      }
-      .agent-node.entering {
-        animation: node-fade-in 240ms ease-out both;
-      }
-      .agent-node.exiting {
-        opacity: 0;
-        pointer-events: none;
-      }
-      .agent-node.dragging {
-        z-index: 100;
-        cursor: grabbing;
-      }
-      @keyframes node-fade-in {
-        from {
-          opacity: 0;
+        .empty-state .empty-title {
+          margin: 0 0 var(--sl-spacing-small);
+          color: var(--sl-color-neutral-900);
+          font-weight: var(--sl-font-weight-semibold);
         }
-        to {
-          opacity: 1;
+        .empty-state .empty-body {
+          margin: 0 0 var(--sl-spacing-medium);
+          max-width: 60ch;
         }
-      }
-      .agent-node sl-card {
-        width: 100%;
-        pointer-events: auto;
-        transition:
-          transform 0.2s,
-          box-shadow 0.2s;
-      }
-      .agent-node:not(.dragging) sl-card:hover {
-        transform: translateY(-4px);
-        box-shadow: var(--sl-shadow-large);
-      }
-      .canvas-legend {
-        position: absolute;
-        left: 20px;
-        bottom: 20px;
-        z-index: 20;
-        background: color-mix(in srgb, var(--console-surface) 92%, transparent);
-        border: 1px solid var(--console-hairline);
-        border-radius: var(--sl-border-radius-medium);
-        padding: 10px 12px;
-        font-size: 0.8rem;
-        color: var(--sl-color-neutral-700);
-        display: flex;
-        gap: 16px;
-        flex-wrap: wrap;
-        max-width: calc(100% - 40px);
-      }
-      .legend-item {
-        display: flex;
-        align-items: center;
-        gap: 8px;
-      }
-      .legend-swatch {
-        display: inline-block;
-        width: 20px;
-        height: 0;
-        flex-shrink: 0;
-      }
-      /* Top-right, not bottom-right: at the bottom the zoom stack sat on top
-         of the nearest agent card and swallowed its clicks. */
-      .controls-overlay {
-        position: absolute;
-        top: 16px;
-        right: 16px;
-        z-index: 20;
-        display: flex;
-        flex-direction: row;
-        gap: 8px;
-        background: var(--console-surface-raised);
-        padding: 8px;
-        border-radius: var(--sl-border-radius-large);
-        box-shadow: var(--console-raised-shadow);
-        border: 1px solid var(--console-hairline);
-      }
-      .connection-line {
-        position: absolute;
-        left: 0;
-        top: 0;
-        overflow: visible;
-        pointer-events: none;
-        transform: translate(-50%, -50%);
-        width: 1px;
-        height: 1px;
-        transition: opacity 220ms ease;
-      }
-      .connection-line.entering {
-        animation: node-fade-in 240ms ease-out both;
-      }
-      .connection-line.exiting {
-        opacity: 0;
-      }
-      @media (prefers-color-scheme: dark) {
-        .canvas-container {
+        .empty-actions {
+          display: flex;
+          flex-wrap: wrap;
+          gap: var(--sl-spacing-small);
+        }
+        .empty-card {
+          width: 100%;
+        }
+        /* Named for a screen reader; the toolbar has no room to print it. */
+        .last-seen-filter::part(form-control-label) {
+          position: absolute;
+          width: 1px;
+          height: 1px;
+          padding: 0;
+          margin: -1px;
+          overflow: hidden;
+          clip: rect(0 0 0 0);
+          white-space: nowrap;
+          border: 0;
+        }
+        .load-more {
+          display: flex;
+          justify-content: center;
+          padding: var(--sl-spacing-medium) 0;
+        }
+        :host(:host-context(.sl-theme-dark)) .title-row {
           border-color: var(--sl-color-neutral-800);
         }
+
+        .agent-speech-bubble {
+          position: absolute;
+          bottom: calc(100% + 12px);
+          left: 50%;
+          transform: translateX(-50%);
+          background: var(--sl-color-neutral-900);
+          color: var(--sl-color-neutral-0);
+          padding: 8px 12px;
+          border-radius: var(--sl-border-radius-medium);
+          font-size: var(--sl-font-size-small);
+          width: max-content;
+          max-width: 280px;
+          box-shadow: var(--sl-shadow-large);
+          pointer-events: none;
+          opacity: 0;
+          transition: opacity 0.5s ease;
+          z-index: 250;
+        }
+        .agent-speech-bubble::after {
+          content: '';
+          position: absolute;
+          top: 100%;
+          left: 50%;
+          margin-left: -6px;
+          border-width: 6px;
+          border-style: solid;
+          border-color: var(--sl-color-neutral-900) transparent transparent
+            transparent;
+        }
+        .agent-speech-bubble.visible {
+          opacity: 1;
+          animation: bubble-bounce 0.4s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+        }
+        @media (prefers-color-scheme: dark) {
+          .flow-icon {
+            filter: invert(0.8) hue-rotate(180deg);
+          }
+        }
+
+        @keyframes bubble-bounce {
+          0% {
+            transform: translateX(-50%) translateY(10px) scale(0.9);
+            opacity: 0;
+          }
+          100% {
+            transform: translateX(-50%) translateY(0) scale(1);
+            opacity: 1;
+          }
+        }
+        .speech-source {
+          font-size: 0.7rem;
+          font-weight: 700;
+          text-transform: uppercase;
+          letter-spacing: 0.05em;
+          opacity: 0.7;
+          margin-bottom: 2px;
+        }
+        .speech-text {
+          overflow: hidden;
+          text-overflow: ellipsis;
+          display: -webkit-box;
+          -webkit-line-clamp: 3;
+          -webkit-box-orient: vertical;
+          line-height: 1.4;
+        }
+        .agent-speech-bubble.tool-bubble {
+          background: var(--sl-color-neutral-100);
+          color: var(--sl-color-neutral-800);
+          border: 1px solid var(--sl-color-neutral-300);
+          box-shadow: 0 4px 12px rgba(var(--sl-color-warning-500-rgb), 0.15);
+        }
+        .agent-speech-bubble.tool-bubble::after {
+          border-color: var(--sl-color-neutral-300) transparent transparent
+            transparent;
+        }
+        .agent-speech-bubble.tool-bubble .speech-source {
+          color: var(--sl-color-warning-600);
+        }
+
+        /* Canvas specific styles */
+        .section-container {
+          max-width: 1400px;
+          margin: 0 auto;
+          padding: 0 2rem;
+        }
+        /* .content-bounds is the page box, declared with .list-bounds above. */
+        .page-canvas-wrapper .content-bounds {
+          /* Any overrides for canvas wrapper */
+        }
+        .page-canvas-wrapper {
+          display: flex;
+          flex-direction: column;
+          height: 100%;
+          width: 100%;
+          position: relative;
+          overflow: hidden;
+        }
+        .canvas-container {
+          flex: 1;
+          min-height: 500px;
+          position: relative;
+          overflow: hidden;
+          background-color: transparent;
+          border-radius: var(--sl-border-radius-medium);
+        }
+        .canvas-viewport {
+          width: 100%;
+          height: 100%;
+          touch-action: none;
+          user-select: none;
+          position: absolute;
+          inset: 0;
+          cursor: grab;
+        }
+        .canvas-viewport:active {
+          cursor: grabbing;
+        }
+        .canvas-content {
+          position: absolute;
+          inset: 0;
+          transform-origin: 0 0;
+          will-change: transform;
+        }
+        .gateway-node {
+          position: absolute;
+          left: 0;
+          top: 0;
+          transform: translate(-50%, -50%);
+          display: flex;
+          flex-direction: column;
+          align-items: center;
+          z-index: 10;
+          pointer-events: none;
+        }
+        .gateway-icon {
+          width: 80px;
+          height: 80px;
+          border-radius: 50%;
+          background-color: var(--sl-color-primary-600);
+          color: white;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          font-size: 40px;
+          box-shadow: var(--sl-shadow-large);
+          position: relative;
+        }
+        .gateway-icon.pulsing::after {
+          content: '';
+          position: absolute;
+          inset: -10px;
+          border-radius: 50%;
+          border: 2px solid var(--sl-color-primary-500);
+          animation: gateway-pulse 2s infinite;
+        }
+        @keyframes gateway-pulse {
+          0% {
+            transform: scale(0.8);
+            opacity: 0.8;
+          }
+          100% {
+            transform: scale(1.5);
+            opacity: 0;
+          }
+        }
         .gateway-label {
-          border-color: var(--sl-color-neutral-700);
-          color: var(--sl-color-primary-400);
+          position: absolute;
+          top: calc(100% + 12px);
+          background-color: var(--console-surface);
+          padding: 4px 12px;
+          border-radius: 20px;
+          font-weight: bold;
+          color: var(--sl-color-primary-600);
+          box-shadow: var(--sl-shadow-medium);
+          border: 1px solid var(--sl-color-neutral-200);
+          letter-spacing: 1px;
+          width: max-content;
         }
+        .agent-node {
+          position: absolute;
+          transform: translate(-50%, -50%);
+          z-index: 5;
+          width: 300px;
+          touch-action: none;
+          cursor: pointer;
+          opacity: 1;
+          transition: opacity 220ms ease;
+        }
+        .agent-node.has-bubble {
+          z-index: 150;
+        }
+        .agent-node.entering {
+          animation: node-fade-in 240ms ease-out both;
+        }
+        .agent-node.exiting {
+          opacity: 0;
+          pointer-events: none;
+        }
+        .agent-node.dragging {
+          z-index: 100;
+          cursor: grabbing;
+        }
+        @keyframes node-fade-in {
+          from {
+            opacity: 0;
+          }
+          to {
+            opacity: 1;
+          }
+        }
+        .agent-node sl-card {
+          width: 100%;
+          pointer-events: auto;
+          transition:
+            transform 0.2s,
+            box-shadow 0.2s;
+        }
+        .agent-node:not(.dragging) sl-card:hover {
+          transform: translateY(-4px);
+          box-shadow: var(--sl-shadow-large);
+        }
+        .canvas-legend {
+          position: absolute;
+          left: 20px;
+          bottom: 20px;
+          z-index: 20;
+          background: color-mix(
+            in srgb,
+            var(--console-surface) 92%,
+            transparent
+          );
+          border: 1px solid var(--console-hairline);
+          border-radius: var(--sl-border-radius-medium);
+          padding: 10px 12px;
+          font-size: 0.8rem;
+          color: var(--sl-color-neutral-700);
+          display: flex;
+          gap: 16px;
+          flex-wrap: wrap;
+          max-width: calc(100% - 40px);
+        }
+        .legend-item {
+          display: flex;
+          align-items: center;
+          gap: 8px;
+        }
+        .legend-swatch {
+          display: inline-block;
+          width: 20px;
+          height: 0;
+          flex-shrink: 0;
+        }
+        /* Top-right, not bottom-right: at the bottom the zoom stack sat on top
+         of the nearest agent card and swallowed its clicks. */
         .controls-overlay {
-          border-color: var(--sl-color-neutral-400);
+          position: absolute;
+          top: 16px;
+          right: 16px;
+          z-index: 20;
+          display: flex;
+          flex-direction: row;
+          gap: 8px;
+          background: var(--console-surface-raised);
+          padding: 8px;
+          border-radius: var(--sl-border-radius-large);
+          box-shadow: var(--console-raised-shadow);
+          border: 1px solid var(--console-hairline);
         }
-      }
-    `,
+        .connection-line {
+          position: absolute;
+          left: 0;
+          top: 0;
+          overflow: visible;
+          pointer-events: none;
+          transform: translate(-50%, -50%);
+          width: 1px;
+          height: 1px;
+          transition: opacity 220ms ease;
+        }
+        .connection-line.entering {
+          animation: node-fade-in 240ms ease-out both;
+        }
+        .connection-line.exiting {
+          opacity: 0;
+        }
+        @media (prefers-color-scheme: dark) {
+          .canvas-container {
+            border-color: var(--sl-color-neutral-800);
+          }
+          .gateway-label {
+            border-color: var(--sl-color-neutral-700);
+            color: var(--sl-color-primary-400);
+          }
+          .controls-overlay {
+            border-color: var(--sl-color-neutral-400);
+          }
+        }
+      `,
+    ],
   ];
 
   connectedCallback(): void {
@@ -1311,6 +1371,7 @@ export class AgentsView extends LitElement {
 
   disconnectedCallback(): void {
     super.disconnectedCallback();
+    ++this.agentsLoadGeneration;
     this.unsubscribeRealtime?.();
     this.narrowViewportSubscription?.disconnect();
     this.narrowViewportSubscription = null;
@@ -1374,7 +1435,10 @@ export class AgentsView extends LitElement {
     return data.users || [];
   }
 
+  private agentsLoadGeneration = 0;
+
   private async loadAgents(): Promise<void> {
+    const generation = ++this.agentsLoadGeneration;
     this.loading = true;
     this.error = null;
 
@@ -1449,6 +1513,22 @@ export class AgentsView extends LitElement {
       if (ownerUsername) params.ownerUsername = ownerUsername;
     }
 
+    // A live refresh of the same query keeps the pages "Load more" already
+    // added (up to the API's page cap), so rows do not vanish on an update.
+    const queryKey = JSON.stringify({
+      ...params,
+      lastSeenAfter: this.lastSeenAfter,
+      skipAgentsFetch,
+    });
+    if (
+      queryKey === this.lastAgentQueryKey &&
+      this.agents &&
+      this.agents.items.length > (params.limit ?? 50)
+    ) {
+      params.limit = Math.min(AGENT_PAGE_CAP, this.agents.items.length);
+    }
+    this.lastAgentQueryKey = queryKey;
+
     try {
       // Agent list first — gateway summary is refreshed separately so it never
       // blocks first paint (cached value may already be showing).
@@ -1462,17 +1542,50 @@ export class AgentsView extends LitElement {
         offset: 0,
         items: [],
       };
-      const [agentsData, flowsData, modelsData, featuresData, users] =
-        await Promise.all([
-          skipAgentsFetch
-            ? Promise.resolve(emptyAgentsData)
-            : getAccountAgents(params),
-          getFlows(),
-          getAIModels().catch(() => [] as AIModel[]),
-          getFeatures().catch(() => ({ features: {}, plugins: [] })),
-          this.fetchUsers().catch(() => []),
-        ]);
-      this.aiModels = modelsData;
+      void getAIModels()
+        .then((models) => {
+          if (generation === this.agentsLoadGeneration) this.aiModels = models;
+        })
+        .catch(() => undefined);
+      void getFeatures()
+        .then((data) => {
+          if (generation !== this.agentsLoadGeneration) return;
+          this.featureFlags = data.features || {};
+          this.computeFeatureEnabled = !!this.featureFlags['compute'];
+          this.edition = editionOf(data);
+        })
+        .catch(() => undefined);
+      void this.fetchUsers()
+        .then((users) => {
+          if (generation === this.agentsLoadGeneration)
+            this.availableUsers = users;
+        })
+        .catch(() => undefined);
+      this.lastAgentListParams = skipAgentsFetch ? null : { ...params };
+      const [agentsData, flowsData] = await Promise.all([
+        (skipAgentsFetch
+          ? Promise.resolve(emptyAgentsData)
+          : getAccountAgents(params)
+        ).then((page) => {
+          // A page without items (an older server, a partial stub) is an
+          // empty page. Every count below reads items.length, and one
+          // missing array used to crash the whole render.
+          const data = {
+            ...page,
+            items: Array.isArray(page?.items) ? page.items : [],
+          };
+          if (generation === this.agentsLoadGeneration) {
+            this.agents = data;
+            this.loading = false;
+            this.initializeNodePositions(false);
+          }
+          return data;
+        }),
+        includeFlows
+          ? getFlowSummaries({ includeStats: true }).catch(() => this.flows)
+          : Promise.resolve([]),
+      ]);
+      if (generation !== this.agentsLoadGeneration) return;
       void this.refreshGatewaySummary();
 
       // Check if a new agent was registered while the dialog is open
@@ -1496,14 +1609,15 @@ export class AgentsView extends LitElement {
 
       this.agents = agentsData;
       this.previousAgentCount = agentsData.items.length;
-      this.featureFlags = featuresData?.features || {};
-      this.computeFeatureEnabled = !!this.featureFlags['compute'];
-      this.isEnterprise =
-        Array.isArray((featuresData as { plugins?: unknown[] })?.plugins) &&
-        ((featuresData as { plugins?: unknown[] }).plugins?.length ?? 0) > 0;
-      this.availableUsers = users;
-
-      if (!this.hasAutoOpenedOnboarding && this.previousAgentCount === 0) {
+      // Only a first visit with no agents at all opens the wizard. A filter
+      // that matches nothing (a kind hidden last time, a search) is not "no
+      // agents": it gets the filtered empty state instead.
+      if (
+        !this.hasAutoOpenedOnboarding &&
+        !this.agentFiltersActive &&
+        (agentsData.total ?? 0) === 0 &&
+        this.previousAgentCount === 0
+      ) {
         this.showOnboardingDialog = true;
         this.hasAutoOpenedOnboarding = true;
       }
@@ -1543,7 +1657,7 @@ export class AgentsView extends LitElement {
             break;
         }
         this.flows = activeFlows.filter((f: any) => {
-          const t = new Date(
+          const t = parseUTCDate(
             f.execution_stats?.last_seen_at || f.created_at
           ).getTime();
           return now - t <= ms;
@@ -1573,13 +1687,14 @@ export class AgentsView extends LitElement {
       }
       this.previousAgentIds = currentAgentIds;
     } catch (error) {
+      if (generation !== this.agentsLoadGeneration) return;
       console.error('Failed to load managed agents or gateway summary:', error);
       this.error =
         error instanceof Error
           ? error.message
           : 'Failed to load managed agents or gateway summary';
     } finally {
-      this.loading = false;
+      if (generation === this.agentsLoadGeneration) this.loading = false;
     }
   }
 
@@ -1604,11 +1719,17 @@ export class AgentsView extends LitElement {
 
     // Sort items by last active timestamp descending so active nodes get closer slots
     items.sort((a, b) => {
-      const aTime = new Date(
-        a.execution_stats?.last_seen_at || a.last_seen_at || a.created_at || 0
+      const aTime = parseUTCDate(
+        a.execution_stats?.last_seen_at ||
+          a.last_seen_at ||
+          a.created_at ||
+          '1970-01-01T00:00:00Z'
       ).getTime();
-      const bTime = new Date(
-        b.execution_stats?.last_seen_at || b.last_seen_at || b.created_at || 0
+      const bTime = parseUTCDate(
+        b.execution_stats?.last_seen_at ||
+          b.last_seen_at ||
+          b.created_at ||
+          '1970-01-01T00:00:00Z'
       ).getTime();
       if (bTime !== aTime) {
         return bTime - aTime;
@@ -2018,7 +2139,7 @@ export class AgentsView extends LitElement {
     const getTimestamp = (id: string) => {
       const item = itemMap.get(id);
       if (!item) return 0;
-      return new Date(
+      return parseUTCDate(
         item.execution_stats?.last_seen_at ||
           item.last_seen_at ||
           item.created_at ||
@@ -2175,13 +2296,9 @@ export class AgentsView extends LitElement {
     return getAgentSourceLabel(sourceType);
   }
 
-  private formatMoney(amount: number | null | undefined): string {
-    return `$${(amount || 0).toFixed(2)}`;
-  }
-
   private formatDateTime(value: string | null | undefined): string {
     if (!value) return 'None';
-    const parsed = new Date(value);
+    const parsed = parseUTCDate(value);
     if (Number.isNaN(parsed.getTime())) return value;
     return parsed.toLocaleString();
   }
@@ -2267,7 +2384,7 @@ export class AgentsView extends LitElement {
   private extractPreviewFromRequest(
     request: any
   ): { text: string; source: string } | null {
-    console.log(
+    debugLog(
       '[Canvas] extractPreviewFromRequest parsing API JSON Payload',
       request
     );
@@ -2281,7 +2398,7 @@ export class AgentsView extends LitElement {
           (part: any) => part.type === 'tool_use' || part.type === 'tool_call'
         );
         if (toolUsePart) {
-          console.log(
+          debugLog(
             '[Canvas] extractPreviewFromRequest found tool use:',
             toolUsePart.name
           );
@@ -2314,7 +2431,7 @@ export class AgentsView extends LitElement {
     }
 
     if (text) {
-      console.log(
+      debugLog(
         '[Canvas] extractPreviewFromRequest resolving bubble display:',
         text.substring(0, 50) + '...'
       );
@@ -2454,7 +2571,7 @@ export class AgentsView extends LitElement {
     const payload = message?.payload ?? {};
     const type = message?.type;
 
-    console.log(`[Canvas/Dashboard] Raw Event received: ${type}`, message);
+    debugLog(`[Canvas/Dashboard] Raw Event received: ${type}`, message);
 
     let agentId = payload.managed_agent_id || payload.flow_id;
     const sessionId =
@@ -2476,7 +2593,7 @@ export class AgentsView extends LitElement {
     }
 
     if (!agentId) {
-      console.log(
+      debugLog(
         '[Canvas] Cannot resolve agentId for event. managed: ',
         payload.managed_agent_id,
         ' session: ',
@@ -3276,11 +3393,147 @@ export class AgentsView extends LitElement {
         'flow_status' in item || ('name' in item && !('display_name' in item))
     ).length;
     const agents = items.length - flows;
-    const parts = [`${agents} ${agents === 1 ? 'agent' : 'agents'}`];
+    const total = this.agents?.total ?? 0;
+    const loaded = this.agents?.items?.length ?? 0;
+    // The list is fetched a page at a time: "50 of 120 agents" says the rest
+    // exists instead of passing the first page off as all of them.
+    const parts = [
+      total > loaded
+        ? `${agents} of ${total.toLocaleString()} agents`
+        : `${agents} ${agents === 1 ? 'agent' : 'agents'}`,
+    ];
     if (flows > 0) {
       parts.push(`${flows} ${flows === 1 ? 'flow' : 'flows'}`);
     }
     return parts.join(' · ');
+  }
+
+  /** True when every agent kind is selected (flows are not a narrowing). */
+  private get allAgentKindsSelected(): boolean {
+    return AVAILABLE_AGENT_KINDS.every(
+      (kind) => kind.value === 'flows' || this.agentKinds.includes(kind.value)
+    );
+  }
+
+  /** True when a kind, last-seen window or search narrows the list. */
+  private get agentFiltersActive(): boolean {
+    return (
+      !this.allAgentKindsSelected ||
+      this.lastSeenAfter !== 'all' ||
+      this.searchQuery.trim() !== ''
+    );
+  }
+
+  /**
+   * Clears the kind, last-seen and search filters. Whether flows are shown
+   * is a view choice, not a filter, so it is kept.
+   */
+  private resetAgentFilters = (): void => {
+    const includeFlows = this.agentKinds.includes('flows');
+    this.agentKinds = AGENT_KIND_VALUES.filter(
+      (kind) => kind !== 'flows' || includeFlows
+    );
+    persistAgentKinds(this.agentKinds);
+    this.lastSeenAfter = 'all';
+    this.searchQuery = '';
+    void this.loadAgents();
+  };
+
+  /** True when the server holds more agents than this page loaded. */
+  private get hasMoreAgents(): boolean {
+    return Boolean(
+      this.agents &&
+      this.lastAgentListParams &&
+      this.agents.total > this.agents.items.length
+    );
+  }
+
+  /** Fetches the next page of agents with the same filters and appends it. */
+  private loadMoreAgents = async (): Promise<void> => {
+    if (!this.agents || !this.lastAgentListParams || this.loadingMoreAgents) {
+      return;
+    }
+    const generation = this.agentsLoadGeneration;
+    this.loadingMoreAgents = true;
+    try {
+      const page = await getAccountAgents({
+        ...this.lastAgentListParams,
+        offset: this.agents.items.length,
+      });
+      if (generation !== this.agentsLoadGeneration || !this.agents) return;
+      const seen = new Set(this.agents.items.map((item) => item.id));
+      this.agents = {
+        ...this.agents,
+        total: page.total,
+        items: [
+          ...this.agents.items,
+          ...page.items.filter((item) => !seen.has(item.id)),
+        ],
+      };
+      this.previousAgentCount = this.agents.items.length;
+      this.initializeNodePositions(false);
+    } catch (error) {
+      showToast(
+        error instanceof Error && error.message
+          ? `Could not load more agents: ${error.message}`
+          : 'Could not load more agents. Try again.',
+        'danger'
+      );
+    } finally {
+      this.loadingMoreAgents = false;
+    }
+  };
+
+  private renderLoadMore() {
+    if (!this.hasMoreAgents || !this.agents) return nothing;
+    return html`<div class="load-more">
+      <sl-button
+        size="small"
+        ?loading=${this.loadingMoreAgents}
+        @click=${this.loadMoreAgents}
+        >Load more agents</sl-button
+      >
+    </div>`;
+  }
+
+  /**
+   * Nothing to list. A first visit says how to connect an agent and offers
+   * both ways to do it; a filter that matched nothing offers to reset it.
+   */
+  private renderEmptyState() {
+    if (this.loading) {
+      return html`<div class="empty-state">Loading agents...</div>`;
+    }
+    if (this.agentFiltersActive) {
+      return html`<div class="empty-state" data-empty="filtered">
+        <p class="empty-title">No agents match these filters</p>
+        <sl-button size="small" @click=${this.resetAgentFilters}
+          >Reset filters</sl-button
+        >
+      </div>`;
+    }
+    return html`<sl-card class="empty-card" data-empty="first-run">
+      <div class="empty-state">
+        <p class="empty-title">No agents connected yet</p>
+        <p class="empty-body">
+          Connect an agent you already run, such as a coding agent on your
+          machine, or deploy a new one that Preloop governs from the start.
+        </p>
+        <div class="empty-actions">
+          <sl-button
+            variant="primary"
+            @click=${() => (this.showOnboardingDialog = true)}
+          >
+            <sl-icon slot="prefix" name="plus-lg"></sl-icon>
+            Onboard existing agent
+          </sl-button>
+          <sl-button @click=${() => (this.showDeployDialog = true)}>
+            <sl-icon slot="prefix" name="cloud-arrow-up"></sl-icon>
+            Deploy new agent
+          </sl-button>
+        </div>
+      </div>
+    </sl-card>`;
   }
 
   /** Flattens agents and flow nodes into the rows the table renders. */
@@ -3478,7 +3731,9 @@ export class AgentsView extends LitElement {
         <td class="numeric">
           <token-figures total-only .usage=${row.tokenUsage}></token-figures>
         </td>
-        <td class="numeric">${this.formatMoney(row.spend)}</td>
+        <td class="numeric">
+          ${html`<span title=${formatUsdExact(row.spend)}>${formatUsd(row.spend)}</span>`}
+        </td>
         <td
           class="muted-cell"
           title=${row.lastSeen ? this.formatDateTime(row.lastSeen) : 'Never'}
@@ -3552,17 +3807,7 @@ export class AgentsView extends LitElement {
     const rows = this.selectionRows;
 
     if (rows.length === 0) {
-      return html`
-        <div class="list-bounds">
-          <div class="empty-state">
-            ${
-              this.loading
-                ? 'Loading agents...'
-                : 'No agents or flows found matching your query.'
-            }
-          </div>
-        </div>
-      `;
+      return html` <div class="list-bounds">${this.renderEmptyState()}</div> `;
     }
 
     return html`
@@ -3627,6 +3872,7 @@ export class AgentsView extends LitElement {
             </table>
           </div>
         </sl-card>
+        ${this.renderLoadMore()}
       </div>
     `;
   }
@@ -3647,7 +3893,7 @@ export class AgentsView extends LitElement {
 
     const isGlowing =
       liveActivity?.lastActivityAt &&
-      Date.now() - new Date(liveActivity.lastActivityAt).getTime() < 2000;
+      Date.now() - parseUTCDate(liveActivity.lastActivityAt).getTime() < 2000;
 
     const displayName = isFlow ? item.name : agent?.display_name;
     const agentKind = isFlow
@@ -3923,7 +4169,7 @@ export class AgentsView extends LitElement {
           <div class="metric-row">
             <span class="label">Estimated spend</span>
             <span class="value numeric"
-              >${this.formatMoney(estimatedCost!)}</span
+              >${html`<span title=${formatUsdExact(estimatedCost!)}>${formatUsd(estimatedCost!)}</span>`}</span
             >
           </div>
 
@@ -3962,14 +4208,11 @@ export class AgentsView extends LitElement {
       <div class="cards">
         ${
           rows.length === 0 && !this.loading
-            ? html`
-                <div class="empty-state">
-                  No agents or flows found matching your query.
-                </div>
-              `
+            ? this.renderEmptyState()
             : rows.map((row) => this.renderAgentCard(row.source))
         }
       </div>
+      ${rows.length > 0 ? this.renderLoadMore() : nothing}
     `;
   }
 
@@ -4077,7 +4320,8 @@ export class AgentsView extends LitElement {
                     Object.values(this.liveActivity).some(
                       (v) =>
                         v.lastActivityAt &&
-                        Date.now() - new Date(v.lastActivityAt).getTime() < 2000
+                        Date.now() - parseUTCDate(v.lastActivityAt).getTime() <
+                          2000
                     )
                       ? 'pulsing'
                       : ''
@@ -4142,14 +4386,14 @@ export class AgentsView extends LitElement {
                     liveActivity?.modelCalls &&
                     liveActivity?.lastActivityAt &&
                     Date.now() -
-                      new Date(liveActivity.lastActivityAt).getTime() <
+                      parseUTCDate(liveActivity.lastActivityAt).getTime() <
                       2000
                   );
                   const toolActive = !!(
                     liveActivity?.toolCalls &&
                     liveActivity?.lastActivityAt &&
                     Date.now() -
-                      new Date(liveActivity.lastActivityAt).getTime() <
+                      parseUTCDate(liveActivity.lastActivityAt).getTime() <
                       2000
                   );
                   const distance = Math.max(
@@ -4450,11 +4694,18 @@ export class AgentsView extends LitElement {
                                 >Spend</span
                               >
                               <strong
-                                >${this.formatMoney(
-                                  isFlow
-                                    ? totalSpend
-                                    : agent?.estimated_cost || 0
-                                )}</strong
+                                >${html`<span
+                                  title=${formatUsdExact(
+                                    isFlow
+                                      ? totalSpend
+                                      : agent?.estimated_cost || 0
+                                  )}
+                                  >${formatUsd(
+                                    isFlow
+                                      ? totalSpend
+                                      : agent?.estimated_cost || 0
+                                  )}</span
+                                >`}</strong
                               >
                             </div>
                             <div
@@ -4538,7 +4789,7 @@ export class AgentsView extends LitElement {
   private renderOnboardingDialog() {
     return html`
       <sl-dialog
-        label="Onboard Agents"
+        label="Onboard an existing agent"
         ?open=${this.showOnboardingDialog}
         @sl-after-hide=${(e: Event) => {
           if (e.target === e.currentTarget) {
@@ -4554,7 +4805,7 @@ export class AgentsView extends LitElement {
                   initial-path="govern"
                   .aiModels=${this.aiModels}
                   .computeFeatureEnabled=${this.computeFeatureEnabled}
-                  .isEnterprise=${this.isEnterprise}
+                  .edition=${this.edition}
                   .isAdmin=${this.isAdmin}
                   @deploy-agent-success=${this.handleDeployAgentSuccess}
                   @deploy-wizard-done=${() => {
@@ -4605,7 +4856,7 @@ export class AgentsView extends LitElement {
         ${this.renderOnboardingDialog()}
 
         <sl-dialog
-          label="Deploy Governed Agent"
+          label="Deploy a new agent"
           ?open=${this.showDeployDialog}
           @sl-after-hide=${(e: Event) => {
             if (e.target === e.currentTarget) {
@@ -4617,7 +4868,7 @@ export class AgentsView extends LitElement {
           <preloop-agent-deployer
             .aiModels=${this.aiModels}
             .computeFeatureEnabled=${this.computeFeatureEnabled}
-            .isEnterprise=${this.isEnterprise}
+            .edition=${this.edition}
             .isAdmin=${this.isAdmin}
             hide-back-button
             @deploy-agent-success=${(e: CustomEvent) => {
@@ -4671,7 +4922,7 @@ export class AgentsView extends LitElement {
           >
             <sl-dropdown stay-open-on-select>
               <sl-button slot="trigger" caret variant="default">
-                Agent Kinds
+                Agent kinds
                 (${
                   this.agentKinds.length === AVAILABLE_AGENT_KINDS.length
                     ? 'All'
@@ -4692,7 +4943,7 @@ export class AgentsView extends LitElement {
                   @sl-change=${(e: any) =>
                     this.handleAgentKindChange('all', e.target.checked)}
                 >
-                  Select All
+                  Select all
                 </sl-checkbox>
                 <sl-divider
                   style="margin: var(--sl-spacing-x-small) 0;"
@@ -4715,10 +4966,12 @@ export class AgentsView extends LitElement {
             </sl-dropdown>
 
             <sl-select
+              class="last-seen-filter"
+              label="Last seen"
               value=${this.lastSeenAfter}
               @sl-change=${this.handleLastSeenAfterChange}
             >
-              <sl-option value="all">All Time</sl-option>
+              <sl-option value="all">All time</sl-option>
               <sl-option value="last_10_minutes">Last 10 minutes</sl-option>
               <sl-option value="last_1_hour">Last 1 hour</sl-option>
               <sl-option value="last_24_hours">Last 24 hours</sl-option>
@@ -4742,6 +4995,13 @@ export class AgentsView extends LitElement {
             : this.effectiveView === 'list'
               ? this.renderListView()
               : this.renderCardsView()
+        }
+        ${
+          this.effectiveView === 'canvas'
+            ? nothing
+            : html`<div class="content-bounds ${this.pageBoxClass}">
+                <discovered-agents-panel></discovered-agents-panel>
+              </div>`
         }
       </div>
     `;

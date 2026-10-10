@@ -182,6 +182,14 @@ serviceAccount:
 # Pod annotations
 podAnnotations: {}
 
+# Extra pod labels on the api, gateway, frontend, and spacesync-* deployments.
+# health-monitor and the chart Jobs do not receive these labels.
+# For Azure OpenAI with Microsoft Entra ID on AKS workload identity, set
+#   podLabels:
+#     azure.workload.identity/use: "true"
+# and annotate the service account with azure.workload.identity/client-id.
+podLabels: {}
+
 # Pod security context
 podSecurityContext: {}
 
@@ -280,6 +288,16 @@ gateway:
   # is not a valid value unless you run a combined process there.
   # See docs/operations/model-gateway-url.md.
   inClusterUrl: ""
+  # Pin a Codex session to one gateway pod (#1454). With
+  # CODEX_UPSTREAM_WEBSOCKET on, each pod keeps a warm upstream socket per
+  # (account, session-id); a call that lands on another pod still works but
+  # resends the full thread on a new socket. When enabled, the gateway Ingress
+  # hashes on the Codex `session-id` header, falling back to the client
+  # address for traffic without one so it still spreads across pods.
+  # nginx-ingress only; it applies to every gateway prefix on that Ingress.
+  sessionAffinity:
+    enabled: false
+    hashBy: "$http_session_id$remote_addr"
   # Proxy settings applied to the model-gateway routes (/openai, /anthropic,
   # /gemini) at every proxy in front of the gateway. Helm ingress sends those
   # prefixes to the gateway Service (skipping console nginx). Console nginx
@@ -420,12 +438,14 @@ environment:
   # Database settings
   databaseUrl: ""
   # JWT settings
-  # No usable default on purpose. The chart used to ship a concrete UUID here,
-  # which meant every install that did not override it signed JWTs with a key
-  # published on GitHub. README.md has documented the default as
-  # change-this-in-production all along; values.yaml now matches. Set a real
-  # one: --set environment.jwtSecret="$(openssl rand -hex 32)"
-  jwtSecret: "change-this-in-production"
+  # No default on purpose: the chart fails closed. The chart used to ship a
+  # concrete UUID here (every install that did not override it signed JWTs
+  # with a key published on GitHub), then the documented placeholder
+  # change-this-in-production, which installs kept just as silently.
+  # templates/secret.yaml now refuses to render while this is empty or a
+  # published placeholder, unless existingSecret provides the key instead.
+  # Set a real one: --set environment.jwtSecret="$(openssl rand -hex 32)"
+  jwtSecret: ""
   jwtAlgorithm: "HS256"
   # Access token lifetime. 1440 (24h) matches the documented session design:
   # 24h access token + 7 day rotating refresh token capped at 30 days.
@@ -850,6 +870,22 @@ agentExecution:
     # If create is false, agents run in the same namespace as Preloop
     name: "agent-executions"
 
+  # RuntimeClass for agent pods: run them under a stronger sandbox runtime
+  # (Kata Containers, gVisor, Firecracker) instead of the node's default.
+  # The RuntimeClass must already exist in the cluster. Empty (the default)
+  # leaves the pod on the node default.
+  runtimeClassName: ""
+
+  # Node selector for agent pods only. This is separate from the top-level
+  # nodeSelector, which places Preloop's own deployments. Empty (the
+  # default) leaves scheduling to Kubernetes.
+  nodeSelector: {}
+
+  # Tolerations for agent pods only. Use this to run agents on a tainted
+  # node pool that provides the RuntimeClass above. Empty (the default)
+  # tolerates nothing.
+  tolerations: []
+
   # RBAC configuration for agent execution
   rbac:
     # If true, creates Role and RoleBinding for agent management
@@ -983,7 +1019,7 @@ agentExecution:
       minMemory: "128Mi"
       # Default limits if not specified
       defaultCpu: "1"
-      defaultMemory: "2Gi"
+      defaultMemory: "4Gi"
       # Default requests if not specified
       defaultRequestCpu: "250m"
       defaultRequestMemory: "512Mi"

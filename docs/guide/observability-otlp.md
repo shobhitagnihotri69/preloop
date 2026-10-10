@@ -1,5 +1,10 @@
 # OTLP export
 
+Editions: OSS, Cloud, Enterprise. Unless stated otherwise, everything on this page ships in OSS.
+
+For what tool/model record stores retain under redaction and reference-only
+policies, see [Sensitive-data handling](sensitive-data.md#what-is-stored).
+
 Preloop can export OpenTelemetry traces (and duration metrics) for
 governed model calls and MCP tool calls to any OTLP-compatible backend.
 Export is **disabled by default**. Turning it on does not replace the
@@ -8,6 +13,10 @@ Export is **disabled by default**. Turning it on does not replace the
 Spans follow [OpenTelemetry GenAI semantic conventions](https://opentelemetry.io/docs/specs/semconv/gen-ai/)
 where they apply. Runtime session identity is emitted as
 `gen_ai.conversation.id` (see [Runtime Session Identity](../architecture/gateway.md)).
+
+Which attribute and metric names are stable, and how renames are
+announced, is set out in the
+[OTLP attribute stability policy](otlp-attribute-stability.md).
 
 ## Privacy
 

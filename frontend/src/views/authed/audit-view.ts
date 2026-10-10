@@ -1,3 +1,9 @@
+import { ConsoleStatus } from '../../controllers/console-status';
+import { formatUsd, formatUsdExact } from '../../utils/money';
+import {
+  replaceListFilters,
+  validFilterDate,
+} from '../../utils/list-filter-url';
 /**
  * Audit Log View - Unified Timeline
  *
@@ -11,7 +17,9 @@ import { customElement, state } from 'lit/decorators.js';
 import { AuthedElement, fetchWithAuth, PermissionError } from '../../api';
 import { permissionErrorFromResponse } from '../../permissions';
 import { parseUTCDate } from '../../utils/date';
+import { withoutApprovalMetadata } from '../../utils/approval-identity';
 import { unifiedWebSocketManager } from '../../services/unified-websocket-manager';
+import '@shoelace-style/shoelace/dist/components/alert/alert.js';
 import '@shoelace-style/shoelace/dist/components/card/card.js';
 import '@shoelace-style/shoelace/dist/components/button/button.js';
 import '@shoelace-style/shoelace/dist/components/spinner/spinner.js';
@@ -27,8 +35,13 @@ import '@shoelace-style/shoelace/dist/components/divider/divider.js';
 import consoleStyles from '../../styles/console-styles.css?inline';
 import { reducedMotionStyles } from '../../styles/reduced-motion';
 import '../../components/view-header.ts';
+import '../../components/audit-integrity-strip';
 import '../../components/permission-denied';
 import { showToast } from '../../components/confirm-dialog';
+import {
+  approvalStatusLabel,
+  approvalStatusVariant,
+} from '../../utils/approvals';
 
 // Types
 interface AuditLog {
@@ -43,6 +56,12 @@ interface AuditLog {
   user_agent: string | null;
   details: Record<string, any> | null;
   timestamp: string;
+  /**
+   * Present only when the timeline payload already carries a chain position.
+   * The grouped timeline response in this tree does not add the field, so the
+   * seal mark stays hidden until a serializer includes it.
+   */
+  chain_seq?: number | null;
 }
 
 interface SubEvent {
@@ -115,30 +134,42 @@ const EVENT_TYPE_OPTIONS = [
  * Once the event is found, its day becomes the date filter, so the operator
  * lands on a page whose filter bar explains itself.
  */
+// Typing in the tool-name search refetches once the user pauses.
+const TOOL_SEARCH_DEBOUNCE_MS = 300;
 const DEEP_LINK_PAGE_SIZE = 200;
+// Live events are coalesced: a short quiet period gathers a burst, and
+// refreshes start at most this often while events keep coming.
+const LIVE_REFRESH_DEBOUNCE_MS = 400;
+const LIVE_REFRESH_MIN_INTERVAL_MS = 2000;
 const DEEP_LINK_PAGES = 4;
 /** The fixed console header, which a scrolled-to row must clear. */
 const HEADER_OFFSET_PX = 60;
 
-// Outcome filter options
+// Outcome filter options. Approval outcomes use the Approvals page words
+// (utils/approvals.ts), so a request reads the same on both pages; a policy
+// `deny` is "Blocked by policy" so it never reads as a reviewer's denial.
 const OUTCOME_OPTIONS = [
   { value: 'allow', label: 'Allowed' },
-  { value: 'deny', label: 'Denied' },
-  { value: 'require_approval', label: 'Approval Required' },
-  { value: 'approved', label: 'Approved' },
-  { value: 'declined', label: 'Declined' },
+  { value: 'deny', label: 'Blocked by policy' },
+  { value: 'require_approval', label: 'Approval required' },
+  { value: 'approved', label: approvalStatusLabel('approved') },
+  { value: 'declined', label: approvalStatusLabel('declined') },
   { value: 'executed', label: 'Executed' },
   { value: 'failed', label: 'Failed' },
-  { value: 'budget_denied', label: 'Budget Denied' },
-  { value: 'expired', label: 'Expired' },
+  { value: 'upstream_error', label: 'Upstream error' },
+  { value: 'budget_denied', label: 'Budget denied' },
+  { value: 'expired', label: approvalStatusLabel('expired') },
 ];
 
 @customElement('audit-view')
 export class AuditView extends AuthedElement {
+  private readonly accessibilityStatus = new ConsoleStatus(this);
   // Timeline data
   @state() private _groups: AuditGroup[] = [];
   @state() private _loading = false;
   @state() private _permissionError: PermissionError | null = null;
+  /** Why the timeline could not be loaded; shown instead of the empty state. */
+  @state() private _loadError: string | null = null;
   @state() private _total = 0;
   @state() private _page = 0;
   @state() private _pageSize = 50;
@@ -169,6 +200,14 @@ export class AuditView extends AuthedElement {
   // Realtime subscription handle + debounced refresh timer.
   private _unsubscribeRealtime: (() => void) | null = null;
   private _refreshTimer: number | null = null;
+  // Live refresh coalescing, see _armLiveRefresh.
+  private _liveRefreshInFlight = false;
+  private _liveRefreshStale = false;
+  private _lastLiveRefreshAt = 0;
+  // Bumped by every foreground load, so older answers are not applied.
+  private _timelineGeneration = 0;
+  // Debounce for the tool-name search box, so typing filters the list.
+  private _toolSearchTimer: number | null = null;
   // Live indicator pulse — flips briefly when a websocket event arrives so
   // the user sees the page is wired to the realtime bus.
   @state() private _livePulse = false;
@@ -182,24 +221,9 @@ export class AuditView extends AuthedElement {
   connectedCallback() {
     super.connectedCallback();
 
-    // Parse URL parameters to initialize filters
+    this._readFilterLocation();
+    window.addEventListener('popstate', this._onFilterPopState);
     const params = new URLSearchParams(window.location.search);
-    const eventType = params.get('event_type');
-    if (eventType) {
-      this._eventTypeFilters = [eventType];
-    }
-    const outcome = params.get('outcome');
-    if (outcome) {
-      this._outcomeFilters = [outcome];
-    }
-    const minCost = params.get('min_cost');
-    if (minCost) {
-      this._minCost = minCost;
-    }
-    const maxCost = params.get('max_cost');
-    if (maxCost) {
-      this._maxCost = maxCost;
-    }
     const event = params.get('event');
     if (event) {
       this._deepLinkEventId = event;
@@ -213,6 +237,7 @@ export class AuditView extends AuthedElement {
 
   disconnectedCallback() {
     super.disconnectedCallback();
+    window.removeEventListener('popstate', this._onFilterPopState);
     if (this._unsubscribeRealtime) {
       this._unsubscribeRealtime();
       this._unsubscribeRealtime = null;
@@ -221,6 +246,7 @@ export class AuditView extends AuthedElement {
       window.clearTimeout(this._refreshTimer);
       this._refreshTimer = null;
     }
+    this._cancelToolSearch();
     if (this._livePulseTimer !== null) {
       window.clearTimeout(this._livePulseTimer);
       this._livePulseTimer = null;
@@ -242,7 +268,7 @@ export class AuditView extends AuthedElement {
 
   private _scheduleRealtimeRefresh() {
     // Pulse the live indicator immediately so the user sees feedback even
-    // before the debounced refetch actually runs.
+    // before the coalesced refetch actually runs.
     this._livePulse = true;
     if (this._livePulseTimer !== null) {
       window.clearTimeout(this._livePulseTimer);
@@ -251,20 +277,59 @@ export class AuditView extends AuthedElement {
       this._livePulse = false;
       this._livePulseTimer = null;
     }, 1500);
+    this._armLiveRefresh();
+  }
 
-    if (this._refreshTimer !== null) {
-      window.clearTimeout(this._refreshTimer);
+  /**
+   * Coalesce live events into background refreshes.
+   *
+   * At most one refresh is in flight. Events that arrive meanwhile mark the
+   * list stale, and one trailing refresh runs after it lands. A pending timer
+   * is never pushed back, so a steady stream of events still refreshes at
+   * least every LIVE_REFRESH_MIN_INTERVAL_MS instead of never. A live refresh
+   * keeps the rows on screen: it never shows the spinner.
+   */
+  private _armLiveRefresh() {
+    if (this._liveRefreshInFlight || this._loading) {
+      this._liveRefreshStale = true;
+      return;
     }
-    // Debounce so a burst of websocket events (notification fan-out across
-    // channels, then approval, then execution) results in a single refetch.
+    if (this._refreshTimer !== null) return;
+    const sinceLast = Date.now() - this._lastLiveRefreshAt;
+    const delay = Math.max(
+      LIVE_REFRESH_DEBOUNCE_MS,
+      LIVE_REFRESH_MIN_INTERVAL_MS - sinceLast
+    );
     this._refreshTimer = window.setTimeout(() => {
       this._refreshTimer = null;
-      // Only auto-refresh page 0 — paging back through history shouldn't
-      // shift under the user's feet when new events arrive.
-      if (this._page === 0) {
-        void this._loadTimeline();
-      }
-    }, 400);
+      void this._runLiveRefresh();
+    }, delay);
+  }
+
+  private async _runLiveRefresh() {
+    // Only auto-refresh page 0: paging back through history shouldn't
+    // shift under the user's feet when new events arrive.
+    if (this._page !== 0 || !this.isConnected) return;
+    if (this._loading) {
+      this._liveRefreshStale = true;
+      return;
+    }
+    this._liveRefreshInFlight = true;
+    this._liveRefreshStale = false;
+    this._lastLiveRefreshAt = Date.now();
+    try {
+      await this._loadTimeline({ background: true });
+    } finally {
+      this._liveRefreshInFlight = false;
+    }
+    this._flushStaleLiveRefresh();
+  }
+
+  /** Run the trailing refresh owed to events seen while a load was busy. */
+  private _flushStaleLiveRefresh() {
+    if (!this._liveRefreshStale || !this.isConnected) return;
+    this._liveRefreshStale = false;
+    this._armLiveRefresh();
   }
 
   // ── Data loading ───────────────────────────────────────────────────
@@ -309,35 +374,74 @@ export class AuditView extends AuthedElement {
     return params;
   }
 
-  private async _loadTimeline() {
-    this._loading = true;
-    this._permissionError = null;
+  /**
+   * Load the current page of the timeline.
+   *
+   * A foreground load (first visit, filter, page) shows the spinner and wins
+   * over anything started before it. A background load (live refresh) keeps
+   * the rows on screen and is dropped if a foreground load started after it,
+   * since its answer is for filters the reader has already left.
+   */
+  private async _loadTimeline({
+    background = false,
+  }: { background?: boolean } = {}) {
+    const generation = background
+      ? this._timelineGeneration
+      : ++this._timelineGeneration;
+    if (!background) {
+      this._loading = true;
+      this._permissionError = null;
+      this._loadError = null;
+    }
     try {
       const params = this._timelineParams(
         this._page * this._pageSize,
         this._pageSize
       );
 
-      const res = await fetchWithAuth(`/api/v1/audit-logs/grouped?${params}`);
+      const res = await fetchWithAuth(
+        `/api/v1/audit-logs/grouped?${params}`,
+        background ? { passive: true } : {}
+      );
+      if (generation !== this._timelineGeneration) return;
       if (res.status === 403) {
         this._permissionError = await permissionErrorFromResponse(res);
         this._groups = [];
         this._total = 0;
         return;
       }
-      if (res.ok) {
-        const data: GroupedResponse = await res.json();
-        this._groups = data.groups;
-        this._total = data.total;
+      if (!res.ok) {
+        // A failed read must never look like an empty audit log. A failed
+        // live refresh leaves the rows it would have replaced on screen.
+        if (!background) {
+          this._loadError = `Couldn't load audit events (HTTP ${res.status}).`;
+        }
+        return;
       }
+      const data: GroupedResponse = await res.json();
+      if (generation !== this._timelineGeneration) return;
+      // A live refresh used to be a foreground load, which cleared a stale
+      // permission or load error. A successful background answer has to do
+      // the same, or the error stays up next to the new rows.
+      this._permissionError = null;
+      this._loadError = null;
+      this._groups = data.groups;
+      this._total = data.total;
     } catch (e) {
       console.error('Failed to load timeline:', e);
+      if (!background && generation === this._timelineGeneration) {
+        this._loadError = "Couldn't load audit events.";
+      }
     } finally {
-      this._loading = false;
+      if (!background && generation === this._timelineGeneration) {
+        this._loading = false;
+      }
     }
+    if (generation !== this._timelineGeneration) return;
     if (this._deepLinkPending) {
       await this._resolveDeepLink();
     }
+    if (!background) this._flushStaleLiveRefresh();
   }
 
   // ── Deep link (?event=) ────────────────────────────────────────────
@@ -378,12 +482,13 @@ export class AuditView extends AuthedElement {
       showToast('Event not in the current range', 'warning');
       return;
     }
-    const day = new Date(when);
+    const day = parseUTCDate(when);
     const next = new Date(day.getTime() + 24 * 3600 * 1000);
     this._startDate = day.toISOString().slice(0, 10);
     this._endDate = next.toISOString().slice(0, 10);
     this._page = 0;
     this._deepLinkPending = true;
+    this._syncFilterLocation();
     await this._loadTimeline();
     if (this._deepLinkPending) {
       this._deepLinkPending = false;
@@ -458,12 +563,73 @@ export class AuditView extends AuthedElement {
     showToast('Link copied', 'success');
   }
 
+  private _readFilterLocation(): void {
+    const params = new URLSearchParams(window.location.search);
+    this._eventTypeFilters = params.getAll('event_type');
+    this._outcomeFilters = params.getAll('outcome');
+    this._toolNameFilter = params.get('tool_name') ?? '';
+    this._startDate = validFilterDate(params.get('start_date'));
+    this._endDate = validFilterDate(params.get('end_date'));
+    this._minCost = params.get('min_cost') ?? '';
+    this._maxCost = params.get('max_cost') ?? '';
+  }
+
+  private _onFilterPopState = (): void => {
+    this._readFilterLocation();
+    this._page = 0;
+    void this._loadTimeline({ background: this._groups.length > 0 });
+  };
+
+  private _syncFilterLocation(): void {
+    replaceListFilters({
+      event_type: this._eventTypeFilters,
+      outcome: this._outcomeFilters,
+      tool_name: this._toolNameFilter,
+      start_date: this._startDate,
+      end_date: this._endDate,
+      min_cost: this._minCost,
+      max_cost: this._maxCost,
+    });
+  }
+
   private _applyFilters() {
+    this._syncFilterLocation();
+    this._cancelToolSearch();
     this._page = 0;
     this._loadTimeline();
   }
 
+  private _cancelToolSearch() {
+    if (this._toolSearchTimer !== null) {
+      window.clearTimeout(this._toolSearchTimer);
+      this._toolSearchTimer = null;
+    }
+  }
+
+  private _onToolSearchInput(value: string) {
+    this._toolNameFilter = value;
+    this._cancelToolSearch();
+    this._toolSearchTimer = window.setTimeout(() => {
+      this._toolSearchTimer = null;
+      this._applyFilters();
+    }, TOOL_SEARCH_DEBOUNCE_MS);
+  }
+
+  /** Whether any filter narrows the timeline, so "no rows" means "no match". */
+  private get _hasActiveFilters(): boolean {
+    return Boolean(
+      this._eventTypeFilters.length ||
+      this._outcomeFilters.length ||
+      this._toolNameFilter ||
+      this._startDate ||
+      this._endDate ||
+      this._minCost ||
+      this._maxCost
+    );
+  }
+
   private _clearFilters() {
+    this._cancelToolSearch();
     this._eventTypeFilters = [];
     this._outcomeFilters = [];
     this._toolNameFilter = '';
@@ -471,6 +637,7 @@ export class AuditView extends AuthedElement {
     this._endDate = '';
     this._minCost = '';
     this._maxCost = '';
+    this._syncFilterLocation();
     this._page = 0;
     this._loadTimeline();
   }
@@ -528,12 +695,6 @@ export class AuditView extends AuthedElement {
     return actor;
   }
 
-  private _formatCurrency(value?: number | null): string {
-    const amount = Number(value || 0);
-    if (amount === 0) return '$0.00';
-    return amount >= 0.01 ? `$${amount.toFixed(2)}` : `$${amount.toFixed(4)}`;
-  }
-
   private _getEventCost(details: Record<string, any> | null): number | null {
     if (!details || details.estimated_cost == null) return null;
     const value = Number(details.estimated_cost);
@@ -564,7 +725,9 @@ export class AuditView extends AuthedElement {
       }
       ${
         cost != null
-          ? html`<span class="event-cost">${this._formatCurrency(cost)}</span>`
+          ? html`<span class="event-cost"
+              >${html`<span title=${formatUsdExact(cost)}>${formatUsd(cost)}</span>`}</span
+            >`
           : nothing
       }
     `;
@@ -833,7 +996,16 @@ export class AuditView extends AuthedElement {
             : nothing
         }
         ${preferredItems} ${remainingItems} ${recipientChips}
-        ${this._renderJsonDetail('Arguments', details.tool_args)}
+        ${this._renderJsonDetail(
+          'Arguments',
+          details.tool_args &&
+            typeof details.tool_args === 'object' &&
+            !Array.isArray(details.tool_args)
+            ? withoutApprovalMetadata(
+                details.tool_args as Record<string, unknown>
+              )
+            : details.tool_args
+        )}
         ${this._renderJsonDetail('Result preview', details.result_preview)}
         ${this._renderJsonDetail('Budget', details.budget)}
         ${this._renderJsonDetail('New Value', details.new_value)}
@@ -851,15 +1023,17 @@ export class AuditView extends AuthedElement {
       case 'executed':
         return { variant: 'success', label: 'Allowed' };
       case 'approved':
-        return { variant: 'success', label: 'Approved' };
-      case 'deny':
-        return { variant: 'danger', label: 'Denied' };
       case 'declined':
-        return { variant: 'danger', label: 'Declined' };
-      case 'require_approval':
-        return { variant: 'warning', label: 'Approval Required' };
       case 'expired':
-        return { variant: 'neutral', label: 'Expired' };
+        // The Approvals page's words and colours for the same outcomes.
+        return {
+          variant: approvalStatusVariant(outcome),
+          label: approvalStatusLabel(outcome),
+        };
+      case 'deny':
+        return { variant: 'danger', label: 'Blocked by policy' };
+      case 'require_approval':
+        return { variant: 'warning', label: 'Approval required' };
       case 'created':
         return { variant: 'success', label: 'Created' };
       case 'updated':
@@ -867,12 +1041,16 @@ export class AuditView extends AuthedElement {
       case 'failed':
       case 'failure':
         return { variant: 'danger', label: 'Failed' };
+      case 'upstream_error':
+        return { variant: 'danger', label: 'Upstream error' };
+      case 'pending_approval':
+        return { variant: 'warning', label: 'Approval pending' };
       case 'budget_denied':
-        return { variant: 'danger', label: 'Budget Denied' };
+        return { variant: 'danger', label: 'Budget denied' };
       case 'success':
         return { variant: 'success', label: 'Success' };
       case 'denied':
-        return { variant: 'danger', label: 'Denied' };
+        return { variant: 'danger', label: 'Blocked' };
       case 'sent':
         return { variant: 'success', label: 'Sent' };
       case 'partial':
@@ -933,7 +1111,7 @@ export class AuditView extends AuthedElement {
         const desc = d.rule_description?.includes('Rule matched: None')
           ? 'Default Rule'
           : d.rule_description;
-        return `Policy: Require Approval${desc ? ` — ${desc}` : ''}`;
+        return `Policy: require approval${desc ? ` — ${desc}` : ''}`;
       }
       case 'approval_created': {
         const timeout = d.timeout_seconds
@@ -944,9 +1122,9 @@ export class AuditView extends AuthedElement {
       case 'approval_approved':
         return `Approved${d.approver_id ? ` by ${this._getUserDisplay(d.approver_id)}` : ''}${d.reason ? ` — ${d.reason}` : ''}`;
       case 'approval_denied':
-        return `Declined${d.approver_id ? ` by ${this._getUserDisplay(d.approver_id)}` : ''}${d.reason ? ` — ${d.reason}` : ''}`;
+        return `Denied${d.approver_id ? ` by ${this._getUserDisplay(d.approver_id)}` : ''}${d.reason ? ` — ${d.reason}` : ''}`;
       case 'approval_expired':
-        return 'Approval expired (timed out)';
+        return 'Approval timed out';
       case 'approval_escalated':
         return `Escalated${d.escalation_reason ? ` — ${d.escalation_reason}` : ''}`;
       case 'approval_notification_sent': {
@@ -987,15 +1165,28 @@ export class AuditView extends AuthedElement {
     }
   }
 
+  private _policyToolName(event: AuditLog): string {
+    return event.details?.tool_name || event.resource_id || 'unknown tool';
+  }
+
   private _getPrimaryLabel(event: AuditLog): string {
     switch (event.action) {
       case 'tool_call':
         return event.resource_id || event.details?.tool_name || 'Unknown tool';
+      case 'policy_deny':
+        return `Blocked by policy: ${this._policyToolName(event)}`;
+      case 'policy_require_approval':
+        return `Approval required: ${this._policyToolName(event)}`;
+      case 'policy_allow':
+        return `Allowed by policy: ${this._policyToolName(event)}`;
       case 'authentication':
         return `Login: ${event.details?.username || 'unknown'}`;
       case 'configuration_change': {
         const ct = event.details?.config_type || event.resource_id || 'unknown';
-        const act = event.details?.action || 'changed';
+        const act = String(event.details?.action || 'changed').replace(
+          /_/g,
+          ' '
+        );
         const labels: Record<string, string> = {
           mcp_server: 'MCP Server',
           tool_configuration: 'Tool',
@@ -1003,6 +1194,7 @@ export class AuditView extends AuthedElement {
           approval_workflow: 'Approval Workflow',
           tracker: 'Tracker',
           flow: 'Flow',
+          policy: 'Policy',
         };
         const pretty = labels[ct] || ct;
         const name = event.details?.new_value
@@ -1051,8 +1243,15 @@ export class AuditView extends AuthedElement {
   }
 
   private _getArgsSummary(details: Record<string, any> | null): string {
-    if (!details?.tool_args) return '';
-    const args = details.tool_args;
+    if (
+      !details?.tool_args ||
+      typeof details.tool_args !== 'object' ||
+      Array.isArray(details.tool_args)
+    )
+      return '';
+    const args = withoutApprovalMetadata(
+      details.tool_args as Record<string, unknown>
+    );
     const entries = Object.entries(args);
     if (entries.length === 0) return '';
     const parts = entries.slice(0, 3).map(([k, v]) => {
@@ -1168,24 +1367,54 @@ export class AuditView extends AuthedElement {
                   message=${this._permissionError.message}
                 ></permission-denied>`
               : html`
+                  <audit-integrity-strip></audit-integrity-strip>
                   ${this._renderFilterBar()}
                   ${
                     this._loading
                       ? html`<div class="loading">
                           <sl-spinner style="font-size: 2rem;"></sl-spinner>
                         </div>`
-                      : this._groups.length === 0
-                        ? html`<div class="empty-state">
-                            No audit events yet. Governed tool calls, approvals,
-                            and policy decisions are recorded here as your
-                            agents work.
-                          </div>`
-                        : html`
-                            <div class="timeline">
-                              ${this._groups.map((g) => this._renderGroup(g))}
+                      : this._loadError
+                        ? html`<sl-alert
+                            variant="danger"
+                            open
+                            class="load-error"
+                            data-testid="audit-load-error"
+                          >
+                            <sl-icon
+                              slot="icon"
+                              name="exclamation-octagon"
+                            ></sl-icon>
+                            <div class="load-error-body">
+                              <span>${this._loadError}</span>
+                              <sl-button
+                                size="small"
+                                @click=${() => void this._loadTimeline()}
+                                >Retry</sl-button
+                              >
                             </div>
-                            ${this._renderPagination()}
-                          `
+                          </sl-alert>`
+                        : this._groups.length === 0
+                          ? this._hasActiveFilters
+                            ? html`<div class="empty-state">
+                                <p>No events match these filters.</p>
+                                <sl-button
+                                  size="small"
+                                  @click=${this._clearFilters}
+                                  >Clear filters</sl-button
+                                >
+                              </div>`
+                            : html`<div class="empty-state">
+                                No audit events yet. Governed tool calls,
+                                approvals, and policy decisions are recorded
+                                here as your agents work.
+                              </div>`
+                          : html`
+                              <div class="timeline">
+                                ${this._groups.map((g) => this._renderGroup(g))}
+                              </div>
+                              ${this._renderPagination()}
+                            `
                   }
                 `
           }
@@ -1269,13 +1498,13 @@ export class AuditView extends AuthedElement {
     return html`
       <div class="filter-bar">
         <sl-input
+          label="Tool"
           placeholder="Search tool name…"
           size="small"
           clearable
           .value=${this._toolNameFilter}
-          @sl-input=${(e: Event) => {
-            this._toolNameFilter = (e.target as HTMLInputElement).value;
-          }}
+          @sl-input=${(e: Event) =>
+            this._onToolSearchInput((e.target as HTMLInputElement).value)}
           @sl-clear=${() => {
             this._toolNameFilter = '';
             this._applyFilters();
@@ -1288,7 +1517,8 @@ export class AuditView extends AuthedElement {
         </sl-input>
 
         <sl-select
-          placeholder="Event Type"
+          label="Event type"
+          placeholder="Any event type"
           size="small"
           clearable
           multiple
@@ -1312,7 +1542,8 @@ export class AuditView extends AuthedElement {
         </sl-select>
 
         <sl-select
-          placeholder="Outcomes"
+          label="Outcome"
+          placeholder="Any outcome"
           size="small"
           clearable
           multiple
@@ -1338,7 +1569,7 @@ export class AuditView extends AuthedElement {
         <sl-input
           type="date"
           size="small"
-          placeholder="From"
+          label="From date"
           .value=${this._startDate}
           @sl-change=${(e: Event) => {
             this._startDate = (e.target as HTMLInputElement).value;
@@ -1349,7 +1580,7 @@ export class AuditView extends AuthedElement {
         <sl-input
           type="date"
           size="small"
-          placeholder="To"
+          label="To date"
           .value=${this._endDate}
           @sl-change=${(e: Event) => {
             this._endDate = (e.target as HTMLInputElement).value;
@@ -1360,13 +1591,15 @@ export class AuditView extends AuthedElement {
         <sl-input
           type="number"
           size="small"
-          placeholder="Min $"
+          label="Min cost ($)"
+          placeholder="0.00"
           min="0"
           step="0.0001"
           .value=${this._minCost}
           @sl-input=${(e: Event) => {
             this._minCost = (e.target as HTMLInputElement).value;
           }}
+          @sl-change=${() => this._applyFilters()}
           @keydown=${(e: KeyboardEvent) => {
             if (e.key === 'Enter') this._applyFilters();
           }}
@@ -1375,26 +1608,22 @@ export class AuditView extends AuthedElement {
         <sl-input
           type="number"
           size="small"
-          placeholder="Max $"
+          label="Max cost ($)"
+          placeholder="Any"
           min="0"
           step="0.0001"
           .value=${this._maxCost}
           @sl-input=${(e: Event) => {
             this._maxCost = (e.target as HTMLInputElement).value;
           }}
+          @sl-change=${() => this._applyFilters()}
           @keydown=${(e: KeyboardEvent) => {
             if (e.key === 'Enter') this._applyFilters();
           }}
         ></sl-input>
 
         ${
-          this._eventTypeFilters.length ||
-          this._outcomeFilters.length ||
-          this._toolNameFilter ||
-          this._startDate ||
-          this._endDate ||
-          this._minCost ||
-          this._maxCost
+          this._hasActiveFilters
             ? html`<sl-button
                 size="small"
                 variant="text"
@@ -1405,6 +1634,23 @@ export class AuditView extends AuthedElement {
         }
       </div>
     `;
+  }
+
+  /**
+   * Sealed or unsealed, only when the row already carries chain_seq.
+   * A missing field is not the same as an unsealed row.
+   */
+  private _renderSeal(event: AuditLog) {
+    if (!Object.prototype.hasOwnProperty.call(event, 'chain_seq')) {
+      return nothing;
+    }
+    const sealed = event.chain_seq != null;
+    const title = sealed
+      ? 'Sealed into the hash chain. This shows the row was not edited after sealing. It does not show the row was true when written.'
+      : 'Written, not sealed yet. Sealing runs behind the write.';
+    return html`<span class="seal-mark" title=${title} data-testid="seal-mark"
+      >${sealed ? `Sealed ${event.chain_seq}` : 'Unsealed'}</span
+    >`;
   }
 
   private _renderGroup(group: AuditGroup) {
@@ -1449,6 +1695,7 @@ export class AuditView extends AuthedElement {
                 ? html`<span class="exec-time">${execTime}ms</span>`
                 : nothing
             }
+            ${this._renderSeal(event)}
             <sl-badge class="status-chip" variant=${badge.variant} pill
               >${badge.label}</sl-badge
             >
@@ -1472,11 +1719,26 @@ export class AuditView extends AuthedElement {
               </button>
             </sl-tooltip>
             ${
+              // The row stays clickable for the mouse. This button is the
+              // keyboard and screen-reader way in: a whole-row role=button
+              // would nest the copy-link button inside another button.
               canExpand
-                ? html`<sl-icon
-                    name=${expanded ? 'chevron-up' : 'chevron-down'}
-                    class="expand-icon"
-                  ></sl-icon>`
+                ? html`<button
+                    type="button"
+                    class="expand-toggle"
+                    aria-expanded=${expanded ? 'true' : 'false'}
+                    aria-label=${`Details for ${this._getPrimaryLabel(event)}`}
+                    @click=${(e: Event) => {
+                      e.stopPropagation();
+                      this._toggleGroup(key);
+                    }}
+                  >
+                    <sl-icon
+                      name=${expanded ? 'chevron-up' : 'chevron-down'}
+                      class="expand-icon"
+                      aria-hidden="true"
+                    ></sl-icon>
+                  </button>`
                 : html`<span class="expand-spacer"></span>`
             }
           </div>
@@ -1631,7 +1893,16 @@ export class AuditView extends AuthedElement {
       } else if (executionSubevent.status === 'failed') {
         const err = executionSubevent.details?.error;
         story += `The tool then failed${err ? ` — ${err}` : ''}.`;
+      } else if (executionSubevent.status === 'upstream_error') {
+        const err = executionSubevent.details?.error;
+        story += `The upstream server then returned an error${err ? `: ${err}` : ''}.`;
       }
+    } else if (
+      group.outcome === 'upstream_error' ||
+      group.outcome === 'failed' ||
+      (group.outcome === 'declined' && !approvalResolutionSubevent)
+    ) {
+      story += this._toolCallFailureStory(group);
     } else if (
       group.outcome === 'success' ||
       group.outcome === 'executed' ||
@@ -1654,11 +1925,24 @@ export class AuditView extends AuthedElement {
       >
         <sl-icon
           name="book"
-          style="margin-right: 6px; color: var(--sl-color-neutral-500);"
+          style="margin-right: 6px; color: var(--console-meta-color);"
         ></sl-icon>
         <strong>Summary:</strong> ${story}
       </div>
     `;
+  }
+
+  private _toolCallFailureStory(group: AuditGroup): string {
+    const details = group.primary_event.details || {};
+    const code = details.error_code ? ` (${details.error_code})` : '';
+    const reason = details.error_reason ? `: ${details.error_reason}` : '';
+    if (group.outcome === 'upstream_error') {
+      return `The upstream server returned an error${code}${reason}.`;
+    }
+    if (group.outcome === 'declined') {
+      return `The call was denied and nothing was forwarded${reason}.`;
+    }
+    return `The tool call failed${code}${reason}.`;
   }
 
   private _renderSubEvent(sub: SubEvent) {
@@ -1781,7 +2065,7 @@ export class AuditView extends AuthedElement {
         font-size: 0.65rem;
         font-weight: 600;
         letter-spacing: 0.05em;
-        color: var(--sl-color-neutral-500);
+        color: var(--console-meta-color);
         padding: 2px 6px;
         border-radius: 999px;
         background: var(--sl-color-neutral-100);
@@ -1823,7 +2107,7 @@ export class AuditView extends AuthedElement {
 
       .total-badge {
         font-size: 0.75rem;
-        color: var(--sl-color-neutral-500);
+        color: var(--console-meta-color);
         background: var(--sl-color-neutral-100);
         padding: 0.15rem 0.5rem;
         border-radius: 999px;
@@ -1845,6 +2129,14 @@ export class AuditView extends AuthedElement {
       .filter-bar sl-select {
         min-width: 0;
       }
+      /* Every filter is named (a native date box shows no placeholder, so
+         From and To looked identical); keep the names small. */
+      .filter-bar sl-input::part(form-control-label),
+      .filter-bar sl-select::part(form-control-label) {
+        font-size: var(--sl-font-size-x-small);
+        color: var(--sl-color-neutral-600);
+        margin-bottom: 2px;
+      }
       /* Clear takes its own row rather than an eighth column. */
       .filter-bar sl-button {
         grid-column: 1 / -1;
@@ -1859,9 +2151,22 @@ export class AuditView extends AuthedElement {
       }
       .empty-state {
         text-align: center;
-        color: var(--sl-color-neutral-500);
+        color: var(--console-meta-color);
         padding: 3rem 0;
         font-size: 0.9rem;
+      }
+      .empty-state p {
+        margin: 0 0 0.75rem;
+      }
+      .load-error {
+        margin: 1rem 0;
+      }
+      .load-error-body {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        justify-content: space-between;
+        gap: 0.5rem 1rem;
       }
 
       /* ── Timeline ──────────────────────────── */
@@ -1903,7 +2208,7 @@ export class AuditView extends AuthedElement {
       .copy-link {
         background: none;
         border: none;
-        color: var(--sl-color-neutral-400);
+        color: var(--console-meta-color);
         cursor: pointer;
         display: inline-flex;
         font-size: 0.85rem;
@@ -1947,7 +2252,7 @@ export class AuditView extends AuthedElement {
 
       .action-icon {
         font-size: 1rem;
-        color: var(--sl-color-neutral-500);
+        color: var(--console-meta-color);
         flex-shrink: 0;
       }
       .primary-label {
@@ -1958,7 +2263,7 @@ export class AuditView extends AuthedElement {
       }
       .args-summary {
         font-size: 0.75rem;
-        color: var(--sl-color-neutral-500);
+        color: var(--console-meta-color);
         font-family: var(--sl-font-mono);
         white-space: nowrap;
         overflow: hidden;
@@ -1968,12 +2273,12 @@ export class AuditView extends AuthedElement {
 
       .exec-time {
         font-size: 0.7rem;
-        color: var(--sl-color-neutral-400);
+        color: var(--console-meta-color);
         font-family: var(--sl-font-mono);
       }
       .event-cost {
         font-size: 0.7rem;
-        color: var(--sl-color-neutral-500);
+        color: var(--console-meta-color);
         font-family: var(--sl-font-mono);
         white-space: nowrap;
       }
@@ -1987,12 +2292,26 @@ export class AuditView extends AuthedElement {
       }
       .timestamp {
         font-size: 0.7rem;
-        color: var(--sl-color-neutral-400);
+        color: var(--console-meta-color);
         white-space: nowrap;
       }
       .expand-icon {
         font-size: 0.9rem;
-        color: var(--sl-color-neutral-400);
+        color: var(--console-meta-color);
+      }
+      .expand-toggle {
+        background: none;
+        border: none;
+        cursor: pointer;
+        display: inline-flex;
+        padding: 0;
+        color: inherit;
+        border-radius: var(--sl-border-radius-small);
+      }
+      .expand-toggle:focus-visible,
+      .copy-link:focus-visible {
+        outline: var(--sl-focus-ring);
+        outline-offset: var(--sl-focus-ring-offset);
       }
       .expand-spacer {
         width: 0.9rem;
@@ -2013,7 +2332,7 @@ export class AuditView extends AuthedElement {
       }
       .detail-label {
         font-size: 0.68rem;
-        color: var(--sl-color-neutral-500);
+        color: var(--console-meta-color);
         text-transform: uppercase;
         letter-spacing: 0.04em;
       }
@@ -2039,7 +2358,7 @@ export class AuditView extends AuthedElement {
       .copy-id::part(base) {
         padding: 0;
         font-size: 0.78rem;
-        color: var(--sl-color-neutral-500);
+        color: var(--console-meta-color);
       }
       .detail-json {
         margin: 0;
@@ -2081,7 +2400,7 @@ export class AuditView extends AuthedElement {
 
       .sub-icon {
         font-size: 0.8rem;
-        color: var(--sl-color-neutral-400);
+        color: var(--console-meta-color);
         flex-shrink: 0;
         z-index: 1;
       }
@@ -2118,7 +2437,7 @@ export class AuditView extends AuthedElement {
       }
       .sub-actor {
         font-size: 0.68rem;
-        color: var(--sl-color-neutral-500);
+        color: var(--console-meta-color);
         max-width: 170px;
         overflow: hidden;
         text-overflow: ellipsis;
@@ -2126,7 +2445,7 @@ export class AuditView extends AuthedElement {
       }
       .sub-timestamp {
         font-size: 0.65rem;
-        color: var(--sl-color-neutral-400);
+        color: var(--console-meta-color);
         white-space: nowrap;
       }
 
@@ -2141,7 +2460,7 @@ export class AuditView extends AuthedElement {
       }
       .page-info {
         font-size: 0.75rem;
-        color: var(--sl-color-neutral-500);
+        color: var(--console-meta-color);
       }
       .page-controls {
         display: flex;

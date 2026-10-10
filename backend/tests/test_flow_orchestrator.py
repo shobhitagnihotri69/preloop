@@ -2,6 +2,8 @@
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
+
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import uuid4
@@ -23,6 +25,9 @@ from preloop.services.flow_orchestrator import (
     FLOW_SUCCESS_SENTINEL,
     FlowExecutionOrchestrator,
     TimeoutBudget,
+    _project_identity_rank,
+    payload_repository_identity,
+    repository_path_from_git_url,
     _build_confirmation_nudge_prompt,
     _failure_report_in_log_lines,
     _result_artifact_confirmation,
@@ -166,6 +171,39 @@ def mock_agent_executor():
     mock_executor._trigger_sentinel = True
 
     return mock_executor
+
+
+def _gitlab_project(db_session, account_id, *, name, slug, identifier):
+    """Create a GitLab tracker project owned by ``account_id``."""
+    from preloop.models import models
+
+    tracker = models.Tracker(
+        name=f"gitlab-{identifier}",
+        account_id=account_id,
+        tracker_type="gitlab",
+        url="https://gitlab.example.com",
+        api_key="test-token",
+        auth_type="api_token",
+    )
+    db_session.add(tracker)
+    db_session.flush()
+    organization = models.Organization(
+        name=name,
+        identifier=identifier,
+        tracker_id=tracker.id,
+    )
+    db_session.add(organization)
+    db_session.flush()
+    project = models.Project(
+        name=name,
+        identifier=identifier,
+        slug=slug,
+        organization_id=organization.id,
+        is_active=True,
+    )
+    db_session.add(project)
+    db_session.flush()
+    return project
 
 
 class TestFlowExecutionOrchestrator:
@@ -1876,6 +1914,11 @@ class TestFlowExecutionOrchestrator:
         )
         assert execution_context["model_api_key"] is None
         assert "model_gateway_disabled_reason" not in execution_context
+        # Harness waits (the Codex stream idle bound) are kept inside it.
+        assert (
+            execution_context["flow_timeout_seconds"]
+            == orchestrator._execution_timeout_budget().seconds
+        )
 
     def test_resolve_trigger_project_id_prefers_event_project(
         self, db_session: Session, test_flow: Flow, mock_nats_client
@@ -1903,6 +1946,176 @@ class TestFlowExecutionOrchestrator:
 
         assert orchestrator._resolve_trigger_project_id() == android_id
 
+    def test_payload_matches_selected_project_without_tracker_id(
+        self,
+        db_session: Session,
+        test_flow: Flow,
+        test_account: Account,
+        mock_nats_client,
+    ):
+        """A CI payload names one selected project, not trigger_project_ids[0]."""
+        admin = _gitlab_project(
+            db_session,
+            test_account.id,
+            name="Preloop Admin",
+            slug="spacecode/preloop-admin",
+            identifier="1",
+        )
+        enterprise = _gitlab_project(
+            db_session,
+            test_account.id,
+            name="Preloop Enterprise",
+            slug=None,
+            identifier="21",
+        )
+        test_flow.trigger_project_ids = [str(admin.id), str(enterprise.id)]
+        test_flow.git_clone_config = {"enabled": True, "repositories": []}
+        orchestrator = FlowExecutionOrchestrator(
+            db=db_session,
+            flow_id=test_flow.id,
+            trigger_event_data={
+                "source": "gitlab",
+                "type": "merge_request_updated",
+                "payload": {
+                    "project": {
+                        "id": 21,
+                        "path_with_namespace": "spacecode/preloop-ee",
+                        "git_http_url": "https://gitlab.example.com/spacecode/preloop-ee.git",
+                        "web_url": "https://gitlab.example.com/spacecode/preloop-ee",
+                    }
+                },
+            },
+            nats_client=mock_nats_client,
+        )
+        orchestrator._get_flow_details()
+
+        assert orchestrator._resolve_trigger_project_id() == str(enterprise.id)
+        clone = orchestrator._git_clone_config_for_trigger()
+        assert clone["repositories"] == [
+            {
+                "project_id": str(enterprise.id),
+                "clone_path": "/workspace",
+                "repository_url": "https://gitlab.example.com/spacecode/preloop-ee.git",
+            }
+        ]
+
+    def test_payload_outside_selected_projects_is_not_the_first_project(
+        self,
+        db_session: Session,
+        test_flow: Flow,
+        test_account: Account,
+        mock_nats_client,
+    ):
+        """A repository the flow did not select is not replaced with another."""
+        admin = _gitlab_project(
+            db_session,
+            test_account.id,
+            name="Preloop Admin",
+            slug="spacecode/preloop-admin",
+            identifier="1",
+        )
+        test_flow.trigger_project_ids = [str(admin.id)]
+        test_flow.git_clone_config = {
+            "enabled": True,
+            "repositories": [
+                {
+                    "repository_url": "https://gitlab.example.com/spacecode/preloop-admin.git",
+                    "project_id": str(admin.id),
+                }
+            ],
+        }
+        orchestrator = FlowExecutionOrchestrator(
+            db=db_session,
+            flow_id=test_flow.id,
+            trigger_event_data={
+                "source": "gitlab",
+                "payload": {
+                    "project": {
+                        "id": 21,
+                        "path_with_namespace": "spacecode/preloop-ee",
+                        "git_http_url": "https://gitlab.example.com/spacecode/preloop-ee.git",
+                    }
+                },
+            },
+            nats_client=mock_nats_client,
+        )
+        orchestrator._get_flow_details()
+
+        assert orchestrator._resolve_trigger_project_id() is None
+        assert orchestrator._git_clone_config_for_trigger()["repositories"] == []
+
+    def test_unrestricted_flow_matches_payload_against_the_account(
+        self,
+        db_session: Session,
+        test_flow: Flow,
+        test_account: Account,
+        mock_nats_client,
+    ):
+        """No selected repositories means the payload may name any account project."""
+        enterprise = _gitlab_project(
+            db_session,
+            test_account.id,
+            name="Preloop Enterprise",
+            slug="spacecode/preloop-ee",
+            identifier="21",
+        )
+        test_flow.trigger_project_ids = []
+        test_flow.git_clone_config = {"enabled": True, "repositories": []}
+        orchestrator = FlowExecutionOrchestrator(
+            db=db_session,
+            flow_id=test_flow.id,
+            trigger_event_data={
+                "source": "gitlab",
+                "payload": {
+                    "project": {
+                        "id": 21,
+                        "path_with_namespace": "spacecode/preloop-ee",
+                    }
+                },
+            },
+            nats_client=mock_nats_client,
+        )
+        orchestrator._get_flow_details()
+
+        assert orchestrator._resolve_trigger_project_id() == str(enterprise.id)
+
+    def test_clone_list_keeps_only_the_payload_repository(
+        self, db_session: Session, test_flow: Flow, mock_nats_client
+    ):
+        """Several configured clone URLs narrow to the one the payload names."""
+        test_flow.trigger_project_ids = []
+        test_flow.git_clone_config = {
+            "enabled": True,
+            "repositories": [
+                {
+                    "repository_url": "https://gitlab.example.com/spacecode/preloop-admin.git"
+                },
+                {
+                    "repository_url": "https://gitlab.example.com/spacecode/preloop-ee.git"
+                },
+            ],
+        }
+        orchestrator = FlowExecutionOrchestrator(
+            db=db_session,
+            flow_id=test_flow.id,
+            trigger_event_data={
+                "source": "gitlab",
+                "payload": {
+                    "project": {
+                        "path_with_namespace": "spacecode/preloop-ee",
+                        "git_http_url": "https://gitlab.example.com/spacecode/preloop-ee.git",
+                    }
+                },
+            },
+            nats_client=mock_nats_client,
+        )
+        orchestrator._get_flow_details()
+
+        clone = orchestrator._git_clone_config_for_trigger()
+        assert clone["repositories"] == [
+            {"repository_url": "https://gitlab.example.com/spacecode/preloop-ee.git"}
+        ]
+
     @pytest.mark.skip(
         reason="FK constraint prevents creating flow with non-existent AI model. "
         "This edge case cannot occur in production. Coverage tested via code review."
@@ -1919,6 +2132,248 @@ class TestFlowExecutionOrchestrator:
         """Test warning when AI model not found."""
         # This scenario is prevented by FK constraint in production
         pass
+
+
+class TestPayloadRepositorySelection:
+    """Selection logic that does not need a migrated database."""
+
+    def _orchestrator(self, flow, event):
+        orchestrator = FlowExecutionOrchestrator.__new__(FlowExecutionOrchestrator)
+        orchestrator.flow = flow
+        orchestrator.db = MagicMock()
+        orchestrator.trigger_event_data = event
+        return orchestrator
+
+    def test_identifier_match_beats_the_first_selected_project(self):
+        """Project 21 is selected even when another project is listed first."""
+        from types import SimpleNamespace
+
+        admin_id = "admin"
+        enterprise_id = "enterprise"
+        flow = SimpleNamespace(
+            trigger_project_ids=[admin_id, enterprise_id],
+            git_clone_config={"enabled": True, "repositories": []},
+            account_id="acct",
+        )
+        event = {
+            "source": "gitlab",
+            "payload": {
+                "project": {
+                    "id": 21,
+                    "path_with_namespace": "spacecode/preloop-ee",
+                    "git_http_url": "https://gitlab.example.com/spacecode/preloop-ee.git",
+                }
+            },
+        }
+        orchestrator = self._orchestrator(flow, event)
+        enterprise = SimpleNamespace(id=enterprise_id, slug=None, identifier="21")
+        orchestrator._projects_matching_identity = lambda identity, selected: (
+            [(enterprise, "gitlab")] if selected == {admin_id, enterprise_id} else []
+        )
+
+        assert orchestrator._resolve_trigger_project_id() == enterprise_id
+        clone = orchestrator._git_clone_config_for_trigger()
+        assert clone["repositories"][0]["project_id"] == enterprise_id
+        assert (
+            clone["repositories"][0]["repository_url"]
+            == "https://gitlab.example.com/spacecode/preloop-ee.git"
+        )
+
+    def test_unselected_repository_does_not_fall_back(self):
+        """A payload outside the selection is not cloned as the first project."""
+        from types import SimpleNamespace
+
+        flow = SimpleNamespace(
+            trigger_project_ids=["admin"],
+            git_clone_config={
+                "enabled": True,
+                "repositories": [
+                    {
+                        "project_id": "admin",
+                        "repository_url": "https://gitlab.example.com/spacecode/preloop-admin.git",
+                    }
+                ],
+            },
+            account_id="acct",
+        )
+        event = {
+            "source": "gitlab",
+            "payload": {
+                "project": {
+                    "id": 21,
+                    "path_with_namespace": "spacecode/preloop-ee",
+                }
+            },
+        }
+        orchestrator = self._orchestrator(flow, event)
+        orchestrator._projects_matching_identity = lambda identity, selected: []
+
+        assert orchestrator._resolve_trigger_project_id() is None
+        with patch("preloop.services.flow_orchestrator.logger.warning") as warning:
+            clone = orchestrator._git_clone_config_for_trigger()
+        assert clone["repositories"] == []
+        warning.assert_called_once()
+        assert "no repository will be cloned" in warning.call_args.args[0]
+
+    def test_unrestricted_flow_accepts_an_account_project(self):
+        """With no selection, the payload may name any project on the account."""
+        from types import SimpleNamespace
+
+        flow = SimpleNamespace(
+            trigger_project_ids=[],
+            git_clone_config={"enabled": True, "repositories": []},
+            account_id="acct",
+        )
+        event = {
+            "source": "gitlab",
+            "payload": {"project": {"path_with_namespace": "spacecode/preloop-ee"}},
+        }
+        orchestrator = self._orchestrator(flow, event)
+        project = SimpleNamespace(
+            id="enterprise", slug="spacecode/preloop-ee", identifier="21"
+        )
+
+        def projects(identity, selected):
+            assert selected is None
+            return [(project, "gitlab")]
+
+        orchestrator._projects_matching_identity = projects
+        assert orchestrator._resolve_trigger_project_id() == "enterprise"
+
+    def test_project_lookup_runs_once_per_orchestrator(self):
+        """Clone narrowing and the execution context share one project query."""
+        from types import SimpleNamespace
+
+        flow = SimpleNamespace(
+            trigger_project_ids=["admin", "enterprise"],
+            git_clone_config={"enabled": True, "repositories": []},
+            account_id="acct",
+        )
+        event = {
+            "source": "gitlab",
+            "payload": {
+                "project": {
+                    "id": 21,
+                    "path_with_namespace": "spacecode/preloop-ee",
+                    "git_http_url": "https://gitlab.example.com/spacecode/preloop-ee.git",
+                }
+            },
+        }
+        orchestrator = self._orchestrator(flow, event)
+        calls = {"n": 0}
+
+        def projects(identity, selected):
+            calls["n"] += 1
+            return [
+                (
+                    SimpleNamespace(id="enterprise", slug=None, identifier="21"),
+                    "gitlab",
+                )
+            ]
+
+        orchestrator._projects_matching_identity = projects
+        assert orchestrator._resolve_trigger_project_id() == "enterprise"
+        assert (
+            orchestrator._resolve_trigger_project_id(allow_first_project_fallback=False)
+            == "enterprise"
+        )
+        assert (
+            orchestrator._git_clone_config_for_trigger()["repositories"][0][
+                "project_id"
+            ]
+            == "enterprise"
+        )
+        assert calls["n"] == 1
+
+
+class TestPayloadRepositoryIdentity:
+    """Provider payload shapes the clone selector reads."""
+
+    @pytest.mark.parametrize(
+        ("url", "path"),
+        [
+            (
+                "https://gitlab.example.com/spacecode/preloop-ee.git",
+                "spacecode/preloop-ee",
+            ),
+            ("https://github.com/preloop/preloop", "preloop/preloop"),
+            ("git@gitlab.example.com:group/sub/repo.git", "group/sub/repo"),
+            ("ssh://git@github.com/preloop/preloop.git", "preloop/preloop"),
+            ("https://gitlab.example.com", None),
+        ],
+    )
+    def test_repository_path_from_git_url(self, url, path):
+        assert repository_path_from_git_url(url) == path
+
+    def test_github_payload(self):
+        identity = payload_repository_identity(
+            {
+                "source": "github",
+                "payload": {
+                    "repository": {
+                        "id": 42,
+                        "full_name": "preloop/preloop",
+                        "clone_url": "https://github.com/preloop/preloop.git",
+                    }
+                },
+            }
+        )
+        assert identity == {
+            "source": "github",
+            "path": "preloop/preloop",
+            "external_id": "42",
+            "clone_url": "https://github.com/preloop/preloop.git",
+        }
+
+    def test_gitlab_payload_uses_project_id_and_git_url(self):
+        identity = payload_repository_identity(
+            {
+                "source": "gitlab",
+                "payload": {
+                    "project": {
+                        "id": 21,
+                        "path_with_namespace": "spacecode/preloop-ee",
+                        "git_http_url": "https://gitlab.example.com/spacecode/preloop-ee.git",
+                        "web_url": "https://gitlab.example.com/spacecode/preloop-ee",
+                    }
+                },
+            }
+        )
+        assert identity["path"] == "spacecode/preloop-ee"
+        assert identity["external_id"] == "21"
+        assert (
+            identity["clone_url"]
+            == "https://gitlab.example.com/spacecode/preloop-ee.git"
+        )
+
+    def test_bitbucket_payload_uses_uuid_and_html_link(self):
+        identity = payload_repository_identity(
+            {
+                "source": "bitbucket",
+                "payload": {
+                    "repository": {
+                        "full_name": "workspace/repo",
+                        "uuid": "{11111111-2222-3333-4444-555555555555}",
+                        "links": {
+                            "html": {"href": "https://bitbucket.org/workspace/repo"}
+                        },
+                    }
+                },
+            }
+        )
+        assert identity["path"] == "workspace/repo"
+        assert identity["external_id"] == "11111111-2222-3333-4444-555555555555"
+        assert identity["clone_url"] == "https://bitbucket.org/workspace/repo"
+
+    def test_gitlab_numeric_id_does_not_match_a_github_project(self):
+        project = SimpleNamespace(slug=None, identifier="21")
+        identity = {
+            "source": "gitlab",
+            "path": "spacecode/preloop-ee",
+            "external_id": "21",
+        }
+        assert _project_identity_rank(project, "github", identity) == 0
+        assert _project_identity_rank(project, "gitlab", identity) == 2
 
 
 class TestWorkspaceSeedValidation:
@@ -2278,6 +2733,19 @@ class TestSuccessConfirmationChannels:
             "id": None,
             "attested_by": "control_plane",
         }
+        expected["sbom_audit"] = dict(expected["sbom_audit"])
+        expected["sbom_audit"]["minimum_elements_measured"] = {
+            "status": "skipped",
+            "reason": "no SBOM seeds reachable",
+        }
+        # The platform derives the VEX-closed tally and the limitations at
+        # persist and stamps this run's values on the drift block.
+        expected["vuln_scan"] = {**expected["vuln_scan"], "closed_by_vex": 0}
+        expected["drift"] = {
+            **expected["drift"],
+            "closed_by_vex": {"previous": None, "current": 0},
+            "limitations": {"previous": None, "current": []},
+        }
         assert result["status"] == "SUCCEEDED"
         assert result["result"] == expected
 
@@ -2308,6 +2776,10 @@ class TestSuccessConfirmationChannels:
             "kind": "hosted",
             "id": None,
             "attested_by": "control_plane",
+        }
+        expected["minimum_elements_measured"] = {
+            "status": "skipped",
+            "reason": "no SBOM seeds reachable",
         }
         assert result["status"] == "FAILED"
         assert "result.json" in (
@@ -3477,7 +3949,125 @@ class TestPerFlowTimeoutBudget:
         assert timed_out[0]["details"] == {
             "timeout_seconds": 60,
             "timeout_source": "flow",
+            # Wall-clock seconds since launch, now part of the evidence.
+            "elapsed_seconds": 60,
         }
+
+    _IDLE_WARN = (
+        "2026-09-27T03:34:41.594867Z  WARN codex_core::responses_retry: stream "
+        "disconnected - retrying sampling request (1/5 in 187ms)... retries=1 "
+        "max_retries=5 sampling_error=stream disconnected before completion: "
+        "idle timeout waiting for SSE"
+    )
+
+    async def _time_out(self, orchestrator, executor, lines):
+        for line in lines:
+            orchestrator.execution_logger.log_agent_output(line)
+        with patch(
+            "preloop.services.flow_orchestrator.asyncio.sleep",
+            new_callable=AsyncMock,
+        ):
+            return await orchestrator._monitor_agent_execution("session-1", executor)
+
+    @pytest.mark.asyncio
+    async def test_timeout_on_a_silent_stream_names_the_stall(
+        self, mock_nats_client, event_data
+    ):
+        """#872: a run that spent its budget on a stream that sent nothing
+        says so, instead of reading like a run that needed more time."""
+        executor = _confirmation_executor(monitor_status=AgentStatus.RUNNING)
+        orchestrator = self._orchestrator(mock_nats_client, event_data, 900)
+
+        result = await self._time_out(
+            orchestrator,
+            executor,
+            [
+                "PRELOOP_STREAM_IDLE_TIMEOUT_SECONDS=450",
+                "PRELOOP_AGENT_EXEC_START",
+                "user",
+                "Review this diff.",
+                self._IDLE_WARN,
+                "ERROR: Reconnecting... 1/5",
+            ],
+        )
+
+        assert result["status"] == "FAILED"
+        assert result["failure_category"] == "model_stream_idle"
+        assert result["error_message"].startswith(
+            "Execution timed out after 900 seconds (this flow's timeout budget) "
+            "while waiting on a silent model stream."
+        )
+        assert "450 seconds" in result["error_message"]
+        assert result["result"]["stream_stall"] == {
+            "reason": "model_stream_idle",
+            "idle_reconnects": 1,
+            "retries_exhausted": False,
+            "stream_idle_timeout_seconds": 450,
+            "last_signal": self._IDLE_WARN,
+        }
+        executor.stop.assert_awaited_once_with("session-1")
+        stalled = _milestones(orchestrator, "agent_stream_stalled")
+        assert stalled[0]["details"]["reason"] == "model_stream_idle"
+        assert (
+            orchestrator._terminal_failure_category("FAILED", result)
+            == "model_stream_idle"
+        )
+
+    @pytest.mark.asyncio
+    async def test_stall_keeps_the_agent_result_artifact(
+        self, mock_nats_client, event_data
+    ):
+        executor = _confirmation_executor(
+            monitor_status=AgentStatus.RUNNING,
+            artifact={"status": "running", "note": "half done"},
+        )
+        orchestrator = self._orchestrator(mock_nats_client, event_data, 900)
+        orchestrator._capture_result_artifact = AsyncMock(
+            return_value={"status": "running", "note": "half done"}
+        )
+
+        result = await self._time_out(orchestrator, executor, [self._IDLE_WARN])
+
+        assert result["result"]["note"] == "half done"
+        assert result["result"]["stream_stall"]["idle_reconnects"] == 1
+
+    @pytest.mark.asyncio
+    async def test_timeout_after_the_stream_recovered_stays_a_timeout(
+        self, mock_nats_client, event_data
+    ):
+        executor = _confirmation_executor(monitor_status=AgentStatus.RUNNING)
+        orchestrator = self._orchestrator(mock_nats_client, event_data, 900)
+
+        result = await self._time_out(
+            orchestrator,
+            executor,
+            [self._IDLE_WARN, "ERROR: Reconnecting... 1/5", "codex", "Reading."],
+        )
+
+        assert "failure_category" not in result
+        assert "silent model stream" not in result["error_message"]
+        assert "this flow's timeout budget" in result["error_message"]
+        assert not _milestones(orchestrator, "agent_stream_stalled")
+        assert orchestrator._terminal_failure_category("FAILED", result) == "timeout"
+
+    def test_budget_labels_match_the_timeout_messages(self):
+        for budget in (
+            TimeoutBudget(seconds=900, source="flow"),
+            TimeoutBudget(seconds=900, source="default"),
+            TimeoutBudget(seconds=600, source="flow", consumed_seconds=300),
+        ):
+            assert budget.label() in budget.timeout_message()
+
+    def test_timeout_message_takes_its_budget_name_from_label(self, monkeypatch):
+        """One place names the budget; rewording it reaches both messages."""
+        monkeypatch.setattr(TimeoutBudget, "label", lambda self: "BUDGET-NAME")
+
+        for budget in (
+            TimeoutBudget(seconds=900, source="flow"),
+            TimeoutBudget(seconds=900, source="default"),
+            TimeoutBudget(seconds=600, source="flow", consumed_seconds=300),
+        ):
+            assert "BUDGET-NAME" in budget.timeout_message()
 
     def test_timeout_messages_stay_in_the_timeout_category(self):
         """The failure-category classifier keys off this sentence."""
@@ -3527,6 +4117,28 @@ class TestFlowTimeoutSecondsField:
                 agent_type="codex",
                 agent_config={},
                 timeout_seconds=bad,
+            )
+
+    @pytest.mark.parametrize("idle", [30, 90, 3600])
+    def test_schema_accepts_a_stream_idle_bound(self, idle):
+        flow_in = FlowCreate(
+            name="Reviewer",
+            prompt_template="review",
+            agent_type="codex",
+            agent_config={"stream_idle_timeout_seconds": idle},
+        )
+        assert flow_in.agent_config["stream_idle_timeout_seconds"] == idle
+
+    @pytest.mark.parametrize("bad", [0, 29, 3601, "90", True, 90.5])
+    def test_schema_rejects_a_bad_stream_idle_bound(self, bad):
+        from pydantic import ValidationError
+
+        with pytest.raises(ValidationError, match="stream_idle_timeout_seconds"):
+            FlowCreate(
+                name="Reviewer",
+                prompt_template="review",
+                agent_type="codex",
+                agent_config={"stream_idle_timeout_seconds": bad},
             )
 
     def test_budget_persists_through_the_crud_layer(
@@ -4059,3 +4671,214 @@ class TestNoProgressRetry:
         failures = _milestones(orchestrator, "no_progress_retry_failed")
         assert len(failures) == 1
         assert "flow is paused" in failures[0]["details"]["reason"]
+
+
+class TestRoutedReasoningEffort:
+    """A label rule can ask for more thinking, not just another model (#851).
+
+    The effort is written by the controller onto the routing record, so the
+    only job here is carrying it into the parameters the harness reads and
+    saying on the execution which label decided.
+    """
+
+    def _orchestrator(self, record):
+        from preloop.models.models.flow_execution import ROUTING_RECORD_KEY
+
+        orchestrator = FlowExecutionOrchestrator(
+            db=MagicMock(spec=Session),
+            flow_id=uuid4(),
+            trigger_event_data={ROUTING_RECORD_KEY: record} if record else {},
+            nats_client=MagicMock(),
+        )
+        orchestrator.execution_logger = MagicMock()
+        return orchestrator
+
+    def test_effort_reaches_the_model_parameters(self):
+        orchestrator = self._orchestrator(
+            {
+                "schema_version": 1,
+                "source": "label",
+                "matched_label": "complexity:high",
+                "rule_id": "by-label-1",
+                "reasoning_effort": "high",
+                "agent_type": "codex",
+                "ai_model_id": str(uuid4()),
+            }
+        )
+        context = {"model_parameters": {"temperature": 0.2}}
+
+        applied = orchestrator._apply_routed_reasoning_effort(context)
+
+        assert applied == "high"
+        assert context["model_parameters"]["reasoning_effort"] == "high"
+        # The model row's own parameters survive the overlay.
+        assert context["model_parameters"]["temperature"] == 0.2
+
+    def test_the_execution_says_which_label_decided(self):
+        orchestrator = self._orchestrator(
+            {
+                "schema_version": 1,
+                "source": "label",
+                "matched_label": "complexity:high",
+                "rule_id": "by-label-1",
+                "reasoning_effort": "high",
+                "agent_type": "codex",
+            }
+        )
+
+        orchestrator._apply_routed_reasoning_effort({})
+
+        milestone, details = orchestrator.execution_logger.log_milestone.call_args[0]
+        assert milestone == "model_by_label"
+        assert details["label"] == "complexity:high"
+        assert details["reasoning_effort"] == "high"
+
+    def test_a_label_rule_without_an_effort_still_shows_up(self):
+        orchestrator = self._orchestrator(
+            {
+                "schema_version": 1,
+                "source": "label",
+                "matched_label": "complexity:low",
+                "rule_id": "by-label-2",
+                "agent_type": "codex",
+            }
+        )
+        context = {"model_parameters": {}}
+
+        assert orchestrator._apply_routed_reasoning_effort(context) is None
+        assert "reasoning_effort" not in context["model_parameters"]
+        assert orchestrator.execution_logger.log_milestone.called
+
+    def test_a_default_run_is_left_alone(self):
+        orchestrator = self._orchestrator(
+            {
+                "schema_version": 1,
+                "source": "default",
+                "agent_type": "codex",
+            }
+        )
+        context = {"model_parameters": {"temperature": 0.2}}
+
+        assert orchestrator._apply_routed_reasoning_effort(context) is None
+        assert context["model_parameters"] == {"temperature": 0.2}
+        assert not orchestrator.execution_logger.log_milestone.called
+
+    def test_a_run_with_no_routing_record_is_left_alone(self):
+        orchestrator = self._orchestrator(None)
+        context = {}
+
+        assert orchestrator._apply_routed_reasoning_effort(context) is None
+        assert context == {}
+
+    def test_a_nonsense_effort_is_ignored(self):
+        """The record is controller-written, but a stale one must not crash
+        a run either."""
+        orchestrator = self._orchestrator(
+            {
+                "schema_version": 1,
+                "source": "label",
+                "matched_label": "complexity:high",
+                "reasoning_effort": {"effort": "high"},
+                "agent_type": "codex",
+            }
+        )
+        context = {"model_parameters": {}}
+
+        assert orchestrator._apply_routed_reasoning_effort(context) is None
+        assert "reasoning_effort" not in context["model_parameters"]
+
+
+class TestMissingPublication:
+    """A run configured to open a PR that ends without one is not a success."""
+
+    async def _run(
+        self,
+        db_session,
+        test_flow,
+        mock_nats_client,
+        event_data,
+        *,
+        no_commits,
+        is_resume=False,
+    ):
+        executor = _confirmation_executor(artifact={"status": "success"})
+        with (
+            patch(
+                "preloop.services.flow_orchestrator.create_executor_for_execution",
+                return_value=executor,
+            ),
+            patch.object(
+                FlowExecutionOrchestrator,
+                "_publication_lookup_enabled",
+                return_value=True,
+            ),
+            patch.object(
+                FlowExecutionOrchestrator,
+                "_publication_is_resume",
+                return_value=is_resume,
+            ),
+            patch.object(
+                FlowExecutionOrchestrator,
+                "_publication_target_branch",
+                return_value="preloop/issue-1",
+            ),
+            patch.object(
+                FlowExecutionOrchestrator,
+                "_publication_tracker_clients",
+                AsyncMock(return_value=[]),
+            ),
+        ):
+            orchestrator = FlowExecutionOrchestrator(
+                db=db_session,
+                flow_id=test_flow.id,
+                trigger_event_data=event_data,
+                nats_client=mock_nats_client,
+            )
+            orchestrator._agent_exec_started = True
+            orchestrator._post_exec_no_commits = no_commits
+            await orchestrator.run()
+            return orchestrator
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("no_commits", [True, False])
+    async def test_success_without_a_pull_request_fails_with_a_reason(
+        self,
+        db_session: Session,
+        test_flow: Flow,
+        mock_nats_client,
+        event_data,
+        no_commits: bool,
+    ):
+        orchestrator = await self._run(
+            db_session,
+            test_flow,
+            mock_nats_client,
+            event_data,
+            no_commits=no_commits,
+        )
+
+        log = orchestrator.execution_log
+        assert log.status == "FAILED"
+        assert log.failure_category == "publication_missing"
+        assert log.error_message.startswith("publication_missing: ")
+        assert "preloop/issue-1" in log.error_message
+        record = log.result["publication_missing"]
+        assert record["status"] == "not_published"
+        assert record["branch"] == "preloop/issue-1"
+        assert ("no commits" in record["reason"]) is no_commits
+
+    @pytest.mark.asyncio
+    async def test_a_resume_onto_an_existing_pr_is_not_judged(
+        self, db_session: Session, test_flow: Flow, mock_nats_client, event_data
+    ):
+        orchestrator = await self._run(
+            db_session,
+            test_flow,
+            mock_nats_client,
+            event_data,
+            no_commits=True,
+            is_resume=True,
+        )
+
+        assert orchestrator.execution_log.status == "SUCCEEDED"
+        assert "publication_missing" not in (orchestrator.execution_log.result or {})

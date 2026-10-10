@@ -1,8 +1,10 @@
-import { html, fixture, expect } from '@open-wc/testing';
+import { html, fixture, expect, waitUntil } from '@open-wc/testing';
+import sinon from 'sinon';
 
 import './tools-editor-component';
 import type { ToolsEditorComponent } from './tools-editor-component';
 import type { ToolWithRules } from './tools-editor-component';
+import { resetConfirmDialogForTests } from './confirm-dialog';
 
 describe('ToolsEditorComponent – MCP server actions', () => {
   const server = {
@@ -62,6 +64,120 @@ describe('ToolsEditorComponent – MCP server actions', () => {
     expect(events).to.deep.equal(['scan-server']);
     expect(scannedId).to.equal('srv-1');
   });
+
+  it('names the edit and delete server buttons', async () => {
+    const el = (await fixture(html`
+      <tools-editor-component
+        mode="global"
+        .mcpServers=${[server]}
+        .tools=${[tool]}
+      ></tools-editor-component>
+    `)) as ToolsEditorComponent;
+    await el.updateComplete;
+
+    expect(
+      el.shadowRoot
+        ?.querySelector('sl-icon-button[name="pencil"]')
+        ?.getAttribute('label')
+    ).to.equal('Edit server Example MCP Server');
+    expect(
+      el.shadowRoot
+        ?.querySelector('sl-icon-button[name="trash"]')
+        ?.getAttribute('label')
+    ).to.equal('Delete server Example MCP Server');
+  });
+
+  it('confirms in the console dialog, with what goes, before deleting a server', async () => {
+    const el = (await fixture(html`
+      <tools-editor-component
+        mode="global"
+        .mcpServers=${[server]}
+        .tools=${[
+          {
+            ...tool,
+            access_rules: [
+              {
+                id: 'r1',
+                action: 'deny',
+                condition_expression: null,
+                condition_type: 'cel',
+                priority: 1,
+                description: null,
+                is_enabled: true,
+                approval_workflow_id: null,
+              },
+            ],
+          },
+        ]}
+      ></tools-editor-component>
+    `)) as ToolsEditorComponent;
+    await el.updateComplete;
+    const nativeConfirm = sinon.stub(window, 'confirm').returns(true);
+    const deleted: string[] = [];
+    el.addEventListener('delete-server', (event: Event) =>
+      deleted.push((event as CustomEvent).detail)
+    );
+    try {
+      (
+        el.shadowRoot?.querySelector(
+          'sl-icon-button[name="trash"]'
+        ) as HTMLElement
+      ).click();
+      await waitUntil(
+        () => !!document.querySelector('confirm-dialog'),
+        'no confirm dialog'
+      );
+      const dialog = document.querySelector('confirm-dialog')!;
+      await (dialog as any).updateComplete;
+      const text = dialog.shadowRoot?.textContent?.replace(/\s+/g, ' ') ?? '';
+      expect(text).to.contain('Example MCP Server');
+      expect(text).to.contain('1 tool and 1 access rule');
+      expect(nativeConfirm.called, 'used the native confirm').to.equal(false);
+      expect(deleted).to.deep.equal([]);
+
+      (
+        dialog.shadowRoot?.querySelector(
+          '[data-testid="confirm-dialog-confirm"]'
+        ) as HTMLElement
+      ).click();
+      await waitUntil(() => deleted.length === 1, 'server was not deleted');
+      expect(deleted).to.deep.equal(['srv-1']);
+    } finally {
+      nativeConfirm.restore();
+      resetConfirmDialogForTests();
+    }
+  });
+
+  it('opens and closes a server group from a real button with aria-expanded', async () => {
+    sessionStorage.removeItem('preloopCollapsedGroups');
+    const el = (await fixture(html`
+      <tools-editor-component
+        mode="global"
+        .mcpServers=${[server]}
+        .tools=${[tool]}
+      ></tools-editor-component>
+    `)) as ToolsEditorComponent;
+    await el.updateComplete;
+
+    const toggle = () =>
+      el.shadowRoot?.querySelector(
+        '.section-header button.section-toggle'
+      ) as HTMLButtonElement;
+    expect(toggle()).to.exist;
+    expect(toggle().textContent).to.contain('Example MCP Server');
+    const before = toggle().getAttribute('aria-expanded');
+    expect(before === 'true' || before === 'false').to.equal(true);
+
+    toggle().click();
+    await el.updateComplete;
+    // One click toggles once: the header's own click handler must not undo it.
+    const after = toggle().getAttribute('aria-expanded');
+    expect(after).to.equal(before === 'true' ? 'false' : 'true');
+    expect(!!el.shadowRoot?.querySelector('.tool-list')).to.equal(
+      after === 'true'
+    );
+    sessionStorage.removeItem('preloopCollapsedGroups');
+  });
 });
 
 function makeTool(
@@ -88,6 +204,58 @@ function groupTitles(editor: ToolsEditorComponent): string[] {
     (node) => (node.textContent || '').trim()
   );
 }
+
+describe('ToolsEditorComponent – tool name collisions (#1135)', () => {
+  it('shows the server warnings and a Shadowed badge on the tool row', async () => {
+    const warning =
+      "Tool 'read_scope' on MCP server 'newer' is shadowed by MCP server 'older'.";
+    const server = {
+      id: 'srv-2',
+      name: 'newer',
+      url: 'https://newer.example.com/mcp',
+      tool_prefix: null,
+      warnings: [warning],
+    };
+    const tool = {
+      name: 'read_scope',
+      description: 'Read',
+      source: 'mcp',
+      source_id: 'srv-2',
+      source_name: 'newer',
+      schema: {},
+      is_enabled: true,
+      is_supported: true,
+      approval_workflow_id: null,
+      has_approval_condition: false,
+      config_id: null,
+      access_rules: [],
+      shadowed: true,
+      warnings: [warning],
+    };
+    const el = (await fixture(html`
+      <tools-editor-component
+        mode="global"
+        .mcpServers=${[server]}
+        .tools=${[tool]}
+      ></tools-editor-component>
+    `)) as ToolsEditorComponent;
+    await el.updateComplete;
+    const root = el.shadowRoot!;
+    expect(
+      root.querySelector('[data-testid="server-warning-badge"]')?.textContent
+    ).to.contain('1 warning');
+    const toggle = root.querySelector('.section-toggle') as HTMLElement;
+    if (!root.querySelector('[data-testid="server-warnings"]')) toggle.click();
+    await el.updateComplete;
+    expect(
+      root.querySelector('[data-testid="server-warnings"]')?.textContent
+    ).to.contain(warning);
+    const row = root.querySelector('tool-list-item') as any;
+    await row.updateComplete;
+    expect(row.shadowRoot.querySelector('[data-testid="tool-shadowed-badge"]'))
+      .to.exist;
+  });
+});
 
 describe('ToolsEditorComponent – native family', () => {
   const mixedTools: ToolWithRules[] = [

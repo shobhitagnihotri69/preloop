@@ -1,3 +1,4 @@
+import { parseUTCDate } from '../utils/date';
 import { LitElement, css, html, nothing } from 'lit';
 import { customElement, property, state } from 'lit/decorators.js';
 import '@shoelace-style/shoelace/dist/components/alert/alert.js';
@@ -15,6 +16,7 @@ import {
   createBudgetPolicy,
   getAccountAgent,
   getAccountRuntimeSessionActivityTimeline,
+  listRuntimeSessionArtifacts,
   getAccountRuntimeSessionDetail,
   getAccountRuntimeSessions,
   getAIModels,
@@ -25,6 +27,7 @@ import {
   getRuntimeSessionOptimizationJob,
   getRuntimeSessionRequests,
   getSimilarSessions,
+  listApprovalRequests,
   listRuntimeSessionOptimizationActions,
   optimizeRuntimeSession,
   submitRuntimeSessionOptimizationJob,
@@ -39,12 +42,16 @@ import type {
   RuntimeSessionOptimizationAppliedAction,
   RuntimeSessionOptimizationResponse,
   RuntimeSessionActivityItem,
+  RuntimeSessionArtifactDescriptor,
   RuntimeSessionCacheSummary,
   RuntimeSessionRequestItem,
   RuntimeSessionSummary,
   SimilarSessionsResponse,
 } from '../types';
-import { unifiedWebSocketManager } from '../services/unified-websocket-manager';
+import {
+  ConnectionState,
+  unifiedWebSocketManager,
+} from '../services/unified-websocket-manager';
 import {
   isHistoryUnavailable,
   requestHistoryUpgrade,
@@ -73,7 +80,21 @@ import './session-list-panel';
 import './session-replay-panel';
 import './session-request-timeline';
 import './similar-sessions-panel';
+import './browser-step-strip';
+import './artifact-image-viewer';
+import './session-artifact-summary';
+import {
+  artifactKindGroup,
+  artifactRowMetadata,
+  artifactView,
+  browserStepKey,
+  browserStepViewerImages,
+  isArtifactRow,
+  sortBrowserSteps,
+  type ArtifactKindGroup,
+} from '../utils/session-artifacts';
 import { consoleDialogStyles } from '../styles/console-dialog';
+import { isUuid, sessionExportHref } from '../utils/records-format';
 
 type SessionInput = RuntimeSessionSummary | Record<string, unknown>;
 type EventPageState = {
@@ -211,6 +232,13 @@ export class PreloopSessionObserver extends LitElement {
   @property({ type: String })
   focusTurnId: string | null = null;
 
+  /**
+   * Artifact to land on (`?artifact=<id>`, a search hit): the timeline
+   * scrolls to its row and highlights it once the session has loaded.
+   */
+  @property({ type: String })
+  focusArtifactId: string | null = null;
+
   /** Optional override for the sidebar's no-sessions message. */
   @property({ type: String })
   emptyText = '';
@@ -257,6 +285,43 @@ export class PreloopSessionObserver extends LitElement {
 
   @state()
   private loadedActivity: Record<string, RuntimeSessionActivityItem[]> = {};
+
+  /**
+   * Approval rows per session, scoped by `runtime_session_id`.
+   *
+   * `{}` for a session whose approvals have not been read yet, which the chat
+   * view renders as "no approval is blocking" rather than as a claim that
+   * none exist. Refreshed on selection and on the `approvals` topic.
+   */
+  @state()
+  private loadedApprovals: Record<
+    string,
+    Array<{ id: string; status: string; requested_at?: string }>
+  > = {};
+
+  /** Index into the active session's browser steps shown full size, or -1. */
+  @state()
+  private browserStepViewerIndex = -1;
+  /** Artifact descriptors per session, by artifact id. */
+  @state()
+  private loadedArtifacts: Record<
+    string,
+    {
+      byId: Record<string, RuntimeSessionArtifactDescriptor>;
+      truncated: boolean;
+    }
+  > = {};
+  /** Header kind filter applied to the timeline, or null. */
+  @state()
+  private artifactKindFilter: ArtifactKindGroup | null = null;
+  /** Index into the active session's image artifacts shown full size, or -1. */
+  @state()
+  private artifactViewerIndex = -1;
+  /** Artifact row highlighted after a `?artifact=` landing or a lineage jump. */
+  @state()
+  private highlightedArtifactId: string | null = null;
+  /** `focusArtifactId` already scrolled to, so live reloads do not re-jump. */
+  private landedArtifactId: string | null = null;
 
   @state()
   private loadedRequests: Record<string, RuntimeSessionRequestItem[]> = {};
@@ -393,6 +458,10 @@ export class PreloopSessionObserver extends LitElement {
   private optimizeHintDismissed = readOptimizeHintDismissed();
 
   private unsubscribeRealtime?: () => void;
+  private unsubscribeRealtimeState: (() => void) | null = null;
+  /** Last socket state the manager reported, or null before it reports one. */
+  @state()
+  private realtimeState: ConnectionState | null = null;
   private refreshTimer: number | null = null;
   private livePulseTimer: number | null = null;
 
@@ -607,7 +676,7 @@ export class PreloopSessionObserver extends LitElement {
       .optimize-hint-dismiss {
         background: none;
         border: none;
-        color: var(--sl-color-neutral-500);
+        color: var(--console-meta-color);
         cursor: pointer;
         font-size: var(--sl-font-size-medium);
         line-height: 1;
@@ -669,7 +738,7 @@ export class PreloopSessionObserver extends LitElement {
       this.handleInspectRequests
     );
     this.addEventListener('session-create-budget', this.handleCreateBudget);
-    void this.loadAIModels();
+    if (this.replayMode === 'optimize') void this.loadAIModels();
     void this.loadSessions();
   }
 
@@ -723,17 +792,128 @@ export class PreloopSessionObserver extends LitElement {
       unifiedWebSocketManager.subscribe('runtime_sessions', (message) =>
         this.handleRuntimeSessionActivity(message)
       ),
+      // Approvals never arrive on `gateway_activity` or `runtime_sessions`,
+      // so a session waiting on a decision used to sit silent until the next
+      // model request woke something else. This is the only topic that says
+      // "somebody is waiting for you".
+      unifiedWebSocketManager.subscribe('approvals', (message) =>
+        this.handleApprovalActivity(message)
+      ),
     ];
     this.unsubscribeRealtime = () => {
       for (const unsubscribe of unsubscribers) unsubscribe();
+      this.unsubscribeRealtimeState?.();
+      this.unsubscribeRealtimeState = null;
     };
+    this.unsubscribeRealtimeState = unifiedWebSocketManager.onStateChange(
+      (state) => {
+        this.realtimeState = state;
+      }
+    );
+    // Read the state that is already true, not just the transitions after
+    // subscribing: a socket that connected before this view mounted would
+    // otherwise read as `unknown` until its next reconnect.
+    this.realtimeState = unifiedWebSocketManager.getState();
     void unifiedWebSocketManager.connect();
   }
 
+  /**
+   * An approval was created, decided, expired or cancelled.
+   *
+   * Only the active session is re-read, and only for the pending set: the
+   * conversation needs "is somebody waiting on me?", not a decision log. A
+   * payload naming another session is ignored outright rather than filtered,
+   * so an approval raised by a session nobody is watching cannot refetch
+   * rows under the one that is.
+   */
+  private handleApprovalActivity(message: any): void {
+    const payload = message?.payload ?? {};
+    const sessionId = payload.runtime_session_id ?? message?.runtime_session_id;
+    if (!sessionId || sessionId !== this.activeSessionId) return;
+    void this.loadApprovalsForSession(sessionId);
+  }
+
+  /**
+   * Read the active session's pending approvals.
+   *
+   * Failures are swallowed on purpose: an approval read that 403s must not
+   * blank a replay the operator is already reading. The line then falls back
+   * to whatever the gateway observed, which is a weaker but true answer.
+   */
+  private async loadApprovalsForSession(sessionId: string): Promise<void> {
+    try {
+      const rows = await listApprovalRequests({
+        runtime_session_id: sessionId,
+        status: 'pending',
+        limit: 100,
+      });
+      this.loadedApprovals = {
+        ...this.loadedApprovals,
+        [sessionId]: (rows as Array<Record<string, unknown>>).map((row) => ({
+          id: String(row.id),
+          status: String(row.status ?? 'pending'),
+          requested_at:
+            typeof row.requested_at === 'string' ? row.requested_at : undefined,
+        })),
+      };
+    } catch (error) {
+      // Deliberately not surfaced: an approvals read that fails must not
+      // blank a replay the operator is already reading. The previously known
+      // set is kept, so the line can be briefly stale rather than wrongly
+      // claiming nothing is waiting.
+      console.error('Failed to refresh session approvals:', error);
+    }
+  }
+
+  /**
+   * Socket health, reported next to the activity line rather than merged into
+   * it.
+   *
+   * `null` before the first state notification, so the line says "reconnecting"
+   * only once the manager has actually told us something. Until then the
+   * activity line falls back to the last observed event, which is the truth we
+   * can still defend.
+   */
+  private get realtimeConnected(): boolean | null {
+    if (this.realtimeState === null) return null;
+    return this.realtimeState === ConnectionState.CONNECTED;
+  }
+
   private handleRuntimeSessionActivity(message: any): void {
-    if (!this.matchesScope(message?.payload ?? {})) return;
+    const payload = message?.payload ?? {};
+    if (!this.matchesScope(payload)) return;
     this.pulseLive();
+    // An operator message (a note, or a command that starts a new turn) is a
+    // timeline row with no gateway twin, so nothing else would put it on the
+    // open session until the agent's next call. Re-read that session's
+    // timeline now: the person who typed it is usually watching.
+    if (
+      payload.activity_type === 'agent_control_message' &&
+      payload.runtime_session_id &&
+      payload.runtime_session_id === this.activeSessionId
+    ) {
+      void this.refreshActivity(payload.runtime_session_id);
+    }
     this.scheduleScopeRefresh();
+  }
+
+  /** Re-read one loaded session's activity timeline in place. */
+  private async refreshActivity(sessionId: string): Promise<void> {
+    if (!this.loadedActivity[sessionId]) return;
+    try {
+      const activity =
+        await getAccountRuntimeSessionActivityTimeline(sessionId);
+      // The selection may have moved while the read was in flight.
+      if (!this.loadedActivity[sessionId]) return;
+      this.loadedActivity = {
+        ...this.loadedActivity,
+        [sessionId]: activity.items || [],
+      };
+    } catch (error) {
+      // The scheduled scope refresh still runs; a failed read here only
+      // means the row shows up a little later.
+      console.error('Failed to refresh session activity:', error);
+    }
   }
 
   private handleGatewayActivity(message: any): void {
@@ -967,6 +1147,12 @@ export class PreloopSessionObserver extends LitElement {
     if (this.replayMode === 'optimize') {
       this.maybeResumeOptimizationJob(sessionId);
     }
+    this.browserStepViewerIndex = -1;
+    this.artifactViewerIndex = -1;
+    this.artifactKindFilter = null;
+    this.highlightedArtifactId = null;
+    // A later link to an artifact of this or another session lands again.
+    this.landedArtifactId = null;
     this.dispatchEvent(
       new CustomEvent('session-selected', {
         detail: { sessionId },
@@ -980,6 +1166,10 @@ export class PreloopSessionObserver extends LitElement {
       return;
     }
     this.loadingSessionId = sessionId;
+    // Approvals are read alongside the timeline, not after it: the first thing
+    // an operator checks on a live session is whether it is blocked, and
+    // waiting for the event page first would make that answer arrive late.
+    void this.loadApprovalsForSession(sessionId);
     // A timeline that cannot load is not worth an error on a replay that
     // otherwise renders, with one exception: a session whose whole activity
     // predates the plan's analytics window. That is the plan speaking, and
@@ -1028,6 +1218,7 @@ export class PreloopSessionObserver extends LitElement {
         ...this.loadedActivity,
         [sessionId]: activity.items || [],
       };
+      void this.loadArtifacts(sessionId);
     } catch (error) {
       console.error('Failed to load selected session:', error);
       this.error =
@@ -1042,8 +1233,8 @@ export class PreloopSessionObserver extends LitElement {
   private sortEventsDescending(events: FlowGatewayEvent[]): FlowGatewayEvent[] {
     return [...events].sort(
       (left, right) =>
-        new Date(right.timestamp || 0).getTime() -
-        new Date(left.timestamp || 0).getTime()
+        parseUTCDate(right.timestamp || '1970-01-01T00:00:00Z').getTime() -
+        parseUTCDate(left.timestamp || '1970-01-01T00:00:00Z').getTime()
     );
   }
 
@@ -1425,15 +1616,30 @@ export class PreloopSessionObserver extends LitElement {
     );
   }
 
-  private async loadAIModels(): Promise<void> {
-    try {
-      this.aiModels = (await getAIModels()).filter(
-        (model) => (model.model_kind || 'llm') === 'llm'
-      );
-    } catch (error) {
-      console.info('Unable to load optimization model choices:', error);
-      this.aiModels = [];
-    }
+  private aiModelsRequest: Promise<void> | null = null;
+  private aiModelsLoaded = false;
+  @state() private aiModelsLoading = false;
+
+  private loadAIModels(): Promise<void> {
+    if (this.aiModelsLoaded) return Promise.resolve();
+    if (this.aiModelsRequest) return this.aiModelsRequest;
+    this.aiModelsLoading = true;
+    const request = (async () => {
+      try {
+        this.aiModels = (await getAIModels()).filter(
+          (model) => (model.model_kind || 'llm') === 'llm'
+        );
+      } catch (error) {
+        console.info('Unable to load optimization model choices:', error);
+        this.aiModels = [];
+      } finally {
+        this.aiModelsLoading = false;
+        this.aiModelsLoaded = true;
+        this.aiModelsRequest = null;
+      }
+    })();
+    this.aiModelsRequest = request;
+    return request;
   }
 
   private getActiveOptimizationSuggestions() {
@@ -1639,6 +1845,265 @@ export class PreloopSessionObserver extends LitElement {
       : [];
   }
 
+  /**
+   * Approvals raised by the ACTIVE session only.
+   *
+   * The account-wide list is deliberately not reused here: showing another
+   * session's pending ask under this conversation would send the operator to
+   * a decision that has nothing to do with what they are watching. The server
+   * scopes the query by session and ANDs it with the caller's account.
+   */
+  private get activePendingApprovals(): Array<{
+    id: string;
+    status: string;
+    requested_at?: string;
+  }> {
+    return this.activeSessionId
+      ? this.loadedApprovals[this.activeSessionId] || []
+      : [];
+  }
+
+  /**
+   * Load the session's artifact descriptors for the header count and the
+   * row details the timeline metadata lacks (sha256, lineage, availability).
+   * A failure leaves the rows on their timeline metadata alone.
+   */
+  private async loadArtifacts(sessionId: string): Promise<void> {
+    try {
+      const { items, truncated } = await listRuntimeSessionArtifacts(sessionId);
+      const byId: Record<string, RuntimeSessionArtifactDescriptor> = {};
+      for (const item of items) byId[item.id] = item;
+      this.loadedArtifacts = {
+        ...this.loadedArtifacts,
+        [sessionId]: { byId, truncated },
+      };
+    } catch (error) {
+      console.warn('Could not list session artifacts:', error);
+    }
+    if (sessionId === this.activeSessionId) void this.landOnFocusArtifact();
+  }
+
+  private get activeArtifacts(): Record<
+    string,
+    RuntimeSessionArtifactDescriptor
+  > {
+    return this.activeSessionId
+      ? this.loadedArtifacts[this.activeSessionId]?.byId || {}
+      : {};
+  }
+
+  /** Artifact rows of the active session, in time order. */
+  private get activeArtifactRows(): RuntimeSessionActivityItem[] {
+    return this.activeActivity
+      .filter((item) => isArtifactRow(item) && artifactRowMetadata(item))
+      .sort(
+        (left, right) =>
+          parseUTCDate(left.timestamp || '1970-01-01T00:00:00Z').getTime() -
+          parseUTCDate(right.timestamp || '1970-01-01T00:00:00Z').getTime()
+      );
+  }
+
+  /**
+   * Header counts per kind group: from the artifact list when it loaded,
+   * which also counts artifacts attached to browser steps, else from the
+   * timeline rows.
+   */
+  private get activeArtifactCounts(): Partial<
+    Record<ArtifactKindGroup, number>
+  > {
+    const counts: Partial<Record<ArtifactKindGroup, number>> = {};
+    const listed = this.activeSessionId
+      ? this.loadedArtifacts[this.activeSessionId]
+      : undefined;
+    const groups = listed
+      ? Object.values(listed.byId).map((item) =>
+          artifactKindGroup(item.kind, item.content_type)
+        )
+      : this.activeArtifactRows.map(
+          (item) => artifactView(item, null)?.group || 'other'
+        );
+    for (const group of groups) counts[group] = (counts[group] || 0) + 1;
+    return counts;
+  }
+
+  /** Image artifact rows the shared viewer can page through. */
+  private get activeImageArtifacts() {
+    const byId = this.activeArtifacts;
+    return this.activeArtifactRows
+      .map((item) => artifactView(item, byId[artifactRowMetadata(item)!.id]))
+      .filter((view) => view?.group === 'screenshot')
+      .map((view) => ({
+        key: view!.id,
+        artifactId: view!.id,
+        availability: view!.availability,
+        title: view!.name,
+        caption: view!.kind,
+      }));
+  }
+
+  private openArtifactViewer(artifactId: string): void {
+    const index = this.activeImageArtifacts.findIndex(
+      (image) => image.artifactId === artifactId
+    );
+    if (index >= 0) this.artifactViewerIndex = index;
+  }
+
+  /** The element that shows the timeline in the current mode. */
+  private get timelineHost():
+    (Element & { scrollToArtifact?: (id: string) => boolean }) | null {
+    if (this.requestsView) return null;
+    const selector =
+      this.replayMode === 'conversation'
+        ? 'session-chat-view'
+        : 'session-replay-panel';
+    return this.renderRoot.querySelector(selector);
+  }
+
+  /** Scroll to an artifact row and highlight it; false if it is not shown. */
+  private async scrollToArtifact(artifactId: string): Promise<boolean> {
+    if (
+      this.artifactKindFilter &&
+      artifactKindGroup(this.activeArtifacts[artifactId]?.kind) !==
+        this.artifactKindFilter
+    ) {
+      this.artifactKindFilter = null;
+    }
+    this.highlightedArtifactId = artifactId;
+    await this.updateComplete;
+    const host = this.timelineHost as
+      (LitElement & { scrollToArtifact?: (id: string) => boolean }) | null;
+    if (host && 'updateComplete' in host) await host.updateComplete;
+    return Boolean(host?.scrollToArtifact?.(artifactId));
+  }
+
+  private async landOnFocusArtifact(): Promise<void> {
+    const id = this.focusArtifactId;
+    if (!id || this.landedArtifactId === id) return;
+    const present = this.activeArtifactRows.some(
+      (item) => artifactRowMetadata(item)?.id === id
+    );
+    if (!present) return;
+    this.landedArtifactId = id;
+    await this.scrollToArtifact(id);
+  }
+
+  /**
+   * Open a session picked in the list; an artifact icon also applies the
+   * header kind filter, after selection has reset it.
+   */
+  private async openFromList(
+    sessionId: string,
+    artifactKind: ArtifactKindGroup | null
+  ): Promise<void> {
+    await this.selectSession(sessionId, { userInitiated: true });
+    if (artifactKind) this.setArtifactKindFilter(artifactKind);
+  }
+
+  private setArtifactKindFilter(kind: ArtifactKindGroup | null): void {
+    this.artifactKindFilter = kind;
+    if (!kind) return;
+    // Bring the first matching row into view.
+    const first = this.activeArtifactRows.find(
+      (item) =>
+        artifactView(item, this.activeArtifacts[artifactRowMetadata(item)!.id])
+          ?.group === kind
+    );
+    const id = first ? artifactRowMetadata(first)?.id : null;
+    if (id) {
+      void this.updateComplete.then(() =>
+        this.timelineHost?.scrollToArtifact?.(id)
+      );
+    }
+  }
+
+  private renderArtifactSummary() {
+    if (!this.activeSessionId || !this.activeSession) return nothing;
+    return html`<session-artifact-summary
+      style="margin-bottom: var(--sl-spacing-small);"
+      .counts=${this.activeArtifactCounts}
+      .truncated=${
+        this.loadedArtifacts[this.activeSessionId]?.truncated ?? false
+      }
+      .activeKind=${this.artifactKindFilter}
+      @artifact-kind-filter=${(
+        event: CustomEvent<{ kind: ArtifactKindGroup | null }>
+      ) => this.setArtifactKindFilter(event.detail.kind)}
+    ></session-artifact-summary>`;
+  }
+
+  private renderArtifactViewer() {
+    const images = this.activeImageArtifacts;
+    if (!images.length || !this.activeSessionId) return nothing;
+    return html`<artifact-image-viewer
+      .sessionId=${this.activeSessionId}
+      .images=${images}
+      .index=${this.artifactViewerIndex}
+      @viewer-close=${() => {
+        this.artifactViewerIndex = -1;
+      }}
+      @viewer-navigate=${(event: CustomEvent<{ index: number }>) => {
+        this.artifactViewerIndex = event.detail.index;
+      }}
+    ></artifact-image-viewer>`;
+  }
+
+  /** Browser steps of the active session, in time order. */
+  private get activeBrowserSteps(): RuntimeSessionActivityItem[] {
+    return sortBrowserSteps(this.activeActivity);
+  }
+
+  private openBrowserStepViewer(key: string): void {
+    const index = this.activeBrowserSteps.findIndex(
+      (item) => browserStepKey(item) === key
+    );
+    if (index >= 0) this.browserStepViewerIndex = index;
+  }
+
+  /**
+   * Scroll the timeline to one browser step. The visible timeline (Conversation
+   * or Transcript) owns the row; when neither shows it, open the step in the
+   * viewer so the click still lands somewhere.
+   */
+  private scrubToBrowserStep(key: string): void {
+    const selector =
+      this.replayMode === 'conversation'
+        ? 'session-chat-view'
+        : 'session-replay-panel';
+    const host = this.renderRoot.querySelector(selector) as
+      (Element & { scrollToBrowserStep?: (key: string) => boolean }) | null;
+    if (this.requestsView || !host?.scrollToBrowserStep?.(key)) {
+      this.openBrowserStepViewer(key);
+    }
+  }
+
+  private renderBrowserStepStrip() {
+    const steps = this.activeBrowserSteps;
+    if (!steps.length || !this.activeSessionId) return nothing;
+    return html`<browser-step-strip
+      style="margin-bottom: var(--sl-spacing-small);"
+      .steps=${steps}
+      .sessionId=${this.activeSessionId}
+      @browser-step-scrub=${(event: CustomEvent<{ key: string }>) =>
+        this.scrubToBrowserStep(event.detail.key)}
+    ></browser-step-strip>`;
+  }
+
+  private renderBrowserStepViewer() {
+    const steps = this.activeBrowserSteps;
+    if (!steps.length || !this.activeSessionId) return nothing;
+    return html`<artifact-image-viewer
+      .sessionId=${this.activeSessionId}
+      .images=${browserStepViewerImages(steps)}
+      .index=${this.browserStepViewerIndex}
+      @viewer-close=${() => {
+        this.browserStepViewerIndex = -1;
+      }}
+      @viewer-navigate=${(event: CustomEvent<{ index: number }>) => {
+        this.browserStepViewerIndex = event.detail.index;
+      }}
+    ></artifact-image-viewer>`;
+  }
+
   private get activeEventPage(): EventPageState | null {
     return this.activeSessionId
       ? this.loadedEventPages[this.activeSessionId] || null
@@ -1696,6 +2161,12 @@ export class PreloopSessionObserver extends LitElement {
   }
 
   updated(changed: Map<string | number | symbol, unknown>): void {
+    if (changed.has('focusArtifactId')) {
+      // Cleared (another session picked, or Back to a URL without it): forget
+      // the last landing so returning to the same ?artifact= lands again.
+      if (this.focusArtifactId) void this.landOnFocusArtifact();
+      else this.landedArtifactId = null;
+    }
     if (
       changed.has('focusTurnId') &&
       this.focusTurnId &&
@@ -1712,6 +2183,7 @@ export class PreloopSessionObserver extends LitElement {
     this.replayMode = mode;
     this.syncReplayModeToUrl();
     if (mode === 'optimize') {
+      void this.loadAIModels();
       // Opening the drawer retires the first-use hint for good.
       this.dismissOptimizeHint();
     }
@@ -1799,19 +2271,31 @@ export class PreloopSessionObserver extends LitElement {
 
   /**
    * Chat-style transcript (P1 of the transcript redesign): only top-level
-   * user prompts and final agent responses expanded; tool calls/results,
-   * system and injected segments collapsed. Rendered ALONGSIDE the replay
+   * user prompts, responses, named tools and approvals are visible;
+   * system and injected segments remain collapsed. Rendered ALONGSIDE the replay
    * panel (which is hidden, not unmounted, in this mode) so switching tabs
    * never loses the panel's expand/replay/optimize state.
    */
   private renderConversationView() {
     if (!this.activeSession) {
+      if (this.replayMode !== 'conversation') return nothing;
       return html`<div class="empty">${this.replayEmptyText}</div>`;
     }
     return html`
       <session-chat-view
+        style=${this.replayMode === 'conversation' ? '' : 'display:none'}
+        .liveEnabled=${this.replayMode === 'conversation'}
+        .sessionId=${this.activeSessionId || ''}
+        .ended=${Boolean(this.activeSession?.endedAt)}
+        @session-live-reload=${() => void this.reloadActiveSession()}
         .events=${this.activeEvents}
         .activity=${this.activeActivity}
+        .pendingApprovals=${this.activePendingApprovals}
+        .sessionEnded=${this.isSessionEnded(this.activeSession)}
+        .connected=${this.realtimeConnected}
+        .artifacts=${this.activeArtifacts}
+        .artifactKindFilter=${this.artifactKindFilter}
+        .highlightArtifactId=${this.highlightedArtifactId}
         .loading=${
           this.activeSessionId !== null &&
           this.loadingSessionId === this.activeSessionId
@@ -2004,7 +2488,7 @@ export class PreloopSessionObserver extends LitElement {
             <sl-icon slot="prefix" name="list-columns-reverse"></sl-icon>
             Requests
           </sl-button>
-          ${this.renderTalkButton()}
+          ${this.renderEvidenceExportButton(session)} ${this.renderTalkButton()}
           <sl-button size="small" @click=${() => this.reloadActiveSession()}>
             Refresh
           </sl-button>
@@ -2029,6 +2513,29 @@ export class PreloopSessionObserver extends LitElement {
         </div>
       </div>
     `;
+  }
+
+  /**
+   * Open the period export pre-filtered to this session (#1088), so its
+   * transcripts, screenshots and files leave with a sha256 each.
+   */
+  private renderEvidenceExportButton(session: ObservedSession | null) {
+    // Synthetic observer rows (gateway-only traffic) have no session to export.
+    if (!session || !isUuid(session.id)) return nothing;
+    return html`<sl-button
+      size="small"
+      data-testid="add-to-evidence-export"
+      href=${sessionExportHref({
+        id: session.id,
+        started_at: session.startedAt,
+        last_activity_at: session.lastActivityAt,
+        ended_at: session.endedAt,
+      })}
+      title="Open the signed period export limited to this session's artifacts"
+    >
+      <sl-icon slot="prefix" name="box-arrow-up"></sl-icon>
+      Add to evidence export
+    </sl-button>`;
   }
 
   /**
@@ -2059,8 +2566,17 @@ export class PreloopSessionObserver extends LitElement {
     }
 
     const content = html`
-      <div class="content">
+      <div
+        class="content"
+        @browser-step-open=${(event: CustomEvent<{ key: string }>) =>
+          this.openBrowserStepViewer(event.detail.key)}
+        @artifact-open=${(event: CustomEvent<{ artifactId: string }>) =>
+          this.openArtifactViewer(event.detail.artifactId)}
+        @artifact-scrub=${(event: CustomEvent<{ artifactId: string }>) =>
+          void this.scrollToArtifact(event.detail.artifactId)}
+      >
         ${this.renderToolbar()} ${this.renderOptimizeHint()}
+        ${this.renderArtifactSummary()} ${this.renderBrowserStepStrip()}
         ${
           this.error
             ? html`
@@ -2171,12 +2687,9 @@ export class PreloopSessionObserver extends LitElement {
               `
             : nothing
         }
-        ${
-          this.replayMode === 'conversation'
-            ? this.renderConversationView()
-            : nothing
-        }
+        ${this.renderConversationView()}
         <session-replay-panel
+          @session-live-reload=${() => void this.reloadActiveSession()}
           style=${this.replayMode === 'conversation' ? 'display: none;' : ''}
           .session=${this.activeSession}
           .emptyText=${this.replayEmptyText}
@@ -2187,6 +2700,9 @@ export class PreloopSessionObserver extends LitElement {
               : []
           }
           .activity=${this.activeActivity}
+          .artifacts=${this.activeArtifacts}
+          .artifactKindFilter=${this.artifactKindFilter}
+          .highlightArtifactId=${this.highlightedArtifactId}
           .focusEventId=${this.focusTurnId}
           .replayMode=${this.replayMode}
           .loading=${
@@ -2206,6 +2722,7 @@ export class PreloopSessionObserver extends LitElement {
           .totalEvents=${this.activeEventPage?.total ?? null}
           .optimizationEnabled=${this.enabledFeatures.optimization}
           .availableModels=${this.aiModels}
+          .availableModelsLoading=${this.aiModelsLoading}
           .optimizationResult=${
             this.activeSessionId
               ? this.loadedOptimizations[this.activeSessionId] || null
@@ -2291,6 +2808,7 @@ export class PreloopSessionObserver extends LitElement {
               `
             : nothing
         }
+        ${this.renderBrowserStepViewer()} ${this.renderArtifactViewer()}
       </div>
     `;
 
@@ -2364,6 +2882,7 @@ export class PreloopSessionObserver extends LitElement {
                       this.hideListSearch
                         ? nothing
                         : html`<sl-input
+                            aria-label="Search sessions"
                             placeholder="Search sessions"
                             clearable
                             .value=${this.searchQuery}
@@ -2384,9 +2903,10 @@ export class PreloopSessionObserver extends LitElement {
                         this.observedSessions.length === 0 ? this.emptyText : ''
                       }
                       @session-selected=${(event: CustomEvent) =>
-                        this.selectSession(event.detail.sessionId, {
-                          userInitiated: true,
-                        })}
+                        this.openFromList(
+                          event.detail.sessionId,
+                          event.detail.artifactKind ?? null
+                        )}
                     ></session-list-panel>
                   </div>
                 `

@@ -11,6 +11,7 @@ conditional flow triggering based on author, labels, assignee, etc.
 from typing import Dict, Any, List, Optional, Tuple
 
 from preloop.models.models.flow_execution import TRIGGER_SUBJECT_KEY
+from preloop.utils.bitbucket_dc_webhooks import BITBUCKET_DC_EVENT_MAP
 from preloop.utils.schedule_text import describe_schedule_config
 
 # Older Issue Triage clones stored GitHub-style dotted names while webhook
@@ -47,6 +48,46 @@ LABEL_CHANGE_EVENT_TYPES: frozenset = frozenset(
 # event type ends up being.
 LABEL_CHANGE_ACTIONS: frozenset = frozenset({"labeled", "unlabeled"})
 
+# ``stop_source`` recorded on an execution that was stopped because the pull
+# or merge request it works on went away (#1032). Machine-readable, next to
+# ``account_halt`` and ``parent_stop``; the sentence a person reads is in
+# ``stop_reason``.
+PR_STOP_SOURCE_MERGED = "pr_merged"
+PR_STOP_SOURCE_CLOSED = "pr_closed"
+PR_STOP_SOURCE_SUPERSEDED = "pr_superseded"
+
+# Normalized event types that end a pull or merge request, mapped to the
+# ``stop_source`` an execution still working on it is stopped with. GitHub
+# ``pull_request.closed``, GitLab ``merge``/``close`` and Bitbucket
+# ``pullrequest:fulfilled``/``pullrequest:rejected`` all land here.
+PR_CLOSE_STOP_SOURCES: Dict[str, str] = {
+    "pull_request_merged": PR_STOP_SOURCE_MERGED,
+    "merge_request_merged": PR_STOP_SOURCE_MERGED,
+    "pull_request_closed": PR_STOP_SOURCE_CLOSED,
+    "merge_request_closed": PR_STOP_SOURCE_CLOSED,
+}
+
+# Normalized event types that can carry a new head commit for an open pull or
+# merge request (GitHub ``synchronize`` and ``edited``, GitLab ``update``,
+# Bitbucket ``pullrequest:updated``). Whether the head actually moved is
+# decided by comparing commit SHAs, not by the type.
+PR_HEAD_UPDATE_EVENT_TYPES: frozenset = frozenset(
+    {"pull_request_updated", "merge_request_updated"}
+)
+
+
+def pr_close_stop_source(event_type: Optional[str]) -> Optional[str]:
+    """``stop_source`` for an event that ends a pull request, else None.
+
+    Args:
+        event_type: Normalized event type from ``normalize_event_type``.
+
+    Returns:
+        ``pr_merged`` or ``pr_closed``, or None when the event does not end
+        a pull or merge request.
+    """
+    return PR_CLOSE_STOP_SOURCES.get(event_type or "")
+
 
 def matching_event_types(event_type: str) -> Tuple[str, ...]:
     """Return the canonical event type plus legacy aliases that should match.
@@ -59,6 +100,49 @@ def matching_event_types(event_type: str) -> Tuple[str, ...]:
     """
     extra = EVENT_TYPE_ALIASES.get(event_type, ())
     return (event_type, *extra)
+
+
+# Types a Jira ``jira:issue_updated`` delivery can normalize to.
+_JIRA_UPDATE_TYPES = frozenset(
+    {"issue_updated", "issue_labeled", "issue_unlabeled", "issue_status_changed"}
+)
+
+
+def secondary_event_types(
+    source: Optional[str], event_type: Optional[str], payload: Optional[dict]
+) -> Tuple[str, ...]:
+    """Extra event types a single delivery should also start flows for.
+
+    Jira folds every edit into one ``jira:issue_updated`` webhook, which
+    normalizes to a single type (added label, then status change, then
+    removed label, then ``issue_updated``). Flows subscribed to the other
+    deltas the same edit carries must still see it, and flows subscribed to
+    ``issue_updated`` keep firing on every edit, as they did before label
+    and status changes had their own types.
+
+    Args:
+        source: Event source (tracker type).
+        event_type: Normalized event type.
+        payload: Enriched payload (raw payload merged with filter fields).
+
+    Returns:
+        Additional normalized event types, possibly empty.
+    """
+    if (source or "").lower() != "jira" or not isinstance(payload, dict):
+        return ()
+    if event_type not in _JIRA_UPDATE_TYPES:
+        return ()
+    extras: List[str] = []
+    carried = (
+        ("issue_labeled", payload.get("added_labels")),
+        ("issue_status_changed", payload.get("status_to")),
+        ("issue_unlabeled", payload.get("removed_labels")),
+        ("issue_updated", True),
+    )
+    for extra_type, present in carried:
+        if present and extra_type != event_type:
+            extras.append(extra_type)
+    return tuple(extras)
 
 
 def gitlab_label_delta(payload: Optional[dict]) -> Tuple[List[str], List[str]]:
@@ -96,6 +180,72 @@ def gitlab_label_delta(payload: Optional[dict]) -> Tuple[List[str], List[str]]:
     previous = _titles(labels_change.get("previous"))
     current = _titles(labels_change.get("current"))
     return sorted(current - previous), sorted(previous - current)
+
+
+def _jira_changelog_items(payload: Optional[dict]) -> List[Dict[str, Any]]:
+    """Return the changelog items of a Jira ``jira:issue_updated`` webhook.
+
+    Jira includes ``changelog.items`` only on issue updates. Each item names
+    the ``field`` that changed plus ``fromString`` / ``toString`` renderings.
+    """
+    if not isinstance(payload, dict):
+        return []
+    changelog = payload.get("changelog")
+    if not isinstance(changelog, dict):
+        return []
+    items = changelog.get("items")
+    if not isinstance(items, list):
+        return []
+    return [item for item in items if isinstance(item, dict)]
+
+
+def jira_label_delta(payload: Optional[dict]) -> Tuple[List[str], List[str]]:
+    """Return (added, removed) labels from a Jira issue update changelog.
+
+    Jira reports a label edit as one changelog item with ``field`` set to
+    ``labels`` and the full before/after label sets as space-separated
+    strings (Jira labels cannot contain spaces). As with
+    ``gitlab_label_delta``, both deltas are always returned and
+    ``normalize_event_type`` gives additions precedence.
+
+    Args:
+        payload: Raw Jira webhook payload.
+
+    Returns:
+        Sorted added labels and sorted removed labels.
+    """
+    previous: set[str] = set()
+    current: set[str] = set()
+    found = False
+    for item in _jira_changelog_items(payload):
+        if str(item.get("field") or "").lower() != "labels":
+            continue
+        found = True
+        previous.update((item.get("fromString") or "").split())
+        current.update((item.get("toString") or "").split())
+    if not found:
+        return [], []
+    return sorted(current - previous), sorted(previous - current)
+
+
+def jira_status_change(payload: Optional[dict]) -> Optional[Tuple[str, str]]:
+    """Return the (from, to) status names of a Jira workflow transition.
+
+    Args:
+        payload: Raw Jira webhook payload.
+
+    Returns:
+        The previous and new status names, or None when the update did not
+        change the status.
+    """
+    for item in _jira_changelog_items(payload):
+        if str(item.get("field") or "").lower() != "status":
+            continue
+        from_status = str(item.get("fromString") or "")
+        to_status = str(item.get("toString") or "")
+        if from_status != to_status and to_status:
+            return from_status, to_status
+    return None
 
 
 # Mapping of GitLab webhook events to normalized event types
@@ -137,6 +287,24 @@ JIRA_EVENT_MAP: Dict[str, str] = {
     "comment_deleted": "comment_deleted",
 }
 
+# Mapping of Bitbucket Cloud webhook event keys (X-Event-Key) to normalized
+# event types. Bitbucket sends one key per action, so no payload refinement
+# is needed.
+BITBUCKET_EVENT_MAP: Dict[str, str] = {
+    "pullrequest:created": "pull_request_opened",
+    "pullrequest:updated": "pull_request_updated",
+    "pullrequest:fulfilled": "pull_request_merged",
+    "pullrequest:rejected": "pull_request_closed",
+    "pullrequest:approved": "pull_request_approved",
+    "pullrequest:unapproved": "pull_request_unapproved",
+    "pullrequest:changes_request_created": "pull_request_changes_requested",
+    "pullrequest:changes_request_removed": "pull_request_changes_request_removed",
+    "pullrequest:comment_created": "comment_created",
+    "pullrequest:comment_updated": "comment_updated",
+    "pullrequest:comment_deleted": "comment_deleted",
+    "repo:push": "push",
+}
+
 
 # Human-readable labels for normalized event types.
 # Mirrors frontend/src/constants/tracker-event-types.ts so the subject rendered
@@ -149,6 +317,7 @@ EVENT_TYPE_LABELS: Dict[str, str] = {
     "issue_deleted": "Issue Deleted",
     "issue_labeled": "Issue Labeled",
     "issue_unlabeled": "Issue Unlabeled",
+    "issue_status_changed": "Issue Status Changed",
     "issue_assigned": "Issue Assigned",
     "issue_unassigned": "Issue Unassigned",
     "pull_request_opened": "Pull Request Opened",
@@ -158,6 +327,10 @@ EVENT_TYPE_LABELS: Dict[str, str] = {
     "pull_request_reopened": "Pull Request Reopened",
     "pull_request_review_requested": "Pull Request Review Requested",
     "pull_request_ready_for_review": "Pull Request Ready for Review",
+    "pull_request_approved": "Pull Request Approved",
+    "pull_request_unapproved": "Pull Request Unapproved",
+    "pull_request_changes_requested": "Pull Request Changes Requested",
+    "pull_request_changes_request_removed": "Pull Request Changes Request Removed",
     "merge_request_opened": "Merge Request Opened",
     "merge_request_updated": "Merge Request Updated",
     "merge_request_closed": "Merge Request Closed",
@@ -324,8 +497,31 @@ def normalize_event_type(
         return normalized or raw_event_type
 
     elif tracker_type_lower == "jira":
-        # Jira events - already normalized in webhook
-        return JIRA_EVENT_MAP.get(raw_event_type, raw_event_type)
+        normalized = JIRA_EVENT_MAP.get(raw_event_type, raw_event_type)
+        if normalized == "issue_updated" and payload:
+            # Jira sends every edit as jira:issue_updated; the changelog says
+            # what changed. One edit can add labels, remove labels and move
+            # the status at once, but only one event type is emitted. Added
+            # wins, as for GitLab above: a label added in the same edit as a
+            # transition is issue_labeled. A transition beats a removal, and
+            # an edit touching neither stays issue_updated. All deltas still
+            # land in filter_fields (added_labels, removed_labels,
+            # status_from, status_to), and secondary_event_types() lets
+            # issue_status_changed flows see the transition of a mixed edit.
+            added, removed = jira_label_delta(payload)
+            if added:
+                normalized = "issue_labeled"
+            elif jira_status_change(payload):
+                normalized = "issue_status_changed"
+            elif removed:
+                normalized = "issue_unlabeled"
+        return normalized
+
+    elif tracker_type_lower == "bitbucket":
+        return BITBUCKET_EVENT_MAP.get(raw_event_type, raw_event_type)
+
+    elif tracker_type_lower == "bitbucket_dc":
+        return BITBUCKET_DC_EVENT_MAP.get(raw_event_type, raw_event_type)
 
     # Unknown tracker type - return as-is
     return raw_event_type
@@ -444,6 +640,72 @@ def _gitlab_subject(payload: Dict[str, Any]) -> Dict[str, Any]:
     return parts
 
 
+def _bitbucket_subject(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Extract subject parts from a Bitbucket Cloud webhook payload."""
+    parts: Dict[str, Any] = {}
+
+    repo = payload.get("repository") or {}
+    if isinstance(repo, dict) and repo.get("full_name"):
+        parts["repo"] = repo["full_name"]
+
+    pr = payload.get("pullrequest")
+    if isinstance(pr, dict) and pr:
+        if pr.get("id"):
+            parts["reference"] = f"#{pr['id']}"
+        if pr.get("title"):
+            parts["title"] = pr["title"]
+        html = (pr.get("links") or {}).get("html") or {}
+        if isinstance(html, dict) and html.get("href"):
+            parts["url"] = html["href"]
+        commit = ((pr.get("source") or {}).get("commit")) or {}
+        if isinstance(commit, dict):
+            parts["commit"] = _short_sha(commit.get("hash"))
+        return parts
+
+    push = payload.get("push")
+    if isinstance(push, dict):
+        changes = push.get("changes") or []
+        last = changes[-1] if isinstance(changes, list) and changes else {}
+        new = (last or {}).get("new") or {}
+        if isinstance(new, dict):
+            if new.get("name"):
+                parts["reference"] = new["name"]
+            target = new.get("target") or {}
+            if isinstance(target, dict):
+                parts["commit"] = _short_sha(target.get("hash"))
+
+    return parts
+
+
+def _bitbucket_dc_subject(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Extract subject parts from a normalized Bitbucket Data Center payload."""
+    parts: Dict[str, Any] = {}
+    repo = payload.get("repository") or {}
+    if isinstance(repo, dict) and repo.get("path"):
+        parts["repo"] = repo["path"]
+    pr = payload.get("pull_request")
+    if isinstance(pr, dict) and pr:
+        if pr.get("number"):
+            parts["reference"] = f"#{pr['number']}"
+        if pr.get("title"):
+            parts["title"] = pr["title"]
+        if pr.get("html_url"):
+            parts["url"] = pr["html_url"]
+        head = pr.get("head")
+        if isinstance(head, dict):
+            parts["commit"] = _short_sha(head.get("sha"))
+        return parts
+    push = payload.get("push")
+    if isinstance(push, dict):
+        changes = push.get("changes") or []
+        last = changes[-1] if isinstance(changes, list) and changes else {}
+        if isinstance(last, dict):
+            if last.get("branch"):
+                parts["reference"] = last["branch"]
+            parts["commit"] = _short_sha(last.get("to_hash"))
+    return parts
+
+
 def _jira_subject(payload: Dict[str, Any]) -> Dict[str, Any]:
     """Extract subject parts from a Jira webhook payload."""
     parts: Dict[str, Any] = {}
@@ -505,6 +767,59 @@ def _manual_subject(event_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     return parts
 
 
+# Human-readable names for the CI providers a CI-dispatched trigger may
+# declare in its ``ci`` block. Anything unknown falls back to title-casing,
+# so a future provider still renders readably rather than as a raw slug.
+_CI_PROVIDER_LABELS: Dict[str, str] = {
+    "github-actions": "GitHub Actions",
+    "gitlab": "GitLab CI",
+    "gitlab-ci": "GitLab CI",
+    "gitlab-ci-cd": "GitLab CI",
+    "jenkins": "Jenkins",
+    "circleci": "CircleCI",
+    "circle-ci": "CircleCI",
+    "buildkite": "Buildkite",
+    "bitbucket": "Bitbucket Pipelines",
+    "bitbucket-pipelines": "Bitbucket Pipelines",
+    "azure-pipelines": "Azure Pipelines",
+    "azure-devops": "Azure DevOps",
+    "teamcity": "TeamCity",
+    "travis": "Travis CI",
+    "travis-ci": "Travis CI",
+}
+
+
+def _ci_provenance(ci: Any) -> Dict[str, str]:
+    """Read the ``ci`` provenance block a CI-dispatched trigger carries.
+
+    A CI job that calls ``preloop flow trigger`` with a full tracker payload
+    marks where it came from with a top-level ``ci`` block
+    (``{"provider": "github-actions", "run_url": ...}``). The provider lets
+    the subject say who dispatched it; the run URL links back to the job.
+
+    Args:
+        ci: The ``ci`` object from the trigger body, or anything else.
+
+    Returns:
+        ``{"label": "<human provider>", "url": "<run url>"}`` when a provider
+        was declared, else ``{}``. ``url`` is omitted when absent or not a
+        non-empty string.
+    """
+    if not isinstance(ci, dict):
+        return {}
+    provider = str(ci.get("provider") or "").strip()
+    if not provider:
+        return {}
+    label = _CI_PROVIDER_LABELS.get(provider.lower())
+    if not label:
+        label = provider.replace("-", " ").replace("_", " ").title()
+    parts: Dict[str, str] = {"label": label}
+    run_url = ci.get("run_url")
+    if isinstance(run_url, str) and run_url.strip():
+        parts["url"] = run_url.strip()
+    return parts
+
+
 def extract_trigger_subject(event_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """Build a compact, human-readable subject for a flow execution.
 
@@ -538,6 +853,12 @@ def extract_trigger_subject(event_data: Dict[str, Any]) -> Optional[Dict[str, An
     if not isinstance(payload, dict):
         payload = {}
 
+    # A CI-dispatched run declares where it came from up front, so read the
+    # provenance before the early returns below. Those returns handle runs a
+    # person (or the scheduler) started; a run carrying a ``ci`` block is not
+    # one of those and must keep its real event label and CI hint.
+    ci = _ci_provenance(event_data.get("ci"))
+
     # A scheduled run and a manual run carry no repo and no reference, so
     # they render their own line: the label plus the one fact that tells two
     # runs of the same flow apart (which schedule, or which person).
@@ -551,8 +872,12 @@ def extract_trigger_subject(event_data: Dict[str, Any]) -> Optional[Dict[str, An
             parts["text"] = "Scheduled"
         return parts
 
-    if source in ("manual", "api", "console") or (
-        not source and (event_data.get("test_mode") or event_data.get("triggered_by"))
+    if not ci and (
+        source in ("manual", "api", "console")
+        or (
+            not source
+            and (event_data.get("test_mode") or event_data.get("triggered_by"))
+        )
     ):
         return _manual_subject(event_data)
 
@@ -562,6 +887,10 @@ def extract_trigger_subject(event_data: Dict[str, Any]) -> Optional[Dict[str, An
         parts = _gitlab_subject(payload)
     elif source == "jira":
         parts = _jira_subject(payload)
+    elif source == "bitbucket":
+        parts = _bitbucket_subject(payload)
+    elif source == "bitbucket_dc":
+        parts = _bitbucket_dc_subject(payload)
     else:
         parts = {}
 
@@ -569,7 +898,10 @@ def extract_trigger_subject(event_data: Dict[str, Any]) -> Optional[Dict[str, An
     parts = {key: value for key, value in parts.items() if value}
 
     label = humanize_event_type(event_type)
-    if event_data.get("test_mode"):
+    # A run a person started from the console or CLI reads "Manual Test Run".
+    # A CI-dispatched run carries its own provenance block, so it keeps the
+    # real event label (e.g. "Pull Request Updated") and names the CI instead.
+    if event_data.get("test_mode") and not ci:
         label = "Manual Test Run"
     if label:
         parts["event"] = label
@@ -589,6 +921,10 @@ def extract_trigger_subject(event_data: Dict[str, Any]) -> Optional[Dict[str, An
         return None
 
     parts["text"] = _SUBJECT_SEPARATOR.join(segments)
+    if ci:
+        parts["ci"] = ci["label"]
+        if ci.get("url"):
+            parts["ci_url"] = ci["url"]
     return parts
 
 
@@ -881,7 +1217,87 @@ def extract_filter_fields(
         if issue_type:
             filter_fields["issue_type"] = issue_type.get("name")
 
+        # Changelog deltas (jira:issue_updated only)
+        added_labels, removed_labels = jira_label_delta(payload)
+        if added_labels:
+            filter_fields["added_labels"] = added_labels
+        if removed_labels:
+            filter_fields["removed_labels"] = removed_labels
+        status_change = jira_status_change(payload)
+        if status_change:
+            filter_fields["status_from"], filter_fields["status_to"] = status_change
+
         # User who triggered the event
         filter_fields["event_user"] = user.get("displayName") or user.get("accountId")
 
+    elif tracker_type_lower == "bitbucket":
+        actor = payload.get("actor") or {}
+        filter_fields["sender"] = _bitbucket_user(actor)
+        filter_fields["action"] = raw_event_type.split(":", 1)[-1]
+        pr = payload.get("pullrequest")
+        if isinstance(pr, dict) and pr:
+            filter_fields["author"] = _bitbucket_user(pr.get("author"))
+            reviewers = [
+                _bitbucket_user(reviewer) for reviewer in pr.get("reviewers") or []
+            ]
+            reviewers = [name for name in reviewers if name]
+            if reviewers:
+                filter_fields["reviewer"] = reviewers
+            state = str(pr.get("state") or "").lower()
+            filter_fields["state"] = state or None
+            filter_fields["merged"] = state == "merged"
+            filter_fields["draft"] = bool(pr.get("draft", False))
+            source_branch = ((pr.get("source") or {}).get("branch") or {}).get("name")
+            target_branch = ((pr.get("destination") or {}).get("branch") or {}).get(
+                "name"
+            )
+            if source_branch:
+                filter_fields["source_branch"] = source_branch
+            if target_branch:
+                filter_fields["target_branch"] = target_branch
+        push = payload.get("push")
+        if isinstance(push, dict):
+            changes = push.get("changes") or []
+            last = changes[-1] if isinstance(changes, list) and changes else {}
+            new = (last or {}).get("new") or {}
+            if isinstance(new, dict) and new.get("name"):
+                filter_fields["ref"] = new["name"]
+
+    elif tracker_type_lower == "bitbucket_dc":
+        # The intake already normalized the payload (see
+        # preloop.utils.bitbucket_dc_webhooks.normalize_delivery).
+        dc = payload.get("bitbucket_dc") or {}
+        filter_fields["sender"] = dc.get("actor")
+        filter_fields["action"] = raw_event_type.split(":")[-1]
+        pr = payload.get("pull_request")
+        if isinstance(pr, dict) and pr:
+            filter_fields["author"] = pr.get("author")
+            if pr.get("reviewers"):
+                filter_fields["reviewer"] = list(pr["reviewers"])
+            filter_fields["state"] = pr.get("state")
+            filter_fields["merged"] = pr.get("state") == "merged"
+            filter_fields["draft"] = bool(pr.get("draft", False))
+            head = pr.get("head") or {}
+            base = pr.get("base") or {}
+            if head.get("ref"):
+                filter_fields["source_branch"] = head["ref"]
+            if base.get("ref"):
+                filter_fields["target_branch"] = base["ref"]
+            filter_fields["head_changed"] = bool(dc.get("head_changed"))
+        if dc.get("participant_status"):
+            filter_fields["review_state"] = dc["participant_status"]
+        push = payload.get("push")
+        if isinstance(push, dict):
+            changes = push.get("changes") or []
+            last = changes[-1] if isinstance(changes, list) and changes else {}
+            if isinstance(last, dict) and last.get("branch"):
+                filter_fields["ref"] = last["branch"]
+
     return filter_fields
+
+
+def _bitbucket_user(user: Any) -> Optional[str]:
+    """Return the nickname (or display name) of a Bitbucket user object."""
+    if not isinstance(user, dict):
+        return None
+    return user.get("nickname") or user.get("display_name")

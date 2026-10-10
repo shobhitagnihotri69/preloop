@@ -4,6 +4,8 @@ import logging
 import os
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
+from urllib.parse import urlsplit
+from typing import Literal
 
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -79,11 +81,13 @@ def _log_insecure_placeholder_jwt_banner() -> None:
 def warn_or_reject_placeholder_jwt_secret(secret: str, *, environment: str) -> None:
     """Reject placeholder JWT secrets in production; warn loudly otherwise.
 
-    Helm ``jwtSecret`` stays optional so ``helm template`` and existing
-    upgrades still render. ENVIRONMENT=production already fails closed when
-    SECRET_KEY is missing; the same gate rejects these public placeholders.
-    Development, test, and unset ENVIRONMENT (the chart default) log a
-    CRITICAL banner instead of refusing to start.
+    The Helm chart fails closed on the same placeholder list at install time
+    (templates/secret.yaml mirrors it); this startup gate is the backstop
+    for non-Helm deployments and for installs that predate the chart guard.
+    ENVIRONMENT=production already fails closed when SECRET_KEY is missing;
+    the same gate rejects these public placeholders. Development, test, and
+    unset ENVIRONMENT (the chart default) log a CRITICAL banner instead of
+    refusing to start.
 
     Args:
         secret: Configured JWT signing key.
@@ -99,6 +103,31 @@ def warn_or_reject_placeholder_jwt_secret(secret: str, *, environment: str) -> N
     # Log a canned banner in a helper that does not take the signing key, so
     # the key never reaches a logging sink (CodeQL py/clear-text-logging).
     _log_insecure_placeholder_jwt_banner()
+
+
+def warn_default_database_credentials(database_url: str) -> None:
+    """Warn when the database URL carries the development default credentials.
+
+    The development docker compose stack defaults ``POSTGRES_PASSWORD`` to
+    ``postgres``, which is fine on a laptop and must never face the internet.
+    The warning message contains no part of the URL, so no credential (not
+    even the public default) reaches a logging sink.
+
+    Args:
+        database_url: The resolved ``DATABASE_URL`` value.
+    """
+    try:
+        parsed = urlsplit(database_url)
+        username, password = parsed.username, parsed.password
+    except ValueError:
+        return
+    if username == "postgres" and password == "postgres":
+        logger.warning(
+            "DATABASE_URL authenticates with the development default "
+            "postgres credentials. Set POSTGRES_PASSWORD (docker compose) "
+            "or a real DATABASE_URL for any deployment that leaves this "
+            "machine."
+        )
 
 
 def _load_release_version(
@@ -375,6 +404,15 @@ class Settings(BaseSettings):
         description=(
             "Disable proprietary RBAC permission checks and plugin loading. "
             "Set via DISABLE_RBAC=true for OSS / unrestricted access."
+        ),
+    )
+    api_key_scope_enforcement: Literal["enforce", "audit", "off"] = Field(
+        "enforce",
+        description=(
+            "How API keys whose only scopes are MCP scopes (flow execution and "
+            "runtime session tokens) are treated on REST routes: 'enforce' "
+            "denies them with 403, 'audit' logs and allows, 'off' allows. "
+            "Set via API_KEY_SCOPE_ENFORCEMENT; unknown values mean 'enforce'."
         ),
     )
 
@@ -660,6 +698,48 @@ class Settings(BaseSettings):
             "subject-scoped allowed_models checks still apply afterwards."
         ),
     )
+    model_gateway_claude_family_autoregister_verify_upstream: bool = Field(
+        True,
+        description=(
+            "Before the Claude family autoregister mints a catalog row for an "
+            "unknown claude-* identifier, verify that Anthropic actually "
+            "serves it (GET /v1/models/{identifier} with the template model's "
+            "subscription-OAuth access token). A 404 means the id is not "
+            "registered: the row is not created and the gateway answers 404 "
+            "instead of advertising a typo or a guessed snapshot date as a "
+            "real model. A 200 proceeds as today; any other status or a "
+            "transport error is 'unknown' and also proceeds as today, so an "
+            "Anthropic outage never blocks a model that used to work. Results "
+            "are cached in process (positive 24h, negative 10min). Disable "
+            "this to keep the previous behaviour and skip the extra call when "
+            "an egress policy forbids it."
+        ),
+    )
+    codex_upstream_websocket: bool = Field(
+        False,
+        description=(
+            "Send Codex OAuth (ChatGPT subscription) gateway calls to "
+            "chatgpt.com over a warm Responses WebSocket per (account, "
+            "session-id), relaying only new items with previous_response_id "
+            "when the thread just grew (#1454). Clients still talk HTTP and "
+            "every gateway hook still sees the full body. Off = the HTTP path. "
+            "An account can override this either way with the boolean "
+            "'codex_upstream_websocket' key in its meta_data."
+        ),
+    )
+    codex_upstream_websocket_max_sockets: int = Field(
+        256, description="Per-pod cap on warm Codex upstream sockets (LRU)."
+    )
+    codex_upstream_websocket_idle_seconds: float = Field(
+        600.0, description="Close a warm Codex upstream socket after this idle time."
+    )
+    codex_upstream_websocket_http_only_seconds: float = Field(
+        600.0,
+        description=(
+            "After a refused Codex WebSocket handshake, use HTTP for that "
+            "(account, session) for this long."
+        ),
+    )
     model_gateway_codex_family_autoregister_enabled: bool = Field(
         True,
         description=(
@@ -678,10 +758,12 @@ class Settings(BaseSettings):
     model_price_live_lookup_enabled: bool = Field(
         True,
         description=(
-            "When a gateway request records an unpriced model, fetch its "
-            "price from the live upstream price map once in the background "
-            "and re-price the row. Unknown models are negative-cached for a "
-            "day so repeated traffic never re-triggers lookups."
+            "Fetch the live upstream price map: on startup and every "
+            "MODEL_PRICE_MAP_TTL_SECONDS in the background (merged over the "
+            "vendored snapshot), and once when a gateway request records an "
+            "unpriced model, re-pricing that row. Unknown models are "
+            "negative-cached for a day so repeated traffic never re-triggers "
+            "lookups. Disable for air-gapped deployments."
         ),
     )
     model_price_refresh_url: str = Field(
@@ -735,6 +817,14 @@ class Settings(BaseSettings):
             "plugin and at least one provider connection are configured."
         ),
     )
+    copilot_usage_sync_enabled: bool = Field(
+        True,
+        description=(
+            "Schedule the daily GitHub Copilot usage import (seats, "
+            "premium-request spend, usage metrics). The task no-ops unless an "
+            "account has configured a Copilot connection on the Cost page."
+        ),
+    )
     provider_billing_drift_alert_pct: float = Field(
         10.0,
         description=(
@@ -757,6 +847,18 @@ class Settings(BaseSettings):
     flow_native_session_retention_hours: int = Field(168, ge=0)
     flow_checkpoint_interval_seconds: int = Field(300, ge=30)
     flow_artifact_direct_upload: bool = False
+    flow_evidence_log_plaintext: bool = Field(
+        True,
+        description=(
+            "Emit result.json, the evidence pack, and the workspace snapshot "
+            "as base64 on the Kubernetes pod log when no direct-upload token "
+            "is present. The default true keeps today's behavior. Set false "
+            "to disable that plaintext log channel. Turning it off without "
+            "FLOW_ARTIFACT_DIRECT_UPLOAD makes evidence unavailable by design: "
+            "the wrapper writes no artifact bytes and an honest "
+            "plaintext_disabled marker."
+        ),
+    )
     flow_evidence_max_bytes: int = Field(
         32 * 1024 * 1024,
         ge=1,
@@ -774,6 +876,108 @@ class Settings(BaseSettings):
             "How long durable evidence artifacts are retained before cleanup "
             "removes ciphertext, in hours. 0 expires on the next janitor pass. "
             "This is operational retention, not legal hold or object-lock."
+        ),
+    )
+    runtime_session_screenshot_max_bytes: int = Field(
+        2 * 1024**2,
+        ge=1,
+        description=(
+            "Maximum plaintext size in bytes for a runtime-session screenshot. "
+            "Larger payloads are rejected before they are encrypted or stored."
+        ),
+    )
+    runtime_session_screenshots_per_session_max: int = Field(
+        500,
+        ge=1,
+        description=(
+            "Maximum available screenshots per runtime session. Past it, the "
+            "oldest screenshots (by browser step time) lose their image bytes "
+            "and keep their metadata, marked evicted. Screenshots under legal "
+            "hold are not evicted."
+        ),
+    )
+    mcp_playwright_derive_browser_steps: bool = Field(
+        True,
+        description=(
+            "Whether the MCP firewall derives a browser_step activity from "
+            "each proxied Playwright MCP tool call (@playwright/mcp browser_* "
+            "tools) on a runtime session, attaching the output of "
+            "browser_take_screenshot as the step's screenshot. What is "
+            "returned to the agent does not change. Off records those calls "
+            "as plain tool_call rows only."
+        ),
+    )
+    runtime_session_recording_max_bytes: int = Field(
+        512 * 1024**2,
+        ge=1,
+        description=(
+            "Maximum plaintext size in bytes for a runtime-session recording. "
+            "Larger payloads are rejected before they are encrypted or stored."
+        ),
+    )
+    runtime_session_screencast_max_bytes: int = Field(
+        64 * 1024**2,
+        ge=1,
+        description=(
+            "Maximum plaintext size in bytes for a runtime-session screencast (video/webm or video/mp4 frame sequence). "
+            "Kept low while artifacts are stored in Postgres. Larger payloads "
+            "are rejected before they are encrypted or stored."
+        ),
+    )
+    runtime_session_audio_max_bytes: int = Field(
+        25 * 1024**2,
+        ge=1,
+        description=(
+            "Maximum plaintext size in bytes for a runtime-session audio artifact. "
+            "Kept low while artifacts are stored in Postgres. Larger payloads "
+            "are rejected before they are encrypted or stored."
+        ),
+    )
+    runtime_session_transcript_max_bytes: int = Field(
+        5 * 1024**2,
+        ge=1,
+        description=(
+            "Maximum plaintext size in bytes for a runtime-session transcript (plain text, WebVTT, SRT or JSON segments). "
+            "Kept low while artifacts are stored in Postgres. Larger payloads "
+            "are rejected before they are encrypted or stored."
+        ),
+    )
+    runtime_session_document_max_bytes: int = Field(
+        10 * 1024**2,
+        ge=1,
+        description=(
+            "Maximum plaintext size in bytes for a runtime-session document (text, markdown, JSON or PDF). "
+            "Kept low while artifacts are stored in Postgres. Larger payloads "
+            "are rejected before they are encrypted or stored."
+        ),
+    )
+    runtime_session_generated_file_max_bytes: int = Field(
+        10 * 1024**2,
+        ge=1,
+        description=(
+            "Maximum plaintext size in bytes for a runtime-session generated file. "
+            "Kept low while artifacts are stored in Postgres. Larger payloads "
+            "are rejected before they are encrypted or stored."
+        ),
+    )
+    runtime_session_trace_max_bytes: int = Field(
+        25 * 1024**2,
+        ge=1,
+        description=(
+            "Maximum plaintext size in bytes for a runtime-session trace archive (for example a Playwright trace.zip). "
+            "Kept low while artifacts are stored in Postgres. Larger payloads "
+            "are rejected before they are encrypted or stored."
+        ),
+    )
+    # TODO: per-account override of this budget. Global setting only for now.
+    runtime_session_artifact_account_max_bytes: int = Field(
+        5 * 1024**3,
+        ge=1,
+        description=(
+            "Per-account plaintext budget for runtime-session artifacts of "
+            "every kind. A store that would exceed it evicts the oldest "
+            "unheld artifacts before inserting. There is no per-account "
+            "override yet."
         ),
     )
     flow_environment_profiles_file: str = ""
@@ -802,6 +1006,43 @@ class Settings(BaseSettings):
             "module constant in preloop.services.retention_policy: this "
             "setting can only raise it, never lower it "
             "(RETENTION_FLOOR_DAYS)."
+        ),
+    )
+    ticket_readiness_enabled: bool = Field(
+        False,
+        description="Opt-in sampled ticket readiness observation and console settings.",
+    )
+    issue_cost_rebuild_enabled: bool = Field(
+        True,
+        description=(
+            "Run the scheduled per-issue cost rebuild: record finished "
+            "executions that no terminal hook recorded, and re-read issue "
+            "estimates from synced issues. Idempotent and additive "
+            "(ISSUE_COST_REBUILD_ENABLED)."
+        ),
+    )
+    issue_cost_rebuild_interval_seconds: int = Field(
+        3600,
+        ge=60,
+        description="Seconds between scheduled issue cost rebuild passes.",
+    )
+    issue_cost_rebuild_lookback_hours: int = Field(
+        72,
+        ge=1,
+        le=2208,
+        description=(
+            "How far back, by execution start, a scheduled rebuild looks for "
+            "unrecorded executions. Older history is backfilled with the "
+            "rebuild endpoint."
+        ),
+    )
+    issue_cost_rebuild_max_executions_per_account: int = Field(
+        500,
+        ge=1,
+        le=2000,
+        description=(
+            "Executions one scheduled pass records for a single account; the "
+            "rest are picked up by the next pass."
         ),
     )
     retention_purge_enabled: bool = Field(
@@ -858,6 +1099,16 @@ class Settings(BaseSettings):
             "Off-peak UTC hour window the purge may run in, as 'start-end' "
             "(half open, so '1-5' means 01:00 to 04:59 UTC). Empty string "
             "means any hour (RETENTION_PURGE_WINDOW_UTC)."
+        ),
+    )
+    retention_export_max_artifact_bytes: int = Field(
+        2 * 1024 * 1024 * 1024,
+        ge=1,
+        description=(
+            "Maximum total artifact bytes one period export may carry. Above "
+            "it the export is refused with export_too_large, naming the count "
+            "and the bytes, so the caller narrows the range or the session "
+            "(RETENTION_EXPORT_MAX_ARTIFACT_BYTES)."
         ),
     )
     retention_export_max_rows: int = Field(
@@ -1043,9 +1294,9 @@ class Settings(BaseSettings):
     cost_digest_enabled: bool = Field(
         True,
         description=(
-            "Schedule the weekly cost optimization & savings digest email. "
-            "The task no-ops unless the Enterprise billing plugin is "
-            "installed."
+            "Schedule the cost digest for Monday 09:00 UTC. A scheduler "
+            "restart does not send one. The task no-ops unless the "
+            "Enterprise billing plugin is installed."
         ),
     )
     model_gateway_max_preview_chars: int = Field(
@@ -1438,7 +1689,11 @@ class Settings(BaseSettings):
         database_url = os.getenv("DATABASE_URL")
         if not database_url:
             database_url = "postgresql+psycopg://postgres:postgres@localhost/preloop"
-            logger.warning(f"DATABASE_URL not set, using default: {database_url}")
+            logger.warning(
+                "DATABASE_URL not set, using default: "
+                "postgresql+psycopg://postgres:***@localhost/preloop"
+            )
+        warn_default_database_credentials(database_url)
 
         secret_key = os.getenv("SECRET_KEY")
         env = os.getenv("ENVIRONMENT", "development")
@@ -1499,6 +1754,12 @@ class Settings(BaseSettings):
             "t",
             "yes",
         )
+        api_key_scope_enforcement = (
+            os.getenv("API_KEY_SCOPE_ENFORCEMENT", "enforce").strip().lower()
+        )
+        if api_key_scope_enforcement not in ("enforce", "audit", "off"):
+            # Fail closed: a typo must not silently switch enforcement off.
+            api_key_scope_enforcement = "enforce"
         bootstrap_token = os.getenv("PRELOOP_BOOTSTRAP_TOKEN", "")
         require_email_verification = os.getenv(
             "REQUIRE_EMAIL_VERIFICATION", "false"
@@ -1644,6 +1905,7 @@ class Settings(BaseSettings):
                 email_verification_resend_window_seconds
             ),
             disable_rbac=disable_rbac,
+            api_key_scope_enforcement=api_key_scope_enforcement,
             database=database,
             security=security,
             server=server,

@@ -429,7 +429,7 @@ def _denied_budget_result() -> BudgetCheckResult:
 def test_embeddings_budget_denial_records_embeddings_kind(
     app, client, db_session, test_user
 ):
-    """A 403 budget denial on embeddings is stamped embeddings, not chat."""
+    """A 429 budget denial on embeddings is stamped embeddings, not chat."""
     _create_embedding_model(db_session, test_user.account_id)
     _runtime_key_auth(app, db_session, test_user)
 
@@ -450,13 +450,15 @@ def test_embeddings_budget_denial_records_embeddings_kind(
             },
         )
 
-    assert response.status_code == 403
+    assert response.status_code == 429
     body = response.json()
     assert "account monthly limit reached" in body["error"]["message"]
+    assert body["error"]["type"] == "insufficient_quota"
+    assert response.headers["x-should-retry"] == "false"
     mock_embedding.assert_not_called()
     rows = _usage_rows(db_session, test_user.account_id)
     assert len(rows) == 1
-    assert rows[0].status_code == 403
+    assert rows[0].status_code == 429
     assert rows[0].meta_data["endpoint_kind"] == "embeddings"
 
 
@@ -541,7 +543,7 @@ def test_embeddings_pass_derived_parent_to_gateway_service(
         ModelGatewayAuthContext(token="runtime-token", user=test_user, api_key=api_key)
     )
 
-    for headers, expected_session, expected_parent in (
+    for headers, expected_session, expected_parent, expected_explicit in (
         (
             {
                 "X-Session-Id": "ses_child",
@@ -549,6 +551,7 @@ def test_embeddings_pass_derived_parent_to_gateway_service(
             },
             "ses_child",
             "ses_parent",
+            False,
         ),
         (
             {
@@ -558,6 +561,7 @@ def test_embeddings_pass_derived_parent_to_gateway_service(
             },
             "explicit-run",
             None,
+            True,
         ),
     ):
         with patch(
@@ -578,6 +582,9 @@ def test_embeddings_pass_derived_parent_to_gateway_service(
         kwargs = service_cls.call_args.kwargs
         assert kwargs["client_session_id"] == expected_session
         assert kwargs["client_parent_session_id"] == expected_parent
+        # Only the explicit Preloop header opts a plain key in; a gated
+        # vendor header does not.
+        assert kwargs["client_session_id_is_explicit"] is expected_explicit
 
 
 def test_embedding_first_opencode_subagent_records_parent_over_http(

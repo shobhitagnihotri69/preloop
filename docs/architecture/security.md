@@ -1,5 +1,7 @@
 # Security Considerations
 
+Editions: OSS. Contributor documentation for this repository.
+
 Auth, tenancy, redaction, and secret custody are platform concerns, not agent self-reporting. This chapter covers the security checklist, redaction policy, secret service, the tamper-evident audit chain and record signatures, security-screen scoring, and `preloop.security`.
 
 ## Security Screen Scoring (QM Proxy Contract)
@@ -19,7 +21,7 @@ Auth, tenancy, redaction, and secret custody are platform concerns, not agent se
 *   **Purpose:** Deterministic, server-side validation of security audit results. It is result validation, not scanning.
 *   **Gap-Register Freeze:** `gap_register.py` validates the `result.json` produced by release security audit runs. Previous SHA+path finding rows are a floor: dropping one without a `resolved` marker plus a reason fails, unclassified rows fail, and `secrets_findings_count` must match the row count. The agent never self-grades the floor.
 *   **Git Guard:** `git_guard.py` allow-lists metadata-only git invocations so no historical blob contents can be dumped into logs or transcripts. It has no production callers yet; it is the enforcement half of the planned follow-up that wires `validate_gap_register` into result ingestion.
-*   **Waiver Inputs:** `waivers.py` deterministically factors human-authored waiver entries (`{id, reason, author, date}`, plus optional scope/expiry/package/version and the platform approval id for interactively collected ones) into a severity-gate outcome: alias-aware matching (a CVE id waives the same advisory surfaced under a GHSA/OSV alias), verbatim echo of applied entries, unmatched/invalid entries surfaced rather than dropped, and an unwaived failure always keeps the gate failed. Interactive `006` waivers bind stored `ask_user` `tool_result`/`responses` (exact finding id and human reason), not `status=approved` or question text. Ambiguous `request_approval` prose, including a `waive_finding` operation, is not a waiver. AI-judged and auto-approved rows cannot authenticate a human waiver or due-diligence decision. The severity gate is KEV or CVSS >= 9.0 unless trigger/CI `gate.fail_on_kev` / `gate.fail_on_cvss_gte` (in `[0, 10]`) override it — never model-authored `gate.policy` display text. There is no per-product policy table.
+*   **Waiver Inputs:** `waivers.py` deterministically factors human-authored waiver entries (`{id, reason, author, date}`, plus optional scope/expiry/package/version and the platform approval id for interactively collected ones) into a severity-gate outcome: alias-aware matching (a CVE id waives the same advisory surfaced under a GHSA/OSV alias), verbatim echo of applied entries, unmatched/invalid entries surfaced rather than dropped, and an unwaived failure always keeps the gate failed. Interactive `006` waivers bind stored `ask_user` `tool_result`/`responses` (exact finding id and human reason), not `status=approved` or question text. Ambiguous `request_approval` prose, including a `waive_finding` operation, is not a waiver. AI-judged and auto-approved rows cannot authenticate a human waiver or due-diligence decision. The severity gate is KEV or CVSS >= 9.0 unless trigger/CI `gate.fail_on_kev` / `gate.fail_on_cvss_gte` (in `[0, 10]`) override it: never model-authored `gate.policy` display text. There is no per-product policy table.
 *   **Scanner Boundary:** Scanners (gitleaks, zizmor) are installed and run inside the agent execution sandbox per the release security audit preset (`backend/presets/006-release-security-audit.yaml`), never on the platform control plane.
 
 ## Tamper-evident audit trail and signed records
@@ -46,13 +48,151 @@ Preloop implements authentication and multi-tenancy:
   so one bump also invalidates them. API keys and runner tokens are
   unchanged. `preloop auth logout --all` and the console Sign out everywhere
   control call that endpoint.
+- `POST /auth/logout` is the console's server-side sign out. It runs the
+  registered H9 `SessionHook.on_logout` (from `preloop.plugins.account_hooks`)
+  with the current token's claims and returns `redirect_url`: a same-origin
+  path the console navigates to next, or null for the default.
+  `run_logout_hook` drops any redirect that is not a same-origin path, and
+  the console checks it again. With no hook registered it changes nothing
+  server-side; the console clears its own tokens either way. Sign out
+  everywhere skips this call because revoke-all already ended the session.
+- `SessionHook.is_token_revoked` runs after the generation and CLI session
+  checks in `reject_revoked_token`, so an extension can revoke a single JWT it
+  issued. With no hook registered it is not called.
 - Console refresh tokens (`POST /auth/refresh`) carry `sat` and are capped
   at `MAX_SESSION_DAYS` (default 30). CLI login refresh tokens stay
   long-lived (`CLI_JWT_REFRESH_TOKEN_EXPIRE_DAYS`, default 365); revocation
   is the control for those, not the session cap.
-- `POST /oauth/revoke` still revokes opaque MCP tokens. When the token
-  decodes as one of our JWTs it returns 400 `unsupported_token_type` and
-  points at `POST /auth/sessions/revoke-all` instead of claiming success.
+- Each CLI login (`/oauth/token` without PKCE) records a `cli_session` row.
+  Its access and refresh JWTs carry the row id as `sid`; the refresh token
+  also carries a `jti` that must equal `cli_session.refresh_jti`. Rotation
+  swaps the `jti` in one conditional UPDATE, so a refresh token that was
+  already rotated away is rejected. Revoking the row (`POST /oauth/revoke`
+  with either token, `DELETE /auth/sessions/cli/{id}`, `preloop auth logout`)
+  rejects both tokens of that login in `get_current_user`, the WebSocket
+  upgrade and the refresh path; other logins are unaffected.
+  `POST /auth/refresh` does not accept a token with `sid`, so a CLI refresh
+  token cannot be turned into console tokens that escape the row check.
+  A CLI refresh token from before `sid` existed is moved onto a new row the
+  next time it rotates; the old token itself stays covered by the
+  generation check only.
+- `POST /oauth/revoke` still revokes opaque MCP tokens. A JWT without `sid`
+  (console tokens, CLI tokens from before `cli_session`) gets 400
+  `unsupported_token_type` pointing at `POST /auth/sessions/revoke-all`
+  instead of a false success.
+
+### Restricted CI identity foundation
+
+`CiPrincipal` is an OSS machine principal with a versioned, typed grant for one
+account-local project and its explicitly bound hosted flow. Separate `ApiKey`
+rows have an explicit `restricted_ci` mode, version, principal reference and
+optional narrower action ceiling. Tokens use the existing high-entropy hashed
+key lifecycle and are disclosed once. Authentication reads current account,
+principal, key and binding state, intersects action ceilings, and returns a
+machine context with no human permissions. Scope enforcement audit/off settings
+never relax this mode. The binding snapshots provider identity, clone path,
+tracker host/type and organization lineage; changing any of these invalidates
+access rather than redirecting an existing grant.
+
+Human administrators provision a restricted CI identity through ten
+authenticated `/api/v1/ci-identities` routes: capabilities, preview, list,
+create, show, update, key issue, key rotate, key revoke, and
+completion-subscription create. The console Restricted CI page and `preloop ci`
+use that same lifecycle. Generic REST, MCP, model gateway, WebSocket and
+session exchange authentication cannot treat a restricted key as its issuing
+human. The legacy key management surface excludes these keys; human CI
+administration must use the dedicated lifecycle seam.
+
+The restricted ASGI guard covers every application role before handler work.
+Only one canonical Bearer transport can enter an explicitly classified,
+machine-aware HTTP handler. Duplicate or custom token transports, WebSockets,
+streams, unclassified operations and generic credential/session exchanges deny.
+An explicit test inventory includes lazy included routers, hidden routes and
+mounted applications through their middleware wrappers. OpenAPI records each
+operation's `x-restricted-ci` policy and authentication/authorization errors.
+
+Machine-aware handlers use `get_current_actor` and an explicit `ci_action` on
+`require_permission`; unmarked handlers reject machine actors, including direct
+service calls. The machine branch never invokes the human RBAC/owner path.
+CRUD revalidates key, principal, account, action and immutable binding before
+protected work, so a retained request context cannot preserve revoked authority.
+The optional machine account-policy hook can only deny this core ceiling;
+missing hooks preserve OSS behavior and hook errors fail closed. Invalid
+restricted credentials receive 401, forbidden operations receive 403, and
+protected object handlers apply their consistent not-found policy. Decision
+logs include safe machine/resource identifiers, never token or result contents.
+
+The operation map permits the existing flow trigger, execution list,
+execution detail, persisted result and stop-command routes, plus principal-owned
+subscription list/create/update/delete and signing-secret rotation. All other
+operations remain denied. Trigger accepts only `{"pr_number": 7, "head_sha": "<exact SHA>"}`;
+the SHA is 40 or 64 lowercase hexadecimal characters. OpenAPI includes the
+restricted request schema beside the ordinary human request contract. The server
+reads the PR/MR by immutable repository ID using its trusted integration and
+requires an open review, matching immutable repository identity, number and exact
+head. v1 supports hosted GitHub and GitLab repositories; fork reviews and custom
+GitHub hosts are refused. Effective GitLab hosts must match the approved binding.
+No execution row or queue operation is created for an invalid review.
+
+The accepted account, principal, project, flow, integration, repository, provider
+PR identity, head and target branch are persisted with the execution. Attribution
+and that snapshot cannot be edited or backfilled onto historical rows. The target
+branch must be a conventional ASCII Git ref; its accepted value is included in
+clone context, so a non-main target does not fall back to `main`. Dispatch checks
+the current principal/grant/resource binding before queueing and re-reads the
+provider review immediately before a new runtime launch. Provider failures block
+launch with a generic `verification_blocked` failure, without recording provider
+response bodies or credentials. Revoking only the initiating key does not cancel
+accepted work; principal or trigger-grant removal blocks future launch. Recovery
+of an already established runtime remains available to human administrators.
+
+Machine list/detail/result/stop queries require the current key/grant and stable
+principal ownership, before filtering, counting or pagination. Other principals,
+human runs and null-owned history are inaccessible. Detail returns only review
+correlation, status, timestamps and failure category. Result returns the same
+correlation plus the persisted report with controller-private fields, prompts,
+MCP logs and runtime credential/configuration fields removed recursively. A
+missing result returns 404 even for a completed run. An agent-authored report is
+not proof that a review was published to the provider; publication receipts must
+be checked independently.
+
+Stop accepts only `{"command": "stop"}` (an explicit null payload is also
+accepted), with no other fields or command payload. It uses the existing runtime
+teardown path, rechecks authority after connecting to the command bus, and is
+idempotent for owned terminal runs. CI decides which PR/head is obsolete; this
+endpoint does not enforce a supersession policy. v1 is one hosted execution:
+matrix, retry, resume, delegation, flow-feedback loops and triage controllers are
+excluded. Model, agent, runner, credentials, prompts and clone/workspace settings
+remain administrator-controlled flow configuration.
+
+Key rotation preserves principal-owned runs. Principal disablement or grant
+removal denies subsequent API reads/stops without automatically terminating an
+already running agent. An authorized human administrator uses ordinary execution
+controls to inspect or stop that run. Restoring a grant requires the same approved
+resource binding; moving a project/repository requires a new principal rather
+than silently redirecting existing executions.
+
+The account owner can administer through core CRUD. An optional edition hook
+checks human operation/resource authority and may delegate or deny human
+administration, while the core account, project, flow and action checks always
+apply. Grant changes, disablement and key lifecycle changes are audited with
+human, principal, key and resource/action identifiers, never token material.
+Disabling an unusable binding or revoking its key remains possible for an
+authorized administrator. Permission changes to the provisioning human do not
+implicitly change the machine's persisted grant.
+
+Execution and subscription ownership is nullable for historical rows and is
+never guessed or backfilled. Rotation atomically replaces a key, preserving
+principal ownership and narrowing to the previous key/current grant intersection.
+Revoking one key does not stop existing work or transfer/delete owned resources.
+Disable a principal to suspend all its machine access; stopping existing runs is
+a separate administrator action. Principals and bound resources use restrictive
+foreign keys to preserve attribution: retire identities by disabling them,
+retain historical owned rows, and explicitly remove retained dependent records
+before resource deletion. Deleting a human retains the principal's nullable
+administration attribution; existing key/user deletion semantics still revoke
+that human's keys. Schema rollback refuses restricted keys or retained principals
+rather than erase machine markers and turn a CI key into an owner key.
 
 **Multi-User Architecture:**
 - **Account Model:** Represents an organization/company
@@ -63,6 +203,15 @@ Preloop implements authentication and multi-tenancy:
 - Password hashing with industry-standard algorithms
 - Account-level data isolation (all queries filtered by `account_id`)
 - User invitation system with secure token-based email verification
+- Email verification and password reset links are bound to one user row (a
+  `uid` claim next to the address). One address can hold a user in several
+  accounts, so a link never resolves by address alone: it is refused if it has
+  no `uid` (links minted before this binding) or if the row's address changed
+  after it was sent, and the person requests a new one. The forgot-password
+  and resend-verification forms send one link per row holding the address,
+  each naming its username. `crud_user.get_by_email` raises
+  `AmbiguousEmailError` rather than choose between rows; use `list_by_email`
+  or an account scope.
 
 **Plugin System:**
 - Extensible plugin architecture for adding custom functionality
@@ -83,6 +232,7 @@ Preloop implements authentication and multi-tenancy:
 - [ ] Rate limiting to prevent abuse (partial implementation exists)
 - [ ] 2FA/MFA support for user accounts
 - [x] Session revocation via per-user token generation (`auth_generation`)
+- [x] Per-login CLI session revocation (`cli_session`, JWT `sid`/`jti`)
 - [ ] Regular security audits and dependency updates
 
 > **Enterprise Security**: Preloop Cloud and Preloop Enterprise add RBAC and comprehensive audit logging. Contact sales@preloop.ai for more information.
@@ -104,3 +254,52 @@ Preloop redacts sensitive data before logging, persisting to audit surfaces, or 
 **Known exceptions:** Approval URLs are not logged in full (replaced with `[sent via notification]`). Progress tokens and request context metadata are not logged. Tracker credentials and AI model API keys are not logged when present in payloads.
 
 **Tests:** `tests/utils/test_redaction.py` asserts that representative secrets never appear in redacted output.
+
+
+### Restricted CI completion callbacks
+
+Restricted CI credentials manage only subscriptions owned by their stable
+principal through the existing endpoint list/create/update/delete routes and
+`POST /api/v1/event-webhooks/endpoints/{endpoint_id}/secret/rotate`. Each accepts
+its specific subscription action. Create defaults to exactly
+`flow.execution.finished`; explicit empty, mixed or duplicate filters, foreign
+resource fields and ownership/configuration overrides are rejected. The binding
+snapshots account, principal, project, flow and repository immutably; historical
+account-wide endpoints are never inferred to be machine-owned.
+
+Dispatch requires the stable principal's current `subscription:create` grant,
+active account/principal and unchanged resource binding, plus any EE denial.
+Removing that action or disabling the principal prevents future delivery,
+including queued retries. Revoking an initiating API key blocks that key's API
+use while retaining principal-owned subscriptions and accepted delivery rights.
+Ownership is checked against the trusted persisted terminal execution when
+queuing and again after a worker acquires a send slot, immediately before POST.
+Partial or malformed machine markers are quarantined, with no human-envelope
+fallback. Generic test-send, replay, delivery-history and dead-letter routes
+remain denied to machine credentials; generic administrator replay excludes
+machine subscriptions.
+
+Human operators see a read-only restricted-CI marker and the fixed completion
+filter. Synthetic test sends are explicitly rejected for these endpoints;
+ordinary pause, receiver and deletion controls remain available. Permanent
+authorization or private-target denials terminate a queued delivery without
+POST. Transient DNS resolution and preparation/database failures consume a
+failed attempt, release the claim and use normal backoff, circuit breaking and
+dead-letter limits. Preparation logs contain delivery IDs and exception classes,
+never exception contents or signing material.
+
+The signed v1 envelope contains only execution/flow/project/repository, PR/MR
+number/provider identity, exact head SHA, terminal status and result readiness.
+Caller event data, runtime prompts, logs and report bodies never enter the
+machine payload. Consumers verify HMAC freshness, deduplicate event IDs across
+retries, match execution and expected head, then read that execution's persisted
+result. A signed completion is not a review-publication receipt and a stale
+head is not current review evidence.
+
+Signing secrets are encrypted and returned once on creation or rotation.
+Queued and retried sends use the current receiver URL and current secret with a
+fresh signature timestamp. A request already in flight can still use the old
+secret: receivers should accept both during their bounded rotation overlap and
+deduplicate by event ID. Endpoint deletion removes its durable delivery history;
+authority-denied queued machine deliveries are marked dead without POST. The
+migration does not backfill and refuses downgrade while retained snapshots exist.

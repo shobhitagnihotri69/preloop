@@ -17,8 +17,12 @@ from typing import Any, Dict, Optional
 from sqlalchemy.orm import Session
 
 from preloop.config import settings
+from preloop.services.audio_storage import expire_audio
 from preloop.models.crud import crud_flow_execution
 from preloop.models.crud import flow_artifact as crud_flow_artifact
+from preloop.models.crud import (
+    runtime_session_artifact as crud_runtime_session_artifact,
+)
 from preloop.utils.workspace_snapshot import WORKSPACE_VOLUME_PREFIX
 
 logger = logging.getLogger(__name__)
@@ -109,8 +113,11 @@ async def cleanup_workspace_artifacts(
 
     cutoff = workspace_snapshot_cutoff(now)
     snapshots = purge_expired_snapshots(db, cutoff=cutoff)
+    stamp = now or datetime.now(UTC)
     if settings.flow_artifact_direct_upload:
-        crud_flow_artifact.cleanup(db, now=now or datetime.now(UTC))
+        crud_flow_artifact.cleanup(db, now=stamp)
+    crud_runtime_session_artifact.cleanup(db, now=stamp)
+    expire_audio(db, now=stamp)
     volumes = await purge_expired_docker_volumes(cutoff=cutoff)
     return {"snapshots_purged": snapshots, "volumes_removed": volumes}
 

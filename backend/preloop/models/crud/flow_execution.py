@@ -1,11 +1,29 @@
 import logging
 import uuid
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, Iterator, List, Optional
 
-from sqlalchemy import ColumnElement, and_, func, or_
-from sqlalchemy.orm import Session, joinedload, load_only, with_expression
+from sqlalchemy import (
+    ColumnElement,
+    Numeric,
+    String,
+    and_,
+    cast,
+    case,
+    func,
+    literal_column,
+    or_,
+    true,
+)
+from sqlalchemy.orm import (
+    Session,
+    contains_eager,
+    joinedload,
+    load_only,
+    with_expression,
+)
 from sqlalchemy.orm.attributes import flag_modified
 from sqlalchemy.future import select
 
@@ -14,6 +32,7 @@ from preloop.models import models
 from preloop.models.models.flow_execution import (
     AGENT_CONTROL_BINDING_KEY,
     DELEGATION_DETAILS_KEY,
+    RESUME_ROOT_SQL,
     STOP_COVERAGE_KEY,
     TRIGGER_SUBJECT_KEY,
     FlowExecution,
@@ -27,6 +46,25 @@ from preloop.models.schemas.flow_execution import (
 from .base import CRUDBase
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class FlowExecutionNavigationRow:
+    """Small navigation projection, excluding trigger bodies and results."""
+
+    id: uuid.UUID
+    status: str
+    start_time: datetime
+    use_issue: bool | None
+    issue_html_url: Any
+    issue_web_url: Any
+    issue_url: Any
+    object_html_url: Any
+    object_web_url: Any
+    object_url: Any
+    result_pr_url: Any
+    resume_pr_url: Any
+    feedback_pr_url: Any
 
 
 async def get_flow_execution(
@@ -110,6 +148,10 @@ async def delete_flow_execution(
 # return 0 or 1; this only caps a malformed key or a filter miss.
 TRACKER_OBJECT_LOOKUP_LIMIT = 16
 
+# Row cap for ``get_active_for_pull_request``: every flow's active runs on
+# one pull request, which is a handful in practice.
+PR_LIFECYCLE_LOOKUP_LIMIT = 50
+
 
 def tracker_object_payload_match(object_key: str) -> Optional[ColumnElement[bool]]:
     """SQL filter that narrows trigger payloads to one tracker object.
@@ -150,11 +192,128 @@ def tracker_object_payload_match(object_key: str) -> Optional[ColumnElement[bool
             payload["object_kind"].astext == kind,
             payload["object_attributes"]["iid"].astext == ident,
         )
+    if source == "bitbucket" and kind == "pr":
+        return and_(
+            source_col == "bitbucket",
+            payload["repository"]["full_name"].astext == repo,
+            payload["pullrequest"]["id"].astext == ident,
+        )
+    if source == "bitbucket_dc" and kind == "pr":
+        return and_(
+            source_col == "bitbucket_dc",
+            payload["repository"]["id"].astext == repo,
+            payload["pull_request"]["number"].astext == ident,
+        )
+    return None
+
+
+def pull_request_payload_match(object_key: str) -> Optional[ColumnElement[bool]]:
+    """SQL filter for trigger payloads about one pull or merge request.
+
+    Wider than :func:`tracker_object_payload_match`: it also matches the
+    comments on the request, whose payload names it differently (a GitHub
+    ``issue_comment`` carries the PR as ``issue`` with a ``pull_request``
+    link; a GitLab note carries it as ``merge_request``). A run resumed by a
+    comment on the request is working on the request too (#1032).
+    """
+    parts = object_key.split(":")
+    if len(parts) < 4:
+        return None
+    source = parts[0].lower()
+    ident = parts[-1]
+    kind = parts[-2]
+    repo = ":".join(parts[1:-2])
+    if not ident or not repo:
+        return None
+    details = FlowExecution.trigger_event_details
+    payload = details["payload"]
+    source_col = details["source"].astext
+    if source == "github" and kind == "pr":
+        return and_(
+            source_col == "github",
+            payload["repository"]["full_name"].astext == repo,
+            or_(
+                payload["pull_request"]["number"].astext == ident,
+                and_(
+                    payload["issue"]["number"].astext == ident,
+                    payload["issue"].has_key("pull_request"),
+                ),
+            ),
+        )
+    if source == "gitlab" and kind == "merge_request":
+        return and_(
+            source_col == "gitlab",
+            payload["project"]["path_with_namespace"].astext == repo,
+            or_(
+                and_(
+                    payload["object_kind"].astext == "merge_request",
+                    payload["object_attributes"]["iid"].astext == ident,
+                ),
+                payload["merge_request"]["iid"].astext == ident,
+            ),
+        )
+    if source in ("bitbucket", "bitbucket_dc") and kind == "pr":
+        return tracker_object_payload_match(object_key)
     return None
 
 
 class CRUDFlowExecution(CRUDBase[FlowExecution]):
     """CRUD operations for FlowExecution model."""
+
+    def get_continuation_navigation(
+        self, db: Session, *, root_id: uuid.UUID, account_id: uuid.UUID
+    ) -> List[FlowExecutionNavigationRow]:
+        """Read the publisher and repairs without loading logs or prompts.
+
+        Ownership is checked on every member, including the publisher.
+        """
+        details = models.FlowExecution.trigger_event_details
+        issue = details["payload"]["issue"]
+        attributes = details["payload"]["object_attributes"]
+        # Match Python's issue-or-object_attributes choice without returning
+        # either complete object (an issue body can be very large).
+        use_issue = and_(
+            issue.isnot(None),
+            func.jsonb_typeof(issue) != "null",
+            ~issue.in_([{}, [], False, 0, ""]),
+        )
+        rows = (
+            db.query(
+                models.FlowExecution.id,
+                models.FlowExecution.status,
+                models.FlowExecution.start_time,
+                use_issue.label("use_issue"),
+                issue["html_url"].label("issue_html_url"),
+                issue["web_url"].label("issue_web_url"),
+                issue["url"].label("issue_url"),
+                attributes["html_url"].label("object_html_url"),
+                attributes["web_url"].label("object_web_url"),
+                attributes["url"].label("object_url"),
+                models.FlowExecution.result["pr_url"].label("result_pr_url"),
+                details["_resume"]["pr_url"].label("resume_pr_url"),
+                details["_feedback"]["pr_url"].label("feedback_pr_url"),
+            )
+            .join(models.Flow, models.Flow.id == models.FlowExecution.flow_id)
+            .filter(
+                models.Flow.account_id == account_id,
+                or_(
+                    models.FlowExecution.id == root_id,
+                    models.FlowExecution.trigger_event_details["_resume"][
+                        "resume_root"
+                    ].astext
+                    == str(root_id),
+                ),
+            )
+            .order_by(
+                case((models.FlowExecution.id == root_id, 0), else_=1),
+                models.FlowExecution.start_time,
+                models.FlowExecution.id,
+            )
+            # Publisher, the first 100 repairs, and one overflow sentinel.
+            .limit(102)
+            .all()
+        )
+        return [FlowExecutionNavigationRow(*row) for row in rows]
 
     def __init__(self):
         """Initialize with the FlowExecution model."""
@@ -180,6 +339,34 @@ class CRUDFlowExecution(CRUDBase[FlowExecution]):
         if account_id:
             query = query.join(Flow).filter(Flow.account_id == account_id)
         return query.first()
+
+    def get_status(
+        self, db: Session, *, execution_id: Any, account_id: Any
+    ) -> Optional[str]:
+        """Return an execution's status without loading the row.
+
+        Used on the credential path for every call made with a flow token,
+        so it selects the one column. Ids that are not UUIDs have no row.
+
+        Args:
+            db: Database session.
+            execution_id: Flow execution id (str or UUID).
+            account_id: Account that must own the execution's flow.
+
+        Returns:
+            The status string, or None when no such execution exists.
+        """
+        try:
+            parsed = uuid.UUID(str(execution_id))
+        except (ValueError, AttributeError, TypeError):
+            return None
+        row = (
+            db.query(FlowExecution.status)
+            .join(Flow, Flow.id == FlowExecution.flow_id)
+            .filter(FlowExecution.id == parsed, Flow.account_id == account_id)
+            .first()
+        )
+        return None if row is None else row[0]
 
     def purge_workspace_snapshots(self, db: Session, *, cutoff: Any) -> int:
         """Release terminal and orphaned snapshots; recent active runs retain state."""
@@ -245,6 +432,54 @@ class CRUDFlowExecution(CRUDBase[FlowExecution]):
             .all()
         )
         return {candidates[row[0]] for row in rows}
+
+    def reserve_employee_event(
+        self,
+        db: Session,
+        *,
+        flow_id: uuid.UUID,
+        account_id: str,
+        event: Dict[str, Any],
+        delivery_key: str,
+    ) -> tuple[models.FlowExecution, bool]:
+        """Atomically reserve one account-owned event, including concurrent replay."""
+        from sqlalchemy.exc import IntegrityError
+        from preloop.services.webhook_delivery_dedupe import is_delivery_key_conflict
+
+        def existing() -> Optional[models.FlowExecution]:
+            return (
+                db.query(models.FlowExecution)
+                .join(models.Flow)
+                .filter(
+                    models.FlowExecution.flow_id == flow_id,
+                    models.Flow.account_id == uuid.UUID(account_id),
+                    models.FlowExecution.webhook_delivery_key == delivery_key,
+                )
+                .first()
+            )
+
+        previous = existing()
+        if previous is not None:
+            return previous, True
+        row = models.FlowExecution(
+            flow_id=flow_id,
+            status="PENDING",
+            trigger_event_details=event,
+            webhook_delivery_key=delivery_key,
+        )
+        db.add(row)
+        try:
+            db.commit()
+        except IntegrityError as exc:
+            db.rollback()
+            if not is_delivery_key_conflict(exc):
+                raise
+            winner = existing()
+            if winner is None:
+                raise
+            return winner, True
+        db.refresh(row)
+        return row, False
 
     def create(self, db: Session, obj_in: FlowExecutionCreate) -> FlowExecution:
         """Create a new flow execution (synchronous)."""
@@ -654,13 +889,29 @@ class CRUDFlowExecution(CRUDBase[FlowExecution]):
         skip: int = 0,
         limit: int = 100,
         account_id: Optional[str] = None,
+        order_by_completion: bool = False,
     ) -> List[FlowExecution]:
-        """Get flow executions for a specific flow (synchronous)."""
-        query = (
-            db.query(FlowExecution)
-            .filter(FlowExecution.flow_id == flow_id)
-            .order_by(FlowExecution.start_time.desc())
-        )
+        """Get flow executions for a specific flow (synchronous).
+
+        Args:
+            db: Database session.
+            flow_id: Flow whose executions to return.
+            skip: Number of rows to skip.
+            limit: Maximum number of rows to return.
+            account_id: When set, keep only executions whose flow belongs
+                to this account.
+            order_by_completion: When true, order by completion time
+                (``end_time``, falling back to ``start_time``) newest first.
+                The default stays start time, which other callers use.
+        """
+        query = db.query(FlowExecution).filter(FlowExecution.flow_id == flow_id)
+        if order_by_completion:
+            completed_at = func.coalesce(
+                FlowExecution.end_time, FlowExecution.start_time
+            )
+            query = query.order_by(completed_at.desc(), FlowExecution.start_time.desc())
+        else:
+            query = query.order_by(FlowExecution.start_time.desc())
         if account_id:
             query = query.join(Flow).filter(Flow.account_id == account_id)
         return query.offset(skip).limit(limit).all()
@@ -696,6 +947,30 @@ class CRUDFlowExecution(CRUDBase[FlowExecution]):
         if account_id:
             query = query.join(Flow).filter(Flow.account_id == account_id)
         return query.order_by(FlowExecution.start_time.desc()).first()
+
+    def last_successful_scheduled_at(
+        self, db: Session, *, flow_id: Any
+    ) -> Optional[str]:
+        """``scheduled_at`` of this flow's newest SUCCEEDED scheduled run.
+
+        Read from the trigger payload the schedule tick wrote, so the value
+        is the tick time the run saw, not when it finished. None when no
+        scheduled run of the flow has succeeded yet.
+        """
+        scheduled_at = FlowExecution.trigger_event_details["payload"][
+            "scheduled_at"
+        ].astext
+        row = (
+            db.query(scheduled_at)
+            .filter(
+                FlowExecution.flow_id == flow_id,
+                FlowExecution.status == "SUCCEEDED",
+                scheduled_at.isnot(None),
+            )
+            .order_by(FlowExecution.start_time.desc())
+            .first()
+        )
+        return row[0] if row else None
 
     def get_by_result_pr_url(
         self,
@@ -886,6 +1161,18 @@ class CRUDFlowExecution(CRUDBase[FlowExecution]):
                 with_expression(
                     FlowExecution.trigger_subject_url, subject["url"].astext
                 ),
+                with_expression(FlowExecution.trigger_subject_ci, subject["ci"].astext),
+                with_expression(
+                    FlowExecution.trigger_subject_ci_url, subject["ci_url"].astext
+                ),
+                # Same as the list projection: ExecutionTreeNode inherits
+                # resume_of, and an unpopulated query expression cannot be read.
+                with_expression(
+                    FlowExecution.resume_of,
+                    FlowExecution.trigger_event_details["_resume"][
+                        "resume_root"
+                    ].astext,
+                ),
                 joinedload(FlowExecution.flow).load_only(Flow.id, Flow.name),
             )
             .join(Flow)
@@ -898,6 +1185,54 @@ class CRUDFlowExecution(CRUDBase[FlowExecution]):
                 FlowExecution.start_time.asc(),
                 FlowExecution.id.asc(),
             )
+            .limit(max(1, int(limit)))
+            .all()
+        )
+
+    def get_recent_for_pull_request(
+        self,
+        db: Session,
+        *,
+        flow_id: uuid.UUID,
+        tracker_object_key: str,
+        account_id: Optional[uuid.UUID] = None,
+        limit: int = TRACKER_OBJECT_LOOKUP_LIMIT,
+    ) -> List[FlowExecution]:
+        """This flow's most recent executions on one pull request, any status.
+
+        Used to recognise a late provider delivery: a pull request state that
+        is older than one a run has already seen, whether that run is still
+        active or has finished.
+
+        Args:
+            db: Database session.
+            flow_id: Flow to look in.
+            tracker_object_key: ``source:repo:pr:id`` key of the request.
+            account_id: Optional owning account.
+            limit: Maximum rows, newest first.
+
+        Returns:
+            Executions with ``id``, ``status`` and ``trigger_event_details``
+            loaded. Empty when the key has no payload filter.
+        """
+        payload_match = pull_request_payload_match(tracker_object_key)
+        if payload_match is None:
+            return []
+        query = (
+            db.query(FlowExecution)
+            .options(
+                load_only(
+                    FlowExecution.id,
+                    FlowExecution.status,
+                    FlowExecution.trigger_event_details,
+                )
+            )
+            .filter(FlowExecution.flow_id == flow_id, payload_match)
+        )
+        if account_id:
+            query = query.join(Flow).filter(Flow.account_id == account_id)
+        return (
+            query.order_by(FlowExecution.start_time.desc())
             .limit(max(1, int(limit)))
             .all()
         )
@@ -974,6 +1309,158 @@ class CRUDFlowExecution(CRUDBase[FlowExecution]):
             return query.limit(max(1, int(limit))).all()
         return query.all()
 
+    def get_active_for_pull_request(
+        self,
+        db: Session,
+        *,
+        account_id: Any,
+        tracker_object_key: str,
+        statuses: Iterable[str],
+        limit: int = PR_LIFECYCLE_LOOKUP_LIMIT,
+    ) -> List[FlowExecution]:
+        """Executions of any flow in the account still working on one PR.
+
+        Used when the pull or merge request goes away (merged or closed,
+        #1032): every flow's run on it is stale, not only one flow's, and so
+        is a run a comment on it started.
+        The JSONB match narrows the read; callers re-check each row with the
+        Python extractor, which stays the source of truth. A key the SQL
+        filter cannot express returns nothing rather than every active row in
+        the account.
+
+        Args:
+            db: Database session.
+            account_id: Account the executions' flows belong to.
+            tracker_object_key: ``source:repo:pr:N`` or
+                ``gitlab:path:merge_request:iid`` key of the request.
+            statuses: Statuses that count as still working on it.
+            limit: Row cap. More active runs than this on one pull request is
+                not a shape any flow produces; the extra rows are ignored.
+
+        Returns:
+            Matching executions, oldest first, with their flow loaded.
+        """
+        payload_match = pull_request_payload_match(tracker_object_key)
+        if payload_match is None:
+            return []
+        return (
+            db.query(FlowExecution)
+            .join(Flow)
+            .options(contains_eager(FlowExecution.flow))
+            .filter(
+                Flow.account_id == account_id,
+                FlowExecution.status.in_(list(statuses)),
+                payload_match,
+            )
+            .order_by(FlowExecution.start_time.asc(), FlowExecution.id.asc())
+            .limit(max(1, int(limit)))
+            .all()
+        )
+
+    def mark_stopped(
+        self,
+        db: Session,
+        *,
+        execution_id: Any,
+        error_message: str,
+        stop_reason: Optional[str] = None,
+        stop_source: Optional[str] = None,
+        now: Optional[datetime] = None,
+        confirmed: bool = False,
+        unconfirmed_reason: Optional[str] = None,
+        confirm_if_never_launched: bool = False,
+        commit: bool = True,
+    ) -> bool:
+        """Record that an execution was stopped, unless it already ended.
+
+        The status write of ``preloop.services.flow_execution_stop``, which
+        both an operator's stop and an automatic stop (#1032) go through.
+        Conditional on the row not being terminal, so a run that finished
+        while its runtime was being torn down keeps its own status, result
+        and cost, and a second stop changes nothing.
+
+        The same write records the durable stop intent: ``stop_requested_at``
+        (kept when already set, otherwise ``now``) and ``stop_source``
+        (``manual`` unless the caller names one). That intent is what launch
+        admission and the monitor read, so a stop issued before the runtime
+        exists still prevents it from running. ``STOPPED`` means the stop
+        was accepted; ``stop_confirmed_at`` is only written here when the
+        caller verified that the runtime is gone (``confirmed``). Otherwise
+        it stays null until the orchestrator confirms termination, and
+        ``unconfirmed_reason`` says why the stop path could not.
+
+        ``confirm_if_never_launched`` is for a stop that found no runtime
+        reference: when, at the moment of this UPDATE, the row was never
+        admitted (no ``launch_requested_at``) and has no runtime reference,
+        nothing can be running and the stop is confirmed in the same write.
+        Decided in SQL, under the row lock, so it cannot race admission.
+
+        Returns:
+            True when this call moved the row to ``STOPPED``.
+        """
+        moment = now or datetime.now(timezone.utc)
+        reason = (
+            "; ".join(part for part in (stop_reason, unconfirmed_reason) if part)
+            or None
+        )
+        values: Dict[Any, Any] = {
+            models.FlowExecution.status: "STOPPED",
+            models.FlowExecution.end_time: moment,
+            models.FlowExecution.error_message: error_message,
+            models.FlowExecution.stop_requested_at: func.coalesce(
+                models.FlowExecution.stop_requested_at, moment
+            ),
+            models.FlowExecution.stop_source: (
+                stop_source[:32]
+                if stop_source is not None
+                else func.coalesce(
+                    models.FlowExecution.stop_source, self.STOP_SOURCE_MANUAL
+                )
+            ),
+        }
+        never_launched = and_(
+            models.FlowExecution.launch_requested_at.is_(None),
+            models.FlowExecution.agent_session_reference.is_(None),
+        )
+        if reason is not None:
+            if confirm_if_never_launched and unconfirmed_reason:
+                values[models.FlowExecution.stop_reason] = case(
+                    (
+                        never_launched,
+                        stop_reason[:500]
+                        if stop_reason is not None
+                        else models.FlowExecution.stop_reason,
+                    ),
+                    else_=reason[:500],
+                )
+            else:
+                values[models.FlowExecution.stop_reason] = reason[:500]
+        if confirmed:
+            values[models.FlowExecution.stop_confirmed_at] = func.coalesce(
+                models.FlowExecution.stop_confirmed_at, moment
+            )
+        elif confirm_if_never_launched:
+            values[models.FlowExecution.stop_confirmed_at] = case(
+                (
+                    never_launched,
+                    func.coalesce(models.FlowExecution.stop_confirmed_at, moment),
+                ),
+                else_=models.FlowExecution.stop_confirmed_at,
+            )
+        count = (
+            db.query(models.FlowExecution)
+            .filter(
+                models.FlowExecution.id == execution_id,
+                models.FlowExecution.status.notin_(
+                    sorted(self.TERMINAL_EXECUTION_STATUSES)
+                ),
+            )
+            .update(values, synchronize_session=False)
+        )
+        if commit:
+            db.commit()
+        return bool(count)
+
     def get_multi(
         self,
         db: Session,
@@ -1046,6 +1533,20 @@ class CRUDFlowExecution(CRUDBase[FlowExecution]):
                 with_expression(
                     FlowExecution.trigger_subject_url,
                     subject["url"].astext,
+                ),
+                with_expression(
+                    FlowExecution.trigger_subject_ci,
+                    subject["ci"].astext,
+                ),
+                with_expression(
+                    FlowExecution.trigger_subject_ci_url,
+                    subject["ci_url"].astext,
+                ),
+                with_expression(
+                    FlowExecution.resume_of,
+                    FlowExecution.trigger_event_details["_resume"][
+                        "resume_root"
+                    ].astext,
                 ),
             )
 
@@ -1144,6 +1645,109 @@ class CRUDFlowExecution(CRUDBase[FlowExecution]):
                 query = query.filter(getattr(FlowExecution, key) == value)
 
         return query
+
+    def get_resume_chain_cost_totals(
+        self,
+        db: Session,
+        *,
+        account_id: Any,
+        roots: List[uuid.UUID],
+        root_texts: List[str],
+    ) -> List[Any]:
+        """Chain totals summed from each member's displayed per-run figures.
+
+        A chain is the publishing execution (``id`` in ``roots``) plus every
+        repair turn whose ``_resume.resume_root`` names it. Both halves are
+        index lookups: the primary key, and the partial expression index
+        ``ix_flow_execution_resume_root`` that holds repair turns only. The
+        expression is spelled as :data:`RESUME_ROOT_SQL` so the planner can
+        match it to that index; written any other way the lookup reads (and
+        detoasts) the trigger payload of every execution in the account.
+
+        Each member
+        contributes the figure the list and the execution page show for it:
+        the sum of its attributed gateway usage rows (``model_gateway``,
+        replay traffic excluded, rounded like
+        ``execution_metrics.get_execution_totals``) when it has any, the
+        stored rollup otherwise. The stored rollup alone lags usage priced
+        after the run, which is how the chain total came to match neither the
+        list nor the header (issue #1275). One statement, so the executions
+        list keeps its query budget.
+
+        Returns:
+            Rows of ``(chain_root, total_tokens, estimated_cost, members,
+            unpriced)``; ``unpriced`` counts members whose gateway usage could
+            not be priced at all.
+        """
+        if not roots and not root_texts:
+            return []
+        from preloop.models.crud.api_usage import exclude_replay_usage_condition
+        from preloop.models.models.api_usage import ApiUsage
+
+        resume_root = literal_column(RESUME_ROOT_SQL, type_=String)
+        chain_key = func.coalesce(resume_root, cast(FlowExecution.id, String))
+        members = (
+            select(
+                chain_key.label("chain_root"),
+                FlowExecution.id.label("execution_id"),
+                FlowExecution.total_tokens.label("stored_tokens"),
+                FlowExecution.estimated_cost.label("stored_cost"),
+            )
+            .join(Flow, Flow.id == FlowExecution.flow_id)
+            .where(
+                Flow.account_id == account_id,
+                or_(
+                    FlowExecution.id.in_(list(roots)),
+                    resume_root.in_(list(root_texts)),
+                ),
+            )
+            .subquery()
+        )
+        usage = (
+            select(
+                ApiUsage.flow_execution_id.label("execution_id"),
+                func.count(ApiUsage.id).label("requests"),
+                func.coalesce(func.sum(ApiUsage.total_tokens), 0).label("tokens"),
+                func.round(cast(func.sum(ApiUsage.estimated_cost), Numeric), 4).label(
+                    "cost"
+                ),
+            )
+            .where(
+                ApiUsage.action_type == "model_gateway",
+                ApiUsage.flow_execution_id.in_(select(members.c.execution_id)),
+                exclude_replay_usage_condition(),
+            )
+            .group_by(ApiUsage.flow_execution_id)
+            .subquery()
+        )
+        has_usage = func.coalesce(usage.c.requests, 0) > 0
+        member_tokens = case(
+            (has_usage, usage.c.tokens),
+            else_=func.coalesce(members.c.stored_tokens, 0),
+        )
+        member_cost = case(
+            (has_usage, func.coalesce(usage.c.cost, 0)),
+            else_=func.coalesce(members.c.stored_cost, 0),
+        )
+        # A member with gateway usage none of which could be priced shows
+        # "Not priced" on its own row; the chain cannot claim a dollar figure.
+        unpriced_member = case(
+            (and_(has_usage, usage.c.cost.is_(None)), 1),
+            else_=0,
+        )
+        return db.execute(
+            select(
+                members.c.chain_root,
+                func.coalesce(func.sum(member_tokens), 0),
+                func.coalesce(func.sum(member_cost), 0),
+                func.count(members.c.execution_id),
+                func.coalesce(func.sum(unpriced_member), 0).label("unpriced"),
+            )
+            .select_from(
+                members.outerjoin(usage, usage.c.execution_id == members.c.execution_id)
+            )
+            .group_by(members.c.chain_root)
+        ).all()
 
     def get_by_statuses(
         self, db: Session, statuses: List[str], account_id: Optional[str] = None
@@ -1286,12 +1890,16 @@ class CRUDFlowExecution(CRUDBase[FlowExecution]):
             # start_time, not the usage row's timestamp. A long run, a
             # delayed gateway write, or a backdated start_time would
             # otherwise print cost for a period the runs count does not.
-            window_cost = (
-                db.query(
-                    self.model.flow_id,
-                    func.coalesce(func.sum(ApiUsage.estimated_cost), 0.0).label(
-                        "estimated_cost"
-                    ),
+            # Aggregated per execution first, through a LATERAL subquery on
+            # ``ix_api_usage_flow_execution_id``, and only then per flow. The
+            # plain join this replaces let the planner hash the window's
+            # executions against a sequential scan of every account's
+            # gateway rows (issue #1197). GROUP BY keeps the subquery from
+            # being flattened back into that join, and drops executions with
+            # no usage, exactly as the inner join did.
+            per_execution = (
+                select(
+                    func.sum(ApiUsage.estimated_cost).label("estimated_cost"),
                     func.coalesce(func.sum(ApiUsage.prompt_tokens), 0).label(
                         "prompt_tokens"
                     ),
@@ -1303,16 +1911,39 @@ class CRUDFlowExecution(CRUDBase[FlowExecution]):
                     ),
                     *cache_split_columns(),
                 )
-                .join(self.model, ApiUsage.flow_execution_id == self.model.id)
-                .filter(
-                    self.model.flow_id.in_(flow_ids),
-                    self.model.start_time >= start_date,
+                .where(
+                    ApiUsage.flow_execution_id == self.model.id,
                     ApiUsage.action_type == "model_gateway",
                     exclude_replay_usage_condition(),
                 )
-                .group_by(self.model.flow_id)
-                .all()
+                .group_by(ApiUsage.flow_execution_id)
+                .lateral("per_execution")
             )
+
+            def _total(column: str, default: Any = 0) -> Any:
+                return func.coalesce(
+                    func.sum(getattr(per_execution.c, column)), default
+                ).label(column)
+
+            window_cost = db.execute(
+                select(
+                    self.model.flow_id,
+                    _total("estimated_cost", 0.0),
+                    _total("prompt_tokens"),
+                    _total("completion_tokens"),
+                    _total("total_tokens"),
+                    _total("cache_read_tokens"),
+                    _total("cache_write_tokens"),
+                    _total("covered_prompt_tokens"),
+                )
+                .select_from(self.model)
+                .join(per_execution, true())
+                .where(
+                    self.model.flow_id.in_(flow_ids),
+                    self.model.start_time >= start_date,
+                )
+                .group_by(self.model.flow_id)
+            ).all()
             window_cost_map = {
                 str(row.flow_id): float(row.estimated_cost or 0.0)
                 for row in window_cost
@@ -1382,8 +2013,11 @@ class CRUDFlowExecution(CRUDBase[FlowExecution]):
                 False when batching many entries and commit manually
                 after the loop.
         """
+        from preloop.models.crud.flow_execution_log import (
+            storable_log_message,
+            storable_log_metadata,
+        )
         from preloop.models.models.flow_execution_log import FlowExecutionLog
-        from preloop.utils.secret_scrubbing import scrub_secrets, scrub_structure
 
         # NATS messages nest actual content under "payload" (e.g. payload.line
         # for agent_log_line).  Derive message from the best available field
@@ -1396,12 +2030,12 @@ class CRUDFlowExecution(CRUDBase[FlowExecution]):
 
         # Last gate before persistence: redact known credential formats so a
         # secret cannot be stored even if its producer skipped scrubbing
-        # (issue #173).
+        # (issue #173), and drop NUL bytes PostgreSQL rejects (#1196).
         log_entry = FlowExecutionLog(
             execution_id=execution_id,
             log_type=log_data.get("type", "log"),
-            message=scrub_secrets(message),
-            metadata_=scrub_structure(metadata) if metadata else None,
+            message=storable_log_message(message),
+            metadata_=storable_log_metadata(metadata),
         )
         db.add(log_entry)
         if commit:
@@ -1460,6 +2094,14 @@ class CRUDFlowExecution(CRUDBase[FlowExecution]):
 
         A launch admitted first is included in activation's stop snapshot. A
         launch arriving after activation never dispatches. No lock spans I/O.
+
+        Admission is also refused for a row that carries a stop request or
+        already ended (an operator stopped it while it was being prepared):
+        the row is left exactly as it is, and in particular is never moved
+        back to ``STARTING``. That refusal is the UPDATE's WHERE clause, not
+        a read followed by an unconditional write: a stop that commits after
+        the account lock is taken and before this statement still matches
+        nothing.
         """
         from .account_halt import crud_account_halt
 
@@ -1475,26 +2117,33 @@ class CRUDFlowExecution(CRUDBase[FlowExecution]):
         if account_id is None:
             raise ValueError("Execution flow not found")
         crud_account_halt.lock_account(db, account_id=account_id)
-        execution = self.get(db, id=execution_id, refresh=True)
-        allowed = (
-            execution is not None
-            and execution.stop_requested_at is None
-            and (
-                "flows"
-                not in crud_account_halt.active_scopes(db, account_id=account_id)
+        if "flows" in crud_account_halt.active_scopes(db, account_id=account_id):
+            if commit:
+                db.commit()
+            return False
+        moment = datetime.now(timezone.utc)
+        count = (
+            db.query(models.FlowExecution)
+            .filter(
+                models.FlowExecution.id == execution_id,
+                models.FlowExecution.stop_requested_at.is_(None),
+                models.FlowExecution.status.notin_(
+                    sorted(self.TERMINAL_EXECUTION_STATUSES)
+                ),
+            )
+            .update(
+                {
+                    models.FlowExecution.launch_requested_at: func.coalesce(
+                        models.FlowExecution.launch_requested_at, moment
+                    ),
+                    models.FlowExecution.status: "STARTING",
+                },
+                synchronize_session=False,
             )
         )
-        if allowed:
-            from datetime import timezone
-
-            execution.launch_requested_at = (
-                execution.launch_requested_at or datetime.now(timezone.utc)
-            )
-            execution.status = "STARTING"
-            db.flush()
         if commit:
             db.commit()
-        return allowed
+        return bool(count)
 
     def cancel_unstarted_stop(self, db: Session, *, execution_id: Any) -> bool:
         """Complete a durable stop when no runtime was ever dispatched."""
@@ -1573,7 +2222,17 @@ class CRUDFlowExecution(CRUDBase[FlowExecution]):
         ``kind`` says what the run is waiting on: an approval request by
         default, or the children it started (``PARK_KIND_CHILDREN``, #633),
         in which case ``approval_request_id`` is the wait id grouping them.
+
+        A human park is refused when that approval is no longer pending.
+        The decision and this write run in different transactions; without
+        the check, a decision that commits first resumes nothing, and the
+        park then suspends a run whose answer is already on the request.
+        Children parks are not approval requests and skip the check.
         """
+        if kind == self.PARK_KIND_HUMAN and not self._approval_still_pending(
+            db, approval_request_id
+        ):
+            return False
         count = (
             db.query(models.FlowExecution)
             .filter(
@@ -1594,6 +2253,25 @@ class CRUDFlowExecution(CRUDBase[FlowExecution]):
         if commit:
             db.commit()
         return bool(count)
+
+    def _approval_still_pending(self, db: Session, approval_request_id: Any) -> bool:
+        """Lock the approval row and report whether it is still pending.
+
+        Same transaction as the park write that follows. A missing row is
+        not pending: there is nothing to wait on.
+        """
+        from preloop.models.models.approval_request import ApprovalRequest
+
+        row = (
+            db.query(ApprovalRequest.id)
+            .filter(
+                ApprovalRequest.id == approval_request_id,
+                ApprovalRequest.status == "pending",
+            )
+            .with_for_update()
+            .first()
+        )
+        return row is not None
 
     def get_park_request(self, db: Session, *, execution_id: Any) -> Optional[dict]:
         """Read park intent fresh on each monitor poll (see get_stop_request)."""
@@ -1790,6 +2468,169 @@ class CRUDFlowExecution(CRUDBase[FlowExecution]):
     #: the same event to whoever is reading the run afterwards.
     STOP_SOURCE_PARENT_STOP = "parent_stop"
 
+    #: ``stop_source`` written on an execution stopped because an operator
+    #: force-deleted the runner that held it (#841).
+    STOP_SOURCE_RUNNER_DELETED = "runner_deleted"
+
+    #: ``stop_source`` written by an operator's stop (the stop command on the
+    #: execution) when the caller names no other source.
+    STOP_SOURCE_MANUAL = "manual"
+
+    #: ``stop_source`` written by the account kill switch.
+    STOP_SOURCE_ACCOUNT_HALT = "account_halt"
+
+    #: Statuses the orchestrator writes while it brings a runtime up. None of
+    #: them may replace a terminal status (see :meth:`claim_live_status`).
+    LIVE_LAUNCH_STATUSES = frozenset({"INITIALIZING", "STARTING", "RUNNING"})
+
+    def claim_live_status(self, db: Session, *, execution_id: Any, status: str) -> bool:
+        """Move a row to a launch status, unless it already ended.
+
+        The orchestrator's ``INITIALIZING``/``STARTING``/``RUNNING`` writes
+        go through here before anything else on the row changes. The UPDATE
+        is conditional on the row not being terminal, so an operator's stop
+        that landed while the runtime was being prepared is never overwritten
+        by a later launch write; the caller learns it lost the race and tears
+        down whatever it already created. The row lock taken by the UPDATE
+        is held until the caller commits, so a concurrent stop waits for the
+        whole launch write instead of interleaving with it.
+
+        Not committed: the caller commits with the rest of its update.
+
+        Returns:
+            True when the row now carries ``status``; False when it is
+            terminal (the caller must not launch or keep a runtime).
+        """
+        if status not in self.LIVE_LAUNCH_STATUSES:
+            raise ValueError(f"not a launch status: {status}")
+        count = (
+            db.query(models.FlowExecution)
+            .filter(
+                models.FlowExecution.id == execution_id,
+                models.FlowExecution.status.notin_(
+                    sorted(self.TERMINAL_EXECUTION_STATUSES)
+                ),
+            )
+            .update({models.FlowExecution.status: status}, synchronize_session=False)
+        )
+        return bool(count)
+
+    def current_status(
+        self, db: Session, *, execution_id: Any, lock: bool = False
+    ) -> Optional[str]:
+        """Read the stored status, bypassing any stale ORM snapshot."""
+        query = db.query(models.FlowExecution.status).filter(
+            models.FlowExecution.id == execution_id
+        )
+        if lock:
+            query = query.with_for_update()
+        row = query.first()
+        return row[0] if row is not None else None
+
+    def record_session_reference(
+        self, db: Session, *, execution_id: Any, session_reference: str
+    ) -> None:
+        """Store the runtime a lost launch race created, without its status.
+
+        The row keeps its terminal status. The reference is what lets the
+        stop be confirmed later (and keeps the runtime counted against the
+        account until it is).
+        """
+        db.query(models.FlowExecution).filter(
+            models.FlowExecution.id == execution_id
+        ).update(
+            {models.FlowExecution.agent_session_reference: session_reference},
+            synchronize_session=False,
+        )
+        db.commit()
+
+    def stop_for_runner_removal(
+        self,
+        db: Session,
+        *,
+        execution_id: Any,
+        reason: str,
+        now: Optional[datetime] = None,
+    ) -> bool:
+        """Stop and settle one execution whose runner is being deleted.
+
+        The stop intent is written the way an account halt writes it, with
+        its own ``stop_source``. It is also confirmed here: termination is
+        normally confirmed only by the owning runner's completion frame, and
+        the runner is losing its credential in the same transaction, so no
+        such frame can arrive. Leaving the stop unconfirmed would keep the
+        execution monitor waiting on a runner that can no longer connect.
+
+        A row that is already terminal keeps its status, result and cost;
+        only a pending stop request on it is settled.
+
+        An isolated publication that has not completed is marked failed, as
+        an abandoned controller phase is, so its writer lease cannot be
+        completed later.
+
+        Args:
+            db: Database session. The caller owns the transaction.
+            execution_id: Execution held by the runner.
+            reason: Operator-visible stop reason.
+            now: Stop timestamp; defaults to ``datetime.now(UTC)``.
+
+        Returns:
+            True when this call moved the execution to ``STOPPED``.
+        """
+        moment = now or datetime.now(timezone.utc)
+        stopped = (
+            db.query(models.FlowExecution)
+            .filter(
+                models.FlowExecution.id == execution_id,
+                models.FlowExecution.status.notin_(
+                    sorted(self.TERMINAL_EXECUTION_STATUSES)
+                ),
+            )
+            .update(
+                {
+                    models.FlowExecution.status: "STOPPED",
+                    models.FlowExecution.end_time: moment,
+                    models.FlowExecution.error_message: reason,
+                    models.FlowExecution.park_expires_at: None,
+                    models.FlowExecution.stop_requested_at: func.coalesce(
+                        models.FlowExecution.stop_requested_at, moment
+                    ),
+                    models.FlowExecution.stop_reason: reason[:500],
+                    models.FlowExecution.stop_source: self.STOP_SOURCE_RUNNER_DELETED,
+                },
+                synchronize_session=False,
+            )
+        )
+        self.confirm_stop(db, execution_id=execution_id, commit=False)
+        execution = (
+            db.query(models.FlowExecution)
+            .filter(models.FlowExecution.id == execution_id)
+            .populate_existing()
+            .first()
+        )
+        state = (
+            (execution.result or {}).get("_private_publication") if execution else None
+        )
+        if isinstance(state, dict) and state.get("phase") not in {
+            "complete",
+            "failed",
+        }:
+            execution.result = {
+                **(execution.result or {}),
+                "_private_publication": {**state, "phase": "failed"},
+            }
+            db.add(execution)
+        if stopped:
+            self.close_parked_parent_for_resume(
+                db,
+                resume_execution_id=execution_id,
+                status="STOPPED",
+                end_time=moment,
+                commit=False,
+            )
+        db.flush()
+        return bool(stopped)
+
     def close_children_park_for_stop(
         self,
         db: Session,
@@ -1798,8 +2639,9 @@ class CRUDFlowExecution(CRUDBase[FlowExecution]):
         reason: str,
         now: Optional[datetime] = None,
         commit: bool = True,
+        stop_source: Optional[str] = None,
     ) -> bool:
-        """Close a park on children because an operator stopped the parent.
+        """Close a park on children because the parent was stopped.
 
         One conditional UPDATE, and it is the whole race: it matches a row
         still sitting on ``WAITING_FOR_CHILDREN``, or a still-live row that
@@ -1811,12 +2653,44 @@ class CRUDFlowExecution(CRUDBase[FlowExecution]):
 
         The park row is closed rather than left claimable: the expiry is
         cleared so no sweep looks at it again, while ``park_request_id`` and
-        ``park_kind`` stay for the audit trail. ``stop_source`` stays NULL
-        on this row: the operator stopped the parent, which is the same
-        provenance as a plain stop. ``parent_stop`` is reserved for
-        children this stop ends.
+        ``park_kind`` stay for the audit trail. ``stop_source`` is the
+        automatic cause when the caller names one (``pr_merged`` and the
+        like, #1032). An operator's stop names none, so this write records
+        ``manual``, the same provenance as a plain stop: ``mark_stopped``
+        matches nothing once the row is already terminal. When that operator
+        stop has no runtime reference, ``stop_confirmed_at`` is set here too,
+        because nothing else will confirm a parked row. ``parent_stop`` is
+        reserved for children this stop ends.
         """
         moment = now or datetime.now(timezone.utc)
+        values = {
+            models.FlowExecution.status: "STOPPED",
+            models.FlowExecution.end_time: moment,
+            models.FlowExecution.error_message: reason,
+            models.FlowExecution.park_expires_at: None,
+            models.FlowExecution.stop_requested_at: func.coalesce(
+                models.FlowExecution.stop_requested_at, moment
+            ),
+            models.FlowExecution.stop_reason: reason[:500],
+            models.FlowExecution.orchestrator_worker_id: None,
+            models.FlowExecution.orchestrator_claimed_at: None,
+            models.FlowExecution.orchestrator_heartbeat_at: None,
+        }
+        if stop_source:
+            values[models.FlowExecution.stop_source] = stop_source[:32]
+        else:
+            # The following mark_stopped misses a row this UPDATE just made
+            # terminal, so an operator's provenance has to land here.
+            values[models.FlowExecution.stop_source] = func.coalesce(
+                models.FlowExecution.stop_source, self.STOP_SOURCE_MANUAL
+            )
+            values[models.FlowExecution.stop_confirmed_at] = case(
+                (
+                    models.FlowExecution.agent_session_reference.is_(None),
+                    func.coalesce(models.FlowExecution.stop_confirmed_at, moment),
+                ),
+                else_=models.FlowExecution.stop_confirmed_at,
+            )
         count = (
             db.query(models.FlowExecution)
             .filter(
@@ -1831,22 +2705,7 @@ class CRUDFlowExecution(CRUDBase[FlowExecution]):
                     ),
                 ),
             )
-            .update(
-                {
-                    models.FlowExecution.status: "STOPPED",
-                    models.FlowExecution.end_time: moment,
-                    models.FlowExecution.error_message: reason,
-                    models.FlowExecution.park_expires_at: None,
-                    models.FlowExecution.stop_requested_at: func.coalesce(
-                        models.FlowExecution.stop_requested_at, moment
-                    ),
-                    models.FlowExecution.stop_reason: reason[:500],
-                    models.FlowExecution.orchestrator_worker_id: None,
-                    models.FlowExecution.orchestrator_claimed_at: None,
-                    models.FlowExecution.orchestrator_heartbeat_at: None,
-                },
-                synchronize_session=False,
-            )
+            .update(values, synchronize_session=False)
         )
         if commit:
             db.commit()
@@ -2128,6 +2987,7 @@ class CRUDFlowExecution(CRUDBase[FlowExecution]):
             db.query(
                 models.FlowExecution.stop_requested_at,
                 models.FlowExecution.stop_reason,
+                models.FlowExecution.stop_source,
                 models.FlowExecution.stop_confirmed_at,
             )
             .filter(models.FlowExecution.id == execution_id)
@@ -2138,23 +2998,53 @@ class CRUDFlowExecution(CRUDBase[FlowExecution]):
         return {
             "requested_at": row.stop_requested_at,
             "reason": row.stop_reason,
+            "source": row.stop_source,
             "confirmed_at": row.stop_confirmed_at,
         }
 
     def confirm_stop(
-        self, db: Session, *, execution_id: Any, commit: bool = True
+        self,
+        db: Session,
+        *,
+        execution_id: Any,
+        commit: bool = True,
+        drop_unconfirmed_reason: Optional[str] = None,
     ) -> None:
-        """Record confirmed terminal runtime evidence, never an optimistic request."""
+        """Record confirmed terminal runtime evidence, never an optimistic request.
+
+        ``drop_unconfirmed_reason``, when set, is removed from ``stop_reason``
+        in the same write. That sentence only explained why termination was
+        still outstanding, and it contradicts ``stop_confirmed_at``.
+        """
         from datetime import timezone
 
+        values: Dict[Any, Any] = {
+            models.FlowExecution.stop_confirmed_at: datetime.now(timezone.utc),
+        }
+        if drop_unconfirmed_reason:
+            stripped = func.nullif(
+                func.btrim(
+                    func.replace(
+                        func.coalesce(models.FlowExecution.stop_reason, ""),
+                        drop_unconfirmed_reason,
+                        "",
+                    ),
+                    "; ",
+                ),
+                "",
+            )
+            values[models.FlowExecution.stop_reason] = case(
+                (
+                    models.FlowExecution.stop_reason.contains(drop_unconfirmed_reason),
+                    stripped,
+                ),
+                else_=models.FlowExecution.stop_reason,
+            )
         db.query(models.FlowExecution).filter(
             models.FlowExecution.id == execution_id,
             models.FlowExecution.stop_requested_at.isnot(None),
             models.FlowExecution.stop_confirmed_at.is_(None),
-        ).update(
-            {models.FlowExecution.stop_confirmed_at: datetime.now(timezone.utc)},
-            synchronize_session=False,
-        )
+        ).update(values, synchronize_session=False)
         if commit:
             db.commit()
 

@@ -1,3 +1,18 @@
+import { parseUTCDate } from '../utils/date';
+import {
+  renderSessionApproval,
+  renderSessionActivity,
+} from './session-approval-presentation';
+import './session-tool-card';
+import './session-approval-card';
+import './session-live-activity';
+import { type SessionApprovalState } from './session-live-activity';
+import {
+  sessionTools,
+  sessionTimelineTime,
+  type SessionTool,
+} from '../utils/session-live';
+import type { ApprovalRequest } from '../types';
 import { LitElement, css, html, nothing } from 'lit';
 import { customElement, property, state } from 'lit/decorators.js';
 import { repeat } from 'lit/directives/repeat.js';
@@ -17,6 +32,7 @@ import type {
   FlowGatewayConversationPreviewMessage,
   FlowGatewayEvent,
   RuntimeSessionActivityItem,
+  RuntimeSessionArtifactDescriptor,
   RuntimeSessionInteractionSummary,
   RuntimeSessionOptimizationAppliedAction,
   RuntimeSessionOptimizationResponse,
@@ -35,6 +51,21 @@ import {
   getGatewayEventUserRequest,
 } from '../utils/session-observer';
 import { outcomeLabel } from '../utils/outcome-label';
+import { getApprovalRepository } from '../utils/approval-identity';
+import './repository-chip';
+import './browser-step-row';
+import './session-artifact-row';
+import {
+  artifactRowKey,
+  artifactRowMetadata,
+  artifactView,
+  browserStepHasScreenshot,
+  browserStepKey,
+  isArtifactRow,
+  isBrowserStep,
+  sortBrowserSteps,
+  type ArtifactKindGroup,
+} from '../utils/session-artifacts';
 import { getExampleSessionOptimization } from '../api';
 import './preloop-gateway-event';
 import './session-optimization-panel';
@@ -137,6 +168,11 @@ type ChatTurn = {
   // Activity (operator/talk) turns are NOT gateway requests: they carry no real
   // token/cost/tool stats, so the header suppresses those meaningless zeros.
   isActivity: boolean;
+  // Set for a `browser_step` activity turn: rendered as a browser-step row
+  // with its screenshot thumbnail instead of chat bubbles.
+  browserStep?: RuntimeSessionActivityItem | null;
+  // Set for an `artifact` activity turn: rendered as a session-artifact-row.
+  artifact?: RuntimeSessionActivityItem | null;
   // Measured idle-TTL cache expiry for this turn (from optimize context profile).
   idleExpiry: ChatTurnIdleExpiry | null;
 };
@@ -176,6 +212,29 @@ const REPLAY_SCROLL_RESUME_DELAY_MS = 550;
 
 @customElement('session-replay-panel')
 export class SessionReplayPanel extends LitElement {
+  @state() private approvalState: SessionApprovalState = {
+    requests: [],
+    canDecide: false,
+    author: '',
+    now: Date.now(),
+  };
+  private renderApproval(request: ApprovalRequest) {
+    return renderSessionApproval(this, this.approvalState, request);
+  }
+  private renderActivity() {
+    if (this.replayMode === 'conversation') return nothing;
+    return renderSessionActivity(
+      this,
+      this.session?.id || '',
+      this.events,
+      this.activity,
+      Boolean(this.session?.endedAt),
+      this.approvalState,
+      (state) => {
+        this.approvalState = state;
+      }
+    );
+  }
   @property({ type: Object })
   session: ObservedSession | null = null;
 
@@ -187,6 +246,18 @@ export class SessionReplayPanel extends LitElement {
 
   @property({ type: Array })
   activity: RuntimeSessionActivityItem[] = [];
+
+  /** Artifact descriptors by id (sha256, lineage, availability). */
+  @property({ attribute: false })
+  artifacts: Record<string, RuntimeSessionArtifactDescriptor> = {};
+
+  /** When set, the thread shows only artifact turns of this kind group. */
+  @property({ type: String })
+  artifactKindFilter: ArtifactKindGroup | null = null;
+
+  /** Artifact turn to highlight (search hit landing, `?artifact=`). */
+  @property({ type: String })
+  highlightArtifactId: string | null = null;
 
   @property({ type: String })
   replayMode: SessionReplayMode = 'timeline';
@@ -252,6 +323,9 @@ export class SessionReplayPanel extends LitElement {
 
   @property({ type: Array })
   availableModels: AIModel[] = [];
+
+  @property({ type: Boolean })
+  availableModelsLoading = false;
 
   @property({ type: Object })
   optimizationResult: RuntimeSessionOptimizationResponse | null = null;
@@ -441,13 +515,19 @@ export class SessionReplayPanel extends LitElement {
     }
 
     .example-provenance {
-      color: var(--sl-color-neutral-500);
+      color: var(--console-meta-color);
       font-size: var(--sl-font-size-x-small);
       line-height: 1.5;
     }
 
     .timeline-event,
     .chat-message,
+    .chat-turn.browser-step-turn {
+      padding: 0;
+      border: none;
+      background: transparent;
+      box-shadow: none;
+    }
     .activity-event {
       background: var(--sl-color-neutral-0);
       border: 1px solid var(--sl-color-neutral-200);
@@ -538,7 +618,7 @@ export class SessionReplayPanel extends LitElement {
     }
 
     .message-footer {
-      color: var(--sl-color-neutral-500);
+      color: var(--console-meta-color);
       font-size: var(--sl-font-size-x-small);
       margin-top: var(--sl-spacing-x-small);
       text-transform: none;
@@ -756,7 +836,7 @@ export class SessionReplayPanel extends LitElement {
     }
 
     .timeline-datetime-label {
-      color: var(--sl-color-neutral-500);
+      color: var(--console-meta-color);
       font-size: 0.62rem;
       position: absolute;
       top: 20px;
@@ -994,7 +1074,7 @@ export class SessionReplayPanel extends LitElement {
     }
 
     .chat-threshold-slider::part(form-control-label) {
-      color: var(--sl-color-neutral-500);
+      color: var(--console-meta-color);
       font-size: var(--sl-font-size-x-small);
     }
 
@@ -1031,7 +1111,7 @@ export class SessionReplayPanel extends LitElement {
     }
 
     .chat-summary-label {
-      color: var(--sl-color-neutral-500);
+      color: var(--console-meta-color);
       letter-spacing: 0.02em;
       text-transform: uppercase;
     }
@@ -1066,7 +1146,7 @@ export class SessionReplayPanel extends LitElement {
     }
 
     .chat-summary-sub {
-      color: var(--sl-color-neutral-500);
+      color: var(--console-meta-color);
     }
 
     .chat-thread {
@@ -1171,7 +1251,7 @@ export class SessionReplayPanel extends LitElement {
     }
 
     .chat-turn-time {
-      color: var(--sl-color-neutral-500);
+      color: var(--console-meta-color);
       font-size: var(--sl-font-size-x-small);
       font-weight: var(--sl-font-weight-normal);
     }
@@ -1186,7 +1266,7 @@ export class SessionReplayPanel extends LitElement {
     /* Per-turn token/cost/tool counts are secondary metadata: quiet, muted,
        lighter weight and a touch smaller than the conversation text. */
     .chat-turn-stat {
-      color: var(--sl-color-neutral-500);
+      color: var(--console-meta-color);
       font-size: var(--sl-font-size-x-small);
       font-weight: var(--sl-font-weight-normal);
       letter-spacing: 0.01em;
@@ -1204,7 +1284,7 @@ export class SessionReplayPanel extends LitElement {
     }
 
     .chat-turn-empty {
-      color: var(--sl-color-neutral-500);
+      color: var(--console-meta-color);
       font-size: var(--sl-font-size-x-small);
       font-style: italic;
     }
@@ -1373,7 +1453,7 @@ export class SessionReplayPanel extends LitElement {
     }
 
     .optimize-range-label {
-      color: var(--sl-color-neutral-500);
+      color: var(--console-meta-color);
       font-size: 0.58rem;
       position: absolute;
       top: 16px;
@@ -1537,6 +1617,17 @@ export class SessionReplayPanel extends LitElement {
     }
   }
 
+  willUpdate(changed: Map<string | number | symbol, unknown>): void {
+    const previous = changed.get('session') as
+      ObservedSession | null | undefined;
+    if (changed.has('session') && previous?.id !== this.session?.id)
+      this.approvalState = {
+        requests: [],
+        canDecide: false,
+        author: '',
+        now: Date.now(),
+      };
+  }
   updated(changed: Map<string | number | symbol, unknown>): void {
     if (changed.has('availableModels') && !this.optimizeModelId) {
       // Preselect the account default so the optimization model dropdown shows
@@ -1597,7 +1688,7 @@ export class SessionReplayPanel extends LitElement {
 
   private formatTime(value: string | null | undefined): string {
     if (!value) return 'Unknown time';
-    const parsed = new Date(value);
+    const parsed = parseUTCDate(value);
     if (Number.isNaN(parsed.getTime())) return value;
     return parsed.toLocaleTimeString();
   }
@@ -1608,7 +1699,7 @@ export class SessionReplayPanel extends LitElement {
   // the label reflects render time — acceptable for a replay/history view.
   private formatRelativeTime(value: string | null | undefined): string {
     if (!value) return 'Unknown time';
-    const parsed = new Date(value);
+    const parsed = parseUTCDate(value);
     if (Number.isNaN(parsed.getTime())) return value;
     const elapsedMs = Date.now() - parsed.getTime();
     if (elapsedMs < 60_000) return 'just now';
@@ -1624,14 +1715,14 @@ export class SessionReplayPanel extends LitElement {
 
   private formatDateTime(value: string | null | undefined): string {
     if (!value) return 'Unknown time';
-    const parsed = new Date(value);
+    const parsed = parseUTCDate(value);
     if (Number.isNaN(parsed.getTime())) return value;
     return parsed.toLocaleString();
   }
 
   private formatTimelineLabel(value: string | null | undefined): string {
     if (!value) return '';
-    const parsed = new Date(value);
+    const parsed = parseUTCDate(value);
     if (Number.isNaN(parsed.getTime())) return value;
     return `${parsed.toLocaleDateString(undefined, {
       month: 'short',
@@ -1977,8 +2068,8 @@ export class SessionReplayPanel extends LitElement {
       ...activityMessages,
     ].sort(
       (left, right) =>
-        new Date(left.timestamp || 0).getTime() -
-        new Date(right.timestamp || 0).getTime()
+        parseUTCDate(left.timestamp || '1970-01-01T00:00:00Z').getTime() -
+        parseUTCDate(right.timestamp || '1970-01-01T00:00:00Z').getTime()
     );
     return this.replayReversed ? messages.reverse() : messages;
   }
@@ -2062,8 +2153,8 @@ export class SessionReplayPanel extends LitElement {
     }
     return Array.from(byId.values()).sort(
       (left, right) =>
-        new Date(left.timestamp || 0).getTime() -
-        new Date(right.timestamp || 0).getTime()
+        parseUTCDate(left.timestamp || '1970-01-01T00:00:00Z').getTime() -
+        parseUTCDate(right.timestamp || '1970-01-01T00:00:00Z').getTime()
     );
   }
 
@@ -2094,11 +2185,15 @@ export class SessionReplayPanel extends LitElement {
       )
       .forEach((item) => {
         const timestamp = item.timestamp || null;
-        const itemTime = new Date(timestamp || 0).getTime();
+        const itemTime = parseUTCDate(
+          timestamp || '1970-01-01T00:00:00Z'
+        ).getTime();
         let nearestIndex = 0;
         let nearestDistance = Number.POSITIVE_INFINITY;
         messages.forEach((message, index) => {
-          const messageTime = new Date(message.timestamp || 0).getTime();
+          const messageTime = parseUTCDate(
+            message.timestamp || '1970-01-01T00:00:00Z'
+          ).getTime();
           const distance = Math.abs(messageTime - itemTime);
           if (distance < nearestDistance) {
             nearestDistance = distance;
@@ -3327,8 +3422,8 @@ export class SessionReplayPanel extends LitElement {
       )
       .sort(
         (left, right) =>
-          new Date(left.timestamp || 0).getTime() -
-          new Date(right.timestamp || 0).getTime()
+          parseUTCDate(left.timestamp || '1970-01-01T00:00:00Z').getTime() -
+          parseUTCDate(right.timestamp || '1970-01-01T00:00:00Z').getTime()
       )
       .map((item) => {
         const metadata = item.metadata ?? {};
@@ -3490,6 +3585,7 @@ export class SessionReplayPanel extends LitElement {
           </sl-button>
           <div class="timeline-wrap">
             <input
+              aria-label="Replay position"
               class="timeline-range"
               type="range"
               min="0"
@@ -3801,8 +3897,9 @@ export class SessionReplayPanel extends LitElement {
               : nothing
           }
         </div>
+        ${showControls && this.availableModelsLoading ? html`<div role="status">Loading optimization models…</div>` : nothing}
         ${
-          showControls
+          showControls && !this.availableModelsLoading
             ? html`
                 <div class="optimize-controls">
                   <div class="optimize-control-row">
@@ -3846,7 +3943,7 @@ export class SessionReplayPanel extends LitElement {
                     </label>
                   </div>
                   <div class="optimize-control-row">
-                    <label class="optimize-range" style="flex: 1 1 100%;">
+                    <div class="optimize-range" style="flex: 1 1 100%;">
                       <div class="event-meta">
                         Optimization scope (events
                         ${this.getEffectiveOptimizeBounds(messages).fromIndex} –
@@ -3872,10 +3969,10 @@ export class SessionReplayPanel extends LitElement {
                         <input
                           class="timeline-range"
                           type="range"
-                          aria-label="Range start"
                           min="0"
                           max=${String(lastIndex)}
                           .value=${String(this.optimizeFromIndex)}
+                          aria-label="Optimization scope range start"
                           @input=${(event: Event) => {
                             const value = Number(
                               (event.target as HTMLInputElement).value
@@ -3889,10 +3986,10 @@ export class SessionReplayPanel extends LitElement {
                         <input
                           class="timeline-range"
                           type="range"
-                          aria-label="Range end"
                           min="0"
                           max=${String(lastIndex)}
                           .value=${String(this.optimizeToIndex || lastIndex)}
+                          aria-label="Optimization scope range end"
                           @input=${(event: Event) => {
                             const value = Number(
                               (event.target as HTMLInputElement).value
@@ -3905,7 +4002,7 @@ export class SessionReplayPanel extends LitElement {
                         />
                       </div>
                       ${this.renderOptimizationRangeMarkers(messages)}
-                    </label>
+                    </div>
                   </div>
                   <div class="source-toggle-row">
                     ${REPLAY_MARKER_LEGEND.map(
@@ -4196,8 +4293,13 @@ export class SessionReplayPanel extends LitElement {
   }
 
   private getSupportingActivity(): RuntimeSessionActivityItem[] {
-    if (!this.events.length) return this.activity;
-    return this.activity.filter((item) => {
+    // Browser steps render as their own turns with screenshots.
+    // Artifacts render as their own turns too.
+    const activity = this.activity.filter(
+      (item) => !isBrowserStep(item) && !isArtifactRow(item)
+    );
+    if (!this.events.length) return activity;
+    return activity.filter((item) => {
       if (item.activity_type === 'model_interaction') return false;
       if (item.activity_type === 'model_gateway_call') return false;
       if (this.isToolCallActivity(item)) return false;
@@ -4206,6 +4308,7 @@ export class SessionReplayPanel extends LitElement {
   }
 
   private isToolCallActivity(item: RuntimeSessionActivityItem): boolean {
+    if (isBrowserStep(item) || isArtifactRow(item)) return false;
     return item.activity_type === 'tool_call' || Boolean(item.tool_name);
   }
 
@@ -4254,8 +4357,8 @@ export class SessionReplayPanel extends LitElement {
     }
     return rows.sort(
       (left, right) =>
-        new Date(left.timestamp || 0).getTime() -
-        new Date(right.timestamp || 0).getTime()
+        parseUTCDate(left.timestamp || '1970-01-01T00:00:00Z').getTime() -
+        parseUTCDate(right.timestamp || '1970-01-01T00:00:00Z').getTime()
     );
   }
 
@@ -4358,6 +4461,7 @@ export class SessionReplayPanel extends LitElement {
 
   private getChatTurns(): ChatTurn[] {
     const events = this.getChatEvents();
+    const tools = sessionTools(this.events, this.activity);
     const seenSignatures = new Set<string>();
     const eventTurns: ChatTurn[] = [];
     const idleExpiryById = this.getIdleExpiryByEventId();
@@ -4377,6 +4481,16 @@ export class SessionReplayPanel extends LitElement {
         if (text && seenSignatures.has(signature)) return;
         if (text) seenSignatures.add(signature);
         const isToolRelated = this.messageIsToolRelated(message);
+        if (
+          isToolRelated &&
+          message.tool_call_ids?.length &&
+          message.tool_call_ids.every((id) =>
+            tools.some(
+              (tool) => tool.callId === id && tool.result !== undefined
+            )
+          )
+        )
+          return;
         if (isToolRelated) toolCallCount += 1;
         deltaMessages.push({
           ...message,
@@ -4436,10 +4550,57 @@ export class SessionReplayPanel extends LitElement {
         idleExpiry: null,
       }));
 
-    const turns = [...eventTurns, ...activityTurns].sort(
+    const browserStepTurns: ChatTurn[] = sortBrowserSteps(this.activity).map(
+      (item) => ({
+        id: browserStepKey(item),
+        index: 0,
+        event: null,
+        timestamp: item.timestamp || null,
+        title: item.title || 'Browser step',
+        deltaMessages: [],
+        totalTokens: 0,
+        promptTokens: 0,
+        completionTokens: 0,
+        cachedTokens: null,
+        estimatedCost: 0,
+        toolCallCount: 0,
+        failed: String(item.status || '').toLowerCase() === 'failed',
+        isActivity: true,
+        browserStep: item,
+        idleExpiry: null,
+      })
+    );
+
+    const artifactTurns: ChatTurn[] = this.activity
+      .filter((item) => isArtifactRow(item) && artifactRowMetadata(item))
+      .map((item) => ({
+        id: artifactRowKey(artifactRowMetadata(item)!.id),
+        index: 0,
+        event: null,
+        timestamp: item.timestamp || null,
+        title: item.title || 'Artifact',
+        deltaMessages: [],
+        totalTokens: 0,
+        promptTokens: 0,
+        completionTokens: 0,
+        cachedTokens: null,
+        estimatedCost: 0,
+        toolCallCount: 0,
+        failed: false,
+        isActivity: true,
+        artifact: item,
+        idleExpiry: null,
+      }));
+
+    const turns = [
+      ...eventTurns,
+      ...activityTurns,
+      ...browserStepTurns,
+      ...artifactTurns,
+    ].sort(
       (left, right) =>
-        new Date(left.timestamp || 0).getTime() -
-        new Date(right.timestamp || 0).getTime()
+        parseUTCDate(left.timestamp || '1970-01-01T00:00:00Z').getTime() -
+        parseUTCDate(right.timestamp || '1970-01-01T00:00:00Z').getTime()
     );
     // Re-index in natural chat order so sort/filter can reorder in place while
     // preserving a stable oldest-first ordering reference.
@@ -4457,8 +4618,29 @@ export class SessionReplayPanel extends LitElement {
     return this.chatSort === 'newest' ? [...messages].reverse() : messages;
   }
 
+  private turnArtifactGroup(turn: ChatTurn): ArtifactKindGroup | null {
+    if (!turn.artifact) return null;
+    const meta = artifactRowMetadata(turn.artifact);
+    return meta
+      ? artifactView(turn.artifact, this.artifacts[meta.id])?.group || null
+      : null;
+  }
+
   private turnPassesTypeFilter(turn: ChatTurn): boolean {
+    if (this.artifactKindFilter) {
+      if (turn.browserStep) {
+        return (
+          this.artifactKindFilter === 'screenshot' &&
+          browserStepHasScreenshot(turn.browserStep)
+        );
+      }
+      return this.turnArtifactGroup(turn) === this.artifactKindFilter;
+    }
     if (this.chatTypeFilter === 'all') return true;
+    // An artifact is something the session produced; keep it in both views.
+    if (turn.artifact) return true;
+    // A browser action is tool activity, not a message.
+    if (turn.browserStep) return this.chatTypeFilter === 'tools';
     if (this.chatTypeFilter === 'tools') return turn.toolCallCount > 0;
     // messages only: non-tool delta messages present.
     return turn.deltaMessages.some((message) => !message.isToolRelated);
@@ -4970,9 +5152,9 @@ export class SessionReplayPanel extends LitElement {
   }
 
   // Drill-down: full request context for an expanded turn. Uses the lazy
-  // eventDetails fetch — the complete message list, model, tokens, finish
-  // reason, retries, and tools with per-tool schema cost.
-  // TODO: deeper nested-tree drill-down (per-message / per-tool sub-trees).
+  // eventDetails fetch: the complete message list, model, tokens, finish
+  // reason, retries, and tools with per-tool schema cost. It does not open
+  // a further tree per message or per tool.
   private renderChatTurnDetail(turn: ChatTurn) {
     if (!turn.event) return nothing;
     const detail = this.eventDetails[turn.event.id];
@@ -5133,10 +5315,67 @@ export class SessionReplayPanel extends LitElement {
     `;
   }
 
+  /** Scroll the turn of one browser step into view and focus it. */
+  scrollToBrowserStep(key: string): boolean {
+    const row = this.renderRoot.querySelector<HTMLElement>(
+      `[data-browser-step-key="${key}"]`
+    );
+    if (!row) return false;
+    row.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    row.focus({ preventScroll: true });
+    return true;
+  }
+
+  /** Scroll the turn of one artifact into view and focus its row. */
+  scrollToArtifact(artifactId: string): boolean {
+    const row = this.renderRoot.querySelector<HTMLElement>(
+      `[data-artifact-key="${artifactRowKey(artifactId)}"] session-artifact-row`
+    );
+    if (!row) return false;
+    row.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    row.focus({ preventScroll: true });
+    return true;
+  }
+
+  private renderArtifactTurn(turn: ChatTurn) {
+    const item = turn.artifact!;
+    const meta = artifactRowMetadata(item);
+    const view = meta ? artifactView(item, this.artifacts[meta.id]) : null;
+    if (!meta || !view) return nothing;
+    const parent = view.parentArtifactId
+      ? this.artifacts[view.parentArtifactId]
+      : null;
+    return html`<div
+      class="chat-turn browser-step-turn artifact-turn"
+      data-artifact-key=${turn.id}
+    >
+      <session-artifact-row
+        .item=${item}
+        .artifact=${view}
+        .sessionId=${this.session?.id || ''}
+        .parentName=${parent?.name || ''}
+        ?highlighted=${this.highlightArtifactId === meta.id}
+      ></session-artifact-row>
+    </div>`;
+  }
+
   private renderChatTurn(
     turn: ChatTurn,
     mostExpensiveTurnId: string | null = null
   ) {
+    if (turn.artifact) return this.renderArtifactTurn(turn);
+    if (turn.browserStep) {
+      return html`<div
+        class="chat-turn browser-step-turn"
+        tabindex="0"
+        data-browser-step-key=${turn.id}
+      >
+        <browser-step-row
+          .item=${turn.browserStep}
+          .sessionId=${this.session?.id || ''}
+        ></browser-step-row>
+      </div>`;
+    }
     const event = turn.event;
     const isMostExpensive = Boolean(
       mostExpensiveTurnId && turn.id === mostExpensiveTurnId
@@ -5450,21 +5689,58 @@ export class SessionReplayPanel extends LitElement {
   private renderChatView() {
     const turns = this.getVisibleChatTurns();
     const mostExpensiveTurnId = this.getMostExpensiveTurnId();
+    const rows: Array<{
+      id: string;
+      timestamp: string | null;
+      turn?: ChatTurn;
+      tool?: SessionTool;
+      request?: ApprovalRequest;
+    }> = [
+      ...turns.map((turn) => ({
+        id: turn.id,
+        timestamp: turn.timestamp,
+        turn,
+      })),
+      ...sessionTools(this.events, this.activity).map((tool) => ({
+        id: tool.id,
+        timestamp: tool.timestamp,
+        tool,
+      })),
+      ...this.approvalState.requests.map((request) => ({
+        id: `approval:${request.id}`,
+        timestamp: request.requested_at,
+        request,
+      })),
+    ];
+    if (this.chatSort === 'newest' || this.chatSort === 'oldest')
+      rows.sort(
+        (a, b) =>
+          (sessionTimelineTime(a.timestamp) -
+            sessionTimelineTime(b.timestamp)) *
+          (this.chatSort === 'newest' ? -1 : 1)
+      );
     return html`
       <div class="panel">
         ${this.renderFocusJumpHint()} ${this.renderChatSummaryBar()}
         ${this.renderChatControlBar(turns.length)}
         ${
-          turns.length
+          rows.length
             ? html`
                 <div
                   class="chat-thread"
                   @keydown=${this.handleChatThreadKeydown}
                 >
                   ${repeat(
-                    turns,
-                    (turn) => turn.id,
-                    (turn) => this.renderChatTurn(turn, mostExpensiveTurnId)
+                    rows,
+                    (row) => row.id,
+                    (row) =>
+                      row.turn
+                        ? this.renderChatTurn(row.turn, mostExpensiveTurnId)
+                        : row.tool
+                          ? html`<session-tool-card
+                              .tool=${row.tool}
+                            ></session-tool-card>`
+                          : this.renderApproval(row.request!)
                   )}
                 </div>
               `
@@ -5511,6 +5787,13 @@ export class SessionReplayPanel extends LitElement {
           <span class="tool-row-name">
             ${item.tool_name || item.title || 'Tool call'}
           </span>
+          ${
+            getApprovalRepository(item.metadata)
+              ? html`<repository-chip
+                  .toolArgs=${item.metadata}
+                ></repository-chip>`
+              : nothing
+          }
           ${
             item.server_name
               ? html`<span class="event-meta">${item.server_name}</span>`
@@ -5608,6 +5891,10 @@ export class SessionReplayPanel extends LitElement {
   }
 
   render() {
+    return html`${this.renderActivity()}${this.renderContent()}`;
+  }
+
+  private renderContent() {
     if (this.loading) {
       return html`
         <div class="loading">
@@ -5621,8 +5908,12 @@ export class SessionReplayPanel extends LitElement {
       return html`<div class="empty">${this.emptyText}</div>`;
     }
 
-    if (!this.events.length && !this.activity.length) {
-      return html`<div class="empty">
+    if (
+      !this.events.length &&
+      !this.activity.length &&
+      !this.approvalState.requests.length
+    ) {
+      return html` <div class="empty">
         No interactions captured for this session.
       </div>`;
     }

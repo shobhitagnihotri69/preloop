@@ -100,6 +100,25 @@ const ACCOUNT_PRESET: FlowPresetRecord = {
   trigger_event_types: ['pull_request_opened'],
 };
 
+/** Mirrors backend/presets/020-audio-transcription-agent.yaml (#1103). */
+const AUDIO_PRESET: FlowPresetRecord = {
+  id: 'preset-020',
+  name: 'Audio Transcription Agent',
+  description:
+    'Labelled transcripts and summaries from your audio MCP server; Preloop ' +
+    'does not verify the consent basis you supply. The agent fetches one ' +
+    "recording and has the operator's speech-to-text MCP server transcribe it.",
+  icon: 'mic',
+  trigger_event_types: null,
+  allowed_mcp_tools: [
+    { name: 'deposit_artifact' },
+    { name: 'ask_user' },
+    { server_name: 'audio-mcp', tool_name: 'get_audio' },
+    { server_name: 'audio-mcp', tool_name: 'transcribe_audio' },
+  ],
+  git_clone_config: null,
+};
+
 describe('presetGroups', () => {
   it('puts account presets first and keeps catalog order without a PR-reviewer hack', () => {
     const groups = presetGroups([...CATALOG, ACCOUNT_PRESET]);
@@ -320,5 +339,113 @@ describe('preloop-flow-preset-picker', () => {
     );
     const event = await selected;
     expect(event.detail.presetId).to.equal('preset-002');
+  });
+});
+
+describe('scheduled presets that read artifacts (#1106)', () => {
+  const EVALUATION: FlowPresetRecord = {
+    id: 'preset-021',
+    name: 'Transcript evaluation',
+    description:
+      'Every hour, read the transcripts deposited since the last run and ' +
+      'turn what they say into suggestions for a person and approved ' +
+      'actions, with a report artifact listing every transcript evaluated. ' +
+      'Same-agent mode works out of the box.',
+    icon: 'chat-square-text',
+    trigger_event_source: 'schedule',
+    trigger_event_types: ['schedule'],
+    allowed_mcp_tools: [
+      { name: 'search_artifacts' },
+      { name: 'get_artifact' },
+      { name: 'deposit_artifact' },
+      { name: 'ask_user' },
+      { name: 'request_approval' },
+      { name: 'send_note' },
+    ],
+  };
+
+  it('groups a schedule preset under Scheduled with a Scheduled chip', () => {
+    const groups = presetGroups([EVALUATION]);
+    expect(groups.map((group) => group.id)).to.deep.equal(['scheduled']);
+    const keys = presetChips(EVALUATION).map((chip) => chip.key);
+    expect(keys).to.include('schedule');
+    expect(keys).not.to.include('tracker');
+  });
+
+  it('card explains same-agent versus cross-agent scope', async () => {
+    const el = await fixture<PreloopFlowPresetPicker>(html`
+      <preloop-flow-preset-picker
+        .presets=${[EVALUATION]}
+      ></preloop-flow-preset-picker>
+    `);
+    const row = el.shadowRoot!.querySelector(
+      '[data-preset-id="preset-021"]'
+    ) as HTMLElement;
+    expect(row).to.exist;
+    expect(row.textContent).to.contain('Scheduled');
+    expect(row.querySelector('.row-desc')!.textContent).to.contain(
+      'Every hour, read the transcripts deposited since the last run'
+    );
+    const note = row.querySelector('[data-testid="preset-scope-note"]');
+    expect(note).to.exist;
+    const text = note!.textContent!.replace(/\s+/g, ' ');
+    expect(text).to.contain(
+      "Same-agent: reads artifacts from this flow's own runs"
+    );
+    expect(text).to.contain(
+      "Cross-agent: other agents' artifacts need the artifact_search.account_scope grant"
+    );
+  });
+
+  it('presets that do not read artifacts carry no scope note', async () => {
+    const el = await fixture<PreloopFlowPresetPicker>(html`
+      <preloop-flow-preset-picker
+        .presets=${[{ ...EVALUATION, id: 'p-x', allowed_mcp_tools: [] }]}
+      ></preloop-flow-preset-picker>
+    `);
+    expect(
+      el.shadowRoot!.querySelector('[data-testid="preset-scope-note"]')
+    ).to.equal(null);
+  });
+});
+
+describe('audio transcription agent card (#1103)', () => {
+  it('shows the card on demand, with its tools and the consent caveat', async () => {
+    const el = await fixture<PreloopFlowPresetPicker>(
+      html`<preloop-flow-preset-picker
+        .presets=${[...CATALOG, AUDIO_PRESET]}
+      ></preloop-flow-preset-picker>`
+    );
+    const row = el.shadowRoot!.querySelector(
+      '[data-preset-id="preset-020"]'
+    ) as HTMLElement;
+    expect(row, 'audio preset row').to.exist;
+    const text = (row.textContent || '').replace(/\s+/g, ' ');
+    expect(text).to.include('Audio Transcription Agent');
+    expect(text).to.include(
+      'Preloop does not verify the consent basis you supply.'
+    );
+    expect(text).to.not.include('The agent fetches one recording');
+    expect(text).to.include('4 tools');
+    expect(text).to.not.include('Tracker');
+    expect(row.querySelector('sl-icon')!.getAttribute('name')).to.equal('mic');
+  });
+
+  it('is found by searching for transcript or consent', async () => {
+    const el = await fixture<PreloopFlowPresetPicker>(
+      html`<preloop-flow-preset-picker
+        .presets=${[...CATALOG, AUDIO_PRESET]}
+      ></preloop-flow-preset-picker>`
+    );
+    const search = el.shadowRoot!.querySelector('sl-input') as SlInput;
+    for (const query of ['transcript', 'consent']) {
+      search.value = query;
+      search.dispatchEvent(new CustomEvent('sl-input', { bubbles: true }));
+      await el.updateComplete;
+      expect(
+        el.shadowRoot!.querySelector('[data-preset-id="preset-020"]'),
+        query
+      ).to.exist;
+    }
   });
 });

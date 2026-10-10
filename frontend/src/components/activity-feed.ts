@@ -1,3 +1,4 @@
+import { formatUsd } from '../utils/money';
 import { LitElement, css, html, nothing, unsafeCSS } from 'lit';
 import { customElement, property, state } from 'lit/decorators.js';
 import { repeat } from 'lit/directives/repeat.js';
@@ -29,6 +30,8 @@ import {
 } from '../utils/execution-subject';
 import './attribution-line';
 import type { AttributionSource } from './attribution-line';
+import './repository-chip';
+import { getApprovalRepository } from '../utils/approval-identity';
 
 export type FeedTone = 'success' | 'warning' | 'danger' | 'neutral';
 
@@ -290,6 +293,7 @@ const CONFIG_LABELS: Record<string, string> = {
   flow: 'Flow',
   api_key: 'API key',
   budget_policy: 'Budget',
+  policy: 'Policy',
 };
 
 function toneFromOutcome(outcome: string | undefined): FeedTone {
@@ -308,12 +312,6 @@ function toneFromOutcome(outcome: string | undefined): FeedTone {
     default:
       return 'neutral';
   }
-}
-
-function money(value: unknown): string {
-  const amount = Number(value || 0);
-  if (!amount) return '';
-  return `$${amount.toFixed(2)}`;
 }
 
 /** One field, or nothing at all: a body of "Server: -" says less than no row. */
@@ -529,7 +527,12 @@ export function feedEventFromAuditGroup(
             firstNumber(details, ['latency_ms', 'duration_ms', 'elapsed_ms'])
           )
         ),
-        field('Cost', money(details.cost_usd || details.total_cost)),
+        field(
+          'Cost',
+          Number(details.cost_usd || details.total_cost)
+            ? formatUsd(Number(details.cost_usd || details.total_cost))
+            : ''
+        ),
         field('Error', firstErrorLine(details.error || details.message), {
           wide: true,
         })
@@ -667,7 +670,7 @@ export function feedEventFromAuditGroup(
     case 'configuration_change': {
       const kind = String(details.config_type || event.resource_id || '');
       const label = CONFIG_LABELS[kind] || humaniseAction(kind) || 'Setting';
-      const action = String(details.action || 'changed');
+      const action = String(details.action || 'changed').replace(/_/g, ' ');
       const name =
         (details.new_value && typeof details.new_value === 'object'
           ? details.new_value.name
@@ -904,9 +907,17 @@ export function feedEventFromRealtime(
         ),
         field(
           '$ est.',
-          money(
+          Number(
             payload.total_cost_usd || payload.cost_usd || payload.total_cost
           )
+            ? formatUsd(
+                Number(
+                  payload.total_cost_usd ||
+                    payload.cost_usd ||
+                    payload.total_cost
+                )
+              )
+            : ''
         ),
         field(
           'Tool calls',
@@ -1042,7 +1053,7 @@ export function feedEventFromRealtime(
       ? budget.account_limit_usd || budget.flow_limit_usd
       : budget.account_soft_limit_usd || budget.flow_soft_limit_usd;
     const period = lookups.budgetPeriod(limit);
-    const amount = money(limit);
+    const amount = Number(limit) ? formatUsd(Number(limit)) : '';
     const words = `${period ? `${period} budget` : 'Budget'} ${
       hard ? 'hard' : 'soft'
     } limit reached`;
@@ -1065,11 +1076,19 @@ export function feedEventFromRealtime(
         field('Limit', amount),
         field(
           'Spend',
-          money(
+          Number(
             budget.current_spend_usd ||
               budget.account_spend_usd ||
               budget.flow_spend_usd
           )
+            ? formatUsd(
+                Number(
+                  budget.current_spend_usd ||
+                    budget.account_spend_usd ||
+                    budget.flow_spend_usd
+                )
+              )
+            : ''
         ),
         field('Scope', budget.flow_limit_usd ? 'Flow' : 'Account')
       ),
@@ -1108,7 +1127,12 @@ export function feedEventFromRealtime(
           'Latency',
           millisText(firstNumber(payload, ['latency_ms', 'duration_ms']))
         ),
-        field('Cost', money(payload.cost_usd || payload.total_cost)),
+        field(
+          'Cost',
+          Number(payload.cost_usd || payload.total_cost)
+            ? formatUsd(Number(payload.cost_usd || payload.total_cost))
+            : ''
+        ),
         field('Error', firstErrorLine(payload.error || payload.message), {
           wide: true,
         })
@@ -1559,6 +1583,10 @@ export class ActivityFeed extends LitElement {
 
       /* Who asked reads first, above the facts about what they asked for. */
       .body-attribution {
+        margin-bottom: var(--sl-spacing-x-small);
+      }
+
+      .body-repository {
         margin-bottom: var(--sl-spacing-x-small);
       }
 
@@ -2101,6 +2129,15 @@ export class ActivityFeed extends LitElement {
                 class="body-attribution"
                 .source=${event.attribution}
               ></attribution-line>`
+            : nothing
+        }
+        ${
+          event.attribution &&
+          getApprovalRepository(event.attribution.tool_args)
+            ? html`<repository-chip
+                class="body-repository"
+                .toolArgs=${event.attribution.tool_args}
+              ></repository-chip>`
             : nothing
         }
         <dl class="fields">

@@ -1,3 +1,7 @@
+import { ConsoleStatus } from '../../controllers/console-status';
+
+import { editionOf } from '../../capabilities';
+import type { Edition } from '../../api';
 import { css, html, nothing, unsafeCSS } from 'lit';
 import { customElement, state } from 'lit/decorators.js';
 import { repeat } from 'lit/directives/repeat.js';
@@ -30,10 +34,11 @@ import {
   getBudgetPolicies,
   BudgetPolicy,
   getFlowExecutions,
-  getFlows,
+  getFlowSummaries,
   getIssueCount,
   getMCPServers,
-  getTools,
+  getToolsSummary,
+  type ToolSummary,
   getTrackers,
   getUsers,
   getFeatures,
@@ -83,7 +88,6 @@ import {
   pickDefaultModel,
   selectableModels,
 } from '../../utils/ai-model-selection';
-import type { Tool } from '../../components/tool-card';
 import type {
   InventoryAgentRow,
   InventoryFlowRow,
@@ -277,6 +281,7 @@ interface DashboardMetric {
 
 @customElement('dashboard-view')
 export class DashboardView extends AuthedElement {
+  private readonly accessibilityStatus = new ConsoleStatus(this);
   @state() private loading = true;
   @state() private fetchingGatewaySummary = true;
   /**
@@ -333,7 +338,7 @@ export class DashboardView extends AuthedElement {
   @state() private trackers: Tracker[] = [];
   @state() private totalIssues = 0;
   @state() private mcpServers: MCPServer[] = [];
-  @state() private tools: Tool[] = [];
+  @state() private tools: ToolSummary[] = [];
   @state() private flowExecutions: FlowExecution[] = [];
   /** Flow ids and names, so the Inventory lists flows that never ran. */
   @state() private flows: Array<{ id: string; name: string }> = [];
@@ -398,7 +403,7 @@ export class DashboardView extends AuthedElement {
   @state() private aiModelOverview: AIModelOverviewItem[] = [];
   @state() private isInviteDialogOpen = false;
   @state() private computeFeatureEnabled = false;
-  @state() private isEnterprise = false;
+  @state() private edition: Edition = 'oss';
   @state() private isAdmin = false;
 
   @state() private budgetPolicies: BudgetPolicy[] = [];
@@ -442,6 +447,7 @@ export class DashboardView extends AuthedElement {
 
   private unsubscribeRealtime?: () => void;
   private refreshInFlight = false;
+  private dashboardLoadGeneration = 0;
   private queuedDashboardRefresh: { preserveLoadingState?: boolean } | null =
     null;
   private topicRefreshesInFlight = new Set<string>();
@@ -750,7 +756,7 @@ export class DashboardView extends AuthedElement {
         border-color: var(--sl-color-neutral-200);
       }
       .attention-strip.low-only .attention-strip-icon {
-        color: var(--sl-color-neutral-500);
+        color: var(--console-meta-color);
       }
       .attention-strip.low-only .attention-strip-count {
         color: var(--sl-color-neutral-700);
@@ -779,7 +785,7 @@ export class DashboardView extends AuthedElement {
         text-decoration: underline;
       }
       .next-step-mark {
-        color: var(--sl-color-neutral-400);
+        color: var(--console-meta-color);
         flex-shrink: 0;
         font-size: 16px;
       }
@@ -1486,11 +1492,11 @@ export class DashboardView extends AuthedElement {
       const res = await getFeatures();
       this.computeFeatureEnabled = !!res.features?.['compute'];
       this.userManagementEnabled = !!res.features?.['user_management'];
-      this.isEnterprise = Array.isArray(res.plugins) && res.plugins.length > 0;
+      this.edition = editionOf(res);
       return res;
     } catch {
       this.computeFeatureEnabled = false;
-      this.isEnterprise = false;
+      this.edition = 'oss';
       this.userManagementEnabled = false;
       return null;
     } finally {
@@ -1500,6 +1506,7 @@ export class DashboardView extends AuthedElement {
 
   disconnectedCallback(): void {
     super.disconnectedCallback();
+    ++this.dashboardLoadGeneration;
     this.pendingTopicRefreshes.clear();
     this.queuedDashboardRefresh = null;
     this.unsubscribeRealtime?.();
@@ -1716,10 +1723,14 @@ export class DashboardView extends AuthedElement {
   }
 
   private loadDismissedState(): void {
-    this.welcomeCardDismissed =
-      localStorage.getItem('dashboard_welcome_dismissed') === 'true';
-    this.nextStepsDismissed =
-      localStorage.getItem(NEXT_STEPS_DISMISSED_KEY) === 'true';
+    try {
+      this.welcomeCardDismissed =
+        localStorage.getItem('dashboard_welcome_dismissed') === 'true';
+      this.nextStepsDismissed =
+        localStorage.getItem(NEXT_STEPS_DISMISSED_KEY) === 'true';
+    } catch {
+      // Blocked storage: nothing was remembered, so nothing is dismissed.
+    }
   }
 
   /**
@@ -1789,11 +1800,14 @@ export class DashboardView extends AuthedElement {
 
   private dismissWelcomeCard(): void {
     this.welcomeCardDismissed = true;
-    // Only persist the dismissal once at least one agent is onboarded, so a
-    // stray click can't permanently erase onboarding guidance for a user who
-    // still has zero agents (session-only dismissal until then).
-    if (this.managedAgents.length > 0) {
+    // Always remembered. The takeover replaces the whole Overview, so a
+    // dismissal that only lasted the visit brought it back full-screen on
+    // every return for an admin who starts with policies, models or teams
+    // and onboards agents later. The Next steps card still tracks progress.
+    try {
       localStorage.setItem('dashboard_welcome_dismissed', 'true');
+    } catch {
+      // Private mode: dismissed for this visit only.
     }
   }
 
@@ -2029,7 +2043,7 @@ export class DashboardView extends AuthedElement {
   /** What a flow execution event can change. */
   private async refreshFlowRuns(): Promise<void> {
     const [flows, flowExecutions] = await Promise.all([
-      this.catchWith403Handling(getFlows(), [] as any[]),
+      this.catchWith403Handling(getFlowSummaries(), [] as any[]),
       this.catchWith403Handling(
         getFlowExecutions({ limit: FLOW_EXECUTIONS_PAGE_SIZE }),
         [] as FlowExecution[]
@@ -2081,7 +2095,7 @@ export class DashboardView extends AuthedElement {
 
   /** The same boundary as `getGatewayStartDate()`, as epoch milliseconds. */
   private getGatewayStartMs(): number {
-    return new Date(this.getGatewayStartDate()).getTime();
+    return parseUTCDate(this.getGatewayStartDate()).getTime();
   }
 
   /**
@@ -2093,7 +2107,7 @@ export class DashboardView extends AuthedElement {
     startDate: string;
     endDate: string;
   } {
-    const start = new Date(startDateStr).getTime();
+    const start = parseUTCDate(startDateStr).getTime();
     const span = Date.now() - start;
     return {
       startDate: new Date(start - span).toISOString(),
@@ -2210,6 +2224,7 @@ export class DashboardView extends AuthedElement {
       return;
     }
     this.refreshInFlight = true;
+    const generation = ++this.dashboardLoadGeneration;
     this.lastFetchStartedAt = Date.now();
     markOverviewTiming('overview-fetch-start');
 
@@ -2263,7 +2278,23 @@ export class DashboardView extends AuthedElement {
             includeBreakdown: false,
           }),
           null
-        ),
+        ).then((summary) => {
+          if (
+            this.isConnected &&
+            generation === this.dashboardLoadGeneration &&
+            range === this.gatewayTimeRange
+          ) {
+            this.gatewaySummary = mergeGatewaySummaryPreservingBreakdown(
+              this.gatewayUsageRange === range ? this.gatewaySummary : null,
+              summary
+            );
+            if (this.gatewayUsageRange !== range) this.gatewayUsageRange = null;
+            this.fetchingGatewaySummary = false;
+            this.updatingUsage = false;
+            this.loading = false;
+          }
+          return summary;
+        }),
         this.catchWith403Handling(
           getAccountGatewayUsageSummary({
             startDate: priorWindow.startDate,
@@ -2281,7 +2312,19 @@ export class DashboardView extends AuthedElement {
         this.catchWith403Handling(
           this.fetchApprovalRequests('pending', 100),
           [] as ApprovalRequest[]
-        ),
+        ).then((approvals) => {
+          if (
+            !this.isConnected ||
+            generation !== this.dashboardLoadGeneration ||
+            range !== this.gatewayTimeRange
+          )
+            return approvals;
+          this.pendingApprovals = approvals.filter((approval) =>
+            this.isUnexpiredPendingApproval(approval)
+          );
+          this.fetchingApprovals = false;
+          return approvals;
+        }),
         // Above the fold a session answers one question - has anything ever
         // run on this account - so a short page is enough. The attention
         // loader asks for the window and the depth its rules need.
@@ -2294,22 +2337,53 @@ export class DashboardView extends AuthedElement {
           {
             items: [],
           } as unknown as Awaited<ReturnType<typeof getAccountRuntimeSessions>>
-        ),
+        ).then((sessions) => {
+          if (
+            !this.isConnected ||
+            generation !== this.dashboardLoadGeneration ||
+            range !== this.gatewayTimeRange
+          )
+            return sessions;
+          this.runtimeSessions = sessions.items || [];
+          this.totalRuntimeSessionsCount =
+            sessions.total ?? this.runtimeSessions.length;
+          return sessions;
+        }),
         this.catchWith403Handling(
           getAccountAgents({ status: 'all', limit: 100 }),
           {
             items: [],
             total: 0,
           } as unknown as Awaited<ReturnType<typeof getAccountAgents>>
-        ),
+        ).then((agents) => {
+          if (
+            !this.isConnected ||
+            generation !== this.dashboardLoadGeneration ||
+            range !== this.gatewayTimeRange
+          )
+            return agents;
+          this.applyAgentsList(agents);
+          this.fetchingAgents = false;
+          return agents;
+        }),
         this.fetchFeatures(),
       ]);
       await adminPromise;
+      if (
+        !this.isConnected ||
+        generation !== this.dashboardLoadGeneration ||
+        range !== this.gatewayTimeRange
+      )
+        return;
 
-      // One batch of assignments with no await between them, so Lit renders
-      // the finished fold once instead of eight times.
+      // The sections above hydrate independently; keep one final snapshot
+      // for the shared cache and deferred inputs.
       this.rateLimitReport = rateLimitReport;
-      if (range === this.gatewayTimeRange) {
+      if (
+        this.isConnected &&
+        generation === this.dashboardLoadGeneration &&
+        range === this.gatewayTimeRange
+      ) {
         this.gatewaySummary = mergeGatewaySummaryPreservingBreakdown(
           this.gatewayUsageRange === range ? this.gatewaySummary : null,
           gatewaySummary
@@ -2350,6 +2424,12 @@ export class DashboardView extends AuthedElement {
         range,
       });
     } catch (error) {
+      if (
+        !this.isConnected ||
+        generation !== this.dashboardLoadGeneration ||
+        range !== this.gatewayTimeRange
+      )
+        return;
       console.error(
         'Failed to complete background loading of overview dashboard',
         error
@@ -2408,6 +2488,7 @@ export class DashboardView extends AuthedElement {
     // The policies are one of the attention inputs, so this is the one place
     // that does wait for them.
     await this.budgetReady.catch(() => undefined);
+    if (!this.isConnected) return;
     // Attention always uses its own rolling 30-day window. The Overview
     // "month" range is a calendar month, which is not the same 30 days.
     await this.refreshAttentionInputs();
@@ -2480,7 +2561,10 @@ export class DashboardView extends AuthedElement {
   private async fetchFlowsList(): Promise<void> {
     this.fetchingFlows = true;
     try {
-      const flows = await this.catchWith403Handling(getFlows(), [] as any[]);
+      const flows = await this.catchWith403Handling(
+        getFlowSummaries(),
+        [] as any[]
+      );
       this.applyFlows(flows);
     } catch (error) {
       console.error('Failed to load the flows list', error);
@@ -2504,7 +2588,7 @@ export class DashboardView extends AuthedElement {
   private async fetchToolsList(): Promise<void> {
     this.fetchingTools = true;
     try {
-      const tools = await this.catchWith403Handling(getTools(), [] as Tool[]);
+      const tools = await this.catchWith403Handling(getToolsSummary(), []);
       this.applyToolsList(tools);
     } catch (error) {
       console.error('Failed to load the tools list', error);
@@ -2532,7 +2616,7 @@ export class DashboardView extends AuthedElement {
     this.aiModelsCount = this.aiModels.length;
   }
 
-  private applyToolsList(tools: Tool[]): void {
+  private applyToolsList(tools: ToolSummary[]): void {
     this.tools = tools || [];
   }
 
@@ -2585,8 +2669,8 @@ export class DashboardView extends AuthedElement {
   private applyFlowExecutions(flowExecutions: FlowExecution[]): void {
     const sorted = [...(flowExecutions || [])].sort(
       (left, right) =>
-        new Date(right.start_time).getTime() -
-        new Date(left.start_time).getTime()
+        parseUTCDate(right.start_time).getTime() -
+        parseUTCDate(left.start_time).getTime()
     );
     this.flowExecutionsCount = sorted.length;
     this.failedExecutionsCount = sorted.filter(
@@ -2896,7 +2980,7 @@ export class DashboardView extends AuthedElement {
       .sort((left, right) => {
         const leftTs = left.last_activity_at || left.started_at;
         const rightTs = right.last_activity_at || right.started_at;
-        return new Date(rightTs).getTime() - new Date(leftTs).getTime();
+        return parseUTCDate(rightTs).getTime() - parseUTCDate(leftTs).getTime();
       });
   }
 
@@ -2910,10 +2994,6 @@ export class DashboardView extends AuthedElement {
     return this.flowExecutions.filter(
       (execution) => execution.status === 'FAILED'
     );
-  }
-
-  private formatCurrency(value: number | null | undefined): string {
-    return `$${(value || 0).toFixed(2)}`;
   }
 
   private formatNumber(value: number | null | undefined): string {
@@ -3228,6 +3308,7 @@ export class DashboardView extends AuthedElement {
 
         <img
           src="/assets/preloop-badge.svg"
+          alt=""
           style="width: 56px; height: 56px; margin-bottom: var(--sl-spacing-small); margin-top: var(--sl-spacing-small); border-radius: var(--sl-border-radius-medium);"
         />
 
@@ -3247,7 +3328,7 @@ export class DashboardView extends AuthedElement {
                   .aiModels=${this.aiModels}
                   .modelsFromHost=${true}
                   .computeFeatureEnabled=${this.computeFeatureEnabled}
-                  .isEnterprise=${this.isEnterprise}
+                  .edition=${this.edition}
                   .isAdmin=${this.isAdmin}
                   hide-cancel
                   @deploy-agent-success=${this.handleDeployAgentSuccess}

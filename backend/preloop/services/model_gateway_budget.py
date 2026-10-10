@@ -7,7 +7,6 @@ from datetime import datetime, timezone
 import math
 from typing import Any, Dict, Optional
 
-from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
 from preloop.config import settings
@@ -22,12 +21,18 @@ from preloop.models.crud.plan import subscription as crud_subscription
 from preloop.models.models.ai_model import AIModel
 from preloop.models.models.flow import Flow
 from preloop.services.model_allowlist import (
+    MODEL_NOT_ALLOWED_ERROR_CODE,
     allowlist_permits_model,
     format_model_not_allowed_detail,
     normalize_allowed_models,
     requested_model_label,
 )
 from preloop.services.model_gateway_auth import ModelGatewayAuthContext
+from preloop.services.model_gateway_denials import (
+    BUDGET_LIMIT_EXCEEDED_CODE,
+    budget_denial_error,
+)
+from preloop.services.model_gateway_errors import GatewayProvider, ModelGatewayAPIError
 from preloop.services.model_pricing import estimate_ai_model_usage_cost
 from preloop.services.model_runtime_resolver import gateway_model_alias_candidates
 from preloop.services.subject_governance import (
@@ -116,12 +121,18 @@ class ModelGatewayBudgetService:
         self, ai_model: AIModel, payload: Dict[str, Any]
     ) -> BudgetCheckResult:
         """Check whether a gateway request can proceed within configured budgets."""
-        account = crud_account.get(self.db, id=self.auth_context.user.account_id)
+        account = crud_account.get(self.db, id=self.auth_context.account_id)
         subject_context = (
             build_subject_context_from_api_key(self.auth_context.api_key)
             if self.auth_context.api_key
             else {}
         )
+        gateway_subject = getattr(self.auth_context, "gateway_subject", None)
+        if gateway_subject is not None:
+            subject_context = {
+                **subject_context,
+                "gateway_subject_id": str(gateway_subject.id),
+            }
 
         estimated_request_cost = self._estimate_request_cost(
             ai_model,
@@ -140,6 +151,23 @@ class ModelGatewayBudgetService:
         governed_model_spellings = self._governed_model_spellings(ai_model, payload)
         denied_allowed_models: Optional[list[str]] = None
 
+        from preloop.models.crud.resource_share import crud_resource_share
+
+        owner_config = crud_resource_share.shared_agent_governance(
+            self.db,
+            account_id=self.auth_context.account_id,
+            agent_id=subject_context.get("managed_agent_id"),
+        )
+        owner_allowed = normalize_allowed_models(owner_config.get("allowed_models"))
+        if owner_allowed and not allowlist_permits_model(
+            owner_allowed,
+            ai_model,
+            requested_spellings=governed_model_spellings,
+        ):
+            hard_limit_exceeded = True
+            enforcement_reason = "subject_model_not_allowed"
+            denied_allowed_models = owner_allowed
+
         # 1. Check subject allowed models. Every scope in the chain (API key,
         # then managed agent) must permit the resolved model; an entry may be
         # a gateway alias, an AIModel id, or an AIModel display name (the
@@ -147,7 +175,7 @@ class ModelGatewayBudgetService:
         # allowlist that names neither the resolved model nor any of its
         # spellings denies the request, including the degenerate case where
         # the request names no model at all.
-        if account is not None:
+        if account is not None and not hard_limit_exceeded:
             for subject_type, subject_id in subject_scope_chain(subject_context):
                 config = get_subject_governance(
                     account.meta_data or {},
@@ -173,10 +201,11 @@ class ModelGatewayBudgetService:
 
         # 2. Check trial mode limitation
         subscription = crud_subscription.get_active_for_account(
-            self.db, account_id=str(self.auth_context.user.account_id)
+            self.db, account_id=str(self.auth_context.account_id)
         )
         if (
-            subscription
+            not hard_limit_exceeded
+            and subscription
             and is_live_trial(subscription)
             and self._is_built_in_hosted_model(ai_model)
         ):
@@ -184,7 +213,7 @@ class ModelGatewayBudgetService:
                 float(settings.billing_trial_hosted_model_hard_cap_usd), 0.0
             )
             trial_hosted_model_current_spend_usd = self._get_trial_hosted_model_spend(
-                account_id=str(self.auth_context.user.account_id),
+                account_id=str(self.auth_context.account_id),
                 start=subscription.current_period_start,
                 end=subscription.current_period_end or datetime.now(timezone.utc),
             )
@@ -204,7 +233,8 @@ class ModelGatewayBudgetService:
                 hard_limit_exceeded = True
                 enforcement_reason = "trial_hosted_model_budget_exceeded"
         elif (
-            subscription is None
+            not hard_limit_exceeded
+            and subscription is None
             and settings.billing_enforce_entitlements
             and self._is_built_in_hosted_model(ai_model)
         ):
@@ -219,7 +249,7 @@ class ModelGatewayBudgetService:
             now = datetime.now(timezone.utc)
             month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
             trial_hosted_model_current_spend_usd = self._get_trial_hosted_model_spend(
-                account_id=str(self.auth_context.user.account_id),
+                account_id=str(self.auth_context.account_id),
                 start=month_start,
                 end=now,
             )
@@ -264,9 +294,26 @@ class ModelGatewayBudgetService:
         )
 
     def enforce_or_raise(
-        self, ai_model: AIModel, payload: Dict[str, Any]
+        self,
+        ai_model: AIModel,
+        payload: Dict[str, Any],
+        *,
+        provider: GatewayProvider = "openai",
     ) -> BudgetCheckResult:
-        """Run the preflight check and raise if a hard limit is exceeded."""
+        """Run the preflight check and raise if a hard limit is exceeded.
+
+        Args:
+            ai_model: Model the request resolved to.
+            payload: Request body.
+            provider: Gateway router format for the error body.
+
+        Returns:
+            The preflight result when no hard limit is exceeded.
+
+        Raises:
+            BudgetDenialError: 429 for every spend reason (#1447).
+            ModelGatewayAPIError: 403 for a model allowlist denial (policy).
+        """
         result = self.preflight_check(ai_model, payload)
         if result.hard_limit_exceeded:
             detail = "Model gateway budget exceeded"
@@ -298,15 +345,22 @@ class ModelGatewayBudgetService:
             if result.reset_at:
                 detail += f", try again at {result.reset_at.isoformat()}"
 
-            headers = {}
+            if result.enforcement_reason == "subject_model_not_allowed":
+                raise ModelGatewayAPIError(
+                    provider=provider,
+                    status_code=403,
+                    message=detail,
+                    code=MODEL_NOT_ALLOWED_ERROR_CODE,
+                )
+            reset_seconds = None
             if result.reset_at:
-                retry_after = max(
+                reset_seconds = max(
                     int((result.reset_at - datetime.now(timezone.utc)).total_seconds()),
                     1,
                 )
-                headers["Retry-After"] = str(retry_after)
-
-            raise HTTPException(status_code=403, detail=detail, headers=headers)
+            raise budget_denial_error(
+                provider, BUDGET_LIMIT_EXCEEDED_CODE, detail, reset_seconds
+            )
         return result
 
     @staticmethod
@@ -417,7 +471,7 @@ class ModelGatewayBudgetService:
         return crud_flow.get(
             self.db,
             id=flow_id,
-            account_id=self.auth_context.user.account_id,
+            account_id=self.auth_context.account_id,
         )
 
     def _estimate_request_cost(
@@ -464,7 +518,10 @@ class ModelGatewayBudgetService:
         self, ai_model: AIModel, payload: Dict[str, Any]
     ) -> Optional[Dict[str, Any]]:
         """Return account pricing override for preflight cost estimates."""
-        from preloop.services.pricing_overrides import resolve_pricing_override
+        from preloop.services.pricing_overrides import (
+            pricing_account_id,
+            resolve_pricing_override,
+        )
 
         raw_model = payload.get("model")
         requested_alias = None
@@ -477,7 +534,7 @@ class ModelGatewayBudgetService:
 
         return resolve_pricing_override(
             self.db,
-            account_id=self.auth_context.user.account_id,
+            account_id=pricing_account_id(self.auth_context.account_id, ai_model),
             ai_model=ai_model,
             requested_alias=requested_alias,
         )

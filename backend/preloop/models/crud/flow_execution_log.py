@@ -1,6 +1,6 @@
 import uuid
 from datetime import datetime
-from typing import List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 from sqlalchemy import select, tuple_
 from sqlalchemy.dialects.postgresql import insert
@@ -9,6 +9,98 @@ from sqlalchemy.orm import Session
 from preloop.models import models
 from preloop.utils.secret_scrubbing import scrub_secrets, scrub_structure
 from .base import CRUDBase
+
+#: Longest message stored for one log line. Agent streams can emit one huge
+#: line of binary garbage on a disconnect; the tail is not useful.
+MAX_LOG_MESSAGE_CHARS = 65536
+_TRUNCATION_MARKER = " [truncated]"
+
+
+def _clean_text(value: str) -> str:
+    """Replace NUL, which PostgreSQL text and JSONB reject, and cap length."""
+    if "\x00" in value:
+        value = value.replace("\x00", "\ufffd")
+    if len(value) > MAX_LOG_MESSAGE_CHARS:
+        keep = MAX_LOG_MESSAGE_CHARS - len(_TRUNCATION_MARKER)
+        value = value[:keep] + _TRUNCATION_MARKER
+    return value
+
+
+def _clean_structure(value: Any) -> Any:
+    """Apply :func:`_clean_text` to every string key and value."""
+    if isinstance(value, str):
+        return _clean_text(value)
+    if isinstance(value, dict):
+        return {
+            _clean_text(k) if isinstance(k, str) else k: _clean_structure(v)
+            for k, v in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_clean_structure(item) for item in value]
+    return value
+
+
+def storable_log_message(message: Any, account_id: Any = None) -> Any:
+    """Scrub secrets, drop NUL and cap the length of one log message.
+
+    The single persistence gate for log messages (#173, #1196). With an
+    ``account_id`` the account's redact rules run after the credential
+    scrub (#1123).
+    """
+    message = scrub_secrets(message)
+    if account_id is not None and isinstance(message, str) and message:
+        from preloop.services.sensitive_data.storage import apply_storage_redaction
+
+        message = apply_storage_redaction(account_id, message)
+    return _clean_text(message) if isinstance(message, str) else message
+
+
+def storable_log_metadata(metadata: Any, account_id: Any = None) -> Any:
+    """Scrub secrets, drop NUL and cap every string in log metadata."""
+    if not metadata:
+        return None
+    scrubbed = scrub_structure(metadata)
+    if account_id is not None:
+        from preloop.services.sensitive_data.storage import apply_storage_redaction
+
+        scrubbed = apply_storage_redaction(account_id, scrubbed)
+    return _clean_structure(scrubbed)
+
+
+_execution_accounts: Dict[str, Optional[str]] = {}
+_EXECUTION_ACCOUNT_CACHE_LIMIT = 4096
+
+
+def _account_for_execution(db: Session, execution_id: Any) -> Optional[str]:
+    """Account that owns a flow execution, cached per process.
+
+    Log rows carry only the execution id; the owning account never changes,
+    so one lookup per execution is enough.
+    """
+    key = str(execution_id)
+    cached = _execution_accounts.get(key)
+    if cached is not None:
+        return cached
+    account_id: Optional[str] = None
+    try:
+        # The execution row carries no account; its flow does.
+        row = db.execute(
+            select(models.Flow.account_id)
+            .join(models.FlowExecution, models.FlowExecution.flow_id == models.Flow.id)
+            .where(models.FlowExecution.id == uuid.UUID(key))
+        ).first()
+        if row is not None and row[0] is not None:
+            account_id = str(row[0])
+    except Exception:  # noqa: BLE001 - redaction degrades, the log is kept
+        account_id = None
+    if account_id is None:
+        # A miss or a transient error is retried on the next log line; only
+        # a successful lookup is remembered.
+        return None
+    if len(_execution_accounts) >= _EXECUTION_ACCOUNT_CACHE_LIMIT:
+        _execution_accounts.clear()
+    _execution_accounts[key] = account_id
+    return account_id
 
 
 class CRUDFlowExecutionLog(CRUDBase[models.FlowExecutionLog]):
@@ -51,10 +143,15 @@ class CRUDFlowExecutionLog(CRUDBase[models.FlowExecutionLog]):
         desc: bool = False,
         skip: int = 0,
         limit: Optional[int] = None,
+        log_types: Optional[Sequence[str]] = None,
     ) -> List[models.FlowExecutionLog]:
         query = select(models.FlowExecutionLog).filter(
             models.FlowExecutionLog.execution_id == execution_id,
         )
+        if log_types is not None:
+            # Filter in SQL so the tail counts only the requested rows: a long
+            # run's agent log lines must not push its model calls out of it.
+            query = query.filter(models.FlowExecutionLog.log_type.in_(log_types))
 
         if desc:
             query = query.order_by(models.FlowExecutionLog.timestamp.desc())
@@ -121,7 +218,9 @@ class CRUDFlowExecutionLog(CRUDBase[models.FlowExecutionLog]):
 
         Callers retain each entry's ``_persistence_id`` across retries, including
         retries after an ambiguous commit failure. Conflicting IDs are already
-        persisted and must not create duplicate events.
+        persisted and must not create duplicate events. NUL bytes are
+        replaced and long messages capped so one bad line cannot fail the
+        whole batch.
         """
         if not batch:
             return
@@ -137,8 +236,12 @@ class CRUDFlowExecutionLog(CRUDBase[models.FlowExecutionLog]):
                     "id": uuid.UUID(log_data["_persistence_id"]),
                     "execution_id": uuid.UUID(execution_id),
                     "log_type": log_data.get("type", "log"),
-                    "message": scrub_secrets(message),
-                    "metadata": scrub_structure(metadata) if metadata else None,
+                    "message": storable_log_message(
+                        message, _account_for_execution(db, execution_id)
+                    ),
+                    "metadata": storable_log_metadata(
+                        metadata, _account_for_execution(db, execution_id)
+                    ),
                 }
             )
         statement = insert(models.FlowExecutionLog.__table__).values(rows)
@@ -165,8 +268,12 @@ class CRUDFlowExecutionLog(CRUDBase[models.FlowExecutionLog]):
         log_entry = models.FlowExecutionLog(
             execution_id=execution_id,
             log_type=log_data.get("type", "log"),
-            message=scrub_secrets(message),
-            metadata_=scrub_structure(metadata) if metadata else None,
+            message=storable_log_message(
+                message, _account_for_execution(db, execution_id)
+            ),
+            metadata_=storable_log_metadata(
+                metadata, _account_for_execution(db, execution_id)
+            ),
         )
         db.add(log_entry)
         if commit:

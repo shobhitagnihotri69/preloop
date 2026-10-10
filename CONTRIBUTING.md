@@ -27,6 +27,42 @@ All new features and bug fixes should include tests when practical.
 - Backend: `pytest`
 - Frontend: `cd frontend && npm run test`
 
+## Guide pages
+
+Pages under `docs/guide/` document shipped behaviour. A findings page or a
+design note records observations or a proposed design, and has to say so
+before any other body text. Start the file with:
+
+```yaml
+---
+status: non-normative
+---
+```
+
+The first line after the title is:
+
+> **Status: findings / design note. Not shipped behaviour.** This page records observations or a proposed design. Nothing here is a product capability unless a linked release note says so.
+
+These pages stay in `docs/guide/` with that banner. Moving them under
+`docs/design/` or `docs/findings/` is a separate change.
+
+## Documentation site
+
+docs.preloop.ai is built from this repository: `mkdocs.yml` at the root,
+pages under `docs/`. Preview and check a change with:
+
+```bash
+pip install --require-hashes -r requirements/docs.txt
+mkdocs serve             # http://127.0.0.1:8000
+mkdocs build --strict    # what CI runs
+```
+
+Every page has an `Editions:` line directly under its title. The default is
+"Unless stated otherwise, everything on this page ships in OSS". Wrap a
+paragraph that applies only to Cloud and Enterprise in a
+`!!! cloud "Cloud and Enterprise"` admonition. On a non-normative page the
+status banner comes first and the `Editions:` line follows it.
+
 ## Submitting Changes
 
 1. Fork the repository and create a feature branch.
@@ -34,3 +70,9 @@ All new features and bug fixes should include tests when practical.
 3. Open a GitHub pull request with a clear description of the change.
 
 Pull requests are reviewed by a core contributor before merge.
+
+Preloop also reviews its own pull requests with the Pull Request Reviewer
+flow. For pull requests from forks, that automated review does not start
+until a maintainer has read the change and added the `preloop-review`
+label; a maintainer may also skip it with `preloop-skip-review`. Do not
+wait for the bot before asking for a human review.

@@ -1,5 +1,7 @@
 # Windows code signing (SignPath Foundation)
 
+Editions: OSS, Cloud, Enterprise. Unless stated otherwise, everything on this page ships in OSS.
+
 > **Code signing policy (user-facing):** see
 > [code-signing-policy.md](./code-signing-policy.md).
 > Free code signing provided by [SignPath.io](https://about.signpath.io/),
@@ -7,8 +9,20 @@
 
 Preloop’s release workflow can Authenticode-sign Windows CLI binaries via
 [SignPath Foundation](https://signpath.org/) (free for open-source projects).
-Signing is **optional until credentials are configured**: releases still
-may publish unsigned binaries, but the required Defender validation must pass.
+
+Current state, precisely:
+
+- The CI wiring is complete; signing activates the moment the SignPath
+  secrets and variables (step 3 below) exist on the repository.
+- Until then releases publish **unsigned** Windows binaries, and the
+  required Defender validation must still pass before anything is released.
+- The repository variable `SIGNPATH_SIGNING_REQUIRED` controls whether that
+  fallback is allowed. While unset (or not `true`), a missing credential
+  produces a warning and an unsigned release. Once set to `true`, the
+  `Check SignPath configuration` step **fails the release** when the
+  SignPath secrets/vars are absent, so signing cannot silently regress.
+  Set it as part of step 4 below, after the first signed release is
+  verified; do not set it before SignPath approval, or every release fails.
 
 CI wiring lives in `.github/workflows/release.yml` (`sign-windows-cli` job)
 and `.signpath/artifact-configurations/windows-cli.xml`.
@@ -25,7 +39,7 @@ Once SignPath secrets/vars are present on `preloop/preloop`:
 
 No private key is stored in GitHub. SignPath holds the certificate on an HSM.
 
-## Manual steps (required once — maintainers)
+## Manual steps (required once: maintainers)
 
 These cannot be done from the codebase alone.
 
@@ -50,7 +64,7 @@ After approval, in the SignPath UI:
 4. Install the **SignPath GitHub App** on the `preloop` org / repo when prompted
 5. Add an **Artifact Configuration**:
    - Slug: `windows-cli`
-   - XML: copy from [`.signpath/artifact-configurations/windows-cli.xml`](../.signpath/artifact-configurations/windows-cli.xml)
+   - XML: copy from [`.signpath/artifact-configurations/windows-cli.xml`](https://github.com/preloop/preloop/blob/main/.signpath/artifact-configurations/windows-cli.xml)
 6. Add a **Signing policy**, e.g. slug `release-signing`
    - Restrict to tag builds / `refs/tags/v*` as required by your policy
    - Grant submitter permission to the bot/user that will use the API token
@@ -73,7 +87,7 @@ Optional:
 |------|------|---------|
 | **Secret** | `VIRUSTOTAL_API_KEY` | Upload Windows CLI binaries to VirusTotal on each tag release |
 
-### 4. Verify on the next tag
+### 4. Verify on the next tag, then make signing required
 
 1. Tag a release (`vX.Y.Z`) as usual
 2. Confirm the `Sign Windows CLI` job runs without skipping SignPath
@@ -84,21 +98,26 @@ Optional:
    # Status should be Valid after SignPath is enabled
    ```
 
+4. Set the repository **variable** `SIGNPATH_SIGNING_REQUIRED=true`. From
+   then on a release with missing SignPath credentials fails instead of
+   publishing unsigned binaries.
+
 Until step 3 is done, the workflow prints a warning and publishes **unsigned**
-binaries only after the Defender gate passes.
+binaries only after the Defender gate passes (and only while
+`SIGNPATH_SIGNING_REQUIRED` is not `true`).
 
 ## Priority checklist (P0 / P1 / P2)
 
 | Priority | Item | Status in this repo |
 |----------|------|---------------------|
-| **P0** | Fix `detect_arch` for Git Bash `i686` / WOW64 | Done — `scripts/install-cli.sh` |
-| **P0** | Ship PowerShell installer as the Windows path | Done — `scripts/install-cli.ps1` + docs |
-| **P1** | Authenticode-sign Windows release binaries (SignPath) | Wired — enable with secrets (this doc) |
-| **P1** | Embed PE version info (`go-winres`) | Done — release `build-cli` job |
-| **P1** | VirusTotal scan each Windows release | Wired — optional `VIRUSTOTAL_API_KEY` |
-| **P1** | Submit Microsoft WDSI false positives when flagged | Manual — see below (cannot automate portal) |
-| **P2** | Docs: Windows install, Defender recovery, checksums | Done — [windows-cli.md](./windows-cli.md), SECURITY.md |
-| **P2** | Official `go install` / build-from-source escape hatch | Done — root + `cli/README.md` |
+| **P0** | Fix `detect_arch` for Git Bash `i686` / WOW64 | Done: `scripts/install-cli.sh` |
+| **P0** | Ship PowerShell installer as the Windows path | Done: `scripts/install-cli.ps1` + docs |
+| **P1** | Authenticode-sign Windows release binaries (SignPath) | Wired: enable with secrets (this doc) |
+| **P1** | Embed PE version info (`go-winres`) | Done: release `build-cli` job |
+| **P1** | VirusTotal scan each Windows release | Wired: optional `VIRUSTOTAL_API_KEY` |
+| **P1** | Submit Microsoft WDSI false positives when flagged | Manual, see below (cannot automate portal) |
+| **P2** | Docs: Windows install, Defender recovery, checksums | Done, [windows-cli.md](./windows-cli.md), SECURITY.md |
+| **P2** | Official `go install` / build-from-source escape hatch | Done: root + `cli/README.md` |
 
 ## Ongoing release hygiene
 
@@ -113,7 +132,7 @@ After each Windows release (especially before SignPath reputation builds):
 2. If Microsoft flags the binary, submit a false positive at
    [WDSI file submission](https://www.microsoft.com/en-us/wdsi/filesubmission)
    with the GitHub release URL and source repo
-3. Keep PE metadata and signing enabled — reputation accumulates over signed
+3. Keep PE metadata and signing enabled: reputation accumulates over signed
    releases
 
 ## User-facing docs

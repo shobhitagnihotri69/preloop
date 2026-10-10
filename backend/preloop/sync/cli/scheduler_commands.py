@@ -14,6 +14,7 @@ from ..services.event_bus import event_bus_service
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.executors.asyncio import AsyncIOExecutor
+from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 from ..config import logger
 
@@ -21,6 +22,29 @@ from ..config import logger
 # --- Scheduler Setup ---
 # Global scheduler instance
 scheduler = None
+
+
+def optimization_digest_trigger() -> CronTrigger:
+    """Return the weekly digest trigger: Monday 09:00 UTC.
+
+    No startup offset. A freshly started scheduler waits until the next
+    Monday, so a deploy cannot send the digest.
+    """
+    return CronTrigger(day_of_week="mon", hour=9, minute=0, timezone="UTC")
+
+
+def spend_outlier_daily_trigger() -> CronTrigger:
+    """Return the daily spend outlier trigger: 00:30 UTC.
+
+    Half an hour after the UTC day closes, so yesterday is complete, and well
+    before the Monday 09:00 UTC digest that lists the findings.
+    """
+    return CronTrigger(hour=0, minute=30, timezone="UTC")
+
+
+#: How often the per-session cost check runs. Not per request: a session that
+#: crosses its threshold is reported within this interval.
+SPEND_OUTLIER_SESSION_CHECK_MINUTES = 15
 
 
 def shutdown_scheduler():
@@ -114,6 +138,28 @@ async def run_scheduler_async(
             next_run_time=datetime.now(pytz.utc) + timedelta(minutes=5),
         )
         logger.info("Scheduled daily provider billing ingestion.")
+
+    # Daily GitHub Copilot usage import. The task pulls the newest report day
+    # GitHub has finished (two full UTC days after it closes) and no-ops when
+    # no account has a Copilot connection.
+    if getattr(settings, "copilot_usage_sync_enabled", True):
+
+        async def _publish_copilot_usage_import() -> None:
+            try:
+                await event_bus_service.publish_task("ingest_copilot_usage")
+            except Exception:
+                logger.exception("Failed to publish Copilot usage import task")
+
+        scheduler.add_job(
+            _publish_copilot_usage_import,
+            trigger=IntervalTrigger(hours=24),
+            id="copilot_usage_import_job",
+            name="Import GitHub Copilot Usage",
+            replace_existing=True,
+            misfire_grace_time=3600,
+            next_run_time=datetime.now(pytz.utc) + timedelta(minutes=10),
+        )
+        logger.info("Scheduled daily GitHub Copilot usage import.")
 
     # Scheduled model-catalog sync (the automatic 'preloop models sync').
     # Default OFF: self-hosted catalogs must never change on upgrade without
@@ -227,8 +273,49 @@ async def run_scheduler_async(
         subscription_reconcile_hours,
     )
 
-    # Weekly cost optimization & savings digest. The worker-side task no-ops
-    # unless the Enterprise billing plugin is present.
+    # Spend outlier alerts (#960). A daily pass for yesterday's per-user spend
+    # and model mix, and a periodic check of recently active sessions. Both
+    # record each finding once, so a restart that re-runs them is harmless.
+    async def _publish_spend_outlier_daily() -> None:
+        try:
+            await event_bus_service.publish_task("evaluate_spend_outliers")
+        except Exception:
+            logger.exception("Failed to publish spend outlier daily pass")
+
+    scheduler.add_job(
+        _publish_spend_outlier_daily,
+        trigger=spend_outlier_daily_trigger(),
+        id="spend_outlier_daily_job",
+        name="Evaluate Spend Outliers",
+        replace_existing=True,
+        misfire_grace_time=3600,
+    )
+
+    async def _publish_spend_outlier_sessions() -> None:
+        try:
+            await event_bus_service.publish_task("evaluate_spend_outlier_sessions")
+        except Exception:
+            logger.exception("Failed to publish spend outlier session check")
+
+    scheduler.add_job(
+        _publish_spend_outlier_sessions,
+        trigger=IntervalTrigger(minutes=SPEND_OUTLIER_SESSION_CHECK_MINUTES),
+        id="spend_outlier_session_job",
+        name="Check Session Spend Outliers",
+        replace_existing=True,
+        misfire_grace_time=300,
+    )
+    logger.info(
+        "Scheduled spend outlier checks: daily 00:30 UTC, sessions every %d min.",
+        SPEND_OUTLIER_SESSION_CHECK_MINUTES,
+    )
+
+    # Weekly cost digest. Cron only: the job store is in-memory, so a
+    # next_run_time of "now + 10 minutes" sent a digest after every scheduler
+    # restart, including every prod deploy. CronTrigger's next fire is the
+    # next Monday 09:00 UTC, including when the process starts on Monday
+    # after that minute. The worker-side task no-ops unless the Enterprise
+    # billing plugin is present.
     if getattr(settings, "cost_digest_enabled", True):
 
         async def _publish_optimization_digest() -> None:
@@ -239,14 +326,13 @@ async def run_scheduler_async(
 
         scheduler.add_job(
             _publish_optimization_digest,
-            trigger=IntervalTrigger(days=7),
+            trigger=optimization_digest_trigger(),
             id="optimization_digest_job",
             name="Send Weekly Optimization Digest",
             replace_existing=True,
             misfire_grace_time=3600,
-            next_run_time=datetime.now(pytz.utc) + timedelta(minutes=10),
         )
-        logger.info("Scheduled weekly optimization digest.")
+        logger.info("Scheduled weekly optimization digest for Monday 09:00 UTC.")
 
     await stop_event.wait()
     logger.info("Scheduler event loop stopped.")

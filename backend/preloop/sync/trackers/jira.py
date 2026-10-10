@@ -14,7 +14,9 @@ import httpx
 from jira import JIRA, JIRAError
 from sqlalchemy.orm import Session
 
+from preloop.schemas.readiness import TicketCreationEvidence
 from preloop.models.crud import crud_webhook, crud_organization, crud_project
+from preloop.services.issue_estimate import synced_estimate_fields
 from preloop.schemas.tracker_models import (
     Issue,
     IssueComment,
@@ -33,6 +35,7 @@ from ..exceptions import (
     TrackerAuthenticationError,
     TrackerConnectionError,
     TrackerResponseError,
+    TrackerError,
 )
 from .base import BaseTracker
 from .utils import (
@@ -50,6 +53,53 @@ from preloop.models.models.organization import Organization
 
 logger = logging.getLogger(__name__)
 
+_URL_RE = re.compile(r"https?://[^\s<>\"]+")
+
+
+def _adf_inline(line: str) -> List[Dict[str, Any]]:
+    """ADF text nodes for one line, with URLs as links."""
+    nodes: List[Dict[str, Any]] = []
+    position = 0
+    for match in _URL_RE.finditer(line):
+        url = match.group(0).rstrip(".,;:)")
+        end = match.start() + len(url)
+        if match.start() > position:
+            nodes.append({"type": "text", "text": line[position : match.start()]})
+        nodes.append(
+            {
+                "type": "text",
+                "text": url,
+                "marks": [{"type": "link", "attrs": {"href": url}}],
+            }
+        )
+        position = end
+    if position < len(line):
+        nodes.append({"type": "text", "text": line[position:]})
+    return nodes
+
+
+def text_to_adf(text: str) -> Dict[str, Any]:
+    """Convert plain text to an Atlassian Document Format document.
+
+    Each non-empty line becomes a paragraph, and ``http(s)`` URLs become
+    link marks so they are clickable in Jira.
+
+    Args:
+        text: Plain text, possibly multi-line.
+
+    Returns:
+        An ADF ``doc`` node.
+    """
+    paragraphs = [
+        {"type": "paragraph", "content": _adf_inline(line)}
+        for line in (text or "").splitlines()
+        if line.strip()
+    ]
+    if not paragraphs:
+        paragraphs = [{"type": "paragraph", "content": []}]
+    return {"type": "doc", "version": 1, "content": paragraphs}
+
+
 DEFAULT_JIRA_WEBHOOK_EVENTS = [
     "jira:issue_created",
     "jira:issue_updated",
@@ -61,6 +111,7 @@ class JiraTracker(BaseTracker):
     """Jira tracker implementation."""
 
     tracker_type: str = "jira"
+    hosts_issues: bool = True
 
     def __init__(
         self,
@@ -316,6 +367,40 @@ class JiraTracker(BaseTracker):
         ]
 
         return issues, total
+
+    async def get_ticket_creation_evidence(
+        self, issue_key: str
+    ) -> "TicketCreationEvidence":
+        """Fetch authoritative Jira creation without the mapper's fallback."""
+        from datetime import UTC
+        from uuid import UUID
+
+        from preloop.schemas.readiness import parse_jira_created
+
+        from urllib.parse import quote
+
+        reason = "ticket_creation_unavailable"
+        created = None
+        try:
+            data = await self._make_request(
+                "GET",
+                f"issue/{quote(issue_key, safe='')}",
+                params={"fields": "created"},
+                api_version="3",
+            )
+            if isinstance(data, dict) and data.get("key") == issue_key:
+                created = parse_jira_created((data.get("fields") or {}).get("created"))
+            else:
+                reason = "ticket_identity_mismatch"
+        except TrackerError:
+            reason = "ticket_creation_unreadable"
+        return TicketCreationEvidence(
+            created_at=created,
+            tracker_id=UUID(self.tracker_id),
+            issue_key=issue_key,
+            retrieved_at=datetime.now(UTC),
+            reason=None if created is not None else reason,
+        )
 
     async def get_issue(self, issue_id: str) -> Issue:
         """Get a specific issue by ID or key.
@@ -1083,25 +1168,16 @@ class JiraTracker(BaseTracker):
         Returns:
             Created comment.
         """
-        # Format comment in Jira Atlassian Document Format
-        comment_body = {
-            "body": {
-                "type": "doc",
-                "version": 1,
-                "content": [
-                    {
-                        "type": "paragraph",
-                        "content": [{"type": "text", "text": comment}],
-                    }
-                ],
-            }
-        }
+        # The body is Atlassian Document Format, which only REST v3 accepts:
+        # v2 takes a plain string and rejects an ADF object.
+        comment_body = {"body": text_to_adf(comment)}
 
         # Add the comment
         comment_data = await self._make_request(
             "POST",
             f"issue/{issue_id}/comment",
             json_data=comment_body,
+            api_version="3",
         )
 
         # Extract comment details
@@ -1128,6 +1204,58 @@ class JiraTracker(BaseTracker):
             author=author,
             url=f"{self.base_url}/browse/{issue_id}?focusedCommentId={comment_id}",
         )
+
+    async def add_remote_link(
+        self,
+        issue_id: str,
+        *,
+        global_id: str,
+        url: str,
+        title: str,
+        summary: Optional[str] = None,
+        resolved: bool = False,
+        relationship: str = "implemented by",
+    ) -> Dict[str, Any]:
+        """Create or update a remote issue link on a Jira issue.
+
+        ``POST /rest/api/3/issue/{issueIdOrKey}/remotelink`` updates the link
+        whose ``globalId`` matches and creates one otherwise, so a stable
+        ``global_id`` makes a repeated call update the same link. Fields left
+        out of the request are set to null on update, so the full object is
+        always sent. Requires issue linking to be enabled on the site.
+
+        Args:
+            issue_id: Issue key or numeric id.
+            global_id: Stable identifier of the remote object.
+            url: Remote object URL (the pull request).
+            title: Link title shown on the issue.
+            summary: Optional one-line summary.
+            resolved: Whether the remote object is done (shown struck through).
+            relationship: Relationship label shown on the issue.
+
+        Returns:
+            Jira's response: the link ``id`` and ``self`` URL.
+        """
+        remote_object: Dict[str, Any] = {
+            "url": url,
+            "title": title,
+            "status": {"resolved": bool(resolved)},
+        }
+        if summary:
+            remote_object["summary"] = summary
+        payload = {
+            "globalId": global_id,
+            "application": {"type": "ai.preloop", "name": "Preloop"},
+            "relationship": relationship,
+            "object": remote_object,
+        }
+        response = await self._make_request(
+            "POST",
+            f"issue/{issue_id}/remotelink",
+            json_data=payload,
+            api_version="3",
+        )
+        return response if isinstance(response, dict) else {}
 
     async def add_relation(
         self, issue_id: str, related_issue_id: str, relation_type: str
@@ -1311,6 +1439,8 @@ class JiraTracker(BaseTracker):
                 "assignees": assignees,
                 "url": issue_url,
                 "source": "preloop-sync",
+                # Raw "Original Estimate" (seconds) for the issue cost report.
+                "estimate_fields": synced_estimate_fields(issue_data),
             },
             "tracker_id": self.tracker_id,
         }
@@ -1343,6 +1473,7 @@ class JiraTracker(BaseTracker):
                 "issuetype",
                 "comment",
                 "issuelinks",
+                "timeoriginalestimate",
             ],
         }
 

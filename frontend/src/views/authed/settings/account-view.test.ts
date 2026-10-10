@@ -1,3 +1,4 @@
+import '../../../components/billing-subscription-details';
 import { html, fixture, expect, waitUntil } from '@open-wc/testing';
 import sinon from 'sinon';
 
@@ -53,6 +54,10 @@ describe('AccountView', () => {
       effectivePlanId?: string;
       effectivePlan?: Record<string, unknown> | null;
       summaryPlan?: Record<string, unknown> | null;
+      sessionArtifactUsage?: Record<string, unknown> | null;
+      artifactSettings?: Record<string, unknown> | null;
+      artifactSettingsPut?: (body: Record<string, unknown>) => Response;
+      accountHierarchy?: boolean;
     } = {}
   ) {
     return sinon
@@ -82,11 +87,43 @@ describe('AccountView', () => {
           });
         }
 
+        if (url.includes('/api/v1/account/session-artifacts/settings')) {
+          if (method === 'PUT' && opts.artifactSettingsPut) {
+            return opts.artifactSettingsPut(JSON.parse(String(init?.body)));
+          }
+          if (!opts.artifactSettings) {
+            return json({ detail: 'no settings in this test' }, 404);
+          }
+          return json(opts.artifactSettings);
+        }
+
+        if (url.includes('/api/v1/account/session-artifacts/usage')) {
+          if (!opts.sessionArtifactUsage) {
+            return json({ detail: 'no usage in this test' }, 404);
+          }
+          return json(opts.sessionArtifactUsage);
+        }
+
         if (url.includes('/api/v1/features')) {
           return json({
             plugins: [],
-            features: { billing: opts.billing === true },
+            features: {
+              billing: opts.billing === true,
+              account_hierarchy: opts.accountHierarchy === true,
+            },
           });
+        }
+
+        if (url.includes('/api/v1/auth/users/me')) {
+          return json({ id: 'user-1', account_id: 'acc-1', permissions: null });
+        }
+
+        if (url.includes('/api/v1/me/memberships')) {
+          return json({ detail: 'Not Found' }, 404);
+        }
+
+        if (url.includes('/api/v1/accounts/acc-1/subaccounts')) {
+          return json({ items: [{ id: 'sub-a', name: 'North', tags: {} }] });
         }
 
         if (url.includes('/api/v1/billing/sync-subscription')) {
@@ -252,6 +289,67 @@ describe('AccountView', () => {
     ).to.equal(false);
   });
 
+  it('shows the Subaccounts card with the account_hierarchy capability', async () => {
+    fetchStub = createFetchStub({ accountHierarchy: true });
+    const element = await fixture<AccountView>(
+      html`<account-view></account-view>`
+    );
+    await waitUntil(() => !(element as any)._loading, 'load');
+    await element.updateComplete;
+    const card = element.shadowRoot!.querySelector(
+      'subaccounts-view[embedded]'
+    ) as HTMLElement & { updateComplete: Promise<unknown> };
+    expect(card).to.exist;
+    await waitUntil(
+      () => card.shadowRoot?.querySelector('tbody tr[data-id="sub-a"]'),
+      'subaccount row did not render'
+    );
+    expect(card.shadowRoot!.textContent).to.contain('Create subaccount');
+  });
+
+  it('has no Subaccounts card without the capability', async () => {
+    fetchStub = createFetchStub();
+    const element = await fixture<AccountView>(
+      html`<account-view></account-view>`
+    );
+    await waitUntil(() => !(element as any)._loading, 'load');
+    await element.updateComplete;
+    expect(element.shadowRoot!.querySelector('subaccounts-view')).to.equal(
+      null
+    );
+  });
+
+  it('keeps only the plan summary and link on Account', async () => {
+    fetchStub = createFetchStub({
+      billing: true,
+      seats: {
+        active_users: 2,
+        included_users: 5,
+        max_users: 5,
+        over_included: false,
+        seat_addon: null,
+      },
+    });
+    const element = await fixture<AccountView>(
+      html`<account-view></account-view>`
+    );
+    await waitUntil(() => !(element as any)._loading);
+    await element.updateComplete;
+    const summary = element.shadowRoot!.querySelector(
+      '[data-testid="billing-summary"]'
+    )!;
+    expect(summary.textContent).to.contain('Pro Plan');
+    expect(summary.querySelector('a')!.getAttribute('href')).to.equal(
+      '/console/settings/plan'
+    );
+    expect(element.shadowRoot!.textContent).not.to.contain(
+      'included users in use'
+    );
+    expect(element.shadowRoot!.textContent).not.to.contain(
+      'Built-in model usage'
+    );
+  });
+
   it('renders organization details after load (non-billing edition)', async () => {
     fetchStub = createFetchStub({ billing: false });
     const element = (await fixture(
@@ -264,7 +362,12 @@ describe('AccountView', () => {
     );
     await element.updateComplete;
 
-    expect(element.shadowRoot?.textContent).to.contain('Organization Details');
+    // The account copy says "Account", not "Organization" (issue #988).
+    expect(element.shadowRoot?.textContent).to.not.contain('Organization');
+    const nameInput = element.shadowRoot?.querySelector(
+      'sl-input[label="Account name"]'
+    );
+    expect(nameInput, 'account name input').to.exist;
     expect((element as any).organizationName).to.equal('Acme Corp');
     // No billing/subscription section in the open-source edition.
     expect(element.shadowRoot?.textContent).to.not.contain('Manage in Stripe');
@@ -273,7 +376,7 @@ describe('AccountView', () => {
   it('renders subscription information in the billing edition', async () => {
     fetchStub = createFetchStub({ billing: true });
     const element = (await fixture(
-      html`<account-view></account-view>`
+      html`<billing-subscription-details></billing-subscription-details>`
     )) as AccountView;
 
     await waitUntil(
@@ -292,7 +395,7 @@ describe('AccountView', () => {
     // button sat there disabled where the one useful action belongs.
     fetchStub = createFetchStub({ billing: true, freeTier: true });
     const element = (await fixture(
-      html`<account-view></account-view>`
+      html`<billing-subscription-details></billing-subscription-details>`
     )) as AccountView;
 
     await waitUntil(() => !(element as any)._loading, 'load');
@@ -309,7 +412,7 @@ describe('AccountView', () => {
   it('sends "Choose a plan" to the plan page', async () => {
     fetchStub = createFetchStub({ billing: true, freeTier: true });
     const element = (await fixture(
-      html`<account-view></account-view>`
+      html`<billing-subscription-details></billing-subscription-details>`
     )) as AccountView;
 
     await waitUntil(() => !(element as any)._loading, 'load');
@@ -332,7 +435,7 @@ describe('AccountView', () => {
   it('offers a subscribed account the plan page beside the portal', async () => {
     fetchStub = createFetchStub({ billing: true });
     const element = (await fixture(
-      html`<account-view></account-view>`
+      html`<billing-subscription-details></billing-subscription-details>`
     )) as AccountView;
 
     await waitUntil(() => !(element as any)._loading, 'load');
@@ -355,7 +458,7 @@ describe('AccountView', () => {
   it('falls back to a full page load where no router claimed the path', async () => {
     fetchStub = createFetchStub({ billing: true, freeTier: true });
     const element = (await fixture(
-      html`<account-view></account-view>`
+      html`<billing-subscription-details></billing-subscription-details>`
     )) as AccountView;
 
     await waitUntil(() => !(element as any)._loading, 'load');
@@ -379,7 +482,7 @@ describe('AccountView', () => {
   it('keeps the portal button for a subscription, disabled only without the permission', async () => {
     fetchStub = createFetchStub({ billing: true, canManageBilling: false });
     const element = (await fixture(
-      html`<account-view></account-view>`
+      html`<billing-subscription-details></billing-subscription-details>`
     )) as AccountView;
 
     await waitUntil(() => !(element as any)._loading, 'load');
@@ -450,7 +553,7 @@ describe('AccountView', () => {
       effectivePlan: { id: 'teams', name: 'Legacy Teams' },
     });
     const element = (await fixture(
-      html`<account-view></account-view>`
+      html`<billing-subscription-details></billing-subscription-details>`
     )) as AccountView;
 
     await waitUntil(() => !(element as any)._loading, 'load');
@@ -478,7 +581,7 @@ describe('AccountView', () => {
       effectivePlan: { id: 'teams', name: 'Legacy Teams' },
     });
     const element = (await fixture(
-      html`<account-view></account-view>`
+      html`<billing-subscription-details></billing-subscription-details>`
     )) as AccountView;
 
     await waitUntil(() => !(element as any)._loading, 'load');
@@ -490,7 +593,7 @@ describe('AccountView', () => {
       'Legacy Teams'
     );
     expect(card?.querySelector('.status-chip')?.textContent?.trim()).to.equal(
-      'active'
+      'Active'
     );
     expect(card?.querySelector('.date')?.textContent).to.contain('Renews on');
     // The retired name must not survive anywhere on the card, and "Teams"
@@ -511,7 +614,7 @@ describe('AccountView', () => {
       },
     });
     const element = (await fixture(
-      html`<account-view></account-view>`
+      html`<billing-subscription-details></billing-subscription-details>`
     )) as AccountView;
 
     await waitUntil(() => !(element as any)._loading, 'load');
@@ -548,7 +651,7 @@ describe('AccountView', () => {
       },
     });
     const element = (await fixture(
-      html`<account-view></account-view>`
+      html`<billing-subscription-details></billing-subscription-details>`
     )) as AccountView;
 
     await waitUntil(() => !(element as any)._loading, 'load');
@@ -582,7 +685,7 @@ describe('AccountView', () => {
       },
     });
     const element = (await fixture(
-      html`<account-view></account-view>`
+      html`<billing-subscription-details></billing-subscription-details>`
     )) as AccountView;
 
     await waitUntil(() => !(element as any)._loading, 'load');
@@ -613,7 +716,7 @@ describe('AccountView', () => {
       },
     });
     const element = (await fixture(
-      html`<account-view></account-view>`
+      html`<billing-subscription-details></billing-subscription-details>`
     )) as AccountView;
 
     await waitUntil(() => !(element as any)._loading, 'load');
@@ -628,7 +731,7 @@ describe('AccountView', () => {
   it('still says "Renews on" for a future period end', async () => {
     fetchStub = createFetchStub({ billing: true });
     const element = (await fixture(
-      html`<account-view></account-view>`
+      html`<billing-subscription-details></billing-subscription-details>`
     )) as AccountView;
 
     await waitUntil(() => !(element as any)._loading, 'load');
@@ -648,7 +751,7 @@ describe('AccountView', () => {
       },
     });
     const element = (await fixture(
-      html`<account-view></account-view>`
+      html`<billing-subscription-details></billing-subscription-details>`
     )) as AccountView;
 
     await waitUntil(() => !(element as any)._loading, 'load');
@@ -663,7 +766,7 @@ describe('AccountView', () => {
   it('hides the interval toggle and grid when no plans render (D13)', async () => {
     fetchStub = createFetchStub({ billing: true, plans: [] });
     const element = (await fixture(
-      html`<account-view></account-view>`
+      html`<billing-subscription-details></billing-subscription-details>`
     )) as AccountView;
 
     await waitUntil(() => !(element as any)._loading, 'load');
@@ -678,7 +781,7 @@ describe('AccountView', () => {
     // This page states which plan is current and links to the rest.
     fetchStub = createFetchStub({ billing: true });
     const element = (await fixture(
-      html`<account-view></account-view>`
+      html`<billing-subscription-details></billing-subscription-details>`
     )) as AccountView;
 
     await waitUntil(() => !(element as any)._loading, 'load');
@@ -694,7 +797,7 @@ describe('AccountView', () => {
   it('never offers an opt-in for extra usage that does not exist (D13)', async () => {
     fetchStub = createFetchStub({ billing: true, extraCreditPricePerUsd: 1 });
     const element = (await fixture(
-      html`<account-view></account-view>`
+      html`<billing-subscription-details></billing-subscription-details>`
     )) as AccountView;
 
     await waitUntil(() => !(element as any)._loading, 'load');
@@ -712,7 +815,7 @@ describe('AccountView', () => {
     // A marked-up rate is still a price for something nobody can buy.
     fetchStub = createFetchStub({ billing: true, extraCreditPricePerUsd: 1.2 });
     const element = (await fixture(
-      html`<account-view></account-view>`
+      html`<billing-subscription-details></billing-subscription-details>`
     )) as AccountView;
 
     await waitUntil(() => !(element as any)._loading, 'load');
@@ -724,7 +827,7 @@ describe('AccountView', () => {
     expect(copy(element)).to.not.contain('per $1.00 of additional usage');
   });
 
-  it('shows $0.00 and the whole cap when a capped plan has no usage yet', async () => {
+  it('does not invent spend or remaining credit when balances are unverified', async () => {
     // The founder's Legacy Teams account: $10 allowance, $10 cap, nothing
     // spent, so the server sends no usage figure at all. "Not configured"
     // there reads as a broken plan; the account simply has not spent.
@@ -738,16 +841,16 @@ describe('AccountView', () => {
       },
     });
     const element = (await fixture(
-      html`<account-view></account-view>`
+      html`<billing-subscription-details></billing-subscription-details>`
     )) as AccountView;
 
     await waitUntil(() => !(element as any)._loading, 'load');
     await element.updateComplete;
 
     const cells = usageCells(element);
-    expect(cells['Usage so far']).to.equal('$0.00');
-    expect(cells['Remaining before cap']).to.equal('$10');
-    expect(cells['Current active cap']).to.equal('$10');
+    expect(cells['Usage so far']).to.equal('Not verified');
+    expect(cells['Remaining before cap']).to.equal('Not verified');
+    expect(cells['Current active cap']).to.equal('$10.00');
     expect(copy(element)).to.not.contain('Not configured');
   });
 
@@ -762,7 +865,7 @@ describe('AccountView', () => {
       },
     });
     const element = (await fixture(
-      html`<account-view></account-view>`
+      html`<billing-subscription-details></billing-subscription-details>`
     )) as AccountView;
 
     await waitUntil(() => !(element as any)._loading, 'load');
@@ -770,7 +873,7 @@ describe('AccountView', () => {
 
     const cells = usageCells(element);
     expect(cells['Usage so far']).to.equal('$0.00');
-    expect(cells['Remaining before cap']).to.equal('$10');
+    expect(cells['Remaining before cap']).to.equal('$10.00');
   });
 
   it('still says "Not configured" when the plan has no allowance and no cap', async () => {
@@ -784,19 +887,19 @@ describe('AccountView', () => {
       },
     });
     const element = (await fixture(
-      html`<account-view></account-view>`
+      html`<billing-subscription-details></billing-subscription-details>`
     )) as AccountView;
 
     await waitUntil(() => !(element as any)._loading, 'load');
     await element.updateComplete;
 
     const cells = usageCells(element);
-    expect(cells['Usage so far']).to.equal('Not configured');
+    expect(cells['Usage so far']).to.equal('Not verified');
     expect(cells['Remaining before cap']).to.equal('Not configured');
     expect(cells['Monthly allowance']).to.equal('Not configured');
   });
 
-  it('measures zero spend against the free tier one-time credit', async () => {
+  it('keeps unverified one-time spend distinct from zero', async () => {
     // Free has a one-time credit instead of a monthly cap, so the cap-based
     // check alone would call an untouched grant "Not configured".
     fetchStub = createFetchStub({
@@ -811,7 +914,7 @@ describe('AccountView', () => {
       },
     });
     const element = (await fixture(
-      html`<account-view></account-view>`
+      html`<billing-subscription-details></billing-subscription-details>`
     )) as AccountView;
 
     await waitUntil(() => !(element as any)._loading, 'load');
@@ -819,9 +922,9 @@ describe('AccountView', () => {
 
     const cells = usageCells(element);
     expect(cells['One-time credit']).to.equal('$5.00');
-    expect(cells['Usage so far']).to.equal('$0.00');
+    expect(cells['Usage so far']).to.equal('Not verified');
     // No cap to subtract from, so nothing is invented for the cap cell.
-    expect(cells['Remaining before cap']).to.equal('Not configured');
+    expect(cells['Remaining before cap']).to.equal('Not verified');
   });
   it('keeps the sales-led plan (null price) and drops only the $0 plan', async () => {
     fetchStub = createFetchStub({
@@ -851,12 +954,16 @@ describe('AccountView', () => {
       ],
     });
     const element = (await fixture(
-      html`<account-view></account-view>`
+      html`<billing-subscription-details></billing-subscription-details>`
     )) as AccountView;
     await waitUntil(() => !(element as any)._loading, 'load');
     await element.updateComplete;
 
-    const ids = (element as any)._publicPlans.map((p: any) => p.id);
+    const ids = (element as any).plans
+      .filter(
+        (plan: any) => plan.price_monthly === null || plan.price_monthly > 0
+      )
+      .map((p: any) => p.id);
     // Enterprise has no price, but it is still a plan you can move to. The
     // old filter dropped it along with Free and left no route to sales.
     expect(ids).to.deep.equal(['pro', 'enterprise']);
@@ -869,7 +976,7 @@ describe('AccountView', () => {
       hostedOverrides: { one_time_credit_usd: 0.5, included_limit_usd: null },
     });
     const element = (await fixture(
-      html`<account-view></account-view>`
+      html`<billing-subscription-details></billing-subscription-details>`
     )) as AccountView;
     await waitUntil(() => !(element as any)._loading, 'load');
     await element.updateComplete;
@@ -885,7 +992,7 @@ describe('AccountView', () => {
   it('calls the paid hosted grant a monthly allowance', async () => {
     fetchStub = createFetchStub({ billing: true });
     const element = (await fixture(
-      html`<account-view></account-view>`
+      html`<billing-subscription-details></billing-subscription-details>`
     )) as AccountView;
     await waitUntil(() => !(element as any)._loading, 'load');
     await element.updateComplete;
@@ -913,7 +1020,7 @@ describe('AccountView', () => {
       },
     });
     const element = (await fixture(
-      html`<account-view></account-view>`
+      html`<billing-subscription-details></billing-subscription-details>`
     )) as AccountView;
     await waitUntil(() => !(element as any)._loading, 'load');
     await element.updateComplete;
@@ -946,7 +1053,7 @@ describe('AccountView', () => {
       },
     });
     const element = (await fixture(
-      html`<account-view></account-view>`
+      html`<billing-subscription-details></billing-subscription-details>`
     )) as AccountView;
     await waitUntil(() => !(element as any)._loading, 'load');
     await element.updateComplete;
@@ -970,7 +1077,7 @@ describe('AccountView', () => {
       },
     });
     const element = (await fixture(
-      html`<account-view></account-view>`
+      html`<billing-subscription-details></billing-subscription-details>`
     )) as AccountView;
     await waitUntil(() => !(element as any)._loading, 'load');
     await element.updateComplete;
@@ -978,7 +1085,7 @@ describe('AccountView', () => {
     const text = copy(element);
     expect(text).to.contain('22 of 20');
     expect(text).to.contain('Agents are unlimited');
-    expect(text).to.contain('$15 each per month');
+    expect(text).to.contain('$15.00 each per month');
   });
 
   it('omits the seat line when the plan has no seat bracket', async () => {
@@ -993,7 +1100,7 @@ describe('AccountView', () => {
       },
     });
     const element = (await fixture(
-      html`<account-view></account-view>`
+      html`<billing-subscription-details></billing-subscription-details>`
     )) as AccountView;
     await waitUntil(() => !(element as any)._loading, 'load');
     await element.updateComplete;
@@ -1014,7 +1121,7 @@ describe('AccountView', () => {
       effectivePlan: { id: 'teams', name: 'Legacy Teams' },
     });
     const element = (await fixture(
-      html`<account-view></account-view>`
+      html`<billing-subscription-details></billing-subscription-details>`
     )) as AccountView;
     await waitUntil(() => !(element as any)._loading, 'load');
     await element.updateComplete;
@@ -1031,7 +1138,7 @@ describe('AccountView', () => {
   it('does not label a current plan as grandfathered', async () => {
     fetchStub = createFetchStub({ billing: true });
     const element = (await fixture(
-      html`<account-view></account-view>`
+      html`<billing-subscription-details></billing-subscription-details>`
     )) as AccountView;
     await waitUntil(() => !(element as any)._loading, 'load');
     await element.updateComplete;
@@ -1056,7 +1163,7 @@ describe('AccountView', () => {
   it('keeps portal mutations disabled for a member without billing permission', async () => {
     fetchStub = createFetchStub({ billing: true, canManageBilling: false });
     const element = await fixture<AccountView>(
-      html`<account-view></account-view>`
+      html`<billing-subscription-details></billing-subscription-details>`
     );
     await waitUntil(() => !(element as any)._loading);
     await element.updateComplete;
@@ -1124,6 +1231,269 @@ describe('AccountView', () => {
       'the window dispatch should fetch summary once'
     );
     expect(summaryGets()).to.equal(before + 1);
+  });
+
+  it('renders session artifact usage as used, budget, and per kind', async () => {
+    fetchStub = createFetchStub({
+      billing: false,
+      sessionArtifactUsage: {
+        used_bytes: 409600,
+        budget_bytes: 1048576,
+        by_kind: { screenshot: 0, recording: 409600 },
+        evicted_count_30d: 1,
+      },
+    });
+    const element = await fixture<AccountView>(
+      html`<account-view></account-view>`
+    );
+    await waitUntil(() => !(element as any)._loading, 'load');
+    await element.updateComplete;
+
+    const row = element.shadowRoot?.querySelector(
+      '[data-testid="session-artifact-usage"]'
+    );
+    expect(row, 'expected the session artifact usage row').to.exist;
+    const text = (row?.textContent ?? '').replace(/\s+/g, ' ');
+    expect(text).to.contain('400 KiB');
+    expect(text).to.contain('1 MiB');
+    expect(text).to.contain('0 B');
+    const cells = usageCells(element);
+    expect(cells['Screenshots']).to.equal('0 B');
+    expect(cells['Recordings']).to.equal('400 KiB');
+    expect(cells['Used']).to.contain('400 KiB');
+    expect(cells['Used']).to.contain('1 MiB');
+  });
+
+  it('links the storage card to the Artifacts page, per kind too', async () => {
+    fetchStub = createFetchStub({
+      billing: false,
+      sessionArtifactUsage: {
+        used_bytes: 3072,
+        budget_bytes: 1048576,
+        by_kind: { screenshot: 1024, recording: 0, transcript: 2048 },
+        evicted_count_30d: 0,
+      },
+    });
+    const element = await fixture<AccountView>(
+      html`<account-view></account-view>`
+    );
+    await waitUntil(() => !(element as any)._loading, 'load');
+    await element.updateComplete;
+
+    const card = element.shadowRoot!.querySelector(
+      '[data-testid="session-artifact-usage"]'
+    )!;
+    const browse = card.querySelector('[data-testid="browse-artifacts-link"]');
+    expect(browse?.getAttribute('href')).to.equal('/console/artifacts');
+    expect(browse?.textContent).to.contain('Browse artifacts');
+    const kinds = Array.from(
+      card.querySelectorAll('[data-testid="artifact-kind-link"]')
+    ).map((a) => [a.textContent?.trim(), a.getAttribute('href')]);
+    expect(kinds).to.deep.equal([
+      ['Screenshots', '/console/artifacts?kind=screenshot'],
+      ['Recordings', '/console/artifacts?kind=recording'],
+      ['Transcript', '/console/artifacts?kind=transcript'],
+    ]);
+  });
+
+  it('renders newer artifact kinds by name and hides empty ones', async () => {
+    fetchStub = createFetchStub({
+      billing: false,
+      sessionArtifactUsage: {
+        used_bytes: 3072,
+        budget_bytes: 1048576,
+        by_kind: {
+          screenshot: 0,
+          recording: 0,
+          audio: 0,
+          transcript: 2048,
+          generated_file: 1024,
+          some_future_kind: 0,
+        },
+        evicted_count_30d: 0,
+      },
+    });
+    const element = await fixture<AccountView>(
+      html`<account-view></account-view>`
+    );
+    await waitUntil(() => !(element as any)._loading, 'load');
+    await element.updateComplete;
+
+    const cells = usageCells(element);
+    expect(cells['Transcript']).to.equal('2 KiB');
+    expect(cells['Generated file']).to.equal('1 KiB');
+    expect(cells['Audio'], 'empty kinds stay hidden').to.be.undefined;
+    expect(cells['Screenshots']).to.equal('0 B');
+  });
+
+  describe('raw audio storage (#1102)', () => {
+    const usage = {
+      used_bytes: 0,
+      budget_bytes: 1048576,
+      by_kind: { screenshot: 0, recording: 0 },
+      evicted_count_30d: 0,
+    };
+    const off = {
+      audio_storage_enabled: false,
+      audio_retention_days: 30,
+      audio_retention_max_days: 180,
+    };
+
+    async function mount(): Promise<AccountView> {
+      const element = await fixture<AccountView>(
+        html`<account-view></account-view>`
+      );
+      await waitUntil(() => !(element as any)._loading, 'load');
+      await waitUntil(
+        () =>
+          element.shadowRoot?.querySelector(
+            '[data-testid="audio-storage-settings"]'
+          ),
+        'audio settings'
+      );
+      return element;
+    }
+
+    function q<T extends Element>(el: AccountView, id: string): T {
+      return el.shadowRoot!.querySelector(`[data-testid="${id}"]`) as T;
+    }
+
+    it('shows the toggle off with the copy and the retention field', async () => {
+      fetchStub = createFetchStub({
+        sessionArtifactUsage: usage,
+        artifactSettings: off,
+      });
+      const element = await mount();
+
+      const toggle = q<HTMLInputElement>(element, 'audio-storage-toggle');
+      expect(toggle.checked).to.equal(false);
+      expect(
+        q(element, 'audio-storage-copy')
+          .textContent!.replace(/\s+/g, ' ')
+          .trim()
+      ).to.equal(
+        'Store raw audio deposited by agents. Off by default. Transcripts are stored either way.'
+      );
+      const days = q<HTMLInputElement>(element, 'audio-retention-days');
+      expect(days.value).to.equal('30');
+      expect(String((days as any).max)).to.equal('180');
+    });
+
+    it('turning the toggle on sends the opt-in and reflects the saved state', async () => {
+      const puts: Record<string, unknown>[] = [];
+      fetchStub = createFetchStub({
+        sessionArtifactUsage: usage,
+        artifactSettings: off,
+        artifactSettingsPut: (body) => {
+          puts.push(body);
+          return json({ ...off, ...body, updated_at: '2026-10-04T00:00:00Z' });
+        },
+      });
+      const element = await mount();
+
+      const toggle = q<HTMLElement>(element, 'audio-storage-toggle');
+      toggle.click();
+      await waitUntil(() => puts.length === 1, 'PUT sent');
+      await waitUntil(
+        () => (element as any)._artifactSettings.audio_storage_enabled
+      );
+      await element.updateComplete;
+
+      expect(puts[0]).to.deep.equal({ audio_storage_enabled: true });
+      expect(
+        q<HTMLInputElement>(element, 'audio-storage-toggle').checked
+      ).to.equal(true);
+    });
+
+    it('saves a new retention in days', async () => {
+      const puts: Record<string, unknown>[] = [];
+      fetchStub = createFetchStub({
+        sessionArtifactUsage: usage,
+        artifactSettings: { ...off, audio_storage_enabled: true },
+        artifactSettingsPut: (body) => {
+          puts.push(body);
+          return json({ ...off, audio_storage_enabled: true, ...body });
+        },
+      });
+      const element = await mount();
+
+      (element as any)._audioRetentionDraft = '7';
+      await element.updateComplete;
+      q<HTMLElement>(element, 'audio-retention-save').click();
+      await waitUntil(() => puts.length === 1, 'PUT sent');
+
+      expect(puts[0]).to.deep.equal({ audio_retention_days: 7 });
+    });
+
+    it('puts the switch back to the saved state when the save fails', async () => {
+      fetchStub = createFetchStub({
+        sessionArtifactUsage: usage,
+        artifactSettings: { ...off, audio_storage_enabled: true },
+        artifactSettingsPut: () => json({ detail: 'boom' }, 500),
+      });
+      const element = await mount();
+      const toggle = q<HTMLInputElement>(element, 'audio-storage-toggle');
+      expect(toggle.checked).to.equal(true);
+
+      toggle.click();
+      await waitUntil(() => q(element, 'audio-storage-error'), 'error shown');
+      await element.updateComplete;
+
+      expect(toggle.checked, 'server still stores audio').to.equal(true);
+    });
+
+    it('names the allowed range when the retention is refused', async () => {
+      fetchStub = createFetchStub({
+        sessionArtifactUsage: usage,
+        artifactSettings: off,
+        artifactSettingsPut: () =>
+          json({ detail: 'audio_retention_days_invalid' }, 422),
+      });
+      const element = await mount();
+
+      (element as any)._audioRetentionDraft = '999';
+      await element.updateComplete;
+      q<HTMLElement>(element, 'audio-retention-save').click();
+      await waitUntil(() => q(element, 'audio-storage-error'), 'error shown');
+
+      expect(q(element, 'audio-storage-error').textContent).to.contain(
+        'Retention must be between 1 and 180 days.'
+      );
+    });
+
+    it('keeps a retention being typed when the switch is saved', async () => {
+      fetchStub = createFetchStub({
+        sessionArtifactUsage: usage,
+        artifactSettings: off,
+        artifactSettingsPut: (body) => json({ ...off, ...body }),
+      });
+      const element = await mount();
+
+      (element as any)._audioRetentionDraft = '12';
+      q<HTMLElement>(element, 'audio-storage-toggle').click();
+      await waitUntil(
+        () => (element as any)._artifactSettings.audio_storage_enabled,
+        'saved'
+      );
+
+      expect((element as any)._audioRetentionDraft).to.equal('12');
+    });
+
+    it('tells a non-admin why the change was refused', async () => {
+      fetchStub = createFetchStub({
+        sessionArtifactUsage: usage,
+        artifactSettings: off,
+        artifactSettingsPut: () => json({ detail: 'denied' }, 403),
+      });
+      const element = await mount();
+
+      q<HTMLElement>(element, 'audio-storage-toggle').click();
+      await waitUntil(() => q(element, 'audio-storage-error'), 'error shown');
+
+      expect(q(element, 'audio-storage-error').textContent).to.contain(
+        'Only an account admin can change audio storage.'
+      );
+    });
   });
 
   it('stops listening after disconnect so a window dispatch fetches nothing', async () => {

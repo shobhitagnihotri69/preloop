@@ -2,7 +2,7 @@ import { html, fixture, expect, waitUntil } from '@open-wc/testing';
 import sinon from 'sinon';
 import '../../components/view-header.ts';
 import './flow-executions-view';
-import { FlowExecutionsView } from './flow-executions-view';
+import { FlowExecutionsView, RANGE_OPTIONS } from './flow-executions-view';
 import { resetConfirmDialogForTests } from '../../components/confirm-dialog';
 import type { ConfirmDialog } from '../../components/confirm-dialog';
 import { unifiedWebSocketManager } from '../../services/unified-websocket-manager';
@@ -11,6 +11,11 @@ import {
   FINISHED_EXECUTION_COST,
   FINISHED_EXECUTION_TOOL_CALLS,
 } from './test-finished-execution';
+import {
+  FLOW_EXECUTION_FILTERS_KEY,
+  FLOW_EXECUTION_RANGES,
+  FLOW_EXECUTION_STATUSES,
+} from '../../utils/list-filters';
 
 const tick = (ms = 150) => new Promise((r) => setTimeout(r, ms));
 
@@ -62,13 +67,23 @@ describe('FlowExecutionsView', () => {
   beforeEach(() => {
     localStorage.setItem('accessToken', 'test-access-token');
     localStorage.setItem('refreshToken', 'test-refresh-token');
+    window.history.replaceState({}, '', '/console/flows/executions');
   });
 
-  afterEach(() => {
+  afterEach(async () => {
+    for (const alert of document.body.querySelectorAll('sl-alert')) {
+      await waitUntil(
+        () => alert.open || !alert.isConnected,
+        'toast did not finish opening or hiding',
+        {
+          timeout: 10000,
+        }
+      );
+      if (alert.isConnected) await alert.hide();
+    }
     sinon.restore();
     fetchStub = undefined as unknown as sinon.SinonStub;
     resetConfirmDialogForTests();
-    document.body.querySelectorAll('sl-alert').forEach((a) => a.remove());
     localStorage.clear();
   });
 
@@ -158,7 +173,11 @@ describe('FlowExecutionsView', () => {
     const el = (await fixture(
       html`<flow-executions-view></flow-executions-view>`
     )) as FlowExecutionsView;
-    await tick();
+    await waitUntil(
+      () => (el.shadowRoot?.querySelectorAll('tbody tr').length ?? 0) > 0,
+      'execution rows did not finish loading',
+      { timeout: 10000 }
+    );
     await el.updateComplete;
 
     const cells = Array.from(
@@ -177,6 +196,42 @@ describe('FlowExecutionsView', () => {
 
     // The runs that carry no category look exactly as they did.
     expect(cells[1].querySelectorAll('sl-badge').length).to.equal(1);
+  });
+
+  it('labels a review resumption and links the publishing execution', async () => {
+    const publisherId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+    fetchStub = stub([
+      {
+        id: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
+        flow_id: 'flow-1',
+        flow_name: 'Automated Issue Implementation',
+        status: 'FAILED',
+        start_time: '2026-03-09T12:00:00Z',
+        end_time: '2026-03-09T12:01:00Z',
+        estimated_cost: 0.04,
+        resume_of: publisherId,
+        resume_totals: { total_tokens: 1400, estimated_cost: 0.14 },
+      },
+    ]);
+    const el = (await fixture(
+      html`<flow-executions-view></flow-executions-view>`
+    )) as FlowExecutionsView;
+    await tick();
+    await el.updateComplete;
+
+    const line = el.shadowRoot!.querySelector(
+      '[data-testid="resume-line"]'
+    ) as HTMLElement;
+    expect(line, 'resume line').to.exist;
+    expect(line.textContent).to.contain('Continuation of original execution');
+    expect(line.textContent).to.contain('1.4K');
+    expect(line.textContent).to.contain('$0.14');
+    const link = line.querySelector(
+      '[data-testid="resume-of-link"]'
+    ) as HTMLAnchorElement;
+    expect(link.getAttribute('href')).to.contain(
+      `/console/flows/executions/${publisherId}`
+    );
   });
 
   it('fits the table inside its wrapper at 1440', async () => {
@@ -227,6 +282,59 @@ describe('FlowExecutionsView', () => {
     ).to.be.at.most(wrapperBox.left + wrapper.clientWidth + 1);
   });
 
+  it('keeps the Subject column usable at the narrowest layout', async () => {
+    // The table declares a 1080px min-width, which is the fixed columns
+    // (954px) plus a ~120px floor for the flexible Subject column. At a
+    // narrower wrapper the table scrolls instead of crushing the column that
+    // names the run to a sliver.
+    fetchStub = stub([
+      {
+        id: 'exec-running-narrow',
+        flow_id: 'flow-2',
+        flow_name: 'Triage',
+        status: 'RUNNING',
+        start_time: new Date(Date.now() - 12.5 * 60_000).toISOString(),
+        trigger_subject:
+          'example/example #138 · Pull request opened · 949d625b',
+        model_alias: 'deepseek-v4.1-flash',
+      },
+    ]);
+    const host = (await fixture(
+      html`<div style="width: 960px;">
+        <flow-executions-view></flow-executions-view>
+      </div>`
+    )) as HTMLElement;
+    const el = host.querySelector('flow-executions-view') as FlowExecutionsView;
+    await tick();
+    await el.updateComplete;
+
+    const wrapper = el.shadowRoot!.querySelector(
+      '.table-wrapper'
+    ) as HTMLElement;
+    const table = wrapper.querySelector('table') as HTMLElement;
+    expect(table.clientWidth).to.be.at.least(1080);
+    expect(table.scrollWidth).to.be.greaterThan(wrapper.clientWidth);
+
+    const subject = table.querySelector('td.subject-cell') as HTMLElement;
+    expect(subject, 'subject cell').to.exist;
+    expect(subject.clientWidth).to.be.at.least(120);
+    // The subject is the flexible column and still ellipsizes inside its
+    // floor rather than widening the table.
+    const subjectText = subject.querySelector(
+      '.execution-subject-text'
+    ) as HTMLElement;
+    expect(subjectText, 'subject text').to.exist;
+    expect(subjectText.scrollWidth).to.be.greaterThan(subjectText.clientWidth);
+
+    const durationText = table.querySelector(
+      'td.duration-cell .duration-text'
+    ) as HTMLElement;
+    const modelCell = table.querySelector('td.model-cell') as HTMLElement;
+    expect(durationText.getBoundingClientRect().right).to.be.at.most(
+      modelCell.getBoundingClientRect().left + 1
+    );
+  });
+
   it('prints the tool calls and cost the execution page states', async () => {
     // The row is the same fixture the execution page test opens. On staging
     // the two said 0 vs 16 tool calls and $0.03 vs $0.08 for one run, because
@@ -236,7 +344,11 @@ describe('FlowExecutionsView', () => {
     const el = (await fixture(
       html`<flow-executions-view></flow-executions-view>`
     )) as FlowExecutionsView;
-    await tick();
+    await waitUntil(
+      () => (el.shadowRoot?.querySelectorAll('tbody tr').length ?? 0) > 0,
+      'execution rows did not finish loading',
+      { timeout: 10000 }
+    );
     await el.updateComplete;
 
     const cells = [
@@ -325,6 +437,203 @@ describe('FlowExecutionsView', () => {
     }
   });
 
+  it('lets URL params win over stored filters', async () => {
+    localStorage.setItem(
+      FLOW_EXECUTION_FILTERS_KEY,
+      JSON.stringify({
+        status: 'SUCCEEDED',
+        flow: 'flow-stored',
+        range: 'week',
+        q: 'nightly',
+      })
+    );
+    const requested: string[] = [];
+    fetchStub = sinon.stub(window, 'fetch').callsFake(async (input) => {
+      requested.push(String(input));
+      return new Response(JSON.stringify(EXECUTIONS), { status: 200 });
+    });
+    window.history.replaceState(
+      {},
+      '',
+      '/console/flows/executions?status=FAILED&flow_id=flow-1'
+    );
+
+    const el = (await fixture(
+      html`<flow-executions-view></flow-executions-view>`
+    )) as FlowExecutionsView;
+    await tick();
+    await el.updateComplete;
+
+    const executions = requested.filter((url) => url.includes('/executions'));
+    expect(executions.some((url) => url.includes('status=FAILED'))).to.be.true;
+    expect(executions.some((url) => url.includes('flow_id=flow-1'))).to.be.true;
+    expect(executions.some((url) => url.includes('flow_id=flow-stored'))).to.be
+      .false;
+    expect(executions.some((url) => url.includes('status=SUCCEEDED'))).to.be
+      .false;
+    expect(executions.some((url) => url.includes('started_after='))).to.be
+      .false;
+    const status = el.shadowRoot?.querySelector(
+      'sl-select.status-filter'
+    ) as HTMLElement & { value: string };
+    expect(status.value).to.equal('FAILED');
+    expect(
+      JSON.parse(localStorage.getItem(FLOW_EXECUTION_FILTERS_KEY) || '{}')
+        .status
+    ).to.equal('SUCCEEDED');
+  });
+
+  it('restores stored status, flow, and range when the URL has no filters', async () => {
+    localStorage.setItem(
+      FLOW_EXECUTION_FILTERS_KEY,
+      JSON.stringify({
+        status: 'SUCCEEDED',
+        flow: 'flow-1',
+        range: 'week',
+        q: 'nightly',
+      })
+    );
+    const requested: string[] = [];
+    fetchStub = sinon.stub(window, 'fetch').callsFake(async (input) => {
+      requested.push(String(input));
+      return new Response(
+        JSON.stringify(
+          String(input).includes('/flows') &&
+            !String(input).includes('/executions')
+            ? [{ id: 'flow-1', name: 'Nightly Sync' }]
+            : EXECUTIONS
+        ),
+        { status: 200 }
+      );
+    });
+
+    const el = (await fixture(
+      html`<flow-executions-view></flow-executions-view>`
+    )) as FlowExecutionsView;
+    await tick();
+    await el.updateComplete;
+
+    const executions = requested.find((url) => url.includes('/executions'));
+    expect(executions).to.contain('status=SUCCEEDED');
+    expect(executions).to.contain('flow_id=flow-1');
+    expect(executions).to.contain('search=nightly');
+    const started = new URL(
+      executions || '',
+      'http://localhost'
+    ).searchParams.get('started_after');
+    const age = Date.now() - Date.parse(started || '');
+    expect(age).to.be.greaterThan(6 * 24 * 60 * 60 * 1000);
+    expect(age).to.be.lessThan(8 * 24 * 60 * 60 * 1000);
+    const status = el.shadowRoot?.querySelector(
+      'sl-select.status-filter'
+    ) as HTMLElement & { value: string };
+    const flow = el.shadowRoot?.querySelector(
+      'sl-select.flow-filter'
+    ) as HTMLElement & { value: string };
+    const range = el.shadowRoot?.querySelector(
+      'time-range-select'
+    ) as HTMLElement & { value: string };
+    expect(status.value).to.equal('SUCCEEDED');
+    expect(flow.value).to.equal('flow-1');
+    expect(range.value).to.equal('week');
+    expect(window.location.search).to.contain('status=SUCCEEDED');
+    expect(window.location.search).to.contain('flow_id=flow-1');
+    expect(window.location.search).to.contain('range=week');
+    expect(window.location.search).to.contain('q=nightly');
+    const toolbar = el.shadowRoot?.querySelector('list-toolbar') as
+      (HTMLElement & { search: string }) | null;
+    expect(toolbar?.search).to.equal('nightly');
+    expect(el.shadowRoot?.querySelector('.reset-filters')).to.exist;
+  });
+
+  it('writes storage when a filter changes', async () => {
+    fetchStub = stub(EXECUTIONS);
+    const el = (await fixture(
+      html`<flow-executions-view></flow-executions-view>`
+    )) as FlowExecutionsView;
+    await tick();
+    await el.updateComplete;
+
+    const select = el.shadowRoot?.querySelector(
+      'sl-select.status-filter'
+    ) as HTMLElement & { value: string };
+    select.value = 'SUCCEEDED';
+    select.dispatchEvent(new CustomEvent('sl-change'));
+    await tick();
+    await el.updateComplete;
+
+    const saved = JSON.parse(
+      localStorage.getItem(FLOW_EXECUTION_FILTERS_KEY) || '{}'
+    );
+    expect(saved.status).to.equal('SUCCEEDED');
+    expect(window.location.search).to.contain('status=SUCCEEDED');
+  });
+
+  it('ignores and clears garbage in filter storage', async () => {
+    localStorage.setItem(FLOW_EXECUTION_FILTERS_KEY, 'not-json');
+    const requested: string[] = [];
+    fetchStub = sinon.stub(window, 'fetch').callsFake(async (input) => {
+      requested.push(String(input));
+      return new Response(JSON.stringify(EXECUTIONS), { status: 200 });
+    });
+
+    const el = (await fixture(
+      html`<flow-executions-view></flow-executions-view>`
+    )) as FlowExecutionsView;
+    await tick();
+    await el.updateComplete;
+
+    expect(localStorage.getItem(FLOW_EXECUTION_FILTERS_KEY)).to.equal(null);
+    const executions = requested.find((url) => url.includes('/executions'));
+    expect(executions).to.contain('started_after=');
+    expect(executions).to.not.contain('status=');
+    const status = el.shadowRoot?.querySelector(
+      'sl-select.status-filter'
+    ) as HTMLElement & { value: string };
+    expect(status.value).to.equal('');
+    expect(el.shadowRoot?.querySelector('.reset-filters')).to.equal(null);
+  });
+
+  it('clears storage and the URL when filters are reset', async () => {
+    localStorage.setItem(
+      FLOW_EXECUTION_FILTERS_KEY,
+      JSON.stringify({
+        status: 'FAILED',
+        flow: 'flow-1',
+        range: 'all',
+        q: 'sync',
+      })
+    );
+    const requested: string[] = [];
+    fetchStub = sinon.stub(window, 'fetch').callsFake(async (input) => {
+      requested.push(String(input));
+      return new Response(JSON.stringify([]), { status: 200 });
+    });
+
+    const el = (await fixture(
+      html`<flow-executions-view></flow-executions-view>`
+    )) as FlowExecutionsView;
+    await tick();
+    await el.updateComplete;
+
+    const reset = el.shadowRoot?.querySelector(
+      '.reset-filters'
+    ) as HTMLButtonElement;
+    expect(reset).to.exist;
+    requested.length = 0;
+    reset.click();
+    await tick();
+    await el.updateComplete;
+
+    expect(localStorage.getItem(FLOW_EXECUTION_FILTERS_KEY)).to.equal(null);
+    expect(window.location.search).to.equal('');
+    const executions = requested.find((url) => url.includes('/executions'));
+    expect(executions).to.not.contain('status=');
+    expect(executions).to.not.contain('flow_id=');
+    expect(executions).to.contain('started_after=');
+    expect(el.shadowRoot?.querySelector('.reset-filters')).to.equal(null);
+  });
+
   it('drops a pending search when the view is torn down', async () => {
     fetchStub = stub(EXECUTIONS);
     const el = (await fixture(
@@ -345,6 +654,43 @@ describe('FlowExecutionsView', () => {
     expect(fetchStub.callCount).to.equal(callsBefore);
   });
 
+  it('still searches when history.replaceState throws', async () => {
+    const requested: string[] = [];
+    fetchStub = sinon.stub(window, 'fetch').callsFake(async (input) => {
+      requested.push(String(input));
+      return new Response(JSON.stringify(EXECUTIONS), { status: 200 });
+    });
+    const replaceState = sinon
+      .stub(window.history, 'replaceState')
+      .throws(new DOMException('The operation is insecure.', 'SecurityError'));
+    const el = (await fixture(
+      html`<flow-executions-view></flow-executions-view>`
+    )) as FlowExecutionsView;
+    await tick();
+    await el.updateComplete;
+    replaceState.resetHistory();
+    requested.length = 0;
+
+    const toolbar = el.shadowRoot?.querySelector('list-toolbar');
+    toolbar?.dispatchEvent(
+      new CustomEvent('search-change', { detail: { value: 'ni' } })
+    );
+    toolbar?.dispatchEvent(
+      new CustomEvent('search-change', { detail: { value: 'nightly' } })
+    );
+    await tick(400);
+    await el.updateComplete;
+
+    expect(requested.some((url) => url.includes('search=nightly'))).to.equal(
+      true
+    );
+    const saved = JSON.parse(
+      localStorage.getItem(FLOW_EXECUTION_FILTERS_KEY) || '{}'
+    );
+    expect(saved.q).to.equal('nightly');
+    expect(replaceState.callCount).to.be.lessThan(3);
+  });
+
   it('offers every execution status in the status filter', async () => {
     fetchStub = stub(EXECUTIONS);
     const el = (await fixture(
@@ -358,12 +704,50 @@ describe('FlowExecutionsView', () => {
     ).map((option) => option.getAttribute('value'));
     expect(options).to.eql([
       '',
-      'RUNNING',
-      'PENDING',
-      'SUCCEEDED',
-      'FAILED',
-      'CANCELLED',
+      ...FLOW_EXECUTION_STATUSES.filter((status) => status !== 'all'),
     ]);
+  });
+
+  it('names the operator queues and asks for both timed-out spellings', async () => {
+    const requested: string[] = [];
+    fetchStub = sinon.stub(window, 'fetch').callsFake(async (input) => {
+      requested.push(String(input));
+      return new Response(JSON.stringify([]), { status: 200 });
+    });
+    window.history.replaceState(
+      {},
+      '',
+      '/console/flows/executions?status=TIMED_OUT'
+    );
+    const el = (await fixture(
+      html`<flow-executions-view></flow-executions-view>`
+    )) as FlowExecutionsView;
+    await tick();
+    await el.updateComplete;
+
+    const labels = Array.from(
+      el.shadowRoot?.querySelectorAll('sl-select.status-filter sl-option') || []
+    ).map((option) => option.textContent?.trim());
+    expect(labels).to.include.members([
+      'Waiting for approval',
+      'Stopped',
+      'Timed out',
+    ]);
+    const status = el.shadowRoot?.querySelector(
+      'sl-select.status-filter'
+    ) as HTMLElement & { value: string };
+    expect(status.value).to.equal('TIMEOUT');
+    const list = requested.filter((url) =>
+      url.includes('/api/v1/flows/executions?')
+    );
+    expect(list.some((url) => /status=TIMEOUT&status=TIMED_OUT/.test(url))).to
+      .be.true;
+  });
+
+  it('keeps the stored range allowlist in step with the control', () => {
+    expect([...FLOW_EXECUTION_RANGES]).to.deep.equal(
+      RANGE_OPTIONS.map((option) => option.value)
+    );
   });
 
   it('names the filter selects for a screen reader without printing them', async () => {
@@ -467,7 +851,13 @@ describe('FlowExecutionsView', () => {
       const el = (await fixture(
         html`<flow-executions-view></flow-executions-view>`
       )) as FlowExecutionsView;
-      await tick();
+      await waitUntil(
+        () =>
+          (el.shadowRoot?.querySelectorAll('tbody tr').length ?? 0) ===
+          rows.length,
+        'the requested execution rows did not finish rendering',
+        { timeout: 10000 }
+      );
       await el.updateComplete;
       return el;
     }
@@ -520,6 +910,67 @@ describe('FlowExecutionsView', () => {
 
       const text = cellText(el, 0);
       expect(text).to.match(/^Running · \d+m \d+s$/);
+    });
+
+    /** The Model cell and rendered duration label of one row. */
+    const durationGeometry = (el: FlowExecutionsView, rowIndex: number) => {
+      const cells = el.shadowRoot
+        ?.querySelectorAll('tbody tr')
+        [rowIndex]?.querySelectorAll('td');
+      const durationCell = cells?.[4] as HTMLElement;
+      const modelCell = cells?.[5] as HTMLElement;
+      const durationText = durationCell?.querySelector(
+        '.duration-text'
+      ) as HTMLElement;
+      return { modelCell, durationText };
+    };
+
+    it('keeps a live duration clear of the model cell', async () => {
+      const el = await renderRows([
+        {
+          id: 'exec-running-long',
+          flow_id: 'flow-2',
+          flow_name: 'Triage',
+          status: 'RUNNING',
+          // 12m 30s elapsed, the case from the report.
+          start_time: new Date(Date.now() - 12.5 * 60_000).toISOString(),
+          model_alias: 'deepseek-v4.1-flash',
+        },
+      ]);
+
+      expect(cellText(el, 0)).to.match(/^Running · 12m 3[01]s$/);
+
+      const { modelCell, durationText } = durationGeometry(el, 0);
+      // The label must end before the Model cell starts; when the Duration
+      // column is too narrow the nowrap text paints over it (issue #1250).
+      expect(durationText.getBoundingClientRect().right).to.be.at.most(
+        modelCell.getBoundingClientRect().left + 1
+      );
+    });
+
+    it('fits the practical widest live duration label without clipping', async () => {
+      const el = await renderRows([
+        {
+          id: 'exec-running-max',
+          flow_id: 'flow-2',
+          flow_name: 'Triage',
+          status: 'RUNNING',
+          // ~41.7 days in: `formatDurationBetween` emits `999h 59m`, the
+          // widest span the Duration column is tuned to fit. The formatter
+          // has no hour cap, so anything longer clips with an ellipsis.
+          start_time: new Date(
+            Date.now() - (999 * 60 + 59) * 60_000
+          ).toISOString(),
+          model_alias: 'deepseek-v4.1-flash',
+        },
+      ]);
+
+      expect(cellText(el, 0)).to.equal('Running · 999h 59m');
+
+      const { modelCell, durationText } = durationGeometry(el, 0);
+      expect(durationText.getBoundingClientRect().right).to.be.at.most(
+        modelCell.getBoundingClientRect().left + 1
+      );
     });
 
     it('shows an em dash for a terminal execution with no end time', async () => {
@@ -575,7 +1026,13 @@ describe('FlowExecutionsView', () => {
       const el = (await fixture(
         html`<flow-executions-view></flow-executions-view>`
       )) as FlowExecutionsView;
-      await tick();
+      await waitUntil(
+        () =>
+          (el.shadowRoot?.querySelectorAll('tbody tr').length ?? 0) ===
+          rows.length,
+        'the requested execution rows did not finish rendering',
+        { timeout: 10000 }
+      );
       await el.updateComplete;
       return el;
     }
@@ -940,7 +1397,13 @@ describe('FlowExecutionsView', () => {
       const el = (await fixture(
         html`<flow-executions-view></flow-executions-view>`
       )) as FlowExecutionsView;
-      await tick();
+      await waitUntil(
+        () =>
+          !!el.shadowRoot?.querySelector('tbody tr') ||
+          (el as unknown as { loadError: string | null }).loadError !== null,
+        'execution rows or the load error did not finish rendering',
+        { timeout: 10000 }
+      );
       await el.updateComplete;
       return el;
     }

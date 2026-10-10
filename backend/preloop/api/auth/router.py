@@ -38,11 +38,14 @@ from preloop.api.auth.jwt import (
     verify_password,
 )
 from preloop.config import settings
+from preloop.plugins import account_hooks
 from preloop.schemas.auth import (
+    LogoutResponse,
     ApiKeyCreate,
     ApiKeyResponse,
     ApiKeySummary,
     ApiUsageStatistics,
+    CliSessionResponse,
     EmailVerificationRequest,
     EmailVerificationResendRequest,
     LoginRequest,
@@ -74,11 +77,13 @@ from preloop.utils.tokens import (
     create_password_reset_token,
     hash_onboarding_claim_token,
     verify_onboarding_claim_token,
-    verify_token,
+    verify_user_token,
 )
 from preloop.models.crud import (
+    AmbiguousEmailError,
     crud_account,
     crud_audit_log,
+    crud_cli_session,
     crud_team,
     crud_user,
     crud_api_key,
@@ -88,12 +93,17 @@ from preloop.models.crud import (
     crud_mcp_server,
     crud_role,
     crud_runtime_session,
+    crud_runtime_session_activity,
     crud_user_role,
 )
 from preloop.models.db.session import get_db_session
-from preloop.models.models.user import User as UserModel
-from preloop.models.models.api_key import ApiKey
+from preloop.models import models
 from pydantic import BaseModel
+from preloop.plugins.account_hooks import (
+    get_login_row_selector,
+    select_email_rows,
+    select_login_row,
+)
 from preloop.services.account_realtime import (
     ACCOUNT_TOPIC_AUDIT,
     ACCOUNT_TOPIC_MANAGED_AGENTS,
@@ -113,6 +123,9 @@ from preloop.services.subject_governance import (
 )
 
 
+UserModel = models.User
+ApiKey = models.ApiKey
+
 logger = logging.getLogger(__name__)
 router = APIRouter()
 RUNTIME_SESSION_SOURCE_TYPES = {
@@ -125,6 +138,7 @@ RUNTIME_SESSION_SOURCE_TYPES = {
     "hermes",
     "pi",
     "deepseek",
+    "nanobot",
     "desktop_agent",
     "custom",
 }
@@ -290,29 +304,47 @@ def _api_key_activity_status(
     return "idle"
 
 
-def _build_api_key_summary(session: Session, key: ApiKey) -> ApiKeySummary:
+def _build_api_key_summary(
+    session: Session,
+    key: models.ApiKey,
+    *,
+    activity: Optional[tuple[Optional[datetime], int, Optional[datetime], int]] = None,
+) -> ApiKeySummary:
+    """Render a summary from batched statistics, or query a single-key detail.
+
+    Args:
+        session: Database session for the single-key fallback.
+        key: Authorized API key whose public summary is requested.
+        activity: Last model time/count and last tool time/count. Supplying an
+            all-empty tuple still avoids querying keys with no activity.
+
+    Returns:
+        The existing public API-key summary, without credential material.
+    """
     context_data = key.context_data if isinstance(key.context_data, dict) else {}
     runtime_principal = (
         context_data.get("runtime_principal")
         if isinstance(context_data.get("runtime_principal"), dict)
         else {}
     )
-    recent_start = datetime.now(UTC) - API_KEY_RECENT_WINDOW
-    last_model_call = crud_api_usage.get_last_model_call_timestamp(
-        session, api_key_id=key.id
-    )
-    recent_model_calls = crud_api_usage.get_recent_model_calls_count(
-        session, api_key_id=key.id, recent_start=recent_start
-    )
-
-    from preloop.models.crud import crud_runtime_session_activity
-
-    last_tool_call = crud_runtime_session_activity.get_last_tool_call_timestamp(
-        session, api_key_id=key.id
-    )
-    recent_tool_calls = crud_runtime_session_activity.get_recent_tool_calls_count(
-        session, api_key_id=key.id, recent_start=recent_start
-    )
+    if activity is None:
+        recent_start = datetime.now(UTC) - API_KEY_RECENT_WINDOW
+        last_model_call = crud_api_usage.get_last_model_call_timestamp(
+            session, api_key_id=key.id
+        )
+        recent_model_calls = crud_api_usage.get_recent_model_calls_count(
+            session, api_key_id=key.id, recent_start=recent_start
+        )
+        last_tool_call = crud_runtime_session_activity.get_last_tool_call_timestamp(
+            session, api_key_id=key.id
+        )
+        recent_tool_calls = crud_runtime_session_activity.get_recent_tool_calls_count(
+            session, api_key_id=key.id, recent_start=recent_start
+        )
+    else:
+        last_model_call, recent_model_calls, last_tool_call, recent_tool_calls = (
+            activity
+        )
     candidate_times = []
     for value in (key.last_used_at, last_model_call, last_tool_call):
         if value:
@@ -388,6 +420,14 @@ def _normalize_runtime_session_tool_names(requested_tools: List[Any]) -> List[st
             normalized_names.append(normalized_name)
 
     return normalized_names
+
+
+RUNTIME_SESSION_NO_TOOLS_WARNING = (
+    "This runtime session token allows no MCP tools: allowed_mcp_servers and "
+    "allowed_mcp_tools resolved to zero tools (empty, missing, inactive or "
+    "not yet scanned). The agent will see an empty tool list. Pass the MCP "
+    "server names in allowed_mcp_servers when minting."
+)
 
 
 def _resolve_runtime_session_tool_restrictions(
@@ -571,11 +611,9 @@ async def register(
 
     # Check if email exists using CRUD layer
     logger.info("[REGISTER] Checking if email exists")
-    existing_email = crud_user.get_by_email(session, email=user_data.email)
-    logger.info(
-        f"[REGISTER] Email check complete, exists: {existing_email is not None}"
-    )
-    if existing_email is not None:
+    email_taken = crud_user.email_exists(session, email=user_data.email)
+    logger.info(f"[REGISTER] Email check complete, exists: {email_taken}")
+    if email_taken:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Email already registered",
@@ -701,6 +739,52 @@ async def register(
         )
 
 
+def _user_for_token(session: Session, token: str, token_type: str) -> UserModel:
+    """The user row a verification or reset link acts on.
+
+    The token names the row by id, never by address: one address can hold a
+    row in several accounts. It also carries the address it was mailed to,
+    and a row whose address has since changed does not honour it, so an old
+    link cannot verify or reset whatever address the row holds now.
+
+    A login row selector (account hook H1) may move the link to another row,
+    but only to one that holds the same address: the link proves possession
+    of that address and nothing else, so it can never verify or reset a row
+    whose address it did not prove.
+
+    Args:
+        session: Database session.
+        token: The token from the link.
+        token_type: "email_verification" or "password_reset".
+
+    Returns:
+        The user row the token names, or the row the selector chose.
+
+    Raises:
+        TokenError: If the token is invalid, no longer matches its row, or
+            the selected row holds a different address.
+        HTTPException: 404 if the row no longer exists.
+    """
+    claims = verify_user_token(token, token_type)
+    user = crud_user.get(session, id=claims.user_id)
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="User not found",
+        )
+    if (user.email or "").lower() != claims.email.lower():
+        raise TokenError(
+            "This link is no longer valid. Request a new one and use that instead."
+        )
+    purpose = "verify_email" if token_type == "email_verification" else "reset_password"
+    selected = select_login_row(session, user, purpose=purpose)
+    if selected is not user and (selected.email or "").lower() != claims.email.lower():
+        raise TokenError(
+            "This link is no longer valid. Request a new one and use that instead."
+        )
+    return selected
+
+
 @router.post("/verify-email", status_code=status.HTTP_200_OK)
 async def verify_email(
     verification_data: EmailVerificationRequest,
@@ -725,20 +809,8 @@ async def verify_email(
         HTTPException: If the token is invalid or the user does not exist.
     """
     try:
-        # Verify the token
-        email = verify_token(verification_data.token, "email_verification")
-
-        # Find and update the user
         session = db
-
-        # Find the user using CRUD layer
-        user = crud_user.get_by_email(session, email=email)
-
-        if not user:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="User not found",
-            )
+        user = _user_for_token(session, verification_data.token, "email_verification")
 
         # Update email verification status
         if not user.email_verified:
@@ -770,6 +842,10 @@ async def verify_email(
                 }
             )
         return response
+    except HTTPException:
+        # "User not found" from _user_for_token is a real answer, not a
+        # server error, so it must not fall into the handler below.
+        raise
     except TokenError as e:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -818,11 +894,23 @@ def resend_verification(
     email = (verification_data.email or "").strip()
     check_resend_rate_limit(get_client_ip(request) or "", email.lower())
 
-    user = crud_user.get_by_email(db, email=email)
-    if user and not user.email_verified:
+    # One address can hold a row in several accounts. Each unverified row
+    # gets its own link, bound to that row, so following one never verifies
+    # another.
+    rows = select_email_rows(
+        db,
+        email,
+        crud_user.list_by_email(db, email=email),
+        purpose="resend_verification",
+    )
+    for user in rows:
+        if user.email_verified:
+            continue
         background_tasks.add_task(
             _send_verification_email_task,
             user_email=user.email,
+            user_id=user.id,
+            username=user.username,
         )
     return {
         "message": (
@@ -831,15 +919,19 @@ def resend_verification(
     }
 
 
-def _send_verification_email_task(user_email: str) -> None:
+def _send_verification_email_task(
+    user_email: str, user_id: UUID, username: Optional[str] = None
+) -> None:
     """Mint a verification token and mail it, swallowing sender failures.
 
     Args:
         user_email: Address to verify.
+        user_id: The row the link verifies.
+        username: That row's username, named in the message.
     """
     try:
-        token = create_email_verification_token(user_email)
-        send_verification_email(user_email=user_email, token=token)
+        token = create_email_verification_token(user_email, user_id=user_id)
+        send_verification_email(user_email=user_email, token=token, username=username)
     except Exception as error:
         logger.error("Failed to resend verification email: %s", error)
 
@@ -850,29 +942,36 @@ async def forgot_password(
     background_tasks: BackgroundTasks,
     db: Session = Depends(get_db_session),
 ) -> Dict[str, str]:
-    """Send a password reset email.
+    """Send a password reset email for every user row holding the address.
+
+    ``user.email`` is not unique: an address invited into a second account
+    holds a second row there, with its own password. This never chooses one
+    of them. Every row holding the address gets its own message, whose link
+    is bound to that row and names its username, so the person resets the
+    account they mean by following that account's link. Each link goes to
+    the address its own row holds, the inbox that row already trusts for a
+    reset, so no row is reachable from an inbox it does not name.
 
     Args:
         reset_data: Password reset request with email.
         background_tasks: Background tasks for sending emails.
 
     Returns:
-        Success message.
+        The same neutral message whether or not the address is registered.
     """
-    # Always return success even if email doesn't exist (security best practice)
-    # But only send email if user exists
-    session = db
-
-    # Find user using CRUD layer
-    user = crud_user.get_by_email(session, email=reset_data.email)
-
-    if user:
-        # Generate password reset token
-        token = create_password_reset_token(reset_data.email)
-
-        # Send password reset email as a background task
+    rows = select_email_rows(
+        db,
+        reset_data.email,
+        crud_user.list_by_email(db, email=reset_data.email),
+        purpose="forgot_password",
+    )
+    for user in rows:
+        token = create_password_reset_token(user.email, user_id=user.id)
         background_tasks.add_task(
-            send_password_reset_email, user_email=reset_data.email, token=token
+            send_password_reset_email,
+            user_email=user.email,
+            token=token,
+            username=user.username,
         )
     return {
         "message": "If your email is registered, you will receive a password reset link"
@@ -896,26 +995,18 @@ async def reset_password(
         HTTPException: If the token is invalid or the user does not exist.
     """
     try:
-        # Verify the token
-        email = verify_token(reset_data.token, "password_reset")
-
-        # Find and update the user
         session = db
-
-        # Find user using CRUD layer
-        user = crud_user.get_by_email(session, email=email)
-
-        if not user:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="User not found",
-            )
+        user = _user_for_token(session, reset_data.token, "password_reset")
 
         # Update password
         user.hashed_password = get_password_hash(reset_data.new_password)
         session.commit()
 
         return {"message": "Password reset successfully"}
+    except HTTPException:
+        # "User not found" from _user_for_token is a real answer, not a
+        # server error, so it must not fall into the handler below.
+        raise
     except TokenError as e:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -927,6 +1018,19 @@ async def reset_password(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Error resetting password",
         )
+
+
+async def _landing_row(user: UserModel, db: Session) -> UserModel:
+    """The row a password sign-in lands on (the checked row unless H1 says).
+
+    Without a registered login row selector this returns ``user`` without
+    leaving the event loop or touching the database.
+    """
+    if get_login_row_selector() is None:
+        return user
+    from preloop.api.loop_safety import run_db_off_loop
+
+    return await run_db_off_loop(lambda: select_login_row(db, user, purpose="login"))
 
 
 @router.post("/token", response_model=Token)
@@ -959,6 +1063,7 @@ async def login_form(
             headers={"WWW-Authenticate": "Bearer"},
         )
     enforce_verified_email(user)
+    user = await _landing_row(user, db)
 
     # Create access token with user information
     access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
@@ -1015,6 +1120,7 @@ async def login_json(
             headers={"WWW-Authenticate": "Bearer"},
         )
     enforce_verified_email(user)
+    user = await _landing_row(user, db)
 
     # Create access token with user information
     access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
@@ -1065,7 +1171,10 @@ def refresh_token(
         # Check if it's a refresh token before touching the database: an
         # access token presented here is always invalid, regardless of user
         # state.
-        if not token_data.refresh:
+        # A CLI login refresh token (sid claim) rotates only at /oauth/token,
+        # where its cli_session row is checked and advanced. Minting console
+        # tokens from it here would drop the sid and escape revocation.
+        if not token_data.refresh or token_data.sid is not None:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Invalid refresh token",
@@ -1156,10 +1265,101 @@ def revoke_all_sessions(
 
     Increments ``auth_generation`` so every outstanding access and refresh
     token (including this request's) fails the generation check on the next
-    use. API keys and runner tokens are unchanged.
+    use. Active ``cli_session`` rows are marked revoked in the same commit so
+    the CLI session list matches what is enforced. API keys and runner tokens
+    are unchanged.
     """
+    crud_cli_session.revoke_all(db, user_id=current_user.id, commit=False)
     new_generation = crud_user.bump_auth_generation(db, user_id=current_user.id)
     return {"auth_generation": new_generation}
+
+
+@router.post("/logout", response_model=LogoutResponse)
+def logout(
+    request: Request,
+    current_user: UserModel = Depends(get_current_active_user),
+    db: Session = Depends(get_db_session),
+) -> LogoutResponse:
+    """Sign the current console session out on the server.
+
+    The client clears its own tokens whatever this returns. Extensions may
+    end server-side state tied to the token and name a same-origin path for
+    the client to go to next; without one the client uses its default. Other
+    sessions of the user are unaffected (see ``/sessions/revoke-all``).
+    """
+    claims = _request_jwt_claims(request)
+    outcome = account_hooks.run_logout_hook(db, current_user, claims)
+    db.commit()
+    return LogoutResponse(redirect_url=outcome.redirect_url)
+
+
+def _request_jwt_claims(request: Request) -> Dict[str, Any]:
+    """Return the claims of the request's bearer JWT; empty for API keys."""
+    auth_header = request.headers.get("authorization", "")
+    scheme, _, token = auth_header.partition(" ")
+    if scheme.lower() != "bearer" or "." not in token:
+        return {}
+    try:
+        return decode_token(token.strip()).claims
+    except HTTPException:
+        return {}
+
+
+def _request_cli_session_id(request: Request) -> Optional[str]:
+    """Return the ``sid`` of the request's bearer JWT, if it has one."""
+    auth_header = request.headers.get("authorization", "")
+    scheme, _, token = auth_header.partition(" ")
+    if scheme.lower() != "bearer" or "." not in token:
+        return None
+    try:
+        return decode_token(token.strip()).sid
+    except HTTPException:
+        return None
+
+
+@router.get("/sessions/cli", response_model=List[CliSessionResponse])
+def list_cli_sessions(
+    request: Request,
+    current_user: UserModel = Depends(get_current_active_user),
+    db: Session = Depends(get_db_session),
+) -> List[CliSessionResponse]:
+    """List the signed-in user's active CLI login sessions.
+
+    Each ``preloop auth login`` creates one. Revoked sessions are omitted.
+    """
+    current_sid = _request_cli_session_id(request)
+    return [
+        CliSessionResponse(
+            id=row.id,
+            created_at=row.created_at,
+            last_seen_at=row.last_seen_at,
+            user_agent=row.user_agent,
+            hostname=row.hostname,
+            current=str(row.id) == current_sid,
+        )
+        for row in crud_cli_session.list_active(db, user_id=current_user.id)
+    ]
+
+
+@router.delete("/sessions/cli/{session_id}", status_code=status.HTTP_204_NO_CONTENT)
+def revoke_cli_session(
+    session_id: UUID,
+    current_user: UserModel = Depends(get_current_active_user),
+    db: Session = Depends(get_db_session),
+) -> None:
+    """Revoke one CLI login session of the signed-in user.
+
+    Its access and refresh tokens are rejected on their next use. Other
+    sessions are unaffected.
+
+    Raises:
+        HTTPException: 404 when no active session with this id belongs to
+            the caller.
+    """
+    if not crud_cli_session.revoke(db, session_id=session_id, user_id=current_user.id):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="CLI session not found"
+        )
 
 
 @router.get("/users/me", response_model=AuthUserResponse)
@@ -1209,6 +1409,70 @@ def change_current_user_password(
     )
 
 
+def _is_account_admin(db: Session, current_user: UserModel) -> bool:
+    """Superuser, the account's primary user, or a holder of manage_account."""
+    from preloop.utils.permissions import user_holds_permission
+
+    if getattr(current_user, "is_superuser", False):
+        return True
+    account = crud_account.get(db, id=current_user.account_id)
+    if account is not None and str(account.primary_user_id) == str(current_user.id):
+        return True
+    return user_holds_permission(db, current_user, "manage_account")
+
+
+def _trusted_upstream_key_context(
+    key_data: ApiKeyCreate, current_user: UserModel, db: Session
+) -> Optional[Dict[str, Any]]:
+    """Validate trusted upstream options and build the key's context data.
+
+    The ``model_gateway:trusted_upstream`` scope lets a key name developers
+    in identity headers, so only account admins (``manage_account``) may
+    grant it. The upstream secret is stored as a sha256 hash only.
+
+    Raises:
+        HTTPException: 403 for a non-admin asking for the scope; 400 when
+            trusted upstream options are sent without the scope.
+    """
+    from preloop.services.gateway_upstream_identity import (
+        PER_SUBJECT_BUDGET_CONTEXT_KEY,
+        TRUSTED_UPSTREAM_SCOPE,
+        UPSTREAM_SECRET_HASH_CONTEXT_KEY,
+        hash_upstream_secret,
+    )
+
+    trusted = TRUSTED_UPSTREAM_SCOPE in (key_data.scopes or [])
+    has_options = (
+        key_data.trusted_upstream_secret is not None
+        or key_data.per_subject_budget is not None
+    )
+    if not trusted:
+        if has_options:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    "trusted_upstream_secret and per_subject_budget require the "
+                    f"{TRUSTED_UPSTREAM_SCOPE} scope"
+                ),
+            )
+        return None
+    if not _is_account_admin(db, current_user):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"Only account admins can grant the {TRUSTED_UPSTREAM_SCOPE} scope",
+        )
+    context: Dict[str, Any] = {}
+    if key_data.trusted_upstream_secret is not None:
+        context[UPSTREAM_SECRET_HASH_CONTEXT_KEY] = hash_upstream_secret(
+            key_data.trusted_upstream_secret
+        )
+    if key_data.per_subject_budget is not None:
+        context[PER_SUBJECT_BUDGET_CONTEXT_KEY] = (
+            key_data.per_subject_budget.model_dump(exclude_none=True)
+        )
+    return context or None
+
+
 @router.post(
     "/api-keys", response_model=ApiKeyResponse, status_code=status.HTTP_201_CREATED
 )
@@ -1226,6 +1490,8 @@ def create_api_key(
     Returns:
         The created API key details.
     """
+    context_data = _trusted_upstream_key_context(key_data, current_user, db)
+
     # Generate a secure random key
     alphabet = string.ascii_letters + string.digits
     key_value = "".join(secrets.choice(alphabet) for _ in range(40))
@@ -1257,6 +1523,7 @@ def create_api_key(
             account_id=current_user.account_id,
             user_id=current_user.id,
             expires_at=key_data.expires_at,
+            context_data=context_data,
         )
 
         session.add(new_key)
@@ -1530,6 +1797,32 @@ async def create_runtime_session_token(
         )
     )
 
+    warnings: List[str] = []
+    if not allowed_mcp_tools:
+        warnings.append(RUNTIME_SESSION_NO_TOOLS_WARNING)
+        logger.warning(
+            "Runtime session token minted with zero MCP tools "
+            "(managed_agent_id=%s, runtime_session_id=%s, "
+            "requested_servers=%d, requested_tools=%d)",
+            managed_agent.id,
+            runtime_session.id,
+            len(session_data.allowed_mcp_servers),
+            len(session_data.allowed_mcp_tools),
+        )
+        try:
+            from preloop.models.crud import crud_runtime_session_activity
+
+            crud_runtime_session_activity.log_session_warning(
+                db,
+                account_id=current_user.account_id,
+                runtime_session_id=runtime_session.id,
+                code="no_mcp_tools",
+                summary=RUNTIME_SESSION_NO_TOOLS_WARNING,
+            )
+        except Exception:
+            db.rollback()
+            logger.debug("Failed to record zero-tools session warning", exc_info=True)
+
     return RuntimeSessionTokenResponse(
         runtime_session_id=runtime_session.id,
         token=token_value,
@@ -1537,6 +1830,7 @@ async def create_runtime_session_token(
         session_source_type=runtime_session.session_source_type,
         session_source_id=runtime_session.session_source_id,
         session_reference=runtime_session.session_reference,
+        warnings=warnings,
     )
 
 
@@ -1557,8 +1851,33 @@ def list_api_keys(
 
     # Get API keys using CRUD layer
     keys = crud_api_key.get_by_user(session, username=current_user.username)
-
-    return [_build_api_key_summary(session, key) for key in keys]
+    if not keys:
+        return []
+    key_ids = [key.id for key in keys]
+    recent_start = datetime.now(UTC) - API_KEY_RECENT_WINDOW
+    model_calls = crud_api_usage.get_model_call_stats_for_api_keys(
+        session,
+        account_id=current_user.account_id,
+        api_key_ids=key_ids,
+        recent_start=recent_start,
+    )
+    tool_calls = crud_runtime_session_activity.get_tool_call_stats_for_api_keys(
+        session,
+        account_id=current_user.account_id,
+        api_key_ids=key_ids,
+        recent_start=recent_start,
+    )
+    return [
+        _build_api_key_summary(
+            session,
+            key,
+            activity=(
+                *model_calls.get(key.id, (None, 0)),
+                *tool_calls.get(key.id, (None, 0)),
+            ),
+        )
+        for key in keys
+    ]
 
 
 @router.get("/api-keys/{key_id}", response_model=ApiKeySummary)
@@ -1933,7 +2252,14 @@ async def complete_onboarding(
     except TokenError:
         raise _refuse_claim()
 
-    user = crud_user.get_by_email(session, email=request.email)
+    # The address alone can match a row in several accounts; the claim names
+    # the account, so the lookup is scoped to it and never picks a row.
+    try:
+        user = crud_user.get_by_email(
+            session, email=request.email, account_id=claims["account_id"]
+        )
+    except AmbiguousEmailError:
+        raise _refuse_claim()
     if not user:
         raise _refuse_claim()
     # The token names the account it opens, so one customer's link cannot

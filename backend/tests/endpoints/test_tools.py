@@ -102,6 +102,11 @@ class TestListAllTools:
             "run_flow",
             "get_execution",
             "search_sessions",
+            "list_sessions",
+            "deposit_artifact",
+            "search_artifacts",
+            "get_artifact",
+            "search",
         }
         # Issue triage folded back into get_issue/update_issue (#661): no
         # separate default-disabled triage tools remain in the catalogue.
@@ -303,8 +308,11 @@ class TestListAllTools:
         mcp_server.id = server_id
         mcp_server.name = "Test MCP Server"
         mcp_server.status = "active"
+        mcp_server.tool_prefix = None
 
         mcp_tool = MagicMock(spec=MCPTool)
+        mcp_tool.shadowed = False
+        mcp_tool.mcp_server_id = server_id
         mcp_tool.name = "custom_tool"
         mcp_tool.description = "A custom MCP tool"
         mcp_tool.input_schema = {"type": "object", "properties": {}}
@@ -319,7 +327,7 @@ class TestListAllTools:
             return_value=[mcp_server],
         )
         mocker.patch(
-            "preloop.api.endpoints.tools.crud_mcp_tool.get_by_server",
+            "preloop.api.endpoints.tools.crud_mcp_tool.get_by_servers_for_account",
             return_value=[mcp_tool],
         )
 

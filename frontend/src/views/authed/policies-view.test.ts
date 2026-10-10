@@ -567,7 +567,12 @@ describe('PoliciesView', () => {
       'require_approval'
     );
     expect(element.shadowRoot?.textContent).to.contain('approve-flagged');
-    expect(element.shadowRoot?.textContent).to.contain('require_approval');
+    const badge = element.shadowRoot?.querySelector(
+      '[data-rule-id="approve-flagged"] sl-badge[data-action]'
+    );
+    // Sentence case and amber, never raw snake_case.
+    expect(badge?.textContent?.trim()).to.equal('Require approval');
+    expect(badge?.getAttribute('variant')).to.equal('warning');
   });
 
   it('shows a unified YAML diff from Describe a change and Save applies', async () => {
@@ -664,6 +669,147 @@ describe('PoliciesView', () => {
     expect((element as any)._showGenerateDialog).to.be.false;
   });
 
+  it('saves the Sensitive data tab through the policy diff and upload path', async () => {
+    let uploadedYaml = '';
+    let previewed = false;
+    const agentUrls: string[] = [];
+    let agentsFail = false;
+    fetchStub = sinon
+      .stub(window, 'fetch')
+      .callsFake(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === 'string' ? input : input.toString();
+        const method = (init?.method || 'GET').toUpperCase();
+        if (
+          url.endsWith('/api/v1/tools') ||
+          url.endsWith('/api/v1/approval-workflows')
+        ) {
+          return json([]);
+        }
+        if (url.includes('/api/v1/features')) {
+          return json({ plugins: [], features: {} });
+        }
+        if (url.includes('/api/v1/policies/model-io-rules')) {
+          return json({ rules: [] });
+        }
+        if (
+          url.includes('/api/v1/policies/versions') ||
+          url.includes('/api/v1/mcp-servers')
+        ) {
+          return json([]);
+        }
+        if (url.includes('/api/v1/agents')) {
+          agentUrls.push(url);
+          if (agentsFail) return json({ detail: 'boom' }, 500);
+          // Mirrors the endpoint: le=100 on limit.
+          const limit = Number(
+            new URL(url, location.origin).searchParams.get('limit')
+          );
+          if (limit > 100) return json({ detail: 'limit too large' }, 422);
+          return json({
+            items: [{ id: 'agent-1', display_name: 'Billing bot' }],
+          });
+        }
+        if (url.includes('/sensitive-data/types')) {
+          return json({
+            types: [
+              {
+                id: 'email',
+                label: 'Email addresses',
+                description: 'Mailbox addresses.',
+                example: 'a@example.com',
+                locales: [],
+                checksum: false,
+                builtin: true,
+              },
+            ],
+            default_types: ['email'],
+          });
+        }
+        if (url.includes('/api/v1/policies/export')) {
+          return new Response('version: "1.0"\nmetadata:\n  name: live\n', {
+            status: 200,
+          });
+        }
+        if (url.endsWith('/api/v1/policies/diff') && method === 'POST') {
+          previewed = true;
+          return json({
+            summary: '1 modified',
+            has_changes: true,
+            changes: { added: [], removed: [], modified: [] },
+          });
+        }
+        if (url.endsWith('/api/v1/policies/upload') && method === 'POST') {
+          uploadedYaml = await (
+            (init!.body as FormData).get('file') as File
+          ).text();
+          return json({ success: true, policy_name: 'live' });
+        }
+        return json({ detail: `Unhandled: ${method} ${url}` }, 500);
+      });
+
+    const element = (await fixture(
+      html`<policies-view></policies-view>`
+    )) as PoliciesView;
+    await waitUntil(() => !(element as any)._loading, 'still loading');
+    // The agent picker loads within the endpoint's page cap, and a failed
+    // load is shown rather than leaving the picker silently empty.
+    agentsFail = true;
+    await (element as any)._loadSensitiveOptions();
+    await element.updateComplete;
+    const failedPanel = element.shadowRoot!.querySelector(
+      'sensitive-data-panel'
+    )!;
+    await failedPanel.updateComplete;
+    expect(
+      failedPanel.shadowRoot!.querySelector(
+        '[data-testid="sensitive-options-error"]'
+      )?.textContent
+    ).to.contain('Could not load the agents list');
+    agentsFail = false;
+    await (element as any)._loadSensitiveOptions();
+    await element.updateComplete;
+    expect(agentUrls.every((url) => url.includes('limit=100'))).to.be.true;
+    expect((element as any)._sensitiveAgents).to.deep.equal([
+      { id: 'agent-1', name: 'Billing bot' },
+    ]);
+    expect((element as any)._sensitiveOptionsError).to.equal('');
+    const tab = element.shadowRoot!.querySelector(
+      'sl-tab[panel="sensitive-data"]'
+    );
+    expect(tab?.textContent?.trim()).to.equal('Sensitive data');
+    const panel = element.shadowRoot!.querySelector('sensitive-data-panel')!;
+    await waitUntil(() => panel.shadowRoot!.querySelector('#type-email'));
+    panel.shadowRoot!.querySelector<HTMLInputElement>('#type-email')!.click();
+    await panel.updateComplete;
+    panel
+      .shadowRoot!.querySelector<HTMLInputElement>(
+        'input[name="action-email"][value="redact"]'
+      )!
+      .click();
+    await panel.updateComplete;
+    panel
+      .shadowRoot!.querySelector<HTMLButtonElement>(
+        '[data-testid="sensitive-save"]'
+      )!
+      .click();
+    await waitUntil(
+      () => (element as any)._showDiffDialog === true,
+      'Save did not open the diff dialog'
+    );
+    expect(previewed).to.be.true;
+    expect(uploadedYaml).to.equal('');
+    await element.updateComplete;
+    // The diff dialog must not live inside the (hidden) YAML tab panel.
+    const openDialog = element.shadowRoot!.querySelector('sl-dialog[open]');
+    expect(openDialog).to.exist;
+    expect(openDialog!.closest('sl-tab-panel')).to.equal(null);
+    await (element as any).applyPolicyFile();
+    expect(uploadedYaml).to.contain('name: live');
+    expect(uploadedYaml).to.contain('id: console-redact');
+    expect(uploadedYaml).to.contain('"on":');
+    expect(uploadedYaml).to.contain('action: redact');
+  });
+
   describe('YAML tab', () => {
     /**
      * Minimal stub focused on the YAML editor: the export is the seed, and
@@ -734,6 +880,34 @@ describe('PoliciesView', () => {
         });
       return { stub, calls };
     }
+
+    it('simulates the unsaved YAML draft when the capability is present', async () => {
+      const { stub } = createYamlStub();
+      fetchStub = stub;
+      const element = await fixture<PoliciesView>(
+        html`<policies-view></policies-view>`
+      );
+      await waitUntil(() => !(element as any)._loading);
+      const view = element as any;
+      view._activeTab = 'files';
+      view._features = { policy_simulation: true };
+      view._yamlDraft = 'version: "1.0"\nmetadata:\n  name: unsaved\n';
+      await element.updateComplete;
+      const simulate = Array.from(
+        element.shadowRoot!.querySelectorAll('.yaml-editor-actions sl-button')
+      ).find((button) =>
+        button.textContent!.includes('Simulate')
+      ) as HTMLElement;
+      expect(simulate).to.exist;
+      simulate.click();
+      await element.updateComplete;
+      const panel = element.shadowRoot!.querySelector(
+        'policy-simulator'
+      ) as any;
+      expect(panel.draftYaml).to.include('name: unsaved');
+      expect(panel.shadowRoot).to.equal(null);
+      expect((element as any)._yamlDraft).to.include('name: unsaved');
+    });
 
     it('seeds the editor with the exported policy YAML', async () => {
       const { stub } = createYamlStub();
@@ -1098,6 +1272,232 @@ describe('PoliciesView', () => {
       expect(form.detectInjection).to.be.true;
       expect(form.detectPii).to.be.false;
       expect(form.detectModeration).to.be.false;
+    });
+
+    it('sends condition_type for a model rule with a CEL expression', async () => {
+      const element = await mountWithDialog();
+
+      (element as any)._patchModelIOForm({
+        id: 'deny-cel',
+        conditionMode: 'custom',
+        action: 'deny',
+        expression: "'credit_card' in pii.types_found",
+      });
+      await element.updateComplete;
+      const rule = (element as any).buildModelIORuleFromForm();
+      expect(rule.conditions[0].condition_type).to.equal('cel');
+
+      (element as any)._patchModelIOForm({ expression: 'pii.found == true' });
+      await element.updateComplete;
+      expect(
+        (element as any).buildModelIORuleFromForm().conditions[0].condition_type
+      ).to.equal('simple');
+    });
+
+    it('posts the model rule condition_type on save', async () => {
+      const element = await mountWithDialog();
+
+      (element as any)._patchModelIOForm({
+        id: 'deny-cel',
+        conditionMode: 'custom',
+        action: 'deny',
+        expression: "'credit_card' in pii.types_found",
+      });
+      await element.updateComplete;
+      await (element as any).saveModelIORule();
+
+      const post = fetchStub
+        .getCalls()
+        .find(
+          (c) =>
+            String(c.args[0]).endsWith('/api/v1/policies/model-io-rules') &&
+            (c.args[1] as RequestInit | undefined)?.method === 'POST'
+        );
+      expect(post, 'model rule POST').to.exist;
+      const body = JSON.parse(
+        String((post!.args[1] as RequestInit | undefined)?.body)
+      );
+      expect(body.conditions[0].condition_type).to.equal('cel');
+    });
+
+    it('keeps PII types, descriptions, timeout and extra conditions when editing', async () => {
+      const stored = {
+        id: 'pii-strict',
+        target: 'model.request',
+        enabled: true,
+        description: 'Narrow PII scan',
+        detector_timeout_ms: 30000,
+        detectors: { pii: { types: ['email'] } },
+        conditions: [
+          {
+            expression: 'pii.found == true',
+            action: 'deny',
+            condition_type: 'simple',
+            description: 'Any PII at all',
+          },
+          {
+            expression: 'pii.types_found.contains("ssn")',
+            action: 'require_approval',
+          },
+        ],
+      };
+      fetchStub = createFetchStub({
+        tools: [sampleTool],
+        modelIORules: [stored],
+      });
+      const element = (await fixture(
+        html`<policies-view></policies-view>`
+      )) as PoliciesView;
+      await waitUntil(() => !(element as any)._loading, 'still loading');
+
+      (element as any).openModelIODialog(stored);
+      await element.updateComplete;
+      await (element as any).saveModelIORule();
+
+      const put = fetchStub
+        .getCalls()
+        .find(
+          (c) =>
+            String(c.args[0]).includes(
+              '/api/v1/policies/model-io-rules/pii-strict'
+            ) && (c.args[1] as RequestInit | undefined)?.method === 'PUT'
+        );
+      expect(put, 'model rule PUT').to.exist;
+      const body = JSON.parse(
+        String((put!.args[1] as RequestInit | undefined)?.body)
+      );
+      expect(body.detectors.pii.types).to.deep.equal(['email']);
+      expect(body.description).to.equal('Narrow PII scan');
+      expect(body.detector_timeout_ms).to.equal(30000);
+      expect(body.conditions).to.have.length(2);
+      expect(body.conditions[0].condition_type).to.equal('simple');
+      expect(body.conditions[0].description).to.equal('Any PII at all');
+      expect(body.conditions[1].expression).to.equal(
+        'pii.types_found.contains("ssn")'
+      );
+      expect(body.conditions[1].condition_type).to.equal('cel');
+    });
+
+    it('heals a legacy simple rule whose expression needs CEL on save', async () => {
+      // Before the backend guard existed, a CEL expression could be stored
+      // with condition_type 'simple'. Opening and saving the rule untouched
+      // must not 422: the selector defaults to auto and the save sends cel.
+      const stored = {
+        id: 'legacy-cel',
+        target: 'model.request',
+        enabled: true,
+        detectors: { pii: { types: ['email'] } },
+        conditions: [
+          {
+            expression: "'credit_card' in pii.types_found",
+            action: 'deny',
+            condition_type: 'simple',
+          },
+        ],
+      };
+      fetchStub = createFetchStub({
+        tools: [sampleTool],
+        modelIORules: [stored],
+      });
+      const element = (await fixture(
+        html`<policies-view></policies-view>`
+      )) as PoliciesView;
+      await waitUntil(() => !(element as any)._loading, 'still loading');
+
+      (element as any).openModelIODialog(stored);
+      await element.updateComplete;
+
+      expect((element as any)._modelIOForm.conditionType).to.equal('auto');
+      await (element as any).saveModelIORule();
+
+      const put = fetchStub
+        .getCalls()
+        .find(
+          (c) =>
+            String(c.args[0]).includes(
+              '/api/v1/policies/model-io-rules/legacy-cel'
+            ) && (c.args[1] as RequestInit | undefined)?.method === 'PUT'
+        );
+      expect(put, 'model rule PUT').to.exist;
+      const body = JSON.parse(
+        String((put!.args[1] as RequestInit | undefined)?.body)
+      );
+      expect(body.conditions[0].condition_type).to.equal('cel');
+      expect(body.detectors.pii.types).to.deep.equal(['email']);
+    });
+
+    it('heals a legacy simple extra condition whose expression needs CEL', async () => {
+      // The form edits only the first condition, so a CEL-shaped second
+      // condition stored as `simple` has no selector to correct it. Saving
+      // the untouched rule must still send `cel` for it, or the backend
+      // rejects the whole-rule PUT with 422.
+      const stored = {
+        id: 'legacy-multi',
+        target: 'model.request',
+        enabled: true,
+        detectors: { pii: true },
+        conditions: [
+          {
+            expression: 'pii.found == true',
+            action: 'deny',
+            condition_type: 'simple',
+          },
+          {
+            expression: "'ssn' in pii.types_found",
+            action: 'require_approval',
+            condition_type: 'simple',
+          },
+        ],
+      };
+      fetchStub = createFetchStub({
+        tools: [sampleTool],
+        modelIORules: [stored],
+      });
+      const element = (await fixture(
+        html`<policies-view></policies-view>`
+      )) as PoliciesView;
+      await waitUntil(() => !(element as any)._loading, 'still loading');
+
+      (element as any).openModelIODialog(stored);
+      await element.updateComplete;
+      await (element as any).saveModelIORule();
+
+      const put = fetchStub
+        .getCalls()
+        .find(
+          (c) =>
+            String(c.args[0]).includes(
+              '/api/v1/policies/model-io-rules/legacy-multi'
+            ) && (c.args[1] as RequestInit | undefined)?.method === 'PUT'
+        );
+      expect(put, 'model rule PUT').to.exist;
+      const body = JSON.parse(
+        String((put!.args[1] as RequestInit | undefined)?.body)
+      );
+      expect(body.conditions[1].condition_type).to.equal('cel');
+    });
+
+    it('lets the author force CEL when automatic detection would pick simple', async () => {
+      const element = await mountWithDialog();
+
+      // The backend simple parser rejects parentheses, while the frontend
+      // heuristic would call this simple; the override must send CEL.
+      (element as any)._patchModelIOForm({
+        id: 'deny-paren',
+        conditionMode: 'custom',
+        action: 'deny',
+        expression: '(pii.found == true)',
+        conditionType: 'cel',
+      });
+      await element.updateComplete;
+
+      const select = element.shadowRoot?.querySelector(
+        '[data-testid="condition-type"]'
+      );
+      expect(select, 'condition language override').to.exist;
+      expect(
+        (element as any).buildModelIORuleFromForm().conditions[0].condition_type
+      ).to.equal('cel');
     });
 
     it('refuses to save a deny rule with no condition', async () => {

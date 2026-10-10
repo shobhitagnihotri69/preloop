@@ -1,9 +1,13 @@
 """Tests for policy loader functionality."""
 
 import json
+from typing import cast
+from unittest.mock import MagicMock
 
 import pytest
 import yaml
+from pytest_mock import MockerFixture
+from sqlalchemy.orm import Session
 
 from preloop.services.policy.loader import (
     PolicyApplier,
@@ -17,6 +21,7 @@ from preloop.services.policy.schema import (
     ApprovalWorkflowDefinition,
     DefaultsDefinition,
     MCPServerDefinition,
+    ModelIORule,
     PolicyDocument,
     PolicyMetadata,
     PolicyVersion,
@@ -413,3 +418,188 @@ class TestPolicyApplierDefaults:
         assert "restrictive default settings" in applier._result.errors[0]
         assert "unknown_tools='require_approval'" in applier._result.errors[0]
         assert "BaseModel.__init__" not in applier._result.errors[0]
+
+
+class TestModelIOConditionUpgrade:
+    """YAML model_io CEL expressions left as 'simple' are upgraded on apply."""
+
+    @staticmethod
+    def _applier() -> PolicyApplier:
+        """Build an applier whose DB is unused by ``_apply_model_io``."""
+        return PolicyApplier(
+            cast(Session, MagicMock()),
+            account_id="00000000-0000-4000-8000-000000000001",
+        )
+
+    def _rule(self, expression: str, condition_type: str = "simple") -> ModelIORule:
+        return ModelIORule.model_validate(
+            {
+                "id": "deny-pii",
+                "target": "model.request",
+                "conditions": [
+                    {
+                        "expression": expression,
+                        "action": "deny",
+                        "condition_type": condition_type,
+                    }
+                ],
+            }
+        )
+
+    def test_apply_model_io_upgrades_cel_shaped_conditions(
+        self, mocker: MockerFixture
+    ) -> None:
+        """CEL syntax, including forms only the parser rejects, becomes CEL."""
+        applier = self._applier()
+        rules = [
+            self._rule("'credit_card' in pii.types_found"),
+            self._rule("(pii.found == true)"),
+            self._rule("pii.found"),
+            self._rule("pii.found == true"),
+        ]
+        replace = mocker.patch(
+            "preloop.services.model_content_policy.replace_model_io_rules",
+            return_value=rules,
+        )
+
+        applier._apply_model_io(rules, dry_run=False)
+
+        applied = replace.call_args.args[2]
+        assert [rule.conditions[0].condition_type for rule in applied] == [
+            "cel",
+            "cel",
+            "cel",
+            "simple",
+        ]
+
+    def test_apply_model_io_keeps_an_explicit_cel_type(
+        self, mocker: MockerFixture
+    ) -> None:
+        applier = self._applier()
+        rules = [self._rule("pii.found == true", condition_type="cel")]
+        replace = mocker.patch(
+            "preloop.services.model_content_policy.replace_model_io_rules",
+            return_value=rules,
+        )
+
+        applier._apply_model_io(rules, dry_run=False)
+
+        applied = replace.call_args.args[2]
+        assert applied[0].conditions[0].condition_type == "cel"
+
+
+class TestPolicyApplierAccountReferences:
+    """Cross-references resolve against objects already in the account (#1134)."""
+
+    @pytest.fixture
+    def existing_objects(self, db_session, test_user):
+        from preloop.models import models
+
+        server = models.MCPServer(
+            name="my-server",
+            url="http://localhost:8080/mcp",
+            transport="http-streaming",
+            auth_type="none",
+            account_id=test_user.account_id,
+            status="active",
+        )
+        workflow = models.ApprovalWorkflow(
+            account_id=test_user.account_id, name="my-workflow"
+        )
+        db_session.add_all([server, workflow])
+        db_session.flush()
+        return server, workflow
+
+    @staticmethod
+    def _yaml(source: str, workflow: str) -> str:
+        return f"""
+version: "1.0"
+metadata:
+  name: "refs"
+tools:
+  - name: "do_thing"
+    source: "{source}"
+    approval_workflow: "{workflow}"
+"""
+
+    def test_existing_server_and_workflow_validate_and_apply(
+        self, db_session, test_user, existing_objects
+    ):
+        policy, result = load_policy_from_string(self._yaml("my-server", "my-workflow"))
+        assert result.is_valid, result.errors
+        applier = PolicyApplier(db_session, account_id=str(test_user.account_id))
+        applied = applier.apply(policy, dry_run=True)
+        assert applied.errors == []
+        assert applied.success is True
+
+    def test_existing_workflow_only(self, db_session, test_user, existing_objects):
+        policy, result = load_policy_from_string(self._yaml("builtin", "my-workflow"))
+        assert result.is_valid, result.errors
+        applier = PolicyApplier(db_session, account_id=str(test_user.account_id))
+        assert applier.apply(policy, dry_run=True).success is True
+
+    def test_missing_server_fails_with_available_names(
+        self, db_session, test_user, existing_objects
+    ):
+        policy, result = load_policy_from_string(
+            self._yaml("missing-server", "my-workflow")
+        )
+        assert result.is_valid, result.errors
+        applier = PolicyApplier(db_session, account_id=str(test_user.account_id))
+        applied = applier.apply(policy, dry_run=True)
+        assert applied.success is False
+        assert any(
+            "missing-server" in e and "my-server" in e for e in applied.errors
+        ), applied.errors
+
+    def test_missing_server_skipped_when_requested(
+        self, db_session, test_user, existing_objects
+    ):
+        policy, _ = load_policy_from_string(self._yaml("missing-server", "my-workflow"))
+        applier = PolicyApplier(db_session, account_id=str(test_user.account_id))
+        applied = applier.apply(policy, dry_run=True, skip_missing_servers=True)
+        assert applied.success is True
+        assert applied.tools_skipped == 1
+        assert any("missing-server" in w for w in applied.warnings)
+
+    def test_missing_workflow_fails_with_available_names(
+        self, db_session, test_user, existing_objects
+    ):
+        policy, _ = load_policy_from_string(self._yaml("my-server", "nope"))
+        applier = PolicyApplier(db_session, account_id=str(test_user.account_id))
+        applied = applier.apply(policy, dry_run=True, skip_missing_servers=True)
+        assert applied.success is False
+        assert any("nope" in e and "my-workflow" in e for e in applied.errors)
+
+    def test_missing_escalation_workflow_fails(self, db_session, test_user):
+        policy, result = load_policy_from_string(
+            """
+version: "1.0"
+metadata:
+  name: "esc"
+approval_workflows:
+  - name: "ai"
+    approval_type: "ai_driven"
+    ai_model: "claude-sonnet-4-20250514"
+    ai_guidelines: "Review"
+    escalation_workflow: "absent"
+"""
+        )
+        assert result.is_valid, result.errors
+        applier = PolicyApplier(db_session, account_id=str(test_user.account_id))
+        applied = applier.apply(policy, dry_run=True)
+        assert applied.success is False
+        assert any("absent" in e for e in applied.errors)
+
+    def test_resolves_workflows_beyond_first_page(self, db_session, test_user):
+        from preloop.models import models
+
+        db_session.add_all(
+            models.ApprovalWorkflow(account_id=test_user.account_id, name=f"wf-{i:03d}")
+            for i in range(105)
+        )
+        db_session.flush()
+        policy, _ = load_policy_from_string(self._yaml("builtin", "wf-104"))
+        applier = PolicyApplier(db_session, account_id=str(test_user.account_id))
+        applied = applier.apply(policy, dry_run=True)
+        assert applied.errors == []

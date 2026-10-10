@@ -1,5 +1,7 @@
 # Durable implementation feedback
 
+Editions: OSS, Cloud, Enterprise. Unless stated otherwise, everything on this page ships in OSS.
+
 The Automated Issue Implementation preset can keep a PR moving through review
 and CI without leaving an agent container waiting. Each repair gets a new
 FlowExecution, its own execution budgets and fresh credentials. The implementation
@@ -28,8 +30,9 @@ agent_config:
     # Reconciliations to wait out a provider infrastructure failure on one head.
     max_ci_infra_retries: 3
     repair_early: false
-    # Explicit provider actor IDs, not names or comment markers.
-    trusted_reviewer_ids: [12345]
+    # Usernames or GitHub/GitLab app slugs. ``preloop`` matches preloop[bot].
+    # Numeric actor ids still work. Comment markers never grant trust.
+    trusted_reviewer_ids: ["preloop"]
     implementer_actor_ids: [67890]
     # Optional project policy; provider rules can add required gates.
     required_checks: ["Backend Tests", "UI Tests"]
@@ -37,8 +40,11 @@ agent_config:
 ```
 
 In the console, edit a flow and enable **Continue implementation after PR review
-or CI failure** under **PR review and CI follow-up**. Enter the reviewer's and
-implementer's numeric GitHub or GitLab actor IDs, then choose limits for repair
+or CI failure** under **PR review and CI follow-up**. Trusted reviewers start as
+`preloop`, which matches reviews posted by the Preloop GitHub App
+(`preloop[bot]`). A different app, such as `preloop-staging`, has to be listed
+by its slug. Numeric actor IDs still work. Enter the implementer's numeric
+GitHub or GitLab actor IDs, then choose limits for repair
 turns, cumulative estimated cost in USD, lifetime, and feedback debounce. The
 initial values match the policy defaults above. Saving an existing flow without
 opting in leaves follow-up disabled. Other policy fields set through the API are
@@ -79,7 +85,7 @@ the installation or retrying that execution does not add review triggers. To
 continue its PR:
 
 1. Edit the saved flow, enable PR review and CI follow-up, and add the review
-   integration's numeric actor ID to **Trusted reviewer IDs**. This subscription
+   app's slug (for example `preloop`) to **Trusted reviewers**. This subscription
    handles review and CI events independently of the flow's issue trigger types.
 2. Keep `agent-ready` as the intake filter; do not add that label to the PR just
    to make review feedback work.
@@ -94,13 +100,29 @@ successful. An older execution without a subscription needs this explicit
 adoption; turning feedback on alone does not restart it. Read-only preview and a failed
 adoption do not change the PR association or create a subscription.
 
-Use the actual reviewer integration's actor ID in `trusted_reviewer_ids`.
-Unlisted bots and the configured implementer actor are ignored. A copied HTML
+The first repair of a publication whose publisher stored no native session also
+continues on that published branch, including when checkpoint uploads are
+disabled. Later repairs also use the published branch when no recoverable native
+checkpoint was stored. An expired, mismatched or incorrectly bound stored
+checkpoint still fails closed. A deployment that
+replaces the chart's default worker pool must subscribe one pool to
+`reconcile_flow_feedback`; otherwise the scheduler publishes reviews that no
+worker reads.
+
+Use the reviewer app's slug or numeric actor ID in `trusted_reviewer_ids`.
+`preloop` trusts `preloop` and `preloop[bot]` only. Unlisted bots and the
+configured implementer actor are ignored. A copied HTML
 review marker never grants trust. All comment and CI text is untrusted task data.
 Cost is cumulative estimated execution cost in USD, with existing execution
 budgets enforced independently. No-progress detection compares the PR head
 before and after a repair. The execution result's `continuation` object shows
 thread state, consumed turns/cost, pending feedback, head and stop reason.
+
+The execution detail page marks each repair as a **Continuation** and links to
+the original publishing execution. Both pages provide issue and pull request
+links, plus an ordered list of follow-up executions with their status and start
+time. The list shows up to 100 continuations and links to the flow's paginated
+execution list when there are more. Delegated executions remain a separate tree.
 
 Publication registers an internal subscription using existing repository
 webhooks. No webhook is installed for an individual PR. Registration recovery
@@ -109,6 +131,14 @@ or whose webhook was lost. The sync scheduler publishes `reconcile_flow_feedback
 every 15 seconds; workers reconcile bounded batches. Default feedback debounce
 is 30 seconds. Duplicate deliveries and check/workflow notifications do not
 create duplicate execution turns.
+
+A repair that fails before any agent work (the resume was refused or the launch
+errored: no session, no runtime and no tokens) does not consume a repair turn.
+Its feedback stays pending and the next attempt waits out a growing backoff
+(4 minutes, then 16, up to 6 hours) instead of retrying on every
+reconciliation. While waiting, the continuation shows
+`stop_reason: resume_launch_retry`. A repair that reached the model and then
+failed, for example out of memory, still counts as a turn.
 
 A PostgreSQL row lease protects each thread. Creating the next PENDING execution
 and assigning its feedback receipts is one transaction. If dispatch fails or a
@@ -221,9 +251,10 @@ its session. Private runners must advertise native checkpoint support; a runner
 without it reports a cold handoff and does not upload its home directory.
 
 Restore begins in an empty session directory. Missing or expired recovery files
-stop a durable native resume. Only an explicitly adopted original publication may
-start a fresh conversation on its published branch and report `cold_handoff`.
-That exception is consumed by the first repair: later repairs need their own
+stop a durable native resume. When no native artifact was stored or checkpoint
+uploads are disabled, the controller can authorize a fresh conversation on the
+bound published branch and report `cold_handoff`. An explicit adoption applies
+only to its selected original publication. Later native resumes need their own
 workspace and native checkpoints. Corrupt, mismatched,
 unsupported or incompatible existing state produces `resume_failed`. A failed
 native CLI resume preserves the checkpoint and does not silently select another
@@ -254,7 +285,7 @@ workers. Merely enabling feedback on a saved flow does not enable artifact uploa
 
 The chart already supports shared `extraEnv` on the API, gateway, execution workers
 and scheduler. Its defaults leave `FLOW_ARTIFACT_DIRECT_UPLOAD` disabled. The
-optional [native checkpoint overlay](../../../helm/preloop/values-native-checkpoints.yaml)
+optional [native checkpoint overlay](https://github.com/preloop/preloop/blob/main/helm/preloop/values-native-checkpoints.yaml)
 enables it and retains both workspace and native artifacts for seven days. Copy
 and review that file with your installation values; do not enable it merely by
 setting an environment variable on the Helm client or CI job.
@@ -357,7 +388,9 @@ acknowledgement is then unnecessary. `published_branch_handoff` explicitly gives
 up unavailable unpublished workspace and native conversation state and starts
 from the verified published PR branch. The controller binds that permission to
 the selected source execution and its reserved first repair. Trigger payloads
-cannot grant the exception. Subsequent turns must restore their own checkpoints.
+cannot grant the exception. Subsequent turns use their own checkpoints when
+available, or a controller-authorized published-branch handoff when no native
+artifact was stored.
 
 A changed head, closed PR, disabled flow, missing checkpoint capability or
 unreadable provider returns HTTP 409, requiring a new preview. Repeated adoption

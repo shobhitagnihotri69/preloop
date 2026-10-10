@@ -6,6 +6,7 @@ import type { AccessRuleSummary } from './governance-rule-set-editor';
 import type { RuleFormData } from './tool-rule-editor';
 import type { GatewayUsageByTool } from '../types';
 import './tool-list-item';
+import { confirmDialog } from './confirm-dialog';
 
 export type ToolWithRules = Omit<Tool, 'access_rules'> & {
   access_rules?: AccessRuleSummary[];
@@ -152,9 +153,27 @@ export class ToolsEditorComponent extends LitElement {
       gap: var(--sl-spacing-small);
       position: relative;
     }
+    .section-toggle {
+      display: inline-flex;
+      align-items: center;
+      gap: var(--sl-spacing-small);
+      min-width: 0;
+      padding: 0;
+      border: 0;
+      background: none;
+      font: inherit;
+      color: inherit;
+      text-align: left;
+      cursor: pointer;
+    }
+    .section-toggle:focus-visible {
+      outline: var(--sl-focus-ring);
+      outline-offset: var(--sl-focus-ring-offset);
+      border-radius: var(--sl-border-radius-small);
+    }
     .section-icon {
       transition: transform 0.2s ease;
-      color: var(--sl-color-neutral-500);
+      color: var(--console-meta-color);
     }
     .section-icon.open {
       transform: rotate(90deg);
@@ -165,7 +184,7 @@ export class ToolsEditorComponent extends LitElement {
     }
     .section-meta {
       font-size: var(--sl-font-size-small);
-      color: var(--sl-color-neutral-500);
+      color: var(--console-meta-color);
       margin-left: var(--sl-spacing-medium);
     }
     .section-actions {
@@ -353,6 +372,43 @@ export class ToolsEditorComponent extends LitElement {
     } catch {}
   }
 
+  /**
+   * Deleting a server takes its tools and their access rules with it, and
+   * agents calling those tools start failing, so the confirm says how much
+   * goes before anything is sent.
+   */
+  private async _confirmDeleteServer(group: ToolGroup) {
+    const toolCount = group.tools.length;
+    const ruleCount = group.tools.reduce(
+      (sum, tool) => sum + (tool.access_rules?.length ?? 0),
+      0
+    );
+    const plural = (n: number, one: string, many: string) =>
+      `${n} ${n === 1 ? one : many}`;
+    const confirmed = await confirmDialog({
+      title: 'Delete this MCP server?',
+      message: `"${group.name}" will be removed with ${plural(
+        toolCount,
+        'tool',
+        'tools'
+      )} and ${plural(ruleCount, 'access rule', 'access rules')}. This cannot be undone.`,
+      detail:
+        'Agents that call these tools through Preloop will get an error until the server is added again.',
+      confirmLabel: 'Delete server',
+      variant: 'danger',
+    });
+    if (!confirmed) return;
+    this.dispatchEvent(
+      new CustomEvent('delete-server', {
+        detail: group.server.id,
+      })
+    );
+  }
+
+  private _warningLabel(count: number): string {
+    return `${count} warning${count === 1 ? '' : 's'}`;
+  }
+
   private _renderToolGroup(group: ToolGroup) {
     const isEnabled = (t: ToolWithRules) =>
       this.mode === 'scoped' && t.name in this.toolEnabledOverrides
@@ -365,18 +421,49 @@ export class ToolsEditorComponent extends LitElement {
     return html`
       <div class="tool-group">
         <div class="section-header" @click=${() => this._toggleGroup(group.id)}>
-          <sl-icon
-            class="section-icon ${!group.collapsed ? 'open' : ''}"
-            name="chevron-right"
-          ></sl-icon>
-          <span class="section-title">${group.name}</span>
-          <span class="section-meta">
+          <!-- The whole header stays clickable for the mouse; this button is
+               the keyboard and screen-reader way to open or close the group.
+               It stops the click so the header does not toggle twice. -->
+          <button
+            type="button"
+            class="section-toggle"
+            aria-expanded=${group.collapsed ? 'false' : 'true'}
+            @click=${(e: Event) => {
+              e.stopPropagation();
+              this._toggleGroup(group.id);
+            }}
+          >
+            <sl-icon
+              class="section-icon ${!group.collapsed ? 'open' : ''}"
+              name="chevron-right"
+              aria-hidden="true"
+            ></sl-icon>
+            <span class="section-title">${group.name}</span>
             ${
-              group.type === 'agent'
-                ? `${enabledCount}/${totalCount}`
-                : `${enabledCount}/${totalCount} enabled`
+              group.type === 'mcp' && group.server?.tool_prefix
+                ? html`<span class="section-meta"
+                    >prefix ${group.server.tool_prefix}_</span
+                  >`
+                : ''
             }
-          </span>
+            ${
+              group.type === 'mcp' && group.server?.warnings?.length
+                ? html`<sl-badge
+                    variant="warning"
+                    pill
+                    data-testid="server-warning-badge"
+                    >${this._warningLabel(group.server.warnings.length)}</sl-badge
+                  >`
+                : ''
+            }
+            <span class="section-meta">
+              ${
+                group.type === 'agent'
+                  ? `${enabledCount}/${totalCount}`
+                  : `${enabledCount}/${totalCount} enabled`
+              }
+            </span>
+          </button>
           <div class="section-line"></div>
           ${
             group.type === 'mcp' && group.server && this.mode === 'global'
@@ -418,6 +505,7 @@ export class ToolsEditorComponent extends LitElement {
                     <sl-tooltip content="Edit server">
                       <sl-icon-button
                         name="pencil"
+                        label=${`Edit server ${group.name}`}
                         @click=${() =>
                           this.dispatchEvent(
                             new CustomEvent('edit-server', {
@@ -429,19 +517,8 @@ export class ToolsEditorComponent extends LitElement {
                     <sl-tooltip content="Delete server">
                       <sl-icon-button
                         name="trash"
-                        @click=${() => {
-                          if (
-                            confirm(
-                              `Delete MCP server "${group.name}" and all its tools?`
-                            )
-                          ) {
-                            this.dispatchEvent(
-                              new CustomEvent('delete-server', {
-                                detail: group.server.id,
-                              })
-                            );
-                          }
-                        }}
+                        label=${`Delete server ${group.name}`}
+                        @click=${() => void this._confirmDeleteServer(group)}
                       ></sl-icon-button>
                     </sl-tooltip>
                   </div>
@@ -455,9 +532,23 @@ export class ToolsEditorComponent extends LitElement {
             ? html`
                 <div class="tool-list">
                   ${
+                    group.type === 'mcp' && group.server?.warnings?.length
+                      ? html`<div
+                          class="server-warnings"
+                          role="note"
+                          data-testid="server-warnings"
+                          style="padding: var(--sl-spacing-small); color: var(--sl-color-warning-700); font-size: var(--sl-font-size-small);"
+                        >
+                          ${group.server.warnings.map(
+                            (warning: string) => html`<div>${warning}</div>`
+                          )}
+                        </div>`
+                      : ''
+                  }
+                  ${
                     group.tools.length === 0
                       ? html`<div
-                          style="padding: var(--sl-spacing-small); color: var(--sl-color-neutral-400); font-size: var(--sl-font-size-small);"
+                          style="padding: var(--sl-spacing-small); color: var(--console-meta-color); font-size: var(--sl-font-size-small);"
                         >
                           No tools${this.filterText ? ' matching filter' : ''}.
                           ${
@@ -532,7 +623,7 @@ export class ToolsEditorComponent extends LitElement {
         ${
           groups.length === 0
             ? html`<div
-                style="padding: 2rem; text-align: center; color: var(--sl-color-neutral-400);"
+                style="padding: 2rem; text-align: center; color: var(--console-meta-color);"
               >
                 ${
                   this.family === 'native'

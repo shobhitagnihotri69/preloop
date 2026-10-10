@@ -1,6 +1,9 @@
-import { LitElement, html, css, unsafeCSS } from 'lit';
+import { LitElement, html, css, unsafeCSS, type PropertyValues } from 'lit';
 import { customElement, property } from 'lit/decorators.js';
 import consoleStyles from '../styles/console-styles.css?inline';
+import { pageTitle } from '../utils/page-title';
+
+export { pageTitle };
 
 @customElement('view-header')
 export class ViewHeader extends LitElement {
@@ -22,11 +25,22 @@ export class ViewHeader extends LitElement {
            not add their own spacers or negative margins to compensate. */
         margin-bottom: var(--sl-spacing-large);
       }
+      /* The shared .header margin and the column's flex gap are for page
+         sections. Inside the header they stacked to ~44px between the
+         title and the line that explains it, so the description read as
+         the start of the page body. Spacing here is set per slot instead. */
+      .main-column {
+        gap: 0;
+      }
       .header {
         display: flex;
         justify-content: space-between;
         align-items: center;
         gap: var(--sl-spacing-medium);
+        margin-bottom: 0;
+      }
+      ::slotted([slot='top']) {
+        margin-bottom: var(--sl-spacing-small);
       }
       h1 {
         margin: 0;
@@ -67,13 +81,34 @@ export class ViewHeader extends LitElement {
     `,
   ];
 
+  /**
+   * Every console page renders one view-header, so it is the one place that
+   * can name the browser tab after the page. Without it every tab, history
+   * entry and bookmark carried the marketing tagline.
+   */
+  protected updated(changed: PropertyValues<this>): void {
+    super.updated(changed);
+    if (changed.has('headerText') && this.headerText) {
+      document.title = pageTitle(this.headerText);
+      this.dispatchEvent(
+        new CustomEvent('console-view-heading-ready', {
+          bubbles: true,
+          composed: true,
+        })
+      );
+    }
+  }
+
   render() {
     return html`
       <div class="column-layout ${this.width}">
         <div class="main-column">
           <slot name="top"></slot>
           <div class="header">
-            <h1 style="display: flex; align-items: center; gap: 12px;">
+            <h1
+              tabindex="-1"
+              style="display: flex; align-items: center; gap: 12px;"
+            >
               <slot name="title-prefix"></slot>${this.headerText}
             </h1>
             <slot name="main-column"></slot>

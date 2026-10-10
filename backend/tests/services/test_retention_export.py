@@ -4,6 +4,7 @@ import hashlib
 import io
 import json
 import tarfile
+import time
 import uuid
 from datetime import UTC, datetime, timedelta
 
@@ -18,6 +19,7 @@ from preloop.services.legal_hold import place_hold
 from preloop.services.retention_export import (
     EXPORT_MANIFEST_SCHEMA,
     MEMBER_APPROVALS,
+    MEMBER_ARTIFACT_MANIFEST,
     MEMBER_AUDIT,
     MEMBER_EVIDENCE,
     MEMBER_HOLDS,
@@ -154,6 +156,7 @@ def test_the_archive_carries_a_manifest_and_one_file_per_class(
         MEMBER_APPROVALS,
         MEMBER_EVIDENCE,
         MEMBER_HOLDS,
+        MEMBER_ARTIFACT_MANIFEST,
     }
 
 
@@ -249,6 +252,40 @@ def test_the_same_rows_produce_the_same_archive_bytes(db_session, account):
     )
 
     assert first.sha256 == second.sha256
+
+
+def test_archive_bytes_do_not_depend_on_the_wall_clock(
+    db_session, account, monkeypatch
+):
+    """Two builds a second apart must still match byte for byte.
+
+    The gzip header carries an MTIME field that defaults to the current time,
+    so without pinning it two builds straddling a second boundary differ.
+    """
+    _audit_row(db_session, account.id, INSIDE)
+    db_session.flush()
+    stamp = datetime(2026, 5, 2, 9, 0, tzinfo=UTC)
+
+    first = build_period_export(
+        db_session,
+        account=account,
+        start=PERIOD_START,
+        end=PERIOD_END,
+        generated_at=stamp,
+    )
+    later = time.time() + 3600
+    monkeypatch.setattr(time, "time", lambda: later)
+    second = build_period_export(
+        db_session,
+        account=account,
+        start=PERIOD_START,
+        end=PERIOD_END,
+        generated_at=stamp,
+    )
+
+    assert first.sha256 == second.sha256
+    # The gzip MTIME field (bytes 4..8, little endian) is zero, not "now".
+    assert first.archive[4:8] == b"\x00\x00\x00\x00"
 
 
 # --- contents --------------------------------------------------------------
@@ -354,8 +391,11 @@ def test_an_empty_period_is_an_archive_not_an_error(db_session, account):
         "approvals": 0,
         "evidence": 0,
         "legal_holds": 0,
+        "artifacts": 0,
+        "artifacts_unavailable": 0,
     }
     assert _members(export.archive)[MEMBER_AUDIT] == b""
+    assert json.loads(_members(export.archive)[MEMBER_ARTIFACT_MANIFEST]) == []
 
 
 # --- bounds ----------------------------------------------------------------

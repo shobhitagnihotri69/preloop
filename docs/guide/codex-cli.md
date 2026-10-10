@@ -1,0 +1,123 @@
+# Codex CLI onboarding
+
+Editions: OSS, Cloud, Enterprise. Unless stated otherwise, everything on this page ships in OSS.
+
+`preloop agents onboard "Codex CLI"` enrolls Codex, routes model traffic
+through the Preloop gateway, and can install approval hooks with
+`--approvals`. Codex keeps `~/.codex/config.toml` for its own settings.
+Agent Control does not write that file.
+
+## Onboard, verify, roll back
+
+```bash
+preloop agents discover
+preloop agents onboard "Codex CLI"              # MCP firewall + model gateway
+preloop agents onboard "Codex CLI" --approvals  # also route tool calls to Preloop policy and approvals
+```
+
+Onboarding backs up `~/.codex/config.toml` (`~/.codex/config.json` is only a
+legacy fallback) and adds a managed `[mcp_servers.preloop]` entry that points
+at the Preloop MCP endpoint. `--approvals` adds hooks to `~/.codex/hooks.json`:
+`PreToolUse` evaluates your central tool rules, and `PermissionRequest` turns
+the prompts Codex would show you into Preloop approval requests you can answer
+from mobile, watch, or the web console.
+
+```bash
+preloop agents status "Codex CLI"
+preloop agents validate "Codex CLI"
+preloop agents restore "Codex CLI"
+preloop agents offboard "Codex CLI"
+```
+
+See the [CLI quick start](quickstart-cli.md), [Safety Layer and access
+rules](concepts/safety-layer.md) and [Claude Code](clients/claude-code.md) for
+the equivalent flow on other agents.
+
+## Agent Control sidecar
+
+Codex has no in-process plugin API for operator messages, so Agent Control
+runs as a sidecar:
+
+- package `@preloop-ai/codex-plugin`
+- command `preloop-codex-plugin`
+- source `runtime-plugins/codex-preloop`
+- config `~/.codex/preloop-control.json`
+
+Onboarding installs the package with npm when it is published, or from the
+local source directory when that checkout is present. It writes the same
+control keys the Claude sidecar uses (`enabled`, `protocol`, `runtime`,
+`control_ws_url`, `bearer_token`, and the runtime identity fields). Nothing
+Codex-specific is added to that file.
+
+```bash
+preloop agents onboard "Codex CLI"
+preloop agents validate "Codex CLI"
+preloop codex sidecar enable
+preloop codex sidecar status
+preloop codex sidecar disable
+```
+
+`validate` reports `control_config_written`, `control_plugin_installed`,
+`control_plugin_verified`, and `control_channel_configured` separately.
+`preloop codex sidecar run` execs `preloop-codex-plugin run` against the
+control file. It is the command launchd and systemd start.
+
+Offboard removes `~/.codex/preloop-control.json` and the sidecar service.
+`~/.codex/config.toml` is restored from the onboarding backup and is not
+rewritten by Agent Control.
+
+Codex refreshes its ChatGPT login on its own, even when model traffic goes
+through Preloop, and the Preloop gateway refreshes the copy it stores. That
+login uses a single-use refresh token, so two holders of one grant revoke
+each other when either refreshes with a stale token. The Codex permission
+hook keeps both copies on the same lineage. It pushes the local bundle
+(`~/.codex/auth.json`, or the macOS Keychain entry when Codex keeps its login
+there) when it is newer than the stamp in the local enrollment state. About
+every two minutes it also reads Preloop's rotation marker, which carries no
+tokens, and when Preloop's copy is newer it writes that bundle back into the
+same place Codex reads it. When both copies changed since the last sync, the
+one with the later `last_refresh` wins and replaces the other. A pull only
+happens when the local login and Preloop's copy name the same ChatGPT
+account. A failed push or pull is logged once, leaves the local login and the
+stamp as they were, and does not change the permission decision. A host with
+no local login never gets one written back. When the hook is not installed, run
+`preloop agents sync-credentials "Codex CLI"`; it reconciles in both
+directions and prints which one ran.
+
+For headless hosts, a single holder is still the recommendation: import the
+login into Preloop, delete the local `auth.json`, and keep
+`requires_openai_auth = false` (the default) on the Preloop model provider in
+`~/.codex/config.toml`, so only Preloop refreshes the grant.
+
+If the provider has already revoked the grant, synchronization cannot repair it.
+Run `preloop agents reconnect "Codex CLI"` to sign in and replace only the stored
+subscription credential, preserving the enrollment and configuration. After a
+separate `codex login`, use `preloop agents reconnect "Codex CLI" --from-local`.
+Update the CLI if this command is not in your installed release. Recovery uploads
+the bundle to one credential and attaches legacy split model rows to that owner;
+it never creates multiple stored copies of the rotating token. The server rejects
+recently consumed refresh tokens and stops retrying provider-declared invalid
+grants until fresh credentials are supplied. Transient failures remain retryable.
+Independent hosts and instances should obtain separate authorization grants;
+the hook cannot make concurrent refreshes by independent holders atomic.
+
+To push a Codex login through the API yourself, send `PUT /api/v1/ai-models/{id}`
+with `credential_type: "oauth_openai_codex"` and a `credential_payload` in
+Preloop's shape, not the key names from `auth.json`:
+
+```json
+{
+  "access": "<access token>",
+  "refresh": "<refresh token>",
+  "account_id": "<ChatGPT account id>",
+  "expires": 1893456000000
+}
+```
+
+`access`, `refresh`, and `account_id` must be non-empty strings. `expires` is
+the access-token expiry as an integer in epoch milliseconds. The server checks
+the payload when you write it and answers 422 with the missing or invalid keys,
+without storing anything. `access_token`, `refresh_token`, and `expires_at` are
+rejected with a hint that names the expected key, and an `expires` in epoch
+seconds or microseconds is rejected too. This is the same shape
+`POST /api/v1/ai-models/{id}/credentials/export` returns.

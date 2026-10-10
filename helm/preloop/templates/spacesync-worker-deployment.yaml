@@ -24,6 +24,9 @@ spec:
         {{- end }}
       labels:
         {{- include "preloop.selectorLabels" $ | nindent 8 }}
+        {{- with $.Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
         app.kubernetes.io/component: preloop-sync-worker-{{ .name }}
         app: preloop-sync-worker-{{ .name }}
     spec:
@@ -85,8 +88,25 @@ spec:
             # gateway traffic to the gateway Service, never the API Service.
             - name: PRELOOP_MODEL_GATEWAY_URL_K8S
               value: {{ include "preloop.modelGatewayUrlK8s" $ | quote }}
+            # Keep launched Jobs aligned with the namespace LimitRange.
+            - name: AGENT_MEMORY_LIMIT
+              value: {{ $.Values.agentExecution.limitRange.container.defaultMemory | quote }}
+            - name: AGENT_MEMORY_REQUEST
+              value: {{ $.Values.agentExecution.limitRange.container.defaultRequestMemory | quote }}
             - name: AGENT_EXECUTION_NAMESPACE
               value: {{ $.Values.agentExecution.namespace.create | ternary $.Values.agentExecution.namespace.name $.Release.Namespace | quote }}
+            {{- if $.Values.agentExecution.runtimeClassName }}
+            - name: AGENT_RUNTIME_CLASS_NAME
+              value: {{ $.Values.agentExecution.runtimeClassName | quote }}
+            {{- end }}
+            {{- if $.Values.agentExecution.nodeSelector }}
+            - name: AGENT_NODE_SELECTOR
+              value: {{ $.Values.agentExecution.nodeSelector | toJson | quote }}
+            {{- end }}
+            {{- if $.Values.agentExecution.tolerations }}
+            - name: AGENT_TOLERATIONS
+              value: {{ $.Values.agentExecution.tolerations | toJson | quote }}
+            {{- end }}
             - name: USE_KUBERNETES
               value: "true"
             - name: SECRET_KEY

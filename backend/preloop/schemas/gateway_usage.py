@@ -7,6 +7,8 @@ from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from preloop.schemas.resource_share import SharedResourceRead
+
 from preloop.services.cache_accounting import compute_cache_hit_ratio
 from preloop.utils.agent_kind import (
     AGENT_KIND_SHAPE_ERROR,
@@ -15,6 +17,7 @@ from preloop.utils.agent_kind import (
 )
 
 UsageBreakdown = Literal["models", "flows", "sessions", "tools", "days", "imported"]
+GatewayUsageBreakdown = Literal["models", "flows", "sessions", "tools", "days"]
 
 
 def _agree_direction_pair(
@@ -388,6 +391,46 @@ class RuntimeSessionSummary(BaseModel):
             "purge leaves it and its activity alone until the hold is released"
         ),
     )
+    # Fields a terminal list needs to pick the session to steer or attach to
+    # (#1148). All are filled for the current page in batched lookups and
+    # stay at their defaults when a lookup is unavailable.
+    managed_agent_id: Optional[str] = Field(
+        None, description="Managed agent whose runtime principal owns this session"
+    )
+    managed_agent_name: Optional[str] = Field(
+        None, description="Display name of that managed agent"
+    )
+    agent_kind: Optional[str] = Field(
+        None,
+        description=(
+            "Agent kind of that managed agent (claude_code, codex, hermes, ...), "
+            "or null when the session has no managed agent"
+        ),
+    )
+    cwd: Optional[str] = Field(
+        None,
+        description=(
+            "Working directory the agent's hook last reported for this session; "
+            "an observation used for labelling, not a trusted path"
+        ),
+    )
+    tool_call_count: int = Field(
+        0,
+        description=(
+            "Tool calls recorded for this session, or the count its usage hook "
+            "reported when no tool call was recorded server side"
+        ),
+    )
+    pending_approval_count: int = Field(
+        0, description="Approval requests for this session still awaiting a decision"
+    )
+    artifact_counts: Dict[str, int] = Field(
+        default_factory=dict,
+        description=(
+            "Available artifacts on this session by kind (screenshot, "
+            "transcript, ...); evicted and expired artifacts are not counted"
+        ),
+    )
 
 
 class AccountRuntimeSessionListResponse(BaseModel):
@@ -463,6 +506,10 @@ class ManagedAgentSummary(BaseModel):
     supports_existing_session: bool = False
     supports_voice: bool = False
     supports_interrupt: bool = False
+    #: Loopback desktop the runtime plugin advertised. ``none`` when the key
+    #: is missing or not a known desktop kind.
+    desktop: Literal["vnc", "rdp", "none"] = "none"
+    desktop_display: Optional[str] = None
     control_session_mode: str = "offline"
     #: Last Agent Control heartbeat this agent's plugin sent. Exposed so an
     #: operator (and staging debugging) can tell "no plugin" from "the plugin
@@ -629,6 +676,13 @@ class ManagedAgentEnrollmentValidateRequest(BaseModel):
 
     status: str = Field(default="validated", min_length=1, max_length=32)
     validation_result: dict = Field(default_factory=dict)
+    # Optional discovery link. The CLI sends the same salted hashes it would
+    # report with ``agents discover --report`` so a reported candidate from
+    # this workstation can be marked onboarded. Never a clear id or path.
+    workstation_fingerprint: Optional[str] = Field(
+        default=None, pattern=r"^[0-9a-f]{64}$"
+    )
+    config_path_hash: Optional[str] = Field(default=None, pattern=r"^[0-9a-f]{64}$")
 
 
 class ManagedAgentEnrollmentRestoreRequest(BaseModel):
@@ -649,7 +703,7 @@ class AccountManagedAgentListResponse(BaseModel):
     total: int = 0
     limit: int = 20
     offset: int = 0
-    items: List[ManagedAgentSummary] = Field(default_factory=list)
+    items: List[SharedResourceRead | ManagedAgentSummary] = Field(default_factory=list)
 
 
 class ManagedAgentDetailResponse(BaseModel):
@@ -745,6 +799,7 @@ class RuntimeSessionUpdateRequest(BaseModel):
 class RuntimeSessionActivityItem(BaseModel):
     """One activity item in a runtime session timeline."""
 
+    activity_id: Optional[str] = None
     activity_type: str
     timestamp: datetime
     title: str
@@ -822,6 +877,11 @@ class RuntimeSessionRequestItem(BaseModel):
     total_tokens: int = 0
     estimated_cost: float = 0.0
     endpoint: Optional[str] = None
+    #: Credential class that authorized the request (``api_key``,
+    #: ``oauth_mcp_token`` or ``user_token``). API consumers can tell a
+    #: plain-key session from a principal session; the console timeline
+    #: does not render this field yet.
+    auth_subject_type: Optional[str] = None
     tools: List[RuntimeSessionRequestTool] = Field(default_factory=list)
     tools_total_schema_tokens: int = 0
     cache: RuntimeSessionRequestCache = Field(

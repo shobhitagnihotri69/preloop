@@ -1,7 +1,13 @@
+import { consumeLoginReturn } from '../utils/login-return';
 import { LitElement, html, css } from 'lit';
 import { customElement } from 'lit/decorators.js';
-import { router, Router, type Route } from '../router';
-import { withLazyRoutes } from '../lazy-routes';
+import { router, Router, LOCATION_CHANGED, type Route } from '../router';
+import {
+  CapabilityRouteGate,
+  isCapabilityPath,
+  withLazyRoutes,
+} from '../lazy-routes';
+import { loadCapabilities, NO_CAPABILITIES } from '../capabilities';
 import { consoleRouteLoaders } from './console-route-loaders';
 import { routeLoadingRenderer } from './route-loading';
 import { getBrandConfig, isSaaS } from '../brand-config';
@@ -32,6 +38,72 @@ import { unifiedWebSocketManager } from '../services/unified-websocket-manager';
 @customElement('lit-app')
 export class LitApp extends LitElement {
   private hasNavigated = false;
+  private syncInConsole?: () => void;
+  private websocketFrame?: number;
+  private websocketStarted = false;
+  private resumeRouteInstallation?: () => void;
+
+  /**
+   * The document title the page was served with. Console pages retitle the
+   * tab after themselves (view-header); leaving the console puts this back,
+   * so the sign-in page never keeps the name of the last console page.
+   */
+  private readonly publicTitle = document.title;
+
+  private restorePublicTitle = () => {
+    const path = window.location.pathname;
+    const inConsole = path === '/console' || path.startsWith('/console/');
+    if (!inConsole) {
+      document.title = this.publicTitle;
+    }
+  };
+
+  connectedCallback() {
+    super.connectedCallback();
+    window.addEventListener(LOCATION_CHANGED, this.restorePublicTitle);
+    if (this.syncInConsole) {
+      window.addEventListener(LOCATION_CHANGED, this.syncInConsole);
+    }
+    if (this.hasUpdated) {
+      this.scheduleWebSocketConnection();
+      this.resumeRouteInstallation?.();
+    }
+  }
+
+  private scheduleWebSocketConnection(): void {
+    if (
+      !this.isConnected ||
+      this.websocketStarted ||
+      this.websocketFrame !== undefined
+    )
+      return;
+    this.websocketFrame = requestAnimationFrame(() => {
+      this.websocketFrame = undefined;
+      if (this.isConnected && !this.websocketStarted) {
+        this.websocketStarted = true;
+        this.connectWebSocket();
+      }
+    });
+  }
+
+  private ownsRouterOutlet(): boolean {
+    return (
+      this.isConnected &&
+      router.getOutlet() === this.renderRoot.querySelector('main')
+    );
+  }
+
+  disconnectedCallback() {
+    super.disconnectedCallback();
+    window.removeEventListener(LOCATION_CHANGED, this.restorePublicTitle);
+    if (this.syncInConsole) {
+      window.removeEventListener(LOCATION_CHANGED, this.syncInConsole);
+    }
+    if (this.websocketFrame !== undefined) {
+      cancelAnimationFrame(this.websocketFrame);
+      this.websocketFrame = undefined;
+    }
+  }
 
   static styles = css`
     :host {
@@ -50,9 +122,7 @@ export class LitApp extends LitElement {
 
     // Defer WebSocket connection until after initial render
     // This ensures the landing page loads quickly without waiting for WebSocket
-    requestAnimationFrame(() => {
-      this.connectWebSocket();
-    });
+    this.scheduleWebSocketConnection();
 
     const outlet = this.renderRoot.querySelector('main');
     const ssrRoute = this.getAttribute('data-ssr-route');
@@ -276,9 +346,8 @@ export class LitApp extends LitElement {
               this._autoStartGitHubAppInstall(accessToken);
             } else {
               // Standard OAuth entry point w/o setup blockers
-              const redirectPath = localStorage.getItem('loginRedirect');
+              const redirectPath = consumeLoginReturn();
               if (redirectPath) {
-                localStorage.removeItem('loginRedirect');
                 setTimeout(() => {
                   Router.go(redirectPath);
                 }, 0);
@@ -286,9 +355,8 @@ export class LitApp extends LitElement {
             }
           } else if (window.location.pathname === '/console') {
             // Handled when returning from e.g. Stripe without an access token hash
-            const redirectPath = localStorage.getItem('loginRedirect');
+            const redirectPath = consumeLoginReturn();
             if (redirectPath) {
-              localStorage.removeItem('loginRedirect');
               setTimeout(() => {
                 Router.go(redirectPath);
               }, 0);
@@ -355,6 +423,7 @@ export class LitApp extends LitElement {
             },
           },
           { path: '/runtime-sessions', component: 'runtime-sessions-view' },
+          { path: '/artifacts', component: 'artifacts-view' },
           { path: '/agents', component: 'agents-view' },
           // Before ':agentId' would not matter to Vaadin Router (it matches
           // the full path), but keeping the more specific route first is how
@@ -369,11 +438,13 @@ export class LitApp extends LitElement {
               return commands.redirect('/console/agents');
             },
           },
+          { path: 'cost/by-issue', component: 'issue-cost-view' },
           { path: 'cost', component: 'cost-view' },
           { path: '/api-usage', component: 'api-usage-view' },
           { path: 'settings', redirect: '/console/settings/profile' },
           { path: 'settings/profile', component: 'profile-view' },
           { path: 'settings/security', component: 'security-view' },
+          { path: 'settings/ci-identities', component: 'ci-identities-view' },
           { path: 'settings/api-keys', component: 'api-keys-view' },
           { path: 'settings/runners', component: 'runners-view' },
           { path: 'settings/webhooks', component: 'webhooks-view' },
@@ -389,6 +460,7 @@ export class LitApp extends LitElement {
           { path: 'settings/appearance', component: 'appearance-view' },
           { path: 'settings/account', component: 'account-view' },
           { path: 'settings/plan', component: 'plan-view' },
+          { path: 'settings/records', component: 'records-view' },
           { path: 'settings/emergency', component: 'emergency-view' },
           { path: 'settings/users', component: 'user-management-view' },
           { path: 'settings/teams', component: 'team-management-view' },
@@ -420,13 +492,77 @@ export class LitApp extends LitElement {
           },
           { path: 'audit', component: 'audit-view' },
           { path: 'attention', component: 'attention-view' },
+          // The bell used to link here; the list lives under flows.
+          {
+            path: 'flow-executions',
+            redirect: '/console/flows/executions',
+          },
+          // Must stay the last console child: an unknown /console/* path (a
+          // typo, a stale bookmark, a capability route this deployment does
+          // not serve) renders the 404 inside the shell, with the sidebar,
+          // instead of falling through to the bare top-level page.
+          // CapabilityRouteGate prepends its routes, so they still match
+          // first.
+          { path: '(.*)', component: 'not-found-view' },
         ],
       },
       // Must stay last: Vaadin Router matches in order, so a catch-all above
       // any real route would swallow it.
       { path: '(.*)', component: 'not-found-view' },
     ];
-    void router.setRoutes(withLazyRoutes(routes, consoleRouteLoaders));
+    const table = withLazyRoutes(routes, consoleRouteLoaders);
+    this.installRoutes(table);
+  }
+
+  /**
+   * Install the route table, plus the console routes that `/features`
+   * capabilities turn on (multi-account, account hierarchy, access rules).
+   * Those register only once the capability is known to be present, so a
+   * deployment without them never matches, loads or links to them.
+   */
+  private installRoutes(table: Route[]) {
+    const consoleRoute = table.find((route) => route.path === '/console');
+    if (!consoleRoute) {
+      void router.setRoutes(table);
+      return;
+    }
+    const gate = new CapabilityRouteGate(router, consoleRoute, async () => {
+      const capabilities = await loadCapabilities();
+      return this.ownsRouterOutlet() ? capabilities : NO_CAPABILITIES;
+    });
+    this.syncInConsole = () => {
+      if (
+        this.ownsRouterOutlet() &&
+        window.location.pathname.startsWith('/console')
+      ) {
+        void gate.sync();
+      }
+    };
+    window.addEventListener(LOCATION_CHANGED, this.syncInConsole);
+    if (isCapabilityPath(window.location.pathname)) {
+      // A deep link to a gated view waits for the answer, so it never flashes
+      // the not-found page before its route exists.
+      let attempt = 0;
+      const install = (): void => {
+        if (!this.ownsRouterOutlet()) return;
+        const currentAttempt = ++attempt;
+        void gate.sync({ render: false }).finally(() => {
+          if (
+            currentAttempt !== attempt ||
+            !this.ownsRouterOutlet() ||
+            this.resumeRouteInstallation !== install
+          )
+            return;
+          this.resumeRouteInstallation = undefined;
+          void router.setRoutes(table);
+        });
+      };
+      this.resumeRouteInstallation = install;
+      install();
+      return;
+    }
+    void router.setRoutes(table);
+    this.syncInConsole();
   }
 
   /**

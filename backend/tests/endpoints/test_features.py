@@ -5,6 +5,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from preloop.config import SERVER_VERSION
+
 
 @pytest.fixture(autouse=True)
 def _clear_users_exist_cache():
@@ -12,7 +14,13 @@ def _clear_users_exist_cache():
     from preloop.api.endpoints.features import reset_users_exist_cache
 
     reset_users_exist_cache()
-    yield
+    with (
+        patch(
+            "preloop.services.instance_service.is_hosted_instance", return_value=False
+        ),
+        patch("preloop.services.instance_service._is_enterprise", return_value=False),
+    ):
+        yield
     reset_users_exist_cache()
 
 
@@ -37,6 +45,8 @@ class TestGetFeatures:
         result = get_features(db=MagicMock())
 
         assert result == {
+            "edition": "oss",
+            "server_version": SERVER_VERSION,
             "plugins": ["rbac", "audit"],
             "features": {
                 "rbac": True,
@@ -45,8 +55,15 @@ class TestGetFeatures:
                 "first_account_pending": False,
                 "registration_bootstrap_pending": False,
                 "session_optimization": True,
+                "policy_simulation": True,
+                "chat_connections": True,
                 "policies_console": True,
+                "bitbucket_dc": False,
                 "passkeys": True,
+                "multi_account": False,
+                "account_hierarchy": False,
+                "abac_rules": False,
+                "ticket_readiness": False,
             },
         }
         mock_get_plugin_manager.assert_called_once()
@@ -69,14 +86,23 @@ class TestGetFeatures:
         result = get_features(db=MagicMock())
 
         assert result == {
+            "edition": "oss",
+            "server_version": SERVER_VERSION,
             "plugins": [],
             "features": {
                 "registration": True,
                 "first_account_pending": False,
                 "registration_bootstrap_pending": False,
                 "session_optimization": True,
+                "policy_simulation": True,
+                "chat_connections": True,
                 "policies_console": True,
+                "bitbucket_dc": False,
                 "passkeys": True,
+                "multi_account": False,
+                "account_hierarchy": False,
+                "abac_rules": False,
+                "ticket_readiness": False,
             },
         }
 
@@ -107,8 +133,10 @@ class TestGetFeatures:
         assert "plugins" in result
         assert "features" in result
         assert len(result["plugins"]) == 3
-        assert len(result["features"]) == 10
+        assert len(result["features"]) == 17
+        assert result["features"]["policy_simulation"] is True
         assert result["features"]["session_optimization"] is True
+        assert result["features"]["chat_connections"] is True
 
     @patch("preloop.api.auth.bootstrap.crud_user")
     @patch("preloop.api.endpoints.features.get_plugin_manager")
@@ -353,3 +381,144 @@ class TestGetFeatures:
         assert result["features"]["registration"] is False
         assert result["features"]["registration_bootstrap_pending"] is False
         assert result["features"]["first_account_pending"] is False
+
+
+class TestAccountCapabilities:
+    """The account capabilities (issue #988) default off; a plugin turns them on."""
+
+    CAPABILITIES = ("multi_account", "account_hierarchy", "abac_rules")
+
+    @patch("preloop.api.auth.bootstrap.crud_user")
+    @patch("preloop.api.endpoints.features.get_plugin_manager")
+    def test_capabilities_default_off(self, mock_get_plugin_manager, mock_crud_user):
+        from preloop.api.endpoints.features import get_features
+
+        mock_plugin_manager = MagicMock()
+        mock_plugin_manager.get_enabled_features.return_value = {
+            "plugins": [],
+            "features": {},
+        }
+        mock_get_plugin_manager.return_value = mock_plugin_manager
+        mock_crud_user.has_any_users.return_value = True
+
+        features = get_features(db=MagicMock())["features"]
+
+        for name in self.CAPABILITIES:
+            assert features[name] is False, name
+
+    @patch("preloop.api.auth.bootstrap.crud_user")
+    @patch("preloop.api.endpoints.features.get_plugin_manager")
+    def test_plugin_value_is_kept(self, mock_get_plugin_manager, mock_crud_user):
+        from preloop.api.endpoints.features import get_features
+
+        mock_plugin_manager = MagicMock()
+        mock_plugin_manager.get_enabled_features.return_value = {
+            "plugins": [{"name": "ee"}],
+            "features": {name: True for name in self.CAPABILITIES},
+        }
+        mock_get_plugin_manager.return_value = mock_plugin_manager
+        mock_crud_user.has_any_users.return_value = True
+
+        features = get_features(db=MagicMock())["features"]
+
+        for name in self.CAPABILITIES:
+            assert features[name] is True, name
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_dc_feature_is_deployment_owned(
+    monkeypatch: pytest.MonkeyPatch, enabled: bool
+) -> None:
+    from preloop.api.endpoints.features import get_features
+
+    monkeypatch.setenv("PRELOOP_BITBUCKET_DC_ENABLED", "true" if enabled else "false")
+    with (
+        patch("preloop.api.endpoints.features.get_plugin_manager") as manager,
+        patch("preloop.api.auth.bootstrap.crud_user") as users,
+    ):
+        manager.return_value.get_enabled_features.return_value = {
+            "plugins": [],
+            "features": {"bitbucket_dc": not enabled},
+        }
+        users.has_any_users.return_value = True
+        assert get_features(db=MagicMock())["features"]["bitbucket_dc"] is enabled
+
+
+@pytest.mark.parametrize(
+    "hosted,enterprise,expected",
+    [
+        (False, False, "oss"),
+        (False, True, "enterprise"),
+        (True, False, "cloud"),
+        (True, True, "cloud"),
+    ],
+)
+def test_features_edition(hosted: bool, enterprise: bool, expected: str) -> None:
+    from preloop.api.endpoints.features import get_features
+
+    with (
+        patch("preloop.api.endpoints.features.get_plugin_manager") as manager,
+        patch("preloop.api.auth.bootstrap.crud_user") as users,
+        patch(
+            "preloop.services.instance_service.is_hosted_instance", return_value=hosted
+        ),
+        patch(
+            "preloop.services.instance_service._is_enterprise", return_value=enterprise
+        ),
+    ):
+        manager.return_value.get_enabled_features.return_value = {
+            "plugins": [{"name": "billing"}],
+            "features": {},
+        }
+        users.has_any_users.return_value = True
+        payload = get_features(db=MagicMock())
+        assert payload["edition"] == expected
+        assert payload["server_version"] == SERVER_VERSION
+
+
+@pytest.mark.parametrize("declared", ["oss", "cloud", "enterprise", "unknown"])
+def test_plugin_edition_declaration(declared: str) -> None:
+    from preloop.api.endpoints.features import get_features
+
+    with (
+        patch("preloop.api.endpoints.features.get_plugin_manager") as manager,
+        patch("preloop.api.auth.bootstrap.crud_user") as users,
+        patch(
+            "preloop.services.instance_service.is_hosted_instance", return_value=False
+        ),
+        patch("preloop.services.instance_service._is_enterprise", return_value=False),
+    ):
+        manager.return_value.get_enabled_features.return_value = {
+            "plugins": [],
+            "features": {"edition": declared},
+        }
+        users.has_any_users.return_value = True
+        assert get_features(db=MagicMock())["edition"] == "oss"
+
+
+@pytest.mark.parametrize(
+    "hosted,enterprise,declared,expected",
+    [(True, True, "enterprise", "cloud"), (False, True, "cloud", "enterprise")],
+)
+def test_static_plugin_cannot_relabel_runtime_edition(
+    hosted: bool, enterprise: bool, declared: str, expected: str
+) -> None:
+    from preloop.api.endpoints.features import get_features
+
+    with (
+        patch("preloop.api.endpoints.features.get_plugin_manager") as manager,
+        patch("preloop.api.auth.bootstrap.crud_user") as users,
+        patch(
+            "preloop.services.instance_service.is_hosted_instance", return_value=hosted
+        ),
+        patch(
+            "preloop.services.instance_service._is_enterprise", return_value=enterprise
+        ),
+    ):
+        manager.return_value.get_enabled_features.return_value = {
+            "plugins": [{"name": "billing"}],
+            "edition": declared,
+            "features": {"edition": declared},
+        }
+        users.has_any_users.return_value = True
+        assert get_features(db=MagicMock())["edition"] == expected

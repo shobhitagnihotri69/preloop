@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from sqlalchemy import or_
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Query, Session
 
 from ..models.api_key import ApiKey
 from ..models.managed_agent_credential import ManagedAgentCredential
@@ -19,6 +19,16 @@ logger = logging.getLogger(__name__)
 
 class CRUDApiKey(CRUDBase[ApiKey]):
     """CRUD operations for API key."""
+
+    @staticmethod
+    def _legacy_only(query: Query[ApiKey]) -> Query[ApiKey]:
+        """Keep every machine marker out of human key administration."""
+        return query.filter(
+            ApiKey.credential_type == "legacy",
+            ApiKey.credential_version.is_(None),
+            ApiKey.ci_principal_id.is_(None),
+            ApiKey.ci_actions.is_(None),
+        )
 
     @staticmethod
     def build_key_hash(key_value: str) -> str:
@@ -86,6 +96,7 @@ class CRUDApiKey(CRUDBase[ApiKey]):
         context_data: Optional[Dict[str, Any]] = None,
         key_value: Optional[str] = None,
         commit: bool = True,
+        restricted_runtime: bool = False,
     ) -> tuple[ApiKey, str]:
         """Create a runtime-scoped API key stored without plaintext value."""
         token_value = key_value or f"flow_{secrets.token_urlsafe(32)}"
@@ -108,6 +119,8 @@ class CRUDApiKey(CRUDBase[ApiKey]):
             scopes=scopes or [],
             is_active=True,
             context_data=context_data,
+            credential_type="restricted_runtime" if restricted_runtime else "legacy",
+            credential_version=1 if restricted_runtime else None,
         )
 
         db.add(db_obj)
@@ -119,7 +132,13 @@ class CRUDApiKey(CRUDBase[ApiKey]):
         return db_obj, token_value
 
     def get_by_key(
-        self, db: Session, *, key: str, account_id: Optional[str] = None
+        self,
+        db: Session,
+        *,
+        key: str,
+        account_id: Optional[str] = None,
+        include_restricted: bool = False,
+        include_restricted_runtime: bool = False,
     ) -> Optional[ApiKey]:
         """Get API key by key string."""
         key_hash = self.build_key_hash(key)
@@ -131,7 +150,20 @@ class CRUDApiKey(CRUDBase[ApiKey]):
         )
         if account_id:
             query = query.filter(ApiKey.account_id == account_id)
-        return query.first()
+        key_obj = query.first()
+        # Custom MCP/gateway/session auth also uses this lookup. Until a caller
+        # explicitly opts into machine authorization, never return a CI key.
+        if (
+            key_obj
+            and key_obj.requires_machine_authorization is True
+            and not include_restricted
+            and not (
+                include_restricted_runtime
+                and key_obj.credential_type == "restricted_runtime"
+            )
+        ):
+            return None
+        return key_obj
 
     def get_active_by_user(
         self,
@@ -148,6 +180,8 @@ class CRUDApiKey(CRUDBase[ApiKey]):
             .join(User, ApiKey.user_id == User.id)
             .filter(User.username == username, ApiKey.is_active.is_(True))
         )
+        # Human key administration must use the CI lifecycle seam for CI keys.
+        query = self._legacy_only(query)
         if account_id:
             query = query.filter(User.account_id == account_id)
         return query.offset(skip).limit(limit).all()
@@ -443,6 +477,7 @@ class CRUDApiKey(CRUDBase[ApiKey]):
             .filter(
                 ApiKey.account_id == account_id,
                 ApiKey.is_active.is_(False),
+                ApiKey.credential_type == "legacy",
                 ApiKey.context_data.op("->>")("managed_agent_id")
                 == str(managed_agent_id),
                 or_(
@@ -530,6 +565,8 @@ class CRUDApiKey(CRUDBase[ApiKey]):
             .join(User, ApiKey.user_id == User.id)
             .filter(User.username == username)
         )
+        # Human key administration must use the CI lifecycle seam for CI keys.
+        query = self._legacy_only(query)
         if account_id:
             query = query.filter(User.account_id == account_id)
         return query.order_by(ApiKey.created_at.desc()).all()
@@ -548,6 +585,8 @@ class CRUDApiKey(CRUDBase[ApiKey]):
             .join(User, ApiKey.user_id == User.id)
             .filter(ApiKey.id == key_id, User.username == username)
         )
+        # Human key administration must use the CI lifecycle seam for CI keys.
+        query = self._legacy_only(query)
         if account_id:
             query = query.filter(User.account_id == account_id)
         return query.first()

@@ -5,6 +5,13 @@ on:
   push:
     branches: [main]
 
+concurrency:
+  # One run per PR, or per branch on push. A newer commit cancels the older
+  # run on PRs and on main; tags, schedules and manual runs are never
+  # cancelled (each tag is its own ref, so tags never collide anyway).
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main') }}
+
 permissions:
   contents: read
 
@@ -20,6 +27,8 @@ jobs:
         shell: powershell
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Install pinned Pester
         run: |
           Save-Module Pester -RequiredVersion 5.7.1 -Path "$env:RUNNER_TEMP/pester-modules" -Force

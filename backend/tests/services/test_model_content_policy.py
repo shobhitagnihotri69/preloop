@@ -23,7 +23,11 @@ from preloop.services.model_content_policy import (
     hold_for_model_io_approval,
     wrap_stream_for_response_policy,
 )
-from preloop.services.policy.schema import ModelIORule, ToolCondition
+from preloop.services.policy.schema import (
+    ModelIORule,
+    SensitiveDataConfig,
+    ToolCondition,
+)
 
 
 def _rule(**kwargs) -> ModelIORule:
@@ -104,6 +108,40 @@ def test_request_allow_when_pii_absent():
         text="No identifiers here",
     )
     assert decision.action == "allow"
+
+
+def test_form_shaped_simple_rule_denies_a_card_number_and_allows_hello():
+    """Regression: the form-shaped simple rule still catches PII.
+
+    The console sends ``pii.found == true`` with the default PII types. A
+    Luhn-valid card is denied; plain text is allowed.
+    """
+    rule = _rule(
+        id="deny-pii",
+        target="model.request",
+        detectors={"pii": {"types": ["email", "phone", "credit_card"]}},
+        conditions=[
+            ToolCondition(
+                expression="pii.found == true",
+                action="deny",
+                condition_type="simple",
+            ),
+        ],
+    )
+    blocked = evaluate_model_io(
+        rules=[rule],
+        target="model.request",
+        text="card 4111 1111 1111 1111",
+    )
+    assert blocked.action == "deny"
+    assert "credit_card" in blocked.detector_summary["pii.types_found"]
+
+    allowed = evaluate_model_io(
+        rules=[rule],
+        target="model.request",
+        text="hello",
+    )
+    assert allowed.action == "allow"
 
 
 def test_deny_when_injection_score_exceeds_threshold():
@@ -227,7 +265,9 @@ def test_extract_stream_text_from_chat_chunk():
 def test_wrap_stream_buffers_then_replays_when_allowed():
     gateway = SimpleNamespace(
         db=MagicMock(),
-        auth_context=SimpleNamespace(user=SimpleNamespace(account_id="acct", id="u")),
+        auth_context=SimpleNamespace(
+            account_id="acct", user=SimpleNamespace(account_id="acct", id="u")
+        ),
         _openai_stream_error_event=lambda exc, err: f"data: error {exc}\n\n",
         _sse_done=lambda: "data: [DONE]\n\n",
     )
@@ -236,8 +276,8 @@ def test_wrap_stream_buffers_then_replays_when_allowed():
         "data: [DONE]\n\n",
     ]
     with patch(
-        "preloop.services.model_content_policy.load_model_io_rules",
-        return_value=[],
+        "preloop.services.model_content_policy.load_gateway_policy_blocks",
+        return_value=([], SensitiveDataConfig()),
     ):
         out = list(
             wrap_stream_for_response_policy(
@@ -254,7 +294,9 @@ def test_wrap_stream_buffers_then_replays_when_allowed():
 def test_wrap_stream_denies_without_replaying_payload():
     gateway = SimpleNamespace(
         db=MagicMock(),
-        auth_context=SimpleNamespace(user=SimpleNamespace(account_id="acct", id="u")),
+        auth_context=SimpleNamespace(
+            account_id="acct", user=SimpleNamespace(account_id="acct", id="u")
+        ),
         _openai_stream_error_event=lambda exc, _err: f"data: {exc.message}\n\n",
         _sse_done=lambda: "data: [DONE]\n\n",
         _client_session_id=None,
@@ -273,8 +315,8 @@ def test_wrap_stream_denies_without_replaying_payload():
         "data: [DONE]\n\n",
     ]
     with patch(
-        "preloop.services.model_content_policy.load_model_io_rules",
-        return_value=[rule],
+        "preloop.services.model_content_policy.load_gateway_policy_blocks",
+        return_value=([rule], SensitiveDataConfig()),
     ):
         out = list(
             wrap_stream_for_response_policy(
@@ -315,7 +357,9 @@ def test_extract_stream_text_anthropic_content_block_delta_not_doubled():
 def test_wrap_stream_responses_assembled_text_is_not_doubled():
     gateway = SimpleNamespace(
         db=MagicMock(),
-        auth_context=SimpleNamespace(user=SimpleNamespace(account_id="acct", id="u")),
+        auth_context=SimpleNamespace(
+            account_id="acct", user=SimpleNamespace(account_id="acct", id="u")
+        ),
         _openai_stream_error_event=lambda exc, err: f"data: error {exc}\n\n",
         _sse_done=lambda: "data: [DONE]\n\n",
         _client_session_id=None,
@@ -339,8 +383,8 @@ def test_wrap_stream_responses_assembled_text_is_not_doubled():
         "data: [DONE]\n\n",
     ]
     with patch(
-        "preloop.services.model_content_policy.load_model_io_rules",
-        return_value=[rule],
+        "preloop.services.model_content_policy.load_gateway_policy_blocks",
+        return_value=([rule], SensitiveDataConfig()),
     ):
         out = list(
             wrap_stream_for_response_policy(
@@ -430,7 +474,9 @@ def test_buffered_response_policy_db_failure_emits_error_without_payload() -> No
 
     gateway = SimpleNamespace(
         db=MagicMock(),
-        auth_context=SimpleNamespace(user=SimpleNamespace(account_id="acct", id="u")),
+        auth_context=SimpleNamespace(
+            account_id="acct", user=SimpleNamespace(account_id="acct", id="u")
+        ),
         _openai_stream_error_event=lambda exc, _err: f"data: {exc.code}\n\n",
         _sse_done=lambda: "data: [DONE]\n\n",
     )
@@ -440,8 +486,11 @@ def test_buffered_response_policy_db_failure_emits_error_without_payload() -> No
         conditions=[ToolCondition(expression="true", action="allow")],
     )
     with patch(
-        "preloop.services.model_content_policy.load_model_io_rules",
-        side_effect=[[rule], SQLAlchemyTimeoutError("sensitive SQL must not escape")],
+        "preloop.services.model_content_policy.load_gateway_policy_blocks",
+        side_effect=[
+            ([rule], SensitiveDataConfig()),
+            SQLAlchemyTimeoutError("sensitive SQL must not escape"),
+        ],
     ):
         out = list(
             wrap_stream_for_response_policy(
@@ -471,13 +520,18 @@ def test_response_buffer_still_enforces_current_deny_rule() -> None:
     )
     gateway = SimpleNamespace(
         db=MagicMock(),
-        auth_context=SimpleNamespace(user=SimpleNamespace(account_id="acct", id="u")),
+        auth_context=SimpleNamespace(
+            account_id="acct", user=SimpleNamespace(account_id="acct", id="u")
+        ),
         _openai_stream_error_event=lambda exc, _err: f"data: {exc.code}\n\n",
         _sse_done=lambda: "data: [DONE]\n\n",
     )
     with patch(
-        "preloop.services.model_content_policy.load_model_io_rules",
-        side_effect=[[prepared], [current]],
+        "preloop.services.model_content_policy.load_gateway_policy_blocks",
+        side_effect=[
+            ([prepared], SensitiveDataConfig()),
+            ([current], SensitiveDataConfig()),
+        ],
     ) as load:
         out = list(
             wrap_stream_for_response_policy(
@@ -505,13 +559,19 @@ def test_response_rule_added_after_empty_request_preflight_blocks_output() -> No
     )
     gateway = SimpleNamespace(
         db=MagicMock(),
-        auth_context=SimpleNamespace(user=SimpleNamespace(account_id="acct", id="u")),
+        auth_context=SimpleNamespace(
+            account_id="acct", user=SimpleNamespace(account_id="acct", id="u")
+        ),
         _openai_stream_error_event=lambda exc, _err: f"data: {exc.code}\n\n",
         _sse_done=lambda: "data: [DONE]\n\n",
     )
     with patch(
-        "preloop.services.model_content_policy.load_model_io_rules",
-        side_effect=[[], [deny], [deny]],
+        "preloop.services.model_content_policy.load_gateway_policy_blocks",
+        side_effect=[
+            ([], SensitiveDataConfig()),
+            ([deny], SensitiveDataConfig()),
+            ([deny], SensitiveDataConfig()),
+        ],
     ) as load:
         enforce_request_policy(
             gateway,

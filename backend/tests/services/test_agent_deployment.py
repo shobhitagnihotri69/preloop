@@ -290,7 +290,8 @@ def ssh_connection(output, exit_status=0):
     process = MagicMock()
     process.__aenter__ = AsyncMock(return_value=process)
     process.__aexit__ = AsyncMock(return_value=False)
-    process.stdout.read = AsyncMock(return_value=output)
+    chunks = list(output) if isinstance(output, list) else [output]
+    process.stdout.read = AsyncMock(side_effect=chunks + [""] * 4)
     process.wait_closed = AsyncMock()
     process.exit_status = exit_status
     connection = MagicMock()
@@ -347,6 +348,7 @@ async def test_remote_version_is_reduced_to_runtime_and_semver():
         )
     assert result.runtime_version == "hermes v2026.9.14"
     assert result.agent_id == agent_id
+    assert result.desktop == "skipped"
 
 
 @pytest.mark.asyncio
@@ -493,6 +495,7 @@ def test_generated_script_verifies_download_and_onboarding_without_child_stdin(
         assert evidence["agent_id"] == agent_id
         assert evidence["model_alias"] == alias
         assert evidence["runtime_version"] == "Hermes 0.21.3"
+        assert evidence["desktop"] == "skipped"
     else:
         assert result.returncode != 0
         marker = {
@@ -501,3 +504,206 @@ def test_generated_script_verifies_download_and_onboarding_without_child_stdin(
             "wrong-model": "PRELOOP_DEPLOY_ONBOARDING_INCOMPLETE",
         }[scenario]
         assert marker in result.stdout
+
+
+def test_deployment_request_accepts_desktop_flag():
+    base = dict(
+        idempotency_key=uuid4(), model_id=uuid4(), target="gcp", runtime="hermes"
+    )
+    assert AgentDeploymentRequest(**base).desktop is False
+    assert AgentDeploymentRequest(**(base | {"desktop": True})).desktop is True
+
+
+def test_desktop_stage_follows_validation_and_does_not_change_firewall():
+    kwargs = dict(
+        runtime="hermes",
+        alias="selected/model",
+        url="https://test.example",
+        token="private-token",
+        request_id=uuid4(),
+    )
+    disabled = service.installation_script(**kwargs)
+    enabled = service.installation_script(**kwargs, desktop=True)
+    assert "--desktop" not in disabled
+    assert "PRELOOP_DEPLOY_DESKTOP_FAILED" not in disabled
+    for script in (disabled, enabled):
+        assert "gcloud compute firewall-rules" not in script
+    command = 'preloop agents install-runtime "$deploy_runtime" --install-only --skip-install --desktop -y'
+    assert command in enabled
+    assert enabled.index("PRELOOP_DEPLOY_VALIDATION_FAILED") < enabled.index(
+        "PRELOOP_DEPLOY_DESKTOP_FAILED"
+    )
+    assert enabled.index("--desktop") < enabled.index('"$deploy_runtime" --version')
+    assert "echo PRELOOP_DEPLOY_DESKTOP_FAILED" in enabled
+
+
+@pytest.mark.parametrize("desktop_exit,expected", [(0, "installed"), (1, "failed")])
+def test_desktop_failure_does_not_fail_validated_deployment(
+    tmp_path, monkeypatch, desktop_exit, expected
+):
+    """A desktop-stage failure is reported and does not flip deployment success."""
+    import hashlib
+    import os
+    import shutil
+    import subprocess
+
+    if not shutil.which("bash") or not shutil.which("sha256sum"):
+        pytest.skip("Bash and sha256sum are required for the Linux bootstrap test")
+    agent_id = str(uuid4())
+    alias = "selected/model"
+    status = {
+        "remote_state": {
+            "agent": {"id": agent_id, "model_gateway_configured": True},
+            "enrollments": [
+                {
+                    "validation_result": {
+                        "validation_passed": True,
+                        "live_validation_status": "passed",
+                        "live_validation_model_alias": alias,
+                        "control_plugin_verified": True,
+                        "control_channel_configured": True,
+                    }
+                }
+            ],
+        }
+    }
+    status_path = tmp_path / "status.json"
+    status_path.write_text(json.dumps(status))
+    cli = tmp_path / "publisher-cli"
+    cli.write_text(
+        "#!/bin/sh\n"
+        'case " $* " in\n'
+        '  *" --desktop "*) exit "$DESKTOP_EXIT" ;;\n'
+        "esac\n"
+        'if [ "$1 $2" = "agents status" ]; then\n'
+        'cat "$TEST_STATUS_FILE"\nelse\ncat >/dev/null\nfi\n'
+    )
+    cli.chmod(0o700)
+    monkeypatch.setenv("PRELOOP_DEPLOY_CLI_URL", "https://publisher.example/cli")
+    monkeypatch.setenv(
+        "PRELOOP_DEPLOY_CLI_SHA256", hashlib.sha256(cli.read_bytes()).hexdigest()
+    )
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    for name, content in {
+        "curl": '#!/bin/sh\nwhile [ "$1" != "-o" ]; do shift; done\ncp "$TEST_CLI_FILE" "$2"\n',
+        "flock": "#!/bin/sh\nexit 0\n",
+        "hermes": "#!/bin/sh\necho 'Hermes 0.21.3'\n",
+    }.items():
+        path = bindir / name
+        path.write_text(content)
+        path.chmod(0o700)
+    environment = dict(
+        os.environ,
+        HOME=str(tmp_path / "home"),
+        PATH=str(bindir) + os.pathsep + os.environ["PATH"],
+        TEST_CLI_FILE=str(cli),
+        TEST_STATUS_FILE=str(status_path),
+        DESKTOP_EXIT=str(desktop_exit),
+    )
+    script = service.installation_script(
+        "hermes",
+        alias,
+        "https://test.example",
+        "private-token",
+        uuid4(),
+        desktop=True,
+    )
+    result = subprocess.run(
+        ["bash", "-s"],
+        input=script,
+        text=True,
+        capture_output=True,
+        env=environment,
+        timeout=10,
+    )
+    assert "private-token" not in result.stdout + result.stderr
+    assert result.returncode == 0, result.stdout + result.stderr
+    evidence = json.loads(result.stdout.strip().splitlines()[-1])
+    assert evidence["desktop"] == expected
+    assert evidence["agent_id"] == agent_id
+    if expected == "failed":
+        assert "PRELOOP_DEPLOY_DESKTOP_FAILED" in result.stdout
+    else:
+        assert "PRELOOP_DEPLOY_DESKTOP_FAILED" not in result.stdout
+
+
+def _evidence_line(desktop="failed"):
+    return json.dumps(
+        {
+            "agent_id": str(uuid4()),
+            "runtime_version": "Hermes Agent v0.21.3",
+            "model_alias": "model",
+            "desktop": desktop,
+        }
+    )
+
+
+async def _install_with_output(output):
+    connection, process = ssh_connection(output)
+    with (
+        patch.object(service, "resolve_ssh_address", AsyncMock(return_value="8.8.8.8")),
+        patch.object(service.asyncssh, "connect", return_value=connection),
+    ):
+        result = await service.install_over_ssh(
+            ssh_input(),
+            runtime="hermes",
+            alias="model",
+            url="https://test.example",
+            token="private-token",
+            request_id=uuid4(),
+            desktop=True,
+        )
+    return result, process
+
+
+@pytest.mark.asyncio
+async def test_desktop_marker_arriving_before_evidence_keeps_validated_runtime():
+    """Prod 2026-10-08: the marker arrived in its own read and caused a 502."""
+    result, _ = await _install_with_output(
+        ["PRELOOP_DEPLOY_DESKTOP_FAILED\n", _evidence_line() + "\n"]
+    )
+    assert result.desktop == "failed"
+    assert result.runtime_version == "hermes v0.21.3"
+
+
+@pytest.mark.asyncio
+async def test_evidence_split_across_chunks_is_reassembled():
+    line = _evidence_line("installed") + "\n"
+    result, _ = await _install_with_output([line[:7], line[7:30], line[30:]])
+    assert result.desktop == "installed"
+
+
+@pytest.mark.asyncio
+async def test_output_over_cap_across_chunks_terminates_session():
+    with pytest.raises(service.DeploymentError, match="excessive"):
+        await _install_with_output(["x" * 40000, "y" * 40000, _evidence_line()])
+
+
+@pytest.mark.asyncio
+async def test_read_bounded_output_stops_after_limit():
+    stream = MagicMock()
+    stream.read = AsyncMock(side_effect=["a" * 10, "b" * 10, "c" * 10, ""])
+    output = await service.read_bounded_output(stream, 15)
+    assert output == "a" * 10 + "b" * 10
+    assert stream.read.await_args_list[0].args == (16,)
+    assert stream.read.await_args_list[1].args == (6,)
+
+
+def test_parse_evidence_ignores_markers_and_rejects_missing_json():
+    line = _evidence_line()
+    assert (
+        service.parse_evidence(f"PRELOOP_DEPLOY_DESKTOP_FAILED\n{line}\n\n")["desktop"]
+        == "failed"
+    )
+    with pytest.raises(ValueError):
+        service.parse_evidence("PRELOOP_DEPLOY_DESKTOP_FAILED\n")
+    with pytest.raises(ValueError):
+        service.parse_evidence("[1, 2]\n")
+
+
+def test_desktop_log_is_kept_on_the_host():
+    script = service.installation_script(
+        "hermes", "model", "https://test.example", "token", uuid4(), desktop=True
+    )
+    assert '"$HOME/.local/state/preloop/desktop.log"' in script

@@ -104,6 +104,7 @@ const MATRIX: Landing[] = [
     tag: 'runtime-sessions-view',
     params: {},
   },
+  { path: '/console/artifacts', tag: 'artifacts-view', params: {} },
   { path: '/console/audit', tag: 'audit-view', params: {} },
   { path: '/console/attention', tag: 'attention-view', params: {} },
   { path: '/console/cost', tag: 'cost-view', params: {} },
@@ -131,6 +132,7 @@ const MATRIX: Landing[] = [
     params: {},
   },
   { path: '/console/settings/plan', tag: 'plan-view', params: {} },
+  { path: '/console/settings/records', tag: 'records-view', params: {} },
   { path: '/console/settings/emergency', tag: 'emergency-view', params: {} },
   // Legacy pricing links land on the plan page, which is where plans live.
   {
@@ -146,9 +148,10 @@ const MATRIX: Landing[] = [
     tag: 'policies-view',
   },
   {
+    // An unknown console path renders the 404 inside the shell, so the
+    // reader keeps the sidebar and header.
     path: '/console/does-not-exist',
     tag: 'not-found-view',
-    atOutlet: true,
   },
 ];
 
@@ -291,7 +294,7 @@ function stubbedBody(url: string): unknown {
   if (/\/api\/v1\/approval-requests\/[^/]+$/u.test(path)) return APPROVAL;
   if (path.includes('/api/v1/approval-requests')) return [APPROVAL];
   if (/\/api\/v1\/agents\/[^/]+$/u.test(path)) return AGENT;
-  if (path.includes('/api/v1/agents')) return [AGENT];
+  if (path.includes('/api/v1/agents')) return { items: [AGENT], total: 1 };
   if (/\/api\/v1\/trackers\/[^/]+$/u.test(path)) return TRACKER;
   if (path.includes('/api/v1/trackers')) return [TRACKER];
   // Everything else: a list where a list is plausible, an object otherwise.
@@ -393,6 +396,32 @@ describe('console route transitions', () => {
       view.firstElementChild,
       `${how}: ${entry.tag} must not host another routed view`
     ).to.equal(null);
+    if (!entry.atOutlet && !how.startsWith('first load')) {
+      const currentHeader = () =>
+        deepest()?.shadowRoot?.querySelector(
+          'view-header'
+        ) as HTMLElement | null;
+      if (currentHeader()) {
+        await waitUntil(
+          () => {
+            const header = currentHeader();
+            const heading = header?.shadowRoot?.querySelector('h1');
+            return !!heading && header?.shadowRoot?.activeElement === heading;
+          },
+          `${how}: route heading receives focus`,
+          { timeout: 10000 }
+        );
+        const heading = currentHeader()!.shadowRoot!.querySelector('h1')!;
+        expect(heading.getAttribute('tabindex')).to.equal('-1');
+        await waitUntil(
+          () =>
+            shell()
+              ?.shadowRoot?.querySelector('.route-announcement')
+              ?.textContent?.includes(heading.textContent!.trim()),
+          `${how}: route announced`
+        );
+      }
+    }
     if (entry.params) {
       expect(view.location?.params, `${how}: params at ${url}`).to.deep.equal(
         entry.params
@@ -467,6 +496,20 @@ describe('console route transitions', () => {
     app = document.createElement('lit-app');
     document.body.append(app);
     await assertLanded(BY_PATH.get('/console')!, 'first load of /console');
+    await waitUntil(
+      () =>
+        deepest()
+          ?.shadowRoot?.querySelector('view-header')
+          ?.shadowRoot?.querySelector('h1'),
+      'initial heading'
+    );
+    const initialHeader = deepest()!.shadowRoot!.querySelector('view-header')!;
+    expect(initialHeader.shadowRoot!.activeElement).to.equal(null);
+    expect(
+      shell()
+        ?.shadowRoot?.querySelector('.route-announcement')
+        ?.textContent?.trim()
+    ).to.equal('');
   });
 
   after(() => {

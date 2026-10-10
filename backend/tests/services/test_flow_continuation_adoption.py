@@ -243,6 +243,86 @@ async def test_gitlab_preflight_rejects_non_get_methods() -> None:
     )
 
 
+def test_metadata_only_workspace_still_allows_native_resume(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A clean checkpoint has no ciphertext and can still be resumed."""
+    from datetime import UTC, datetime, timedelta
+
+    account, execution_id, tracker_id, flow_id = uuid4(), uuid4(), uuid4(), uuid4()
+    native_id = uuid4()
+    expires_at = datetime.now(UTC) + timedelta(hours=2)
+    manifest_sha = "c" * 64
+    flow = SimpleNamespace(
+        id=flow_id,
+        account_id=account,
+        is_enabled=True,
+        agent_config={"feedback": {"enabled": True}},
+        trigger_event_source=str(tracker_id),
+    )
+    row = SimpleNamespace(
+        id=execution_id,
+        flow_id=flow_id,
+        status="SUCCEEDED",
+        result={
+            "pr_url": "https://github.com/example/repo/pull/42",
+            "pr_source_branch": "fix/41",
+        },
+        cli_session={
+            "agent_type": "opencode",
+            "session_id": "ses_ab12cd34",
+            "artifact_reference": {
+                "artifact_id": str(native_id),
+                "execution_id": str(execution_id),
+                "manifest_sha256": manifest_sha,
+            },
+        },
+        trigger_event_details={
+            "source": "github",
+            "tracker_id": str(tracker_id),
+            "payload": {"repository": {"id": 123}, "issue": {"number": 41}},
+        },
+    )
+    tracker = SimpleNamespace(
+        account_id=account, tracker_type="github", resolved_api_key="synthetic-key"
+    )
+    workspace = SimpleNamespace(
+        id=uuid4(),
+        execution_id=execution_id,
+        kind="workspace",
+        ciphertext=None,
+        availability="available",
+        expires_at=expires_at,
+        manifest={"metadata": {"metadata_only": True}},
+    )
+    native = SimpleNamespace(
+        id=native_id,
+        execution_id=execution_id,
+        kind="native_session",
+        ciphertext=b"session-bytes",
+        availability="available",
+        expires_at=expires_at,
+        manifest_sha256=manifest_sha,
+        manifest={},
+    )
+    monkeypatch.setattr(service, "get_session_factory", lambda: MagicMock())
+    monkeypatch.setattr(service.crud_flow_execution, "get", lambda *a, **k: row)
+    monkeypatch.setattr(service.crud_flow, "get", lambda *a, **k: flow)
+    monkeypatch.setattr(service.crud_tracker, "get", lambda *a, **k: tracker)
+    monkeypatch.setattr(service, "feedback_tracker_options", lambda *a: {})
+    monkeypatch.setattr(service.crud_flow_feedback, "find", lambda *a, **k: [])
+    monkeypatch.setattr(service.flow_artifact, "latest", lambda *a, **k: workspace)
+    monkeypatch.setattr(service.flow_artifact, "get", lambda *a, **k: native)
+
+    source = service._load_source(account, execution_id)
+    assert source["native_resume_available"] is True
+    assert source["native_resume_expires_at"] == expires_at
+
+    workspace.manifest = {"metadata": {}}
+    refused = service._load_source(account, execution_id)
+    assert refused["native_resume_available"] is False
+
+
 def test_preview_surfaces_native_checkpoint_expiry() -> None:
     """Preview advertises the real checkpoint window, not a policy lifetime."""
     from datetime import UTC, datetime
@@ -565,3 +645,132 @@ def test_selected_pr_url_is_canonical_before_preview_and_adoption(
     ):
         service.adopt_continuation(account, row.id, request)
     assert bind.call_args.kwargs["pr_url"] == publication["pr_url"]
+
+
+@pytest.mark.asyncio
+async def test_bitbucket_read_publication_matches_repository_uuid() -> None:
+    """The Bitbucket read validates both sides against the bound repo UUID."""
+    repo_uuid = "22222222-2222-2222-2222-222222222222"
+    pr = {
+        "state": "OPEN",
+        "source": {
+            "branch": {"name": "feat/x"},
+            "commit": {"hash": "head"},
+            "repository": {"uuid": "{" + repo_uuid + "}", "full_name": "ws/repo"},
+        },
+        "destination": {
+            "branch": {"name": "main"},
+            "repository": {"uuid": "{" + repo_uuid + "}", "full_name": "ws/repo"},
+        },
+        "links": {"html": {"href": "https://bitbucket.org/ws/repo/pull-requests/7"}},
+    }
+    raw = SimpleNamespace(
+        _request=AsyncMock(return_value=SimpleNamespace(json=lambda: pr))
+    )
+    source = {
+        "provider": "bitbucket",
+        "repository_id": f"ws/{repo_uuid}",
+        "number": "7",
+        "tracker_id": uuid4(),
+        "tracker_key": "k",
+        "tracker_options": {},
+        "policy": {},
+    }
+    with (
+        patch.object(service, "create_tracker_client", AsyncMock(return_value=raw)),
+        patch.object(
+            service.FeedbackProvider,
+            "read",
+            AsyncMock(return_value=FeedbackState("head")),
+        ),
+    ):
+        result = await service._read_publication(source)
+    assert result["open"] is True
+    assert result["same_repository"] is True
+    assert result["branch"] == "feat/x"
+    assert result["pr_url"] == "https://bitbucket.org/ws/repo/pull-requests/7"
+    path = raw._request.await_args_list[0].args[1]
+    assert path == "repositories/ws/%7B" + repo_uuid + "%7D/pullrequests/7"
+
+
+@pytest.mark.asyncio
+async def test_bitbucket_read_publication_rejects_fork_source() -> None:
+    """A PR whose source lives in another repository is not the publication."""
+    repo_uuid = "22222222-2222-2222-2222-222222222222"
+    pr = {
+        "state": "OPEN",
+        "source": {
+            "branch": {"name": "feat/x"},
+            "commit": {"hash": "head"},
+            "repository": {"uuid": "{99999999-9999-9999-9999-999999999999}"},
+        },
+        "destination": {
+            "branch": {"name": "main"},
+            "repository": {"uuid": "{" + repo_uuid + "}"},
+        },
+        "links": {"html": {"href": "https://bitbucket.org/ws/repo/pull-requests/7"}},
+    }
+    raw = SimpleNamespace(
+        _request=AsyncMock(return_value=SimpleNamespace(json=lambda: pr))
+    )
+    source = {
+        "provider": "bitbucket",
+        "repository_id": f"ws/{repo_uuid}",
+        "number": "7",
+        "tracker_id": uuid4(),
+        "tracker_key": "k",
+        "tracker_options": {},
+        "policy": {},
+    }
+    with (
+        patch.object(service, "create_tracker_client", AsyncMock(return_value=raw)),
+        patch.object(
+            service.FeedbackProvider,
+            "read",
+            AsyncMock(return_value=FeedbackState("head")),
+        ),
+    ):
+        result = await service._read_publication(source)
+    assert result["same_repository"] is False
+
+
+def test_jira_triggered_source_uses_the_bound_repository() -> None:
+    """Review on #1434: a Jira-triggered execution published to its bound
+    Bitbucket repository; adoption must key on that binding instead of
+    refusing with "no valid provider PR binding"."""
+    account, execution = uuid4(), uuid4()
+    bitbucket_tracker = uuid4()
+    flow = SimpleNamespace(
+        id=uuid4(), account_id=account, trigger_event_source=str(uuid4())
+    )
+    row = SimpleNamespace(
+        flow_id=flow.id,
+        status="SUCCEEDED",
+        trigger_event_details={
+            "source": "jira",
+            "tracker_id": str(uuid4()),
+            "payload": {"issue": {"key": "JMR-4"}},
+        },
+        result={
+            "pr_url": "https://bitbucket.org/ws/repo/pull-requests/5",
+            "pr_source_branch": "preloop/issue-JMR-4-11386163",
+        },
+    )
+    bound = (
+        "bitbucket",
+        str(bitbucket_tracker),
+        {"full_name": "ws/repo", "uuid": "22222222-2222-2222-2222-222222222222"},
+    )
+    with (
+        patch.object(service, "get_session_factory", return_value=MagicMock()),
+        patch.object(service.crud_flow_execution, "get", return_value=row),
+        patch.object(service.crud_flow, "get", return_value=flow),
+        patch.object(service, "bound_repository", return_value=bound) as resolver,
+        patch.object(service.crud_tracker, "get", return_value=None) as tracker_get,
+    ):
+        with pytest.raises(service.ContinuationAdoptionError) as error:
+            service._load_source(account, execution)
+    # Past the provider check: the bound Bitbucket tracker was looked up.
+    assert error.value.status_code == 404
+    assert resolver.called
+    assert tracker_get.call_args.kwargs["id"] == bitbucket_tracker

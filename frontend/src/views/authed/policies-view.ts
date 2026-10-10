@@ -1,8 +1,12 @@
-import { LitElement, html, css, unsafeCSS } from 'lit';
+import { ConsoleStatus } from '../../controllers/console-status';
+import { parseUTCDate } from '../../utils/date';
+import { LitElement, html, css, nothing, unsafeCSS } from 'lit';
 import { customElement, state } from 'lit/decorators.js';
 import { repeat } from 'lit/directives/repeat.js';
 import {
   getTools,
+  getAccountAgents,
+  getMCPServers,
   getApprovalWorkflows,
   createToolConfiguration,
   getFeatures,
@@ -20,6 +24,8 @@ import {
   normalizePolicyDiff,
   normalizePolicyRollback,
 } from '../../api';
+import '../../components/capability-extension';
+import { hasCapability } from '../../capabilities';
 import type {
   AccessRule,
   ModelIORule,
@@ -31,6 +37,12 @@ import { confirmDialog, showToast } from '../../components/confirm-dialog';
 import { hasPermission } from '../../permissions';
 import type { Tool, ApprovalWorkflow } from '../../components/tool-card';
 import '../../components/policy-generate-dialog';
+import '../../components/sensitive-data-panel';
+import '../../components/policy-simulator';
+import type {
+  AgentOption,
+  SensitiveDataPanel,
+} from '../../components/sensitive-data-panel';
 import '../../components/view-header';
 import '../../components/permission-denied';
 import '@shoelace-style/shoelace/dist/components/alert/alert.js';
@@ -61,6 +73,13 @@ import '@shoelace-style/shoelace/dist/components/menu/menu.js';
 import '@shoelace-style/shoelace/dist/components/menu-item/menu-item.js';
 import consoleStyles from '../../styles/console-styles.css?inline';
 import { consoleDialogStyles } from '../../styles/console-dialog';
+import { ruleActionLabel, ruleActionMeta } from '../../utils/rule-actions';
+
+/**
+ * Actions the rule dialog offers. `notify` (#959) is for model text rules
+ * only: the call proceeds and policy owners are told. Tool rules never get it.
+ */
+type ModelIOFormAction = 'allow' | 'deny' | 'require_approval' | 'notify';
 
 // Types for tool access rules
 interface ToolAccessRule {
@@ -142,6 +161,28 @@ export const MODEL_IO_PRESETS = [
   },
 ];
 
+/** Entity types the PII detector scans when the form enables it. */
+const DEFAULT_PII_TYPES = ['email', 'phone', 'credit_card'];
+
+/**
+ * Start the PII switch from the types the stored detector actually uses.
+ * A rule authored as `pii: { types: [email] }` keeps its narrower scan when
+ * it is opened and saved again, instead of quietly widening to every type.
+ */
+function piiTypesFor(
+  pii: boolean | { types?: string[] } | null | undefined
+): string[] {
+  if (
+    pii &&
+    typeof pii === 'object' &&
+    Array.isArray(pii.types) &&
+    pii.types.length > 0
+  ) {
+    return [...pii.types];
+  }
+  return [...DEFAULT_PII_TYPES];
+}
+
 /** CEL when the expression uses CEL functions or operators. */
 export function conditionTypeFor(expr: string): 'cel' | 'simple' {
   if (!expr) return 'simple';
@@ -191,11 +232,17 @@ const DETECTOR_FACTS: Array<{
 
 @customElement('policies-view')
 export class PoliciesView extends LitElement {
+  private readonly accessibilityStatus = new ConsoleStatus(this);
   @state() private _activeTab = 'rules';
   @state() private _ruleFilter:
     'all' | 'tools' | 'model.request' | 'model.response' = 'all';
   @state() private _showGenerateDialog = false;
   @state() private _currentExportYaml = '';
+  @state() private _pendingSensitiveSave = false;
+  @state() private _sensitiveAgents: AgentOption[] = [];
+  @state() private _sensitiveServers: string[] = [];
+  @state() private _sensitiveOptionsError = '';
+  private _sensitiveOptionsLoaded = false;
   @state() private _tools: Tool[] = [];
   @state() private _approvalPolicies: ApprovalWorkflow[] = [];
   @state() private _loading = false;
@@ -219,7 +266,7 @@ export class PoliciesView extends LitElement {
     toolName: '',
     target: 'model.request' as 'model.request' | 'model.response',
     enabled: true,
-    action: 'deny' as 'allow' | 'deny' | 'require_approval',
+    action: 'deny' as ModelIOFormAction,
     expression: 'pii.found == true',
     approvalWorkflow: '',
     detectPii: true,
@@ -229,6 +276,18 @@ export class PoliciesView extends LitElement {
     conditionMode: 'preset' as 'preset' | 'custom',
     presetId: MODEL_IO_PRESETS[0].id,
     idTouched: false,
+    piiTypes: [...DEFAULT_PII_TYPES] as string[],
+    // Fields the form does not surface but must write back unchanged: a PUT
+    // replaces the whole rule, so dropping them would reset a YAML-authored
+    // value such as `detector_timeout_ms: 30000` on every save.
+    description: '',
+    conditionDescription: '',
+    conditionType: 'auto' as 'auto' | 'simple' | 'cel',
+    detectorTimeoutMs: 500,
+    moderationBackend: '',
+    // Model rules can carry several conditions; the form edits the first and
+    // carries the rest through untouched so an edit never drops them.
+    extraConditions: [] as ModelIORule['conditions'],
   };
 
   // Policy files state
@@ -239,6 +298,7 @@ export class PoliciesView extends LitElement {
   @state() private _isExporting = false;
 
   // YAML tab: live editor over the active policy export.
+  @state() private _showSimulation = false;
   @state() private _yamlDraft = '';
   @state() private _yamlDirty = false;
   @state() private _yamlValidating = false;
@@ -392,7 +452,7 @@ export class PoliciesView extends LitElement {
 
       .model-io-hint {
         font-size: var(--sl-font-size-x-small);
-        color: var(--sl-color-neutral-500);
+        color: var(--console-meta-color);
         margin: var(--sl-spacing-2x-small) 0 var(--sl-spacing-medium);
         line-height: 1.5;
       }
@@ -501,14 +561,14 @@ export class PoliciesView extends LitElement {
 
       .preset-meta {
         font-size: var(--sl-font-size-x-small);
-        color: var(--sl-color-neutral-500);
+        color: var(--console-meta-color);
       }
 
       .detector-facts {
         margin: var(--sl-spacing-x-small) 0 0;
         padding-left: var(--sl-spacing-large);
         font-size: var(--sl-font-size-x-small);
-        color: var(--sl-color-neutral-500);
+        color: var(--console-meta-color);
         line-height: 1.7;
       }
 
@@ -720,7 +780,7 @@ export class PoliciesView extends LitElement {
 
       .version-date {
         font-size: var(--sl-font-size-x-small);
-        color: var(--sl-color-neutral-500);
+        color: var(--console-meta-color);
       }
 
       .version-badges {
@@ -756,13 +816,13 @@ export class PoliciesView extends LitElement {
       }
 
       .version-stat sl-icon {
-        color: var(--sl-color-neutral-500);
+        color: var(--console-meta-color);
       }
 
       .empty-versions {
         text-align: center;
         padding: var(--sl-spacing-2x-large);
-        color: var(--sl-color-neutral-500);
+        color: var(--console-meta-color);
       }
 
       .rollback-preview {
@@ -977,7 +1037,7 @@ export class PoliciesView extends LitElement {
       toolName: '',
       target: preset.target as 'model.request' | 'model.response',
       enabled: true,
-      action: preset.action as 'allow' | 'deny' | 'require_approval',
+      action: preset.action as ModelIOFormAction,
       expression: preset.expression,
       approvalWorkflow: '',
       detectPii: preset.detectPii,
@@ -987,6 +1047,13 @@ export class PoliciesView extends LitElement {
       conditionMode: 'preset' as 'preset' | 'custom',
       presetId: preset.id,
       idTouched: false,
+      piiTypes: [...DEFAULT_PII_TYPES],
+      description: '',
+      conditionDescription: '',
+      conditionType: 'auto' as 'auto' | 'simple' | 'cel',
+      detectorTimeoutMs: 500,
+      moderationBackend: '',
+      extraConditions: [] as ModelIORule['conditions'],
     };
   }
 
@@ -1019,9 +1086,9 @@ export class PoliciesView extends LitElement {
         idTouched: true,
       };
     } else if (rule) {
-      const condition = rule.conditions?.[0];
-      const action = (condition?.action || 'deny') as
-        'allow' | 'deny' | 'require_approval';
+      const [condition, ...extraConditions] = rule.conditions ?? [];
+      const action = (condition?.action || 'deny') as ModelIOFormAction;
+      const moderation = rule.detectors?.moderation;
       this._editingModelIOId = rule.id;
       this._modelIOForm = {
         id: rule.id,
@@ -1031,6 +1098,23 @@ export class PoliciesView extends LitElement {
         enabled: rule.enabled !== false,
         action,
         expression: condition?.expression || '',
+        // Carry fields this form does not edit so the whole-rule PUT keeps
+        // them instead of nulling or resetting them.
+        description: rule.description || '',
+        conditionDescription: condition?.description || '',
+        // A rule stored as `simple` before the backend guard existed may hold
+        // a CEL expression. Seed "auto" so an untouched legacy rule heals to
+        // CEL on save instead of being rejected with a 422.
+        conditionType:
+          condition?.condition_type === 'simple' &&
+          conditionTypeFor(condition?.expression || '') === 'cel'
+            ? 'auto'
+            : condition?.condition_type || 'auto',
+        detectorTimeoutMs: rule.detector_timeout_ms ?? 500,
+        moderationBackend:
+          moderation && typeof moderation === 'object'
+            ? moderation.backend || ''
+            : '',
         approvalWorkflow: rule.approval_workflow || '',
         detectPii: Boolean(rule.detectors?.pii),
         detectInjection: Boolean(rule.detectors?.injection),
@@ -1040,6 +1124,8 @@ export class PoliciesView extends LitElement {
         conditionMode: 'custom',
         presetId: '',
         idTouched: true,
+        piiTypes: piiTypesFor(rule.detectors?.pii),
+        extraConditions,
       };
     } else {
       this._editingModelIOId = null;
@@ -1069,7 +1155,12 @@ export class PoliciesView extends LitElement {
   };
 
   private _patchModelIOForm(patch: Partial<typeof this._modelIOForm>) {
-    this._modelIOForm = { ...this._modelIOForm, ...patch };
+    const next = { ...this._modelIOForm, ...patch };
+    // Tool rules have no notify action; fall back to the dialog's default.
+    if (next.ruleType === 'tool' && next.action === 'notify') {
+      next.action = 'deny';
+    }
+    this._modelIOForm = next;
   }
 
   /** A preset fills in target, detectors, condition, and suggested action. */
@@ -1088,6 +1179,10 @@ export class PoliciesView extends LitElement {
       detectPii: preset.detectPii,
       detectInjection: preset.detectInjection,
       detectModeration: preset.detectModeration,
+      piiTypes: [...DEFAULT_PII_TYPES],
+      conditionDescription: '',
+      conditionType: 'auto',
+      extraConditions: [],
       id:
         this._modelIOForm.idTouched && this._modelIOForm.id.trim()
           ? this._modelIOForm.id
@@ -1155,29 +1250,62 @@ export class PoliciesView extends LitElement {
     const form = this._modelIOForm;
     const detectors: ModelIORule['detectors'] = {};
     if (form.detectPii) {
-      detectors.pii = { types: ['email', 'phone', 'credit_card'] };
+      detectors.pii = {
+        types:
+          form.piiTypes.length > 0
+            ? [...form.piiTypes]
+            : [...DEFAULT_PII_TYPES],
+      };
     }
     if (form.detectInjection) {
       detectors.injection = true;
     }
     if (form.detectModeration) {
-      detectors.moderation = true;
+      detectors.moderation = form.moderationBackend
+        ? { backend: form.moderationBackend }
+        : true;
     }
+    // The backend defaults a condition to `simple`, so a CEL expression saved
+    // without its type would be evaluated by the wrong engine. Send the type
+    // the same way tool rules do. Only an allow rule may fall back to
+    // "always": saveModelIORule rejects an empty deny condition first.
+    const expression = form.expression.trim() || 'true';
+    const primaryCondition = {
+      expression,
+      action: form.action,
+      condition_type:
+        form.conditionType === 'auto'
+          ? conditionTypeFor(form.expression)
+          : form.conditionType,
+      description: form.conditionDescription.trim() || null,
+    };
+    // Conditions after the first are edited elsewhere (or imported as YAML);
+    // keep them, with a type, so an edit does not delete them. A condition
+    // stored as `simple` but written in CEL has to be healed here too: this
+    // form edits only the first condition, and the backend guard rejects a
+    // `simple` CEL expression with 422. The primary condition is seeded to
+    // "auto" when the rule is opened, so this mirrors that heal.
+    const extraConditions = form.extraConditions.map((condition) => {
+      const detected = conditionTypeFor(condition.expression);
+      const stored = condition.condition_type;
+      return {
+        ...condition,
+        condition_type:
+          stored === 'simple' && detected === 'cel'
+            ? 'cel'
+            : stored || detected,
+      };
+    });
     return {
       id: form.id.trim(),
       target: form.target,
       enabled: form.enabled,
+      description: form.description.trim() || null,
       approval_workflow: form.approvalWorkflow || null,
       detectors,
+      detector_timeout_ms: form.detectorTimeoutMs,
       on_detector_timeout: form.onDetectorTimeout,
-      conditions: [
-        {
-          // Only an allow rule may fall back to "always": defaulting a deny
-          // rule to true would block every scanned request.
-          expression: form.expression.trim() || 'true',
-          action: form.action,
-        },
-      ],
+      conditions: [primaryCondition, ...extraConditions],
     };
   }
 
@@ -1189,7 +1317,7 @@ export class PoliciesView extends LitElement {
     }
     if (!form.expression.trim() && form.action !== 'allow') {
       this._ruleDialogError =
-        `A ${form.action} rule needs a condition. An empty condition would ` +
+        `A ${ruleActionLabel(form.action).toLowerCase()} rule needs a condition. An empty condition would ` +
         'match every scanned request.';
       return;
     }
@@ -1216,6 +1344,11 @@ export class PoliciesView extends LitElement {
 
   private async saveToolRuleFromForm() {
     const form = this._modelIOForm;
+    const action = form.action;
+    if (action === 'notify') {
+      this._ruleDialogError = 'Notify is only available for model text rules.';
+      return;
+    }
     const tool = this._tools.find((item) => item.name === form.toolName);
     if (!tool) {
       this._ruleDialogError = 'Choose a tool';
@@ -1229,9 +1362,9 @@ export class PoliciesView extends LitElement {
           tool_name: tool.name,
           tool_source: tool.source,
           mcp_server_id: tool.source_id,
-          is_enabled: form.action !== 'deny',
+          is_enabled: action !== 'deny',
           approval_workflow_id:
-            form.action === 'require_approval'
+            action === 'require_approval'
               ? this._approvalPolicies.find(
                   (p) => p.name === form.approvalWorkflow
                 )?.id ||
@@ -1243,12 +1376,12 @@ export class PoliciesView extends LitElement {
         configId = created.id;
       }
       const payload = {
-        action: form.action,
+        action,
         condition_expression: form.expression.trim() || null,
         condition_type: conditionTypeFor(form.expression),
         is_enabled: form.enabled,
         approval_workflow_id:
-          form.action === 'require_approval'
+          action === 'require_approval'
             ? this._approvalPolicies.find(
                 (p) => p.name === form.approvalWorkflow
               )?.id || null
@@ -1388,12 +1521,14 @@ export class PoliciesView extends LitElement {
     } catch (err: any) {
       this._reportError(err, 'Failed to preview policy file');
       this._pendingYamlSave = false;
+      this._pendingSensitiveSave = false;
     } finally {
       this._isUploading = false;
     }
   }
 
   private _cancelDiffPreview = () => {
+    this._pendingSensitiveSave = false;
     this._showDiffDialog = false;
     this._pendingFile = null;
     this._diffResult = null;
@@ -1421,7 +1556,9 @@ export class PoliciesView extends LitElement {
 
       const fromYamlEditor = this._pendingYamlSave;
       const fromGenerate = this._showGenerateDialog;
+      const fromSensitive = this._pendingSensitiveSave;
       this._pendingYamlSave = false;
+      this._pendingSensitiveSave = false;
       this._showDiffDialog = false;
       this._pendingFile = null;
       this._diffResult = null;
@@ -1436,6 +1573,13 @@ export class PoliciesView extends LitElement {
       await this.loadData();
       if (fromYamlEditor) {
         this._yamlNotice = 'Policy saved and applied.';
+      }
+      if (fromSensitive) {
+        await this.updateComplete;
+        this.shadowRoot
+          ?.querySelector<SensitiveDataPanel>('sensitive-data-panel')
+          ?.reset();
+        showToast('Sensitive data settings saved and applied.', 'success');
       }
     } catch (err: any) {
       this._reportError(err, 'Failed to apply policy file');
@@ -1831,7 +1975,7 @@ export class PoliciesView extends LitElement {
     if (!dateStr) {
       return 'Unknown date';
     }
-    const date = new Date(dateStr);
+    const date = parseUTCDate(dateStr);
     if (Number.isNaN(date.getTime())) {
       return 'Unknown date';
     }
@@ -1966,6 +2110,7 @@ export class PoliciesView extends LitElement {
             <sl-button
               size="small"
               variant=${this._ruleFilter === filter ? 'primary' : 'default'}
+              aria-pressed=${this._ruleFilter === filter ? 'true' : 'false'}
               @click=${() => (this._ruleFilter = filter)}
             >
               ${
@@ -2029,17 +2174,14 @@ export class PoliciesView extends LitElement {
                                 ? 'action-allow'
                                 : rule.action === 'deny'
                                   ? 'action-deny'
-                                  : 'action-approval'
+                                  : rule.action === 'notify'
+                                    ? 'action-notify'
+                                    : 'action-approval'
                             }
-                            variant=${
-                              rule.action === 'allow'
-                                ? 'success'
-                                : rule.action === 'deny'
-                                  ? 'danger'
-                                  : 'warning'
-                            }
+                            variant=${ruleActionMeta(rule.action).variant}
+                            data-action=${rule.action}
                           >
-                            ${rule.action}
+                            ${ruleActionLabel(rule.action)}
                           </sl-badge>
                           ${rule.detectors.map(
                             (chip) =>
@@ -2089,6 +2231,7 @@ export class PoliciesView extends LitElement {
         <div class="form-group">
           <label>What does this rule govern?</label>
           <sl-radio-group
+            aria-label="Rule type"
             data-testid="rule-type"
             .value=${form.ruleType}
             @sl-change=${(e: any) =>
@@ -2112,6 +2255,7 @@ export class PoliciesView extends LitElement {
                 <div class="form-group">
                   <label>Tool</label>
                   <sl-select
+                    aria-label="Policy tool"
                     .value=${
                       form.toolName ? encodeURIComponent(form.toolName) : ''
                     }
@@ -2133,6 +2277,7 @@ export class PoliciesView extends LitElement {
                 <div class="form-group">
                   <label>Which side of the call?</label>
                   <sl-radio-group
+                    aria-label="Rule target"
                     data-testid="rule-target"
                     .value=${form.target}
                     @sl-change=${(e: any) =>
@@ -2150,6 +2295,7 @@ export class PoliciesView extends LitElement {
                 <div class="form-group">
                   <label>Rule id</label>
                   <sl-input
+                    aria-label="Policy ID"
                     .value=${form.id}
                     placeholder="deny-pii-in-prompts"
                     ?disabled=${Boolean(this._editingModelIOId)}
@@ -2166,6 +2312,7 @@ export class PoliciesView extends LitElement {
         <div class="form-group">
           <label>Action</label>
           <sl-select
+            aria-label="Policy action"
             .value=${form.action}
             @sl-change=${(e: any) =>
               this._patchModelIOForm({ action: e.target.value })}
@@ -2173,7 +2320,23 @@ export class PoliciesView extends LitElement {
             <sl-option value="allow">Allow</sl-option>
             <sl-option value="deny">Deny</sl-option>
             <sl-option value="require_approval">Require approval</sl-option>
+            ${
+              isTool
+                ? nothing
+                : html`<sl-option value="notify">Notify</sl-option>`
+            }
           </sl-select>
+          ${
+            form.action === 'notify'
+              ? html`<p class="model-io-hint" data-testid="notify-hint">
+                  The call goes through unchanged. Each match is recorded with a
+                  short excerpt (secrets redacted) and policy owners are told by
+                  email, push or the approval workflow's chat channel, at most
+                  once an hour per rule and user. Later deny or approval rules
+                  still apply.
+                </p>`
+              : nothing
+          }
         </div>
 
         ${
@@ -2191,6 +2354,7 @@ export class PoliciesView extends LitElement {
                         `
                       : html`
                           <sl-select
+                            aria-label="Approval workflow"
                             .value=${form.approvalWorkflow}
                             @sl-change=${(e: any) =>
                               this._patchModelIOForm({
@@ -2225,6 +2389,7 @@ export class PoliciesView extends LitElement {
                 <div class="form-group">
                   <label>If a detector times out</label>
                   <sl-select
+                    aria-label="Detector timeout behavior"
                     .value=${form.onDetectorTimeout}
                     @sl-change=${(e: any) =>
                       this._patchModelIOForm({
@@ -2286,6 +2451,7 @@ export class PoliciesView extends LitElement {
       <div class="form-group">
         <label>When should it fire?</label>
         <sl-textarea
+          aria-label="Policy expression"
           rows="2"
           placeholder="Leave empty to apply to every call to this tool"
           .value=${form.expression}
@@ -2328,6 +2494,7 @@ export class PoliciesView extends LitElement {
       <div class="form-group">
         <label>When should it fire?</label>
         <sl-radio-group
+          aria-label="Condition mode"
           data-testid="condition-mode"
           .value=${form.conditionMode}
           @sl-change=${(e: any) => this._setConditionMode(e.target.value)}
@@ -2354,7 +2521,8 @@ export class PoliciesView extends LitElement {
                       <span class="preset-label">${preset.label}</span>
                       <span class="preset-summary">${preset.summary}</span>
                       <span class="preset-meta">
-                        ${preset.target} &middot; ${preset.action} &middot;
+                        ${preset.target} &middot;
+                        ${ruleActionLabel(preset.action)} &middot;
                         <code>${preset.expression}</code>
                       </span>
                     </button>
@@ -2369,6 +2537,7 @@ export class PoliciesView extends LitElement {
           : html`
               <div class="form-group">
                 <sl-textarea
+                  aria-label="Condition expression"
                   rows="2"
                   data-testid="condition-expression"
                   placeholder="pii.found == true"
@@ -2382,6 +2551,29 @@ export class PoliciesView extends LitElement {
                   <code>moderation.flagged == true</code>,
                   <code>model.id == 'gpt-5'</code>, or
                   <code>session.id != ''</code>.
+                </p>
+              </div>
+              <div class="form-group">
+                <label>Condition language</label>
+                <sl-select
+                  aria-label="Condition type"
+                  data-testid="condition-type"
+                  .value=${form.conditionType}
+                  @sl-change=${(e: any) =>
+                    this._patchModelIOForm({ conditionType: e.target.value })}
+                >
+                  <sl-option value="auto">
+                    Detect automatically (recommended)
+                  </sl-option>
+                  <sl-option value="simple">Simple comparison</sl-option>
+                  <sl-option value="cel">CEL expression</sl-option>
+                </sl-select>
+                <p class="model-io-hint">
+                  Simple reads comparisons such as
+                  <code>pii.found == true</code>. Pick CEL when the expression
+                  uses <code>contains(...)</code>, <code>in</code>, indexing, or
+                  anything the automatic check reads as simple but the server
+                  rejects.
                 </p>
               </div>
             `
@@ -2423,6 +2615,17 @@ export class PoliciesView extends LitElement {
             `
           )}
         </ul>
+        ${
+          form.extraConditions.length > 0
+            ? html`
+                <p class="model-io-hint" data-testid="extra-conditions-hint">
+                  This rule keeps ${form.extraConditions.length} more
+                  condition${form.extraConditions.length === 1 ? '' : 's'} with
+                  their own actions; this form edits only the first one.
+                </p>
+              `
+            : nothing
+        }
       </div>
     `;
   }
@@ -2435,7 +2638,25 @@ export class PoliciesView extends LitElement {
       this.loadVersions();
     }
 
+    // The shareable baseline is the active version, else the newest one.
+    const baseline =
+      this._versions.find((version) => version.is_active) ??
+      this._versions.reduce<PolicyVersion | null>(
+        (best, version) =>
+          !best || version.version_number > best.version_number
+            ? version
+            : best,
+        null
+      );
     return html`
+      ${
+        baseline
+          ? html`<capability-extension
+              name="resource-access"
+              .context=${{ kind: 'policy', resourceId: baseline.id }}
+            ></capability-extension>`
+          : ''
+      }
       <div class="policy-files-container">
         <div class="yaml-editor-header">
           <div class="yaml-editor-intro">
@@ -2446,6 +2667,17 @@ export class PoliciesView extends LitElement {
             </p>
           </div>
           <div class="yaml-editor-actions">
+            ${
+              this._features['policy_simulation'] === true
+                ? html`<sl-button
+                    size="small"
+                    @click=${() => {
+                      this._showSimulation = !this._showSimulation;
+                    }}
+                    >Simulate</sl-button
+                  >`
+                : ''
+            }
             <sl-button
               size="small"
               ?disabled=${!this._yamlDirty}
@@ -2470,6 +2702,8 @@ export class PoliciesView extends LitElement {
             </sl-button>
           </div>
         </div>
+
+        ${this._showSimulation ? html`<policy-simulator .draftYaml=${this._yamlDraft}></policy-simulator>` : ''}
 
         <sl-textarea
           class="yaml-editor"
@@ -2572,10 +2806,6 @@ defaults:
         <!-- Version Management Section -->
         ${this.renderVersionsSection()}
       </div>
-
-      ${this.renderDiffDialog()} ${this.renderSaveVersionDialog()}
-      ${this.renderPruneVersionsDialog()} ${this.renderTagVersionDialog()}
-      ${this.renderRollbackConfirmDialog()}
     `;
   }
 
@@ -2697,6 +2927,7 @@ defaults:
             <sl-tooltip content="View diff">
               <sl-icon-button
                 name="file-diff"
+                label=${`View diff for v${version.version_number}`}
                 @click=${() => this.openRollbackPreview(version, false)}
                 ?disabled=${version.is_active}
               ></sl-icon-button>
@@ -2704,6 +2935,7 @@ defaults:
             <sl-tooltip content="Roll back to this version">
               <sl-icon-button
                 name="arrow-counterclockwise"
+                label=${`Roll back to v${version.version_number}`}
                 @click=${() => this.openRollbackPreview(version, true)}
                 ?disabled=${version.is_active}
               ></sl-icon-button>
@@ -2711,12 +2943,14 @@ defaults:
             <sl-tooltip content="Edit tag">
               <sl-icon-button
                 name="tag"
+                label=${`Edit tag for v${version.version_number}`}
                 @click=${() => this.openTagDialog(version)}
               ></sl-icon-button>
             </sl-tooltip>
             <sl-tooltip content="Delete">
               <sl-icon-button
                 name="trash"
+                label=${`Delete v${version.version_number}`}
                 @click=${() => this.deleteVersion(version)}
                 ?disabled=${version.is_active || this._deletingVersion}
               ></sl-icon-button>
@@ -2772,6 +3006,7 @@ defaults:
         <div class="form-field">
           <label class="form-label">Description</label>
           <sl-textarea
+            aria-label="Version description"
             placeholder="Optional description of this version"
             .value=${this._versionForm.description}
             @sl-input=${(e: any) =>
@@ -2786,6 +3021,7 @@ defaults:
         <div class="form-field">
           <label class="form-label">Tag (optional)</label>
           <sl-input
+            aria-label="Version tag"
             placeholder="e.g., production-v1, stable, release-2024-01"
             .value=${this._versionForm.tag}
             @sl-input=${(e: any) =>
@@ -2794,7 +3030,7 @@ defaults:
                 tag: e.target.value,
               })}
           ></sl-input>
-          <small style="color: var(--sl-color-neutral-500);">
+          <small style="color: var(--console-meta-color);">
             Tagged versions can be protected from pruning.
           </small>
         </div>
@@ -2830,6 +3066,7 @@ defaults:
         <div class="form-field">
           <label class="form-label">Keep versions newer than (days)</label>
           <sl-input
+            aria-label="Days of versions to keep"
             type="number"
             min="1"
             .value=${String(this._pruneForm.keepDays)}
@@ -2844,6 +3081,7 @@ defaults:
         <div class="form-field">
           <label class="form-label">Minimum versions to keep</label>
           <sl-input
+            aria-label="Minimum versions to keep"
             type="number"
             min="1"
             .value=${String(this._pruneForm.minVersionsToKeep)}
@@ -2871,7 +3109,7 @@ defaults:
                 })}
             ></sl-switch>
           </div>
-          <small style="color: var(--sl-color-neutral-500);">
+          <small style="color: var(--console-meta-color);">
             Tagged versions will not be deleted regardless of age.
           </small>
         </div>
@@ -2915,6 +3153,7 @@ defaults:
                 <div class="form-field">
                   <label class="form-label">Tag</label>
                   <sl-input
+                    aria-label="Version tag"
                     placeholder="e.g., production-v1, stable"
                     .value=${this._tagForm.tag}
                     @sl-input=${(e: any) =>
@@ -3307,6 +3546,53 @@ defaults:
     if (name === 'files' && !this._yamlDirty) {
       void this._refreshCurrentExport();
     }
+    if (name === 'sensitive-data') {
+      void this._loadSensitiveOptions();
+    }
+  };
+
+  /** Agent and server pickers for the Sensitive data tab, loaded on first open. */
+  private async _loadSensitiveOptions() {
+    if (this._sensitiveOptionsLoaded) return;
+    this._sensitiveOptionsLoaded = true;
+    const [agents, servers] = await Promise.allSettled([
+      // The endpoint caps a page at 100.
+      getAccountAgents({ limit: 100 }),
+      getMCPServers(),
+    ]);
+    const failed = [
+      agents.status === 'rejected' ? 'agents' : '',
+      servers.status === 'rejected' ? 'MCP servers' : '',
+    ].filter(Boolean);
+    this._sensitiveOptionsError = failed.length
+      ? `Could not load the ${failed.join(' and ')} list, so those pickers are empty. Reload to try again.`
+      : '';
+    if (failed.length) this._sensitiveOptionsLoaded = false;
+    if (agents.status === 'fulfilled') {
+      this._sensitiveAgents = agents.value.items.map((agent) => ({
+        id: agent.id,
+        name: agent.display_name || agent.id,
+      }));
+    }
+    if (servers.status === 'fulfilled') {
+      this._sensitiveServers = servers.value
+        .map((server: any) => String(server.name || ''))
+        .filter(Boolean);
+    }
+  }
+
+  /** Sensitive data tab Save: same diff dialog and import path as YAML. */
+  private _handleSensitiveSave = async (
+    event: CustomEvent<{ yaml: string }>
+  ) => {
+    this._error = null;
+    this._pendingYamlSave = false;
+    this._pendingSensitiveSave = true;
+    await this.previewPolicyFile(
+      new File([event.detail.yaml], 'policies.yaml', {
+        type: 'application/x-yaml',
+      })
+    );
   };
 
   render() {
@@ -3358,6 +3644,7 @@ defaults:
       </view-header>
 
       <input
+        aria-label="Import policy file"
         type="file"
         id="policy-file-input"
         accept=".yaml,.yml,.json"
@@ -3400,6 +3687,26 @@ defaults:
                     >
                       YAML
                     </sl-tab>
+                    <sl-tab
+                      slot="nav"
+                      panel="sensitive-data"
+                      ?active=${this._activeTab === 'sensitive-data'}
+                    >
+                      Sensitive data
+                    </sl-tab>
+                    ${
+                      // Tag based access rules come from an extension plugin;
+                      // the tab exists only where /features reports them.
+                      hasCapability(this._features, 'abac_rules')
+                        ? html`<sl-tab
+                            slot="nav"
+                            panel="access-rules"
+                            ?active=${this._activeTab === 'access-rules'}
+                          >
+                            Access rules
+                          </sl-tab>`
+                        : ''
+                    }
 
                     <sl-tab-panel name="rules">
                       ${this.renderRulesTab()}
@@ -3407,8 +3714,44 @@ defaults:
                     <sl-tab-panel name="files">
                       ${this.renderPolicyFilesTab()}
                     </sl-tab-panel>
+                    <sl-tab-panel name="sensitive-data">
+                      <sensitive-data-panel
+                        .policyYaml=${this._currentExportYaml}
+                        .agents=${this._sensitiveAgents}
+                        .tools=${[
+                          ...new Set(this._tools.map((tool) => tool.name)),
+                        ]}
+                        .servers=${this._sensitiveServers}
+                        .optionsError=${this._sensitiveOptionsError}
+                        .saving=${this._isUploading}
+                        @sensitive-data-save=${this._handleSensitiveSave}
+                      ></sensitive-data-panel>
+                    </sl-tab-panel>
+                    ${
+                      hasCapability(this._features, 'abac_rules')
+                        ? html`<sl-tab-panel name="access-rules">
+                            ${
+                              this._activeTab === 'access-rules'
+                                ? html`<capability-extension
+                                    name="access-rules"
+                                  ></capability-extension>`
+                                : ''
+                            }
+                          </sl-tab-panel>`
+                        : ''
+                    }
                   </sl-tab-group>
                   ${this.renderModelIODialog()}
+                  ${
+                    // Page level, not inside the YAML tab: the Sensitive data
+                    // tab saves through the same diff dialog and a dialog in
+                    // a hidden tab panel never shows.
+                    this.renderDiffDialog()
+                  }
+                  ${this.renderSaveVersionDialog()}
+                  ${this.renderPruneVersionsDialog()}
+                  ${this.renderTagVersionDialog()}
+                  ${this.renderRollbackConfirmDialog()}
                   <policy-generate-dialog
                     .open=${this._showGenerateDialog}
                     .currentYaml=${this._currentExportYaml}

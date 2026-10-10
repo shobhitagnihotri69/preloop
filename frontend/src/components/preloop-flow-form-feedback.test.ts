@@ -78,6 +78,30 @@ describe('PreloopFlowForm PR feedback controls', () => {
     });
   });
 
+  it('leaves a saved empty reviewer list empty when follow-up is re-enabled', async () => {
+    const element = await mount({
+      feedback: { enabled: false, trusted_reviewer_ids: [] },
+    });
+    await toggle(element, true);
+    expect(control(element, 'trusted_reviewer_ids').value).to.equal('');
+    const event = await submit(element);
+    expect(
+      event.firstCall.args[0].detail.flow.agent_config.feedback
+        .trusted_reviewer_ids
+    ).to.deep.equal([]);
+  });
+
+  it('prefills the Preloop app slug when follow-up is enabled', async () => {
+    const element = await mount();
+    await toggle(element, true);
+    expect(control(element, 'trusted_reviewer_ids').value).to.equal('preloop');
+    const event = await submit(element);
+    expect(
+      event.firstCall.args[0].detail.flow.agent_config.feedback
+        .trusted_reviewer_ids
+    ).to.deep.equal(['preloop']);
+  });
+
   it('opts in through rendered controls and serializes bounded numeric policy and exact IDs', async () => {
     const element = await mount();
     await toggle(element, true);
@@ -100,10 +124,12 @@ describe('PreloopFlowForm PR feedback controls', () => {
       max_age_hours: 72,
       debounce_seconds: 0,
     });
-    expect(element.shadowRoot!.textContent).to.include(
+    expect(element.shadowRoot!.textContent!.replace(/\s+/g, ' ')).to.include(
       'starts fresh from the issue and PR context'
     );
-    expect(element.shadowRoot!.textContent).to.include('Merge remains manual');
+    expect(element.shadowRoot!.textContent!.replace(/\s+/g, ' ')).to.include(
+      'Merge remains manual'
+    );
   });
 
   it('hydrates JSON configuration and preserves routing, execution and advanced feedback keys', async () => {
@@ -186,6 +212,46 @@ describe('PreloopFlowForm PR feedback controls', () => {
     });
   });
 
+  it('accepts Bitbucket account ids and user UUIDs as trusted reviewers', async () => {
+    const element = await mount();
+    await toggle(element, true);
+    await change(
+      element,
+      'trusted_reviewer_ids',
+      '{a1b2c3d4-e5f6-4890-abcd-ef1234567890}, 712020:a1b2c3d4-e5f6-4890-abcd-ef1234567890, a1b2c3d4-e5f6-4890-abcd-ef1234567890'
+    );
+    const event = await submit(element);
+    expect(event.callCount).to.equal(1);
+    expect(
+      event.firstCall.args[0].detail.flow.agent_config.feedback
+        .trusted_reviewer_ids
+    ).to.deep.equal([
+      '{a1b2c3d4-e5f6-4890-abcd-ef1234567890}',
+      '712020:a1b2c3d4-e5f6-4890-abcd-ef1234567890',
+      'a1b2c3d4-e5f6-4890-abcd-ef1234567890',
+    ]);
+  });
+
+  it('accepts legacy Bitbucket account ids and rejects resource identifiers', async () => {
+    const element = await mount();
+    await toggle(element, true);
+    await change(element, 'trusted_reviewer_ids', '5b10ac8d82e05b22cc7d4ef5');
+    let event = await submit(element);
+    expect(event.callCount).to.equal(1);
+    expect(
+      event.firstCall.args[0].detail.flow.agent_config.feedback
+        .trusted_reviewer_ids
+    ).to.deep.equal(['5b10ac8d82e05b22cc7d4ef5']);
+
+    await change(
+      element,
+      'trusted_reviewer_ids',
+      'ari:cloud:identity::user/5b10ac8d82e05b22cc7d4ef5'
+    );
+    event = await submit(element);
+    expect(event.callCount).to.equal(0);
+  });
+
   for (const [field, value] of [
     ['max_turns', '0'],
     ['max_turns', '1.5'],
@@ -193,7 +259,7 @@ describe('PreloopFlowForm PR feedback controls', () => {
     ['max_cost', ''],
     ['max_age_hours', '8761'],
     ['debounce_seconds', '-1'],
-    ['trusted_reviewer_ids', 'review-bot'],
+    ['trusted_reviewer_ids', 'not a name'],
     ['implementer_actor_ids', '1.5'],
   ]) {
     it(`rejects invalid ${field} ${JSON.stringify(value)} before submit`, async () => {

@@ -138,6 +138,14 @@ func NewClient(tokenOverride, urlOverride string) (*Client, error) {
 	}
 
 	explicitTokenOverride := tokenOverride != "" || os.Getenv(config.EnvToken) != ""
+	if cfg.AccountMissing && !explicitTokenOverride {
+		// Never fall back to another account's token: a command meant for
+		// one account must not run against a different one.
+		return nil, fmt.Errorf(
+			"no stored session for account %q in profile %q; run `preloop accounts switch %s`",
+			cfg.Account, cfg.Profile, cfg.Account,
+		)
+	}
 
 	return &Client{
 		baseURL: strings.TrimRight(cfg.APIURL, "/"),
@@ -214,6 +222,43 @@ func (c *Client) PostWithHeaders(
 	result interface{},
 ) error {
 	return c.doWithHeaders(http.MethodPost, path, body, headers, result)
+}
+
+// RawResponse is an HTTP response returned without status interpretation.
+type RawResponse struct {
+	StatusCode int
+	Header     http.Header
+	Body       []byte
+}
+
+// PostRaw performs a JSON POST and returns the status, headers and body as
+// received, without turning a non-2xx status into an error. Callers that
+// report on the response itself (e.g. `preloop models smoke`, which prints
+// the gateway's status and its X-Preloop-Usage-Id header) need all three.
+// An expired login session is refreshed and retried once, as in Post.
+// The returned error covers only transport and encoding failures.
+func (c *Client) PostRaw(path string, body interface{}) (*RawResponse, error) {
+	bodyBytes, err := json.Marshal(body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal request body: %w", err)
+	}
+	statusCode, responseBody, header, err := c.executeRequest(
+		http.MethodPost, path, bodyBytes, "application/json", nil,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if statusCode == http.StatusUnauthorized && c.refreshEnabled {
+		if refreshErr := c.RefreshAccessToken(); refreshErr == nil {
+			statusCode, responseBody, header, err = c.executeRequest(
+				http.MethodPost, path, bodyBytes, "application/json", nil,
+			)
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
+	return &RawResponse{StatusCode: statusCode, Header: header, Body: responseBody}, nil
 }
 
 // PostMultipart performs a multipart/form-data POST request with one file.
@@ -347,38 +392,13 @@ func (c *Client) executeRequest(
 	contentType string,
 	extraHeaders map[string]string,
 ) (int, []byte, http.Header, error) {
-	url := strings.TrimRight(c.baseURL, "/") + path
-
 	var bodyReader io.Reader
 	if bodyBytes != nil {
 		bodyReader = bytes.NewReader(bodyBytes)
 	}
-
-	req, err := http.NewRequest(method, url, bodyReader)
+	req, err := c.newRequest(method, path, bodyReader, contentType, extraHeaders)
 	if err != nil {
-		return 0, nil, nil, fmt.Errorf("failed to create request: %w", err)
-	}
-
-	// Apply extra headers FIRST so the canonical headers below win on
-	// conflict. This is what protects callers from accidentally
-	// overriding Content-Type / Authorization with stale values passed in
-	// from upstream code paths. Accept is the one exception: an endpoint
-	// that serves a file needs to ask for that file's media type, so a
-	// caller-supplied Accept stands.
-	for key, value := range extraHeaders {
-		req.Header.Set(key, value)
-	}
-
-	if contentType != "" {
-		req.Header.Set("Content-Type", contentType)
-	}
-	if req.Header.Get("Accept") == "" {
-		req.Header.Set("Accept", "application/json")
-	}
-	version.SetClientIdentityHeaders(req.Header)
-
-	if c.token != "" {
-		req.Header.Set("Authorization", "Bearer "+c.token)
+		return 0, nil, nil, err
 	}
 
 	resp, err := c.httpClient.Do(req)
@@ -393,6 +413,42 @@ func (c *Client) executeRequest(
 	}
 
 	return resp.StatusCode, responseBody, resp.Header, nil
+}
+
+// newRequest builds one authenticated API request. Every path (the JSON
+// helpers, GetFile and Stream) goes through it, so the header rules live in
+// one place.
+//
+// Extra headers are applied FIRST so the canonical headers below win on
+// conflict. This is what protects callers from accidentally overriding
+// Content-Type / Authorization with stale values passed in from upstream
+// code paths. Accept is the one exception: an endpoint that serves a file
+// needs to ask for that file's media type, so a caller-supplied Accept
+// stands.
+func (c *Client) newRequest(
+	method, path string,
+	body io.Reader,
+	contentType string,
+	extraHeaders map[string]string,
+) (*http.Request, error) {
+	req, err := http.NewRequest(method, strings.TrimRight(c.baseURL, "/")+path, body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+	for key, value := range extraHeaders {
+		req.Header.Set(key, value)
+	}
+	if contentType != "" {
+		req.Header.Set("Content-Type", contentType)
+	}
+	if req.Header.Get("Accept") == "" {
+		req.Header.Set("Accept", "application/json")
+	}
+	version.SetClientIdentityHeaders(req.Header)
+	if c.token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.token)
+	}
+	return req, nil
 }
 
 // GetFile performs a GET and hands back the body and the response headers
@@ -444,6 +500,9 @@ func (c *Client) RefreshAccessToken() error {
 	form := url.Values{}
 	form.Set("grant_type", "refresh_token")
 	form.Set("refresh_token", c.refreshToken)
+	if host := version.DeviceName(); host != "" {
+		form.Set("device_name", host)
+	}
 
 	statusCode, responseBody, _, err := c.executeRequest(
 		http.MethodPost,

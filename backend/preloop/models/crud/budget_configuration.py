@@ -4,11 +4,19 @@ from typing import Any
 from sqlalchemy import select, or_
 from sqlalchemy.orm import Session
 from preloop.models import models
+from preloop.models.models.access_values import RESERVED_BUDGET_SUBJECTS
 
 
 def validate_budget_subject(
     db: Session, *, account_id: Any, subject_type: str, subject_id: Any
 ) -> Any:
+    if subject_type in RESERVED_BUDGET_SUBJECTS:
+        # Owned by a plugin (team budgets, account hierarchy), which validates
+        # and enforces the subject behind its own endpoints.
+        raise ValueError(
+            f"Budget subject '{subject_type}' is available with the plugin "
+            "that provides it, not on this endpoint"
+        )
     if subject_type == "account":
         if subject_id is not None:
             raise ValueError("Account policies must not specify a subject id")
@@ -18,6 +26,7 @@ def validate_budget_subject(
         "managed_agent": models.ManagedAgent,
         "ai_model": models.AIModel,
         "user": models.User,
+        "gateway_subject": models.GatewaySubject,
     }
     model = subjects.get(subject_type)
     if model is None or subject_id is None:
@@ -28,6 +37,15 @@ def validate_budget_subject(
     subject = db.execute(
         select(model).where(model.id == subject_id, account_filter)
     ).scalar_one_or_none()
+    if subject is None and subject_type in {"ai_model", "managed_agent"}:
+        from preloop.models.crud.resource_share import crud_resource_share
+
+        subject = crud_resource_share.visible_resource(
+            db,
+            account_id=account_id,
+            resource_type=subject_type,
+            resource_id=subject_id,
+        )
     if subject is None:
         raise ValueError("Budget subject was not found in this account")
     return subject

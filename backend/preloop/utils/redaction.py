@@ -26,6 +26,7 @@ SENSITIVE_FIELD_NAMES: Set[str] = {
     "secret",
     "token",
     "api_key",
+    "encrypted_api_key",
     "apikey",
     "api-key",
     "auth",
@@ -52,6 +53,10 @@ SENSITIVE_FIELD_NAMES: Set[str] = {
     "approvaltoken",
     "key",
     "keys",
+    # Encrypted original arguments on a pending reference-only approval
+    # (#1124): shown in the console only, never in emails or webhooks.
+    "_preloop_sealed_args",
+    "sealed_args",
 }
 
 
@@ -71,6 +76,29 @@ def _is_sensitive_key(key: str) -> bool:
     if re.search(r"(token|secret|password|api_key|credential)s?$", key_lower):
         return True
     return False
+
+
+def omit_preloop_markers(data: Any) -> Any:
+    """Drop trusted ``_preloop_`` markers from a tool-argument display copy.
+
+    The markers travel on the stored approval so surfaces can read them.
+    They are not arguments the model chose, so a rendered argument list
+    leaves them out. Nested values are unchanged.
+
+    Args:
+        data: Tool arguments, or any other value.
+
+    Returns:
+        A shallow copy of a dict without ``_preloop_`` keys. Non-dicts are
+        returned unchanged.
+    """
+    if not isinstance(data, dict):
+        return data
+    return {
+        key: value
+        for key, value in data.items()
+        if not (isinstance(key, str) and key.startswith("_preloop_"))
+    }
 
 
 def redact_dict(

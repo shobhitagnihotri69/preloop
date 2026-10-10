@@ -1,3 +1,7 @@
+import { ConsoleStatus } from '../../controllers/console-status';
+import { parseUTCDate } from '../../utils/date';
+import { formatUsd, formatUsdExact } from '../../utils/money';
+import { billingAttribution } from '../../utils/billing-attribution';
 import { LitElement, html, css, nothing, unsafeCSS } from 'lit';
 import { customElement, state } from 'lit/decorators.js';
 
@@ -43,6 +47,7 @@ import {
   requestHistoryUpgrade,
 } from '../../utils/history-window';
 import { analyticsWindow } from '../../utils/usage-nudges';
+import '../../components/capability-extension';
 import {
   formatTimeRangeWindow,
   resolvePreviousTimeRange,
@@ -68,6 +73,7 @@ const DATE_RANGE_OPTIONS: Array<{ value: TimeRangeKey; label: string }> = [
 
 @customElement('api-usage-view')
 export class ApiUsageView extends LitElement {
+  private readonly accessibilityStatus = new ConsoleStatus(this);
   @state()
   private summary: AccountGatewayUsageSummaryResponse | null = null;
 
@@ -537,6 +543,8 @@ export class ApiUsageView extends LitElement {
       this.searchDebounce = undefined;
     }
     super.disconnectedCallback();
+    ++this.summaryLoadGeneration;
+    ++this.searchRequestId;
   }
 
   /** The selected window, in the shape the gateway endpoints take. */
@@ -555,49 +563,50 @@ export class ApiUsageView extends LitElement {
     return params;
   }
 
+  private summaryLoadGeneration = 0;
+
   private async loadSummary() {
+    const generation = ++this.summaryLoadGeneration;
     this.loading = true;
     this.error = null;
 
     const previousRange = resolvePreviousTimeRange(this.selectedRange);
+    this.previousSummary = null;
+    // The comparison needs totals only and can arrive after current usage.
+    if (previousRange.startDate) {
+      void getAccountGatewayUsageSummary({
+        startDate: previousRange.startDate,
+        endDate: previousRange.endDate ?? undefined,
+        includeBreakdown: false,
+      })
+        .catch(() => null)
+        .then((summary) => {
+          if (generation === this.summaryLoadGeneration)
+            this.previousSummary = summary;
+        });
+    }
 
     try {
       const params = this.rangeParams();
-      const searchQuery = this.searchQuery.trim();
-      const [summary, searchResults, rateLimitReport, previousSummary] =
-        await Promise.all([
-          getAccountGatewayUsageSummary({
-            ...params,
-            // This view renders model/flow/session/day breakdowns.
-            includeBreakdown: true,
-          }),
-          getAccountGatewayUsageSearch({
-            ...params,
-            query: searchQuery || undefined,
-            limit: 10,
-          }),
-          // Rate-limit telemetry is supplementary; a failure here must not
-          // blank the whole usage view.
-          getAccountRateLimitReport(params).catch((error: unknown) => {
-            console.error('Failed to load rate limit report:', error);
-            return null;
-          }),
-          // The comparison window is a garnish on one stat: if it fails, the
-          // stat says it has no comparison rather than the page failing. All
-          // time has nothing before it, so it costs no request.
-          previousRange.startDate
-            ? getAccountGatewayUsageSummary({
-                startDate: previousRange.startDate,
-                endDate: previousRange.endDate ?? undefined,
-              }).catch(() => null)
-            : Promise.resolve(null),
-        ]);
+      void this.loadSearchResults();
+      this.rateLimitReport = null;
+      void getAccountRateLimitReport(params)
+        .then((report) => {
+          if (generation === this.summaryLoadGeneration)
+            this.rateLimitReport = report;
+        })
+        .catch((error: unknown) =>
+          console.error('Failed to load rate limit report:', error)
+        );
+      const summary = await getAccountGatewayUsageSummary({
+        ...params,
+        includeBreakdown: true,
+        breakdowns: ['models', 'flows', 'sessions', 'days'],
+      });
+      if (generation !== this.summaryLoadGeneration) return;
       this.summary = summary;
-      this.searchResults = searchResults;
-      this.searchError = null;
-      this.rateLimitReport = rateLimitReport;
-      this.previousSummary = previousSummary;
     } catch (error) {
+      if (generation !== this.summaryLoadGeneration) return;
       console.error('Failed to load account gateway usage summary:', error);
       if (isHistoryUnavailable(error) && this.rangeChosenByUser) {
         // The person picked a window their plan does not show. That is a
@@ -615,7 +624,7 @@ export class ApiUsageView extends LitElement {
       this.rateLimitReport = null;
       this.previousSummary = null;
     } finally {
-      this.loading = false;
+      if (generation === this.summaryLoadGeneration) this.loading = false;
     }
   }
 
@@ -755,23 +764,11 @@ export class ApiUsageView extends LitElement {
     return `${value.toFixed(1)}%`;
   }
 
-  private formatCost(value: number | null | undefined): string {
-    if (typeof value !== 'number' || Number.isNaN(value)) {
-      return '$0.00';
-    }
-
-    if (value === 0) {
-      return '$0.00';
-    }
-
-    return value >= 0.01 ? `$${value.toFixed(2)}` : `$${value.toFixed(4)}`;
-  }
-
   private formatDateLabel(value: string): string {
     return new Intl.DateTimeFormat(undefined, {
       month: 'short',
       day: 'numeric',
-    }).format(new Date(value));
+    }).format(parseUTCDate(value));
   }
 
   private formatDateTimeLabel(value: string): string {
@@ -781,7 +778,7 @@ export class ApiUsageView extends LitElement {
       year: 'numeric',
       hour: 'numeric',
       minute: '2-digit',
-    }).format(new Date(value));
+    }).format(parseUTCDate(value));
   }
 
   private getSessionSourceType(session: GatewayUsageBySession): string | null {
@@ -884,7 +881,7 @@ export class ApiUsageView extends LitElement {
 
   private renderStatCard(
     label: string,
-    value: string,
+    value: string | ReturnType<typeof html>,
     detail: unknown,
     icon: string,
     exact?: string
@@ -929,7 +926,7 @@ export class ApiUsageView extends LitElement {
             <div class="budget-meta-item">
               <div class="budget-meta-label">Current Spend</div>
               <div class="budget-meta-value">
-                ${this.formatCost(budget.current_spend_usd)}
+                ${html`<span title=${formatUsdExact(budget.current_spend_usd)}>${formatUsd(budget.current_spend_usd)}</span>`}
               </div>
             </div>
             <div class="budget-meta-item">
@@ -938,7 +935,9 @@ export class ApiUsageView extends LitElement {
                 ${
                   budget.soft_limit_usd === null
                     ? 'Not set'
-                    : this.formatCost(budget.soft_limit_usd)
+                    : html`<span title=${formatUsdExact(budget.soft_limit_usd)}
+                        >${formatUsd(budget.soft_limit_usd)}</span
+                      >`
                 }
               </div>
             </div>
@@ -948,7 +947,10 @@ export class ApiUsageView extends LitElement {
                 ${
                   budget.monthly_limit_usd === null
                     ? 'Not set'
-                    : this.formatCost(budget.monthly_limit_usd)
+                    : html`<span
+                        title=${formatUsdExact(budget.monthly_limit_usd)}
+                        >${formatUsd(budget.monthly_limit_usd)}</span
+                      >`
                 }
               </div>
             </div>
@@ -1164,7 +1166,7 @@ export class ApiUsageView extends LitElement {
                 ${this.formatNumber(day.request_count)} req
               </div>
               <div class="cell-numeric">
-                ${this.formatCost(day.estimated_cost)}
+                ${html`<span title=${formatUsdExact(day.estimated_cost)}>${formatUsd(day.estimated_cost)}</span>`}
               </div>
             </div>
           `
@@ -1218,7 +1220,7 @@ export class ApiUsageView extends LitElement {
                 ></token-figures>
               </div>
               <div class="cell-numeric">
-                ${this.formatCost(model.estimated_cost)}
+                ${html`<span title=${formatUsdExact(model.estimated_cost)}>${formatUsd(model.estimated_cost)}</span>`}
               </div>
             </div>
           `
@@ -1272,7 +1274,7 @@ export class ApiUsageView extends LitElement {
                 ></token-figures>
               </div>
               <div class="cell-numeric">
-                ${this.formatCost(flow.estimated_cost)}
+                ${html`<span title=${formatUsdExact(flow.estimated_cost)}>${formatUsd(flow.estimated_cost)}</span>`}
               </div>
             </div>
           `
@@ -1293,9 +1295,12 @@ export class ApiUsageView extends LitElement {
 
     const sortedSessions = [...sessions].sort(
       (left, right) =>
-        new Date(this.getSessionLastActivity(right) || 0).getTime() -
-          new Date(this.getSessionLastActivity(left) || 0).getTime() ||
-        right.request_count - left.request_count
+        parseUTCDate(
+          this.getSessionLastActivity(right) || '1970-01-01T00:00:00Z'
+        ).getTime() -
+          parseUTCDate(
+            this.getSessionLastActivity(left) || '1970-01-01T00:00:00Z'
+          ).getTime() || right.request_count - left.request_count
     );
 
     return html`
@@ -1366,7 +1371,7 @@ export class ApiUsageView extends LitElement {
                 ></token-figures>
               </div>
               <div class="cell-numeric">
-                ${this.formatCost(session.estimated_cost)}
+                ${html`<span title=${formatUsdExact(session.estimated_cost)}>${formatUsd(session.estimated_cost)}</span>`}
               </div>
               <div>
                 ${
@@ -1392,6 +1397,13 @@ export class ApiUsageView extends LitElement {
           <div>${this.searchError}</div>
         </div>
       `;
+    }
+
+    if (this.searchLoading && !results) {
+      return html`<div class="empty-state" role="status">
+        <sl-spinner></sl-spinner>
+        <div>Loading captured interactions…</div>
+      </div>`;
     }
 
     if (!results || results.items.length === 0) {
@@ -1440,11 +1452,12 @@ export class ApiUsageView extends LitElement {
             ${item.outcome}
           </sl-badge>
         </div>
+        <div class="search-meta">${billingAttribution(item.meta_data)}</div>
         <div class="search-excerpt">${item.excerpt}</div>
         <div class="search-meta">
           ${this.formatDateTimeLabel(item.timestamp)} ·
           <token-figures .usage=${item.token_usage}></token-figures> ·
-          ${this.formatCost(item.estimated_cost)}
+          ${html`<span title=${formatUsdExact(item.estimated_cost)}>${formatUsd(item.estimated_cost)}</span>`}
           ${item.flow_name ? html` · ${item.flow_name}` : ''}
           ${
             item.runtime_principal_name
@@ -1472,7 +1485,9 @@ export class ApiUsageView extends LitElement {
         )}
         ${this.renderStatCard(
           `$ est. \u00b7 ${range}`,
-          this.formatCost(summary.estimated_cost),
+          html`<span title=${formatUsdExact(summary.estimated_cost)}
+            >${formatUsd(summary.estimated_cost)}</span
+          >`,
           this.spendComparisonDetail(),
           'cash'
         )}
@@ -1520,6 +1535,10 @@ export class ApiUsageView extends LitElement {
               </sl-input>
             </div>
 
+            <capability-extension
+              name="usage-rollup"
+              .context=${{ range: this.selectedRange }}
+            ></capability-extension>
             ${
               this.error
                 ? html`

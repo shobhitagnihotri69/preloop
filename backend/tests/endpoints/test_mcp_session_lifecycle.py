@@ -19,8 +19,15 @@ from preloop.models import models
 @pytest.fixture
 def tool_pool(monkeypatch: pytest.MonkeyPatch) -> Generator[Any, None, None]:
     """Use a real single-connection pool, without external database services."""
+    # Snapshot reads run in worker threads; reuse the one pooled connection
+    # across workers while retaining the minimal pool and leak assertions.
     engine = create_engine(
-        "sqlite://", poolclass=QueuePool, pool_size=1, max_overflow=0, pool_timeout=0.01
+        "sqlite://",
+        connect_args={"check_same_thread": False},
+        poolclass=QueuePool,
+        pool_size=1,
+        max_overflow=0,
+        pool_timeout=0.01,
     )
     sessions: list[Session] = []
 
@@ -193,6 +200,7 @@ async def test_external_mcp_waits_do_not_hold_database_connections(
     def get_server(db: Session, **kwargs: Any) -> Any:
         db.execute(text("SELECT 1"))
         return SimpleNamespace(
+            id="server",
             name="Example",
             url="https://example.com/mcp",
             auth_type="none",
@@ -205,7 +213,11 @@ async def test_external_mcp_waits_do_not_hold_database_connections(
         lambda: SimpleNamespace(account_id="account", username="example")
     )
     monkeypatch.setattr(dynamic_fastmcp, "get_db", mcp.get_db)
-    monkeypatch.setattr(dynamic_fastmcp.crud_mcp_server, "get", get_server)
+    monkeypatch.setattr(
+        dynamic_fastmcp,
+        "_resolve_proxied_tool_server",
+        lambda db, account_id, tool_name: get_server(db),
+    )
     monkeypatch.setattr(
         dynamic_fastmcp,
         "get_mcp_client_pool",
@@ -216,7 +228,7 @@ async def test_external_mcp_waits_do_not_hold_database_connections(
     )
     monkeypatch.setattr(server, "_halt_dispatch_denial", AsyncMock(return_value=None))
     wrapper = server._create_proxied_tool_wrapper(
-        "example", "server", "account", "Example", {"properties": {}}
+        "example", "account", "Example", {"properties": {}}
     )
     tasks = [asyncio.create_task(wrapper()) for _ in range(count)]
     try:

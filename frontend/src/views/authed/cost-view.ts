@@ -1,3 +1,15 @@
+import { ConsoleStatus } from '../../controllers/console-status';
+import { tableScrollStyles } from '../../styles/table-scroll';
+import { parseUTCDate } from '../../utils/date';
+import { formatUsd, formatUsdExact } from '../../utils/money';
+import '@shoelace-style/shoelace/dist/components/tooltip/tooltip.js';
+import { EditPermissions } from '../../controllers/edit-permissions';
+import '../../components/hosted-allowance';
+import {
+  parseDigestLink,
+  withoutDigestPeriod,
+  type DigestPeriod,
+} from '../../utils/digest-period';
 import { html, css, unsafeCSS, nothing } from 'lit';
 import { customElement, state } from 'lit/decorators.js';
 import {
@@ -7,10 +19,13 @@ import {
   deleteModelPriceOverride,
   updateModelPriceOverride,
   getAccountAgents,
+  getAccountDetails,
   getAIModels,
   getBudgetPolicies,
   getCostAnalyticsSummary,
+  getCostHealth,
   getCostReconciliation,
+  getCopilotUsage,
   getFeatures,
   getProviderBillingConnections,
   getUsers,
@@ -24,9 +39,12 @@ import {
 import type {
   AIModel,
   CostAnalyticsSummaryResponse,
+  CostHealthCheck,
   CostReconciliationResponse,
   CostReconciliationRow,
   GatewayTokenUsage,
+  GatewayUsageByDay,
+  GatewayUsageByModel,
   GatewayUsageBySession,
   GatewayUsageByTool,
   ImportedUsageByConversation,
@@ -47,6 +65,7 @@ import '../../components/time-range-select.ts';
 import '../../components/budget-policy-editor.ts';
 import '../../components/budget-health-card.ts';
 import '../../components/tool-cost-flags-panel.ts';
+import '../../components/copilot-usage-panel.ts';
 import '../../components/token-figures.ts';
 import { sumTokenUsage } from '../../components/token-figures';
 import '@shoelace-style/shoelace/dist/components/alert/alert.js';
@@ -63,6 +82,15 @@ import '@shoelace-style/shoelace/dist/components/tab/tab.js';
 import '@shoelace-style/shoelace/dist/components/tab-group/tab-group.js';
 import '@shoelace-style/shoelace/dist/components/tab-panel/tab-panel.js';
 import { consoleDialogStyles } from '../../styles/console-dialog';
+import { hasCapability } from '../../capabilities';
+import { Router } from '../../router';
+import '@shoelace-style/shoelace/dist/components/dropdown/dropdown.js';
+import '@shoelace-style/shoelace/dist/components/menu/menu.js';
+import '@shoelace-style/shoelace/dist/components/menu-item/menu-item.js';
+
+/** Where an operator learns why a model can have no price. */
+const MODEL_PRICING_DOCS_URL =
+  'https://docs.preloop.ai/guide/model-price-refresh';
 
 type DateRangePreset =
   | 'today'
@@ -87,6 +115,10 @@ type SortState = {
 
 // A single sortable column. `value` extracts the sort key from a row; `numeric`
 // selects numeric vs. locale-string comparison.
+// Outlier alerts live on Attention; Spend settings links there rather than
+// embedding the alert engine.
+const SPEND_OUTLIERS_HREF = '/console/attention#spend-outliers';
+
 type SortColumn<T> = {
   key: string;
   label: string;
@@ -150,7 +182,12 @@ const DATE_RANGE_OPTIONS: { value: DateRangePreset; label: string }[] = [
 
 @customElement('cost-view')
 export class CostView extends AuthedElement {
+  private readonly accessibilityStatus = new ConsoleStatus(this);
+  private readonly editPermissions = new EditPermissions(this);
   @state() private summary: CostAnalyticsSummaryResponse | null = null;
+  // Accounting findings shown on this page (#1401); other checks stay in
+  // GET /cost/health for operators and alerting.
+  @state() private accountingFindings: CostHealthCheck[] = [];
   @state() private previousRangeSummary: CostAnalyticsSummaryResponse | null =
     null;
   // When the numbers on screen were fetched. The page dropped its Refresh
@@ -163,6 +200,23 @@ export class CostView extends AuthedElement {
   @state() private loading = true;
   @state() private saving = false;
   @state() private error: string | null = null;
+  @state() private digestPeriod: DigestPeriod | null = null;
+  @state() private digestNotice: string | null = null;
+  @state() private digestBlocked = false;
+  @state() private activeAccountLabel = '';
+  /**
+   * The account a mismatched digest belongs to, when this person is a member
+   * of it and the deployment can switch accounts (multi_account).
+   */
+  @state() private digestSwitchTarget: { id: string; name: string } | null =
+    null;
+  @state() private digestSwitching = false;
+  private digestAccountId: string | null = null;
+  private readonly restoreUrlPeriod = () => {
+    this.readUrlPeriod();
+    void this.load();
+  };
+
   @state() private selectedRange: DateRangePreset = 'last-30';
   @state() private budgetDialogOpen = false;
   @state() private priceDialogOpen = false;
@@ -230,6 +284,8 @@ export class CostView extends AuthedElement {
   // range when its tab is next shown.
   @state() private loadedTabs = new Set<string>();
   @state() private activeTab = 'agents';
+  // Team id -> name, for team rows of the budget health card.
+  @state() private teamNames: Record<string, string> = {};
   @state() private sectionStates: Record<
     string,
     'loading' | 'ready' | 'error'
@@ -252,6 +308,12 @@ export class CostView extends AuthedElement {
   @state() private sessionSort: SortState = { key: 'cost', dir: 'desc' };
   @state() private userSort: SortState = { key: 'cost', dir: 'desc' };
   @state() private importedSort: SortState = { key: 'cost', dir: 'desc' };
+  @state() private modelSort: SortState = { key: 'cost', dir: 'desc' };
+  // Copilot is an import, so its tab waits for a connection: a Copilot
+  // connection, or a Copilot provider billing connection. Checked once per
+  // visit; the Imports destination in Spend settings reveals it to set one up.
+  @state() private copilotConnected = false;
+  @state() private copilotRevealed = false;
 
   private get modelPriceOverridesEnabled(): boolean {
     return this.featureFlags.model_price_overrides === true;
@@ -264,368 +326,459 @@ export class CostView extends AuthedElement {
   private get reconciliationEnabled(): boolean {
     return this.featureFlags.provider_billing_reconciliation === true;
   }
+  // Teams tab and team names on budget rows: the team budgets plugin
+  // (`team_budgets`) on a server where teams exist (`team_management`).
+  private get teamBudgetsEnabled(): boolean {
+    return (
+      this.featureFlags.team_budgets === true &&
+      this.featureFlags.team_management === true
+    );
+  }
 
   static styles = [
-    consoleDialogStyles,
-    unsafeCSS(consoleStyles),
-    css`
-      :host {
-        display: block;
-      }
+    tableScrollStyles,
+    [
+      consoleDialogStyles,
+      unsafeCSS(consoleStyles),
+      css`
+        :host {
+          display: block;
+        }
 
-      .page {
-        display: flex;
-        flex-direction: column;
-        gap: var(--sl-spacing-large);
-      }
+        .page {
+          display: flex;
+          flex-direction: column;
+          gap: var(--sl-spacing-large);
+        }
 
-      .analytics-stack,
-      .actions-stack {
-        display: flex;
-        flex-direction: column;
-        gap: var(--sl-spacing-large);
-      }
+        .analytics-stack,
+        .actions-stack {
+          display: flex;
+          flex-direction: column;
+          gap: var(--sl-spacing-large);
+        }
 
-      .toolbar {
-        display: flex;
-        gap: var(--sl-spacing-medium);
-        align-items: center;
-        flex-wrap: wrap;
-      }
+        .toolbar {
+          display: flex;
+          gap: var(--sl-spacing-medium);
+          align-items: center;
+          flex-wrap: wrap;
+        }
 
-      /* Wide enough for "Last month"; the shared control is 96px by default,
+        /* Wide enough for "Last month"; the shared control is 96px by default,
          which is sized for 24h/7d/30d chips. */
-      .toolbar time-range-select {
-        --time-range-select-width: 140px;
-      }
+        .daily-spend {
+          display: flex;
+          align-items: flex-end;
+          gap: var(--sl-spacing-medium);
+          flex-wrap: wrap;
+        }
 
-      /* The window the numbers cover, restated beside the control that chose
+        .daily-spend-summary {
+          display: flex;
+          flex-direction: column;
+          font-size: var(--sl-font-size-small);
+          color: var(--sl-color-neutral-600);
+        }
+
+        .daily-spend-title {
+          font-weight: var(--sl-font-weight-semibold);
+          color: var(--sl-color-neutral-800);
+        }
+
+        .daily-bars {
+          display: flex;
+          align-items: flex-end;
+          gap: 2px;
+          height: 32px;
+          flex: 1;
+          min-width: 120px;
+        }
+
+        .daily-bar {
+          flex: 1;
+          height: 100%;
+          display: flex;
+          align-items: flex-end;
+        }
+
+        .daily-bar span {
+          display: block;
+          width: 100%;
+          border-radius: 2px 2px 0 0;
+          background: var(--sl-color-primary-500);
+        }
+
+        .model-provider {
+          font-size: var(--sl-font-size-x-small);
+          color: var(--sl-color-neutral-600);
+        }
+
+        .toolbar time-range-select {
+          --time-range-select-width: 140px;
+        }
+
+        /* The window the numbers cover, restated beside the control that chose
          it, plus how fresh they are now that there is no Refresh button. */
-      .range-window {
-        color: var(--sl-color-neutral-600);
-        font-size: var(--sl-font-size-small);
-        font-variant-numeric: tabular-nums;
-      }
+        .range-window {
+          color: var(--sl-color-neutral-600);
+          font-size: var(--sl-font-size-small);
+          font-variant-numeric: tabular-nums;
+        }
 
-      /* It opens a dialog, so it is a button. As an anchor it pointed at a
+        .active-account {
+          margin: 0 0 var(--sl-spacing-small);
+          color: var(--console-meta-color, var(--sl-color-neutral-600));
+          font-size: var(--sl-font-size-small);
+        }
+
+        .digest-actions {
+          margin-top: var(--sl-spacing-small);
+        }
+
+        .unpriced-links {
+          display: flex;
+          flex-wrap: wrap;
+          gap: var(--sl-spacing-medium);
+          margin-top: var(--sl-spacing-x-small);
+        }
+
+        /* It opens a dialog, so it is a button. As an anchor it pointed at a
          fragment that cannot resolve inside a shadow root, and told assistive
          tech it was a link. */
-      .catalog-action {
-        appearance: none;
-        background: none;
-        border: none;
-        padding: 0;
-        font: inherit;
-        color: var(--sl-color-primary-600);
-        cursor: pointer;
-      }
+        .catalog-action {
+          appearance: none;
+          background: none;
+          border: none;
+          padding: 0;
+          font: inherit;
+          color: var(--sl-color-primary-600);
+          cursor: pointer;
+        }
 
-      .catalog-action:hover {
-        text-decoration: underline;
-      }
+        .catalog-action:hover {
+          text-decoration: underline;
+        }
 
-      .metric-grid {
-        display: grid;
-        grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
-        gap: var(--sl-spacing-medium);
-      }
+        .metric-grid {
+          display: grid;
+          grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+          gap: var(--sl-spacing-medium);
+        }
 
-      .metric-card {
-        padding: var(--sl-spacing-medium);
-        border: 1px solid var(--sl-color-neutral-200);
-        border-radius: var(--sl-border-radius-medium);
-        background: var(--sl-color-neutral-0);
-      }
+        .metric-card {
+          padding: var(--sl-spacing-medium);
+          border: 1px solid var(--sl-color-neutral-200);
+          border-radius: var(--sl-border-radius-medium);
+          background: var(--sl-color-neutral-0);
+        }
 
-      .metric-label {
-        color: var(--sl-color-neutral-600);
-        font-size: var(--sl-font-size-small);
-      }
+        .metric-label {
+          color: var(--sl-color-neutral-600);
+          font-size: var(--sl-font-size-small);
+        }
 
-      .metric-value {
-        margin-top: var(--sl-spacing-x-small);
-        font-size: 1.6rem;
-        font-weight: 700;
-        color: var(--sl-color-neutral-950);
-      }
+        .metric-value {
+          margin-top: var(--sl-spacing-x-small);
+          font-size: 1.6rem;
+          font-weight: 700;
+          color: var(--sl-color-neutral-950);
+        }
 
-      .metric-detail {
-        margin-top: var(--sl-spacing-2x-small);
-        color: var(--sl-color-neutral-600);
-        font-size: var(--sl-font-size-small);
-      }
+        .metric-detail {
+          margin-top: var(--sl-spacing-2x-small);
+          color: var(--sl-color-neutral-600);
+          font-size: var(--sl-font-size-small);
+        }
 
-      .section-header {
-        display: flex;
-        justify-content: space-between;
-        align-items: flex-start;
-        gap: var(--sl-spacing-small);
-      }
+        .subscription-usage {
+          margin-top: var(--sl-spacing-medium);
+        }
 
-      .section-title {
-        display: flex;
-        align-items: center;
-        gap: var(--sl-spacing-small);
-        font-weight: 700;
-        color: var(--sl-color-neutral-900);
-      }
+        .subscription-usage-heading {
+          grid-column: 1 / -1;
+          color: var(--sl-color-neutral-700);
+          font-size: var(--sl-font-size-small);
+          font-weight: 600;
+        }
 
-      .tool-cost-flags-section {
-        display: flex;
-        flex-direction: column;
-        width: 100%;
-      }
+        .accounting-findings ul {
+          margin: var(--sl-spacing-2x-small) 0 0;
+          padding-left: var(--sl-spacing-large);
+        }
 
-      sl-tab-group::part(base) {
-        --track-color: var(--sl-color-neutral-200);
-      }
+        .section-header {
+          display: flex;
+          justify-content: space-between;
+          align-items: flex-start;
+          gap: var(--sl-spacing-small);
+        }
 
-      .tab-panel-body {
-        display: flex;
-        flex-direction: column;
-        gap: var(--sl-spacing-medium);
-      }
+        .section-title {
+          display: flex;
+          align-items: center;
+          gap: var(--sl-spacing-small);
+          font-weight: 700;
+          color: var(--sl-color-neutral-900);
+        }
 
-      .styled-table th.sortable {
-        cursor: pointer;
-        user-select: none;
-        white-space: nowrap;
-      }
+        .tool-cost-flags-section {
+          display: flex;
+          flex-direction: column;
+          width: 100%;
+        }
 
-      .styled-table th.sortable:hover {
-        color: var(--sl-color-primary-600);
-      }
+        sl-tab-group::part(base) {
+          --track-color: var(--sl-color-neutral-200);
+        }
 
-      .sort-header {
-        display: inline-flex;
-        align-items: center;
-        gap: var(--sl-spacing-2x-small);
-      }
+        .tab-panel-body {
+          display: flex;
+          flex-direction: column;
+          gap: var(--sl-spacing-medium);
+        }
 
-      .sort-header sl-icon {
-        font-size: 0.85em;
-        color: var(--sl-color-primary-600);
-      }
+        .styled-table th.sortable {
+          cursor: pointer;
+          user-select: none;
+          white-space: nowrap;
+        }
 
-      .cell-subtitle {
-        color: var(--sl-color-neutral-500);
-        font-size: var(--sl-font-size-x-small);
-      }
+        .styled-table th.sortable:hover {
+          color: var(--sl-color-primary-600);
+        }
 
-      .tools-notice {
-        margin-bottom: var(--sl-spacing-medium);
-      }
+        .sort-header {
+          display: inline-flex;
+          align-items: center;
+          gap: var(--sl-spacing-2x-small);
+        }
 
-      .form-grid {
-        display: grid;
-        grid-template-columns: 1fr;
-        gap: var(--sl-spacing-medium);
-      }
+        .sort-header sl-icon {
+          font-size: 0.85em;
+          color: var(--sl-color-primary-600);
+        }
 
-      .empty {
-        color: var(--sl-color-neutral-600);
-        padding: var(--sl-spacing-large);
-      }
+        .cell-subtitle {
+          color: var(--console-meta-color);
+          font-size: var(--sl-font-size-x-small);
+        }
 
-      .action-card-body,
-      .dialog-description {
-        color: var(--sl-color-neutral-600);
-        font-size: var(--sl-font-size-small);
-        line-height: 1.5;
-      }
+        .tools-notice {
+          margin-bottom: var(--sl-spacing-medium);
+        }
 
-      .action-card-body {
-        display: flex;
-        flex-direction: column;
-        gap: var(--sl-spacing-medium);
-      }
+        .form-grid {
+          display: grid;
+          grid-template-columns: 1fr;
+          gap: var(--sl-spacing-medium);
+        }
 
-      .action-row {
-        display: flex;
-        justify-content: space-between;
-        gap: var(--sl-spacing-small);
-        align-items: center;
-      }
+        .empty {
+          color: var(--sl-color-neutral-600);
+          padding: var(--sl-spacing-large);
+        }
 
-      .policy-summary {
-        display: flex;
-        flex-direction: column;
-        gap: var(--sl-spacing-small);
-      }
+        .action-card-body,
+        .dialog-description {
+          color: var(--sl-color-neutral-600);
+          font-size: var(--sl-font-size-small);
+          line-height: 1.5;
+        }
 
-      .policy-summary-row {
-        display: flex;
-        justify-content: space-between;
-        gap: var(--sl-spacing-small);
-      }
+        .action-card-body {
+          display: flex;
+          flex-direction: column;
+          gap: var(--sl-spacing-medium);
+        }
 
-      .policy-summary-label {
-        color: var(--sl-color-neutral-600);
-      }
+        .action-row {
+          display: flex;
+          justify-content: space-between;
+          gap: var(--sl-spacing-small);
+          align-items: center;
+        }
 
-      .policy-summary-value {
-        color: var(--sl-color-neutral-900);
-        font-weight: 600;
-      }
+        .policy-summary {
+          display: flex;
+          flex-direction: column;
+          gap: var(--sl-spacing-small);
+        }
 
-      /* An override that is off or out of its window still belongs in the
+        .policy-summary-row {
+          display: flex;
+          justify-content: space-between;
+          gap: var(--sl-spacing-small);
+        }
+
+        .policy-summary-label {
+          color: var(--sl-color-neutral-600);
+        }
+
+        .policy-summary-value {
+          color: var(--sl-color-neutral-900);
+          font-weight: 600;
+        }
+
+        /* An override that is off or out of its window still belongs in the
          table: it explains a past cost. It is dimmed, not hidden. */
-      tr.override-inactive td {
-        opacity: 0.6;
-      }
+        tr.override-inactive td {
+          opacity: 0.6;
+        }
 
-      .override-model-meta {
-        color: var(--sl-color-neutral-500);
-        font-size: var(--sl-font-size-x-small);
-        display: flex;
-        align-items: center;
-        gap: var(--sl-spacing-2x-small);
-      }
+        .override-model-meta {
+          color: var(--console-meta-color);
+          font-size: var(--sl-font-size-x-small);
+          display: flex;
+          align-items: center;
+          gap: var(--sl-spacing-2x-small);
+        }
 
-      .override-model-link {
-        color: var(--sl-color-primary-600);
-        text-decoration: none;
-      }
+        .override-model-link {
+          color: var(--sl-color-primary-600);
+          text-decoration: none;
+        }
 
-      .override-model-link:hover {
-        text-decoration: underline;
-      }
+        .override-model-link:hover {
+          text-decoration: underline;
+        }
 
-      .override-notes {
-        max-width: 18ch;
-        overflow: hidden;
-        text-overflow: ellipsis;
-        white-space: nowrap;
-      }
+        .override-notes {
+          max-width: 18ch;
+          overflow: hidden;
+          text-overflow: ellipsis;
+          white-space: nowrap;
+        }
 
-      .override-actions {
-        white-space: nowrap;
-        display: flex;
-        gap: var(--sl-spacing-2x-small);
-      }
+        .override-actions {
+          white-space: nowrap;
+          display: flex;
+          gap: var(--sl-spacing-2x-small);
+        }
 
-      .override-empty {
-        color: var(--sl-color-neutral-500);
-      }
+        .override-empty {
+          color: var(--console-meta-color);
+        }
 
-      .override-error {
-        color: var(--sl-color-danger-700);
-      }
+        .override-error {
+          color: var(--sl-color-danger-700);
+        }
 
-      .override-removed-notice {
-        color: var(--sl-color-neutral-700);
-      }
+        .override-removed-notice {
+          color: var(--sl-color-neutral-700);
+        }
 
-      .loading-state {
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        gap: var(--sl-spacing-small);
-        min-height: 160px;
-        color: var(--sl-color-neutral-600);
-      }
+        .loading-state {
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          gap: var(--sl-spacing-small);
+          min-height: 160px;
+          color: var(--sl-color-neutral-600);
+        }
 
-      /* The previous range's answers, on their way out: readable, clearly not
+        /* The previous range's answers, on their way out: readable, clearly not
          current, and in exactly the place the new ones will appear. Only the
          answers dim and go inert. The side column (budgets, pricing
          overrides) is not an answer about the range, so it stays live: no
          opacity here on the wrapper, which would group the side column into
          the fade. */
-      .results.is-updating > *:not(.column-layout),
-      .results.is-updating .main-column {
-        opacity: 0.6;
-        pointer-events: none;
-      }
+        .results.is-updating > *:not(.column-layout),
+        .results.is-updating .main-column {
+          opacity: 0.6;
+          pointer-events: none;
+        }
 
-      .analytics-card::part(body) {
-        padding: var(--sl-spacing-large);
-      }
+        .analytics-card::part(body) {
+          padding: var(--sl-spacing-large);
+        }
 
-      .imported-usage-note {
-        margin-bottom: var(--sl-spacing-medium);
-        color: var(--sl-color-neutral-600);
-        font-size: var(--sl-font-size-small);
-        line-height: 1.5;
-      }
+        .imported-usage-note {
+          margin-bottom: var(--sl-spacing-medium);
+          color: var(--sl-color-neutral-600);
+          font-size: var(--sl-font-size-small);
+          line-height: 1.5;
+        }
 
-      .imported-usage-totals {
-        display: flex;
-        flex-wrap: wrap;
-        gap: var(--sl-spacing-large);
-        margin-bottom: var(--sl-spacing-medium);
-      }
+        .imported-usage-totals {
+          display: flex;
+          flex-wrap: wrap;
+          gap: var(--sl-spacing-large);
+          margin-bottom: var(--sl-spacing-medium);
+        }
 
-      .imported-usage-total-label {
-        color: var(--sl-color-neutral-600);
-        font-size: var(--sl-font-size-small);
-      }
+        .imported-usage-total-label {
+          color: var(--sl-color-neutral-600);
+          font-size: var(--sl-font-size-small);
+        }
 
-      .imported-usage-total-value {
-        margin-top: var(--sl-spacing-2x-small);
-        font-size: 1.25rem;
-        font-weight: 700;
-        color: var(--sl-color-neutral-950);
-      }
+        .imported-usage-total-value {
+          margin-top: var(--sl-spacing-2x-small);
+          font-size: 1.25rem;
+          font-weight: 700;
+          color: var(--sl-color-neutral-950);
+        }
 
-      .imported-conversations-title {
-        margin: var(--sl-spacing-large) 0 var(--sl-spacing-x-small);
-        font-size: var(--sl-font-size-medium);
-        font-weight: 600;
-        color: var(--sl-color-neutral-950);
-      }
+        .imported-conversations-title {
+          margin: var(--sl-spacing-large) 0 var(--sl-spacing-x-small);
+          font-size: var(--sl-font-size-medium);
+          font-weight: 600;
+          color: var(--sl-color-neutral-950);
+        }
 
-      .conversation-child-cell {
-        padding-left: var(--sl-spacing-x-large);
-      }
+        .conversation-child-cell {
+          padding-left: var(--sl-spacing-x-large);
+        }
 
-      .conversation-child-marker {
-        color: var(--sl-color-neutral-500);
-        margin-right: var(--sl-spacing-2x-small);
-      }
+        .conversation-child-marker {
+          color: var(--console-meta-color);
+          margin-right: var(--sl-spacing-2x-small);
+        }
 
-      .conversation-thread-total td {
-        font-weight: 600;
-        background: var(--sl-color-neutral-50);
-      }
+        .conversation-thread-total td {
+          font-weight: 600;
+          background: var(--sl-color-neutral-50);
+        }
 
-      .not-reported {
-        color: var(--sl-color-neutral-500);
-        font-style: italic;
-      }
+        .not-reported {
+          color: var(--console-meta-color);
+          font-style: italic;
+        }
 
-      .analytics-table-wrap {
-        overflow-x: auto;
-      }
+        .analytics-table-wrap {
+          overflow-x: auto;
+        }
 
-      .analytics-card .styled-table th {
-        background: transparent;
-        font-weight: 700;
-      }
+        .analytics-card .styled-table th {
+          background: transparent;
+          font-weight: 700;
+        }
 
-      .subject-links {
-        display: flex;
-        flex-wrap: wrap;
-        gap: var(--sl-spacing-2x-small);
-      }
+        .subject-links {
+          display: flex;
+          flex-wrap: wrap;
+          gap: var(--sl-spacing-2x-small);
+        }
 
-      .agent-breakdown {
-        margin-top: var(--sl-spacing-x-small);
-        padding-left: var(--sl-spacing-medium);
-        color: var(--sl-color-neutral-600);
-        font-size: var(--sl-font-size-x-small);
-      }
+        .agent-breakdown {
+          margin-top: var(--sl-spacing-x-small);
+          padding-left: var(--sl-spacing-medium);
+          color: var(--sl-color-neutral-600);
+          font-size: var(--sl-font-size-x-small);
+        }
 
-      .agent-breakdown-row {
-        display: flex;
-        justify-content: space-between;
-        gap: var(--sl-spacing-small);
-        padding: 2px 0;
-      }
+        .agent-breakdown-row {
+          display: flex;
+          justify-content: space-between;
+          gap: var(--sl-spacing-small);
+          padding: 2px 0;
+        }
 
-      sl-dialog::part(panel) {
-        --width: 640px;
-      }
-    `,
+        sl-dialog::part(panel) {
+          --width: 640px;
+        }
+      `,
+    ],
   ];
 
   connectedCallback() {
@@ -634,11 +787,51 @@ export class CostView extends AuthedElement {
     this.requestedPanel = new URLSearchParams(window.location.search).get(
       'panel'
     );
+    this.readUrlPeriod();
+    window.addEventListener('popstate', this.restoreUrlPeriod);
     void this.load();
+    void this.loadCopilotConnection();
+  }
+
+  private async loadCopilotConnection() {
+    const [copilot, billing] = await Promise.allSettled([
+      getCopilotUsage({}),
+      getProviderBillingConnections(),
+    ]);
+    const viaCopilot =
+      copilot.status === 'fulfilled' && copilot.value?.connection != null;
+    const viaBilling =
+      billing.status === 'fulfilled' &&
+      Array.isArray(billing.value) &&
+      billing.value.some((connection) =>
+        String(connection.provider).toLowerCase().includes('copilot')
+      );
+    this.copilotConnected = viaCopilot || viaBilling;
+  }
+
+  private get copilotTabShown(): boolean {
+    return (
+      this.copilotConnected ||
+      this.copilotRevealed ||
+      this.activeTab === 'copilot'
+    );
+  }
+
+  private readUrlPeriod() {
+    const link = parseDigestLink(window.location.search);
+    this.digestPeriod = link.period;
+    this.digestAccountId = link.accountId;
+    this.digestNotice = link.error;
+    this.digestBlocked = link.blocked;
+    this.digestSwitchTarget = null;
+    if (!link.period && !link.accountId) this.activeAccountLabel = '';
+    this.selectedRange = this.loadStoredDateRange();
+    this.summary = null;
   }
 
   disconnectedCallback() {
     ++this.loadGeneration;
+    window.removeEventListener('popstate', this.restoreUrlPeriod);
     super.disconnectedCallback();
   }
 
@@ -684,6 +877,7 @@ export class CostView extends AuthedElement {
   private getDateParams(
     range: DateRangePreset = this.selectedRange
   ): DateRangeParams {
+    if (this.digestPeriod) return { ...this.digestPeriod };
     const window = resolveTimeRange(range);
     return {
       startDate: window.startDate as string,
@@ -773,9 +967,33 @@ export class CostView extends AuthedElement {
     const detail = (event as CustomEvent<{ value?: string }>).detail;
     const value = (detail?.value ??
       (event.target as HTMLSelectElement).value) as DateRangePreset;
-    if (!DATE_RANGE_PRESETS.includes(value) || value === this.selectedRange) {
+    if (
+      !DATE_RANGE_PRESETS.includes(value) ||
+      (value === this.selectedRange &&
+        !this.digestPeriod &&
+        !this.digestAccountId &&
+        !this.digestNotice)
+    ) {
       return;
     }
+    const hadDigestContext =
+      this.digestPeriod !== null ||
+      this.digestAccountId !== null ||
+      this.digestNotice !== null;
+    this.digestPeriod = null;
+    this.digestAccountId = null;
+    this.digestNotice = null;
+    this.digestBlocked = false;
+    this.digestSwitchTarget = null;
+    this.activeAccountLabel = '';
+    // Only leaving digest mode changes the URL; ordinary preset changes must
+    // not stack no-op history entries.
+    if (hadDigestContext)
+      window.history.pushState(
+        {},
+        '',
+        withoutDigestPeriod(window.location.href)
+      );
     this.selectedRange = value;
     this.previousRangeSummary = null;
     this.persistDateRange(value);
@@ -798,22 +1016,54 @@ export class CostView extends AuthedElement {
     this.budgetContextReady = false;
     this.pricingContextReady = false;
     this.overrideRemoved = null;
-    void this.loadContext(generation);
+    if (this.digestPeriod || this.digestAccountId || this.digestBlocked)
+      this.summary = null;
     try {
+      if (this.digestBlocked) {
+        this.loading = false;
+        return;
+      }
+      // Resolve the authenticated account before any window-specific request.
+      // Never send the URL's account id to an analytics endpoint.
+      if (this.digestAccountId || this.digestPeriod) {
+        const account = await getAccountDetails();
+        if (generation !== this.loadGeneration) return;
+        this.activeAccountLabel = account.organization_name || account.id;
+        if (
+          this.digestAccountId &&
+          account.id.toLowerCase() !== this.digestAccountId
+        ) {
+          this.digestNotice =
+            'This digest belongs to a different account. Switch accounts to view it.';
+          this.digestBlocked = true;
+          this.loading = false;
+          void this.resolveDigestSwitch(this.digestAccountId, generation);
+          return;
+        }
+      }
+      void this.loadContext(generation);
+      void this.loadAccountingFindings(generation);
       const summary = await getCostAnalyticsSummary({
         ...period,
         includeBreakdown: false,
       });
       if (generation !== this.loadGeneration) return;
       this.summary = summary;
-      this.currentPeriod = {
-        startDate: summary.period_start,
-        endDate: summary.period_end,
-      };
+      this.currentPeriod = this.digestPeriod
+        ? { ...period }
+        : {
+            startDate: summary.period_start,
+            endDate: summary.period_end,
+          };
       this.loadedAt = new Date().toISOString();
       this.loading = false;
-      void this.loadPreviousRangeSummary(generation, range);
+      if (!this.digestPeriod)
+        void this.loadPreviousRangeSummary(generation, range);
       void this.loadTab(this.activeTab, generation);
+      // The daily strip is small and always visible, so it loads with the page.
+      this.loadBreakdowns(['days'], generation).catch(() => {
+        // Decoration only: the strip stays hidden without its data.
+      });
       if (summary.imported_usage?.event_count)
         void this.loadTab('imported', generation);
     } catch (error) {
@@ -825,6 +1075,28 @@ export class CostView extends AuthedElement {
           : 'Failed to load cost analytics';
     } finally {
       if (generation === this.loadGeneration) this.loading = false;
+    }
+  }
+
+  /** Health checks this page explains: token detail drift, subscription billing. */
+  private static readonly SHOWN_HEALTH_CHECKS = new Set([
+    'token_details_normalized',
+    'subscription_billing_coverage',
+  ]);
+
+  private async loadAccountingFindings(generation = this.loadGeneration) {
+    try {
+      const health = await getCostHealth();
+      if (generation !== this.loadGeneration) return;
+      this.accountingFindings = (health.checks ?? []).filter(
+        (check) =>
+          CostView.SHOWN_HEALTH_CHECKS.has(check.key) &&
+          (check.status === 'warn' || check.status === 'fail')
+      );
+    } catch (error) {
+      // Decoration only: the cost numbers stand without it.
+      console.warn('Could not load accounting health:', error);
+      if (generation === this.loadGeneration) this.accountingFindings = [];
     }
   }
 
@@ -851,6 +1123,7 @@ export class CostView extends AuthedElement {
         request: getFeatures().then(async (features) => {
           if (generation !== this.loadGeneration) return;
           this.featureFlags = features.features || {};
+          if (this.teamBudgetsEnabled) void this.loadTeamNames(generation);
           // The whole list, not only the active rows: an expired or disabled
           // override is exactly what somebody reading this table came to
           // find, and the summary count still counts the active ones.
@@ -872,6 +1145,17 @@ export class CostView extends AuthedElement {
       ? `Could not load ${failed.join(', ')}.`
       : null;
     this.contextLoading = false;
+  }
+
+  private async loadTeamNames(generation = this.loadGeneration): Promise<void> {
+    try {
+      const { listTeamBudgets, teamNamesFrom } =
+        await import('../../team-budgets-api');
+      const names = teamNamesFrom(await listTeamBudgets());
+      if (generation === this.loadGeneration) this.teamNames = names;
+    } catch {
+      // Labels only: a team row falls back to "Team".
+    }
   }
 
   private async loadPreviousRangeSummary(
@@ -951,11 +1235,14 @@ export class CostView extends AuthedElement {
       return;
     const sections: Record<string, CostUsageBreakdown[]> = {
       agents: ['sessions', 'flows'],
+      models: ['models'],
       sessions: ['sessions'],
       users: ['sessions'],
       tools: ['tools'],
       imported: ['imported'],
+      copilot: [],
       reconciliation: [],
+      teams: [],
     };
     if (!(tab in sections)) return;
     this.sectionStates = { ...this.sectionStates, [tab]: 'loading' };
@@ -966,6 +1253,10 @@ export class CostView extends AuthedElement {
         tab === 'tools' ? this.loadToolFlagCount(generation) : undefined,
         tab === 'reconciliation'
           ? this.loadReconciliation(generation)
+          : undefined,
+        // The panel ships in its own chunk, fetched when the tab opens.
+        tab === 'teams'
+          ? import('../../components/team-budgets-panel')
           : undefined,
       ]);
       if (generation !== this.loadGeneration) return;
@@ -1072,6 +1363,7 @@ export class CostView extends AuthedElement {
   // Re-price unpriced usage rows in the current window from stored tokens and
   // the current price catalog/overrides, then reload the summary.
   private async handleReprice() {
+    if (!this.editPermissions.allows('manage_budgets')) return;
     if (this.repricing || this.repricePending) return;
     this.repricing = true;
     this.repriceNotice = null;
@@ -1128,17 +1420,12 @@ export class CostView extends AuthedElement {
   // coalesces rows with no model alias to "unknown"; pre-filling that
   // placeholder would invite a no-op override, so the field stays empty.
   private openPriceOverrideForUnpriced() {
+    if (!this.editPermissions.allows('edit_ai_models')) return;
     this.openPriceOverrideEditor(null);
     const top = this.summary?.unpriced_models?.[0];
     if (top && top.model !== 'unknown') {
       this.priceModelAlias = top.model;
     }
-  }
-
-  private formatCurrency(value?: number | null): string {
-    const amount = Number(value || 0);
-    if (amount === 0) return '$0.00';
-    return amount >= 0.01 ? `$${amount.toFixed(2)}` : `$${amount.toFixed(4)}`;
   }
 
   private formatNumber(value?: number | null): string {
@@ -1163,7 +1450,9 @@ export class CostView extends AuthedElement {
    * The short form of the selected range, for stat labels ("$ est. · 30d").
    */
   private rangeChipLabel(): string {
-    return timeRangeShortLabel(this.selectedRange);
+    return this.digestPeriod
+      ? 'Digest period'
+      : timeRangeShortLabel(this.selectedRange);
   }
 
   /**
@@ -1173,9 +1462,11 @@ export class CostView extends AuthedElement {
    * actually given.
    */
   private rangeWindowLabel(): string {
+    if (this.digestPeriod)
+      return `Digest period: ${this.digestPeriod.startDate} to ${this.digestPeriod.endDate} (UTC; end exclusive)`;
     const params = this.getDateParams();
-    const start = new Date(this.summary?.period_start || params.startDate);
-    const end = new Date(this.summary?.period_end || params.endDate);
+    const start = parseUTCDate(this.summary?.period_start || params.startDate);
+    const end = parseUTCDate(this.summary?.period_end || params.endDate);
     if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) return '';
     const day = (date: Date) =>
       date.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
@@ -1183,7 +1474,7 @@ export class CostView extends AuthedElement {
     // Cost has no websocket subscription and no poll, so the numbers are as
     // old as the last load. A relative "updated just now" painted once would
     // still say "just now" an hour later; a clock time cannot go stale.
-    const loaded = this.loadedAt ? new Date(this.loadedAt) : null;
+    const loaded = this.loadedAt ? parseUTCDate(this.loadedAt) : null;
     if (!loaded || Number.isNaN(loaded.getTime())) return window;
     const read = loaded.toLocaleTimeString(undefined, {
       hour: 'numeric',
@@ -1194,7 +1485,7 @@ export class CostView extends AuthedElement {
 
   /** The full timestamp behind "read 14:02", for the label's tooltip. */
   private rangeWindowTitle(): string {
-    const loaded = this.loadedAt ? new Date(this.loadedAt) : null;
+    const loaded = this.loadedAt ? parseUTCDate(this.loadedAt) : null;
     if (!loaded || Number.isNaN(loaded.getTime())) return '';
     return `Loaded ${loaded.toLocaleString()}`;
   }
@@ -1217,7 +1508,7 @@ export class CostView extends AuthedElement {
   }
 
   private getProjectedPeriodCost(): number | null {
-    if (!this.summary) return null;
+    if (!this.summary || this.digestPeriod) return null;
     const now = new Date();
     if (this.selectedRange === 'today') {
       const dayStart = new Date(this.getDateParams('today').startDate);
@@ -1274,6 +1565,7 @@ export class CostView extends AuthedElement {
   }
 
   private spendComparisonDetail(): string {
+    if (this.digestPeriod) return 'Gateway estimate for this interval';
     const previousCost = this.previousRangeSummary?.estimated_cost;
     if (previousCost === null || previousCost === undefined) {
       return `Compared to ${this.previousRangeLabel()}`;
@@ -1331,6 +1623,7 @@ export class CostView extends AuthedElement {
    * override is spelled; the row is remembered so a save updates it in place.
    */
   private openPriceOverrideEditor(override: ModelPriceOverride | null) {
+    if (!this.editPermissions.allows('edit_ai_models')) return;
     this.overrideActionError = null;
     this.priceFormError = null;
     this.overrideRemoved = null;
@@ -1407,6 +1700,7 @@ export class CostView extends AuthedElement {
    * account now has rather than what this view guessed.
    */
   private async removeOverride() {
+    if (!this.editPermissions.allows('edit_ai_models')) return;
     const target = this.overrideRemoveTarget;
     if (!target || this.overrideRemoving) return;
     this.overrideRemoving = true;
@@ -1430,6 +1724,7 @@ export class CostView extends AuthedElement {
   }
 
   private async savePriceOverride() {
+    if (!this.editPermissions.allows('edit_ai_models')) return;
     this.priceFormError = null;
     if (!this.priceModelAlias) {
       this.priceFormError = 'Enter a model alias for the price override.';
@@ -1536,13 +1831,13 @@ export class CostView extends AuthedElement {
         <div class="metric-card">
           <div class="metric-label">
             ${
-              this.selectedRange === 'this-month'
+              !this.digestPeriod && this.selectedRange === 'this-month'
                 ? 'Month to date'
                 : `$ est. · ${this.rangeChipLabel()}`
             }
           </div>
           <div class="metric-value">
-            ${this.formatCurrency(summary?.estimated_cost)}
+            ${html`<span title=${formatUsdExact(summary?.estimated_cost)}>${formatUsd(summary?.estimated_cost)}</span>`}
           </div>
           <div class="metric-detail">${this.spendComparisonDetail()}</div>
         </div>
@@ -1580,7 +1875,7 @@ export class CostView extends AuthedElement {
                 <div class="metric-card">
                   <div class="metric-label">${this.projectedPeriodLabel()}</div>
                   <div class="metric-value">
-                    ${this.formatCurrency(projectedPeriodCost)}
+                    ${html`<span title=${formatUsdExact(projectedPeriodCost)}>${formatUsd(projectedPeriodCost)}</span>`}
                   </div>
                   <div class="metric-detail">
                     ${this.projectedPeriodComparisonDetail(projectedPeriodCost)}
@@ -1591,6 +1886,177 @@ export class CostView extends AuthedElement {
         }
       </div>
     `;
+  }
+
+  /**
+   * Subscription workload stays apart from marginal API spend (#1401): its
+   * spend is $0, the API-equivalent figure is an estimate, and billed
+   * subscription dollars are not tracked, so they are shown as unavailable.
+   */
+  private renderSubscriptionUsage() {
+    const block = this.summary?.subscription_usage;
+    if (!block?.request_count) return nothing;
+    const coverage =
+      block.coverage === null || block.coverage === undefined
+        ? 'unknown'
+        : `${Math.round(block.coverage * 100)}%`;
+    return html`
+      <div
+        class="metric-grid subscription-usage"
+        role="region"
+        aria-label="Subscription workload"
+      >
+        <div class="subscription-usage-heading">
+          Subscription workload · not included in spend above
+        </div>
+        <div class="metric-card">
+          <div class="metric-label">Subscription requests</div>
+          <div
+            class="metric-value"
+            title=${this.formatNumber(block.request_count)}
+          >
+            ${this.formatCompactNumber(block.request_count)}
+          </div>
+          <div class="metric-detail">$0 marginal API spend</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-label">Subscription tokens</div>
+          <div
+            class="metric-value"
+            title=${this.formatNumber(block.total_tokens)}
+          >
+            ${this.formatCompactNumber(block.total_tokens)}
+          </div>
+          <div class="metric-detail">
+            ${this.formatCompactNumber(block.prompt_tokens)} in ·
+            ${this.formatCompactNumber(block.completion_tokens)} out
+          </div>
+        </div>
+        <div class="metric-card" data-testid="subscription-api-equivalent">
+          <div class="metric-label">API-equivalent cost (estimate)</div>
+          <div class="metric-value">
+            ${html`<span title=${formatUsdExact(block.api_equivalent_cost)}>${formatUsd(block.api_equivalent_cost)}</span>`}
+          </div>
+          <div class="metric-detail">
+            Coverage ${coverage}: ${this.formatNumber(block.covered_requests)}
+            of ${this.formatNumber(block.request_count)} requests carry an
+            estimate
+          </div>
+        </div>
+        <div class="metric-card" data-testid="subscription-billed">
+          <div class="metric-label">Billed subscription cost</div>
+          <div class="metric-value">Not tracked</div>
+          <div class="metric-detail">
+            No provider billing source; not derived from tokens
+          </div>
+        </div>
+      </div>
+    `;
+  }
+
+  private renderAccountingFindings() {
+    if (!this.accountingFindings.length) return nothing;
+    return html`
+      <sl-alert
+        class="accounting-findings"
+        variant="warning"
+        open
+        role="status"
+        aria-label="Accounting health"
+      >
+        <sl-icon slot="icon" name="exclamation-triangle"></sl-icon>
+        Accounting health (last 24 hours, not the selected range)
+        <ul>
+          ${this.accountingFindings.map(
+            (check) => html`<li data-check=${check.key}>${check.detail}</li>`
+          )}
+        </ul>
+      </sl-alert>
+    `;
+  }
+
+  /**
+   * Say what the person can do about a digest from another account. With
+   * multi_account on and a membership in that account, offer to switch and
+   * reopen the same link; without the capability, say to sign in to it.
+   * The hierarchy client is loaded only on this path, so the open-source
+   * bundle never fetches it.
+   */
+  private async resolveDigestSwitch(accountId: string, generation: number) {
+    const prefix = 'This digest belongs to a different account';
+    try {
+      const features = await getFeatures();
+      if (generation !== this.loadGeneration) return;
+      if (!hasCapability(features.features, 'multi_account')) {
+        this.digestNotice = `${prefix}. Sign in to that account to view it.`;
+        return;
+      }
+      const { getMemberships } = await import('../../hierarchy-api');
+      const memberships = await getMemberships();
+      if (generation !== this.loadGeneration) return;
+      const membership = memberships.find(
+        (entry) => entry.account_id.toLowerCase() === accountId
+      );
+      if (!membership) {
+        this.digestNotice = `${prefix}, and you are not a member of it.`;
+        return;
+      }
+      const name = membership.account_name || 'that account';
+      this.digestSwitchTarget = { id: membership.account_id, name };
+      this.digestNotice = `${prefix}: ${name}.`;
+    } catch (error) {
+      console.warn('Could not look up the digest account:', error);
+    }
+  }
+
+  /** Test seam: a real switch reloads the page at the digest link. */
+  private navigateAfterSwitch(url: string) {
+    window.location.assign(url);
+  }
+
+  private async handleDigestSwitch() {
+    const target = this.digestSwitchTarget;
+    if (!target) return;
+    this.digestSwitching = true;
+    try {
+      const { switchAccount } = await import('../../hierarchy-api');
+      // Reloads this same URL in the other account, so the digest opens.
+      await switchAccount(target.id, (url) => this.navigateAfterSwitch(url));
+    } catch (error) {
+      this.digestNotice = `Could not switch to ${target.name}. ${
+        error instanceof Error ? error.message : ''
+      }`.trim();
+      this.digestSwitchTarget = null;
+    } finally {
+      this.digestSwitching = false;
+    }
+  }
+
+  private renderDigestNotice() {
+    if (!this.digestNotice) return nothing;
+    const target = this.digestSwitchTarget;
+    return html`<sl-alert
+      class="digest-notice"
+      open
+      variant="warning"
+      role="alert"
+    >
+      <sl-icon slot="icon" name="exclamation-triangle"></sl-icon>
+      ${this.digestNotice}
+      ${
+        target
+          ? html`<div class="digest-actions">
+              <sl-button
+                size="small"
+                variant="primary"
+                ?loading=${this.digestSwitching}
+                @click=${() => void this.handleDigestSwitch()}
+                >Switch to ${target.name} and open</sl-button
+              >
+            </div>`
+          : nothing
+      }
+    </sl-alert>`;
   }
 
   // Warning banner when usage rows carry tokens but no cost (model missing
@@ -1613,6 +2079,17 @@ export class CostView extends AuthedElement {
         : nothing;
     }
     const unpricedModels = this.summary?.unpriced_models ?? [];
+    // Without billing or price overrides (the open-source server) nothing on
+    // this page can price these models, so the banner explains instead of
+    // raising an alarm with no action. It waits for the feature flags, so a
+    // deployment that can fix it never sees this copy first.
+    const explainOnly =
+      this.pricingContextReady &&
+      !this.billingEnabled &&
+      !this.modelPriceOverridesEnabled;
+    if (explainOnly) {
+      return this.renderUnpricedExplanation(unpricedRequests, unpricedModels);
+    }
     return html`
       <sl-alert id="panel-pricing-catalog" variant="warning" open role="alert">
         <sl-icon slot="icon" name="exclamation-triangle"></sl-icon>
@@ -1642,25 +2119,32 @@ export class CostView extends AuthedElement {
         }
         ${
           this.billingEnabled
-            ? html`<sl-button
-                size="small"
-                variant="warning"
-                outline
-                .loading=${this.repricing}
-                ?disabled=${this.repricePending}
-                @click=${() => void this.handleReprice()}
-                >Reprice now</sl-button
+            ? html`<sl-tooltip
+                content=${!this.editPermissions.allows('manage_budgets') ? 'Requires manage_budgets' : ''}
+                ><sl-button
+                  size="small"
+                  variant="warning"
+                  outline
+                  .loading=${this.repricing}
+                  ?disabled=${!this.editPermissions.allows('manage_budgets') || this.repricePending}
+                  @click=${() => void this.handleReprice()}
+                  >Reprice now</sl-button
+                ></sl-tooltip
               >`
             : nothing
         }
         ${
           unpricedModels.length && this.modelPriceOverridesEnabled
-            ? html`<sl-button
-                size="small"
-                variant="warning"
-                outline
-                @click=${() => this.openPriceOverrideForUnpriced()}
-                >Set price override</sl-button
+            ? html`<sl-tooltip
+                content=${!this.editPermissions.allows('edit_ai_models') ? 'Requires edit_ai_models' : ''}
+                ><sl-button
+                  ?disabled=${!this.editPermissions.allows('edit_ai_models')}
+                  size="small"
+                  variant="warning"
+                  outline
+                  @click=${() => this.openPriceOverrideForUnpriced()}
+                  >Set price override</sl-button
+                ></sl-tooltip
               >`
             : nothing
         }
@@ -1669,11 +2153,55 @@ export class CostView extends AuthedElement {
     `;
   }
 
+  private renderUnpricedExplanation(
+    unpricedRequests: number,
+    unpricedModels: NonNullable<CostAnalyticsSummaryResponse['unpriced_models']>
+  ) {
+    return html`
+      <sl-alert
+        id="panel-pricing-catalog"
+        class="unpriced-explanation"
+        variant="neutral"
+        open
+        role="status"
+      >
+        <sl-icon slot="icon" name="info-circle"></sl-icon>
+        ${this.formatNumber(unpricedRequests)}
+        request${unpricedRequests === 1 ? '' : 's'}
+        (${this.formatNumber(this.summary?.unpriced_tokens)} tokens) in this
+        window used models with no catalog price. Their tokens are counted, but
+        they add nothing to estimated spend or to budgets.
+        ${
+          unpricedModels.length
+            ? html`<div class="unpriced-models">
+                Models without a price:
+                ${unpricedModels.map(
+                  (entry, index) =>
+                    html`${index > 0 ? ', ' : ''}<code>${entry.model}</code>
+                      (${this.formatNumber(entry.tokens)} tokens)`
+                )}.
+              </div>`
+            : nothing
+        }
+        <div>
+          Models outside the public price catalog, such as self-hosted or
+          OpenAI-compatible endpoints, can't be priced on this deployment.
+        </div>
+        <div class="unpriced-links">
+          <a href="/console/ai-models">Review models</a>
+          <a href=${MODEL_PRICING_DOCS_URL} target="_blank" rel="noopener"
+            >How model prices work</a
+          >
+        </div>
+      </sl-alert>
+    `;
+  }
+
   // One quiet provenance line: which price snapshot produced the estimates.
   private renderCatalogInfo() {
     const catalog = this.summary?.price_catalog;
     if (!catalog?.fetched_at) return nothing;
-    const fetched = new Date(catalog.fetched_at);
+    const fetched = parseUTCDate(catalog.fetched_at);
     const ageDays = Math.floor(
       (Date.now() - fetched.getTime()) / (24 * 60 * 60 * 1000)
     );
@@ -1692,7 +2220,7 @@ export class CostView extends AuthedElement {
         (${catalog.model_count ?? '?'} models), ${ageDays}
         ${ageDays === 1 ? 'day' : 'days'} old.
         ${
-          ageDays > 45
+          ageDays > 45 && this.editPermissions.allows('edit_ai_models')
             ? html`<button
                 type="button"
                 class="catalog-action"
@@ -1915,7 +2443,7 @@ export class CostView extends AuthedElement {
         label: 'Last event',
         numeric: true,
         value: (r) =>
-          r.last_event_at ? new Date(r.last_event_at).getTime() : 0,
+          r.last_event_at ? parseUTCDate(r.last_event_at).getTime() : 0,
       },
     ];
     const rows = this.sortRows(
@@ -1955,7 +2483,7 @@ export class CostView extends AuthedElement {
           <div>
             <div class="imported-usage-total-label">Imported cost</div>
             <div class="imported-usage-total-value">
-              ${this.formatCurrency(imported.imported_cost)}
+              ${html`<span title=${formatUsdExact(imported.imported_cost)}>${formatUsd(imported.imported_cost)}</span>`}
             </div>
           </div>
         </div>
@@ -1964,46 +2492,52 @@ export class CostView extends AuthedElement {
             ? this.renderSectionState('imported')
             : rows.length
               ? html`<div class="analytics-table-wrap">
-                  <table
-                    class="styled-table"
-                    aria-label="Imported usage by model"
-                  >
-                    <thead>
-                      <tr>
-                        ${columns.map((column) =>
-                          this.renderSortableHeader(
-                            column,
-                            this.importedSort,
-                            (key) =>
-                              (this.importedSort = this.toggleSort(
-                                this.importedSort,
-                                key
-                              ))
-                          )
+                  <div class="table-scroll">
+                    <table
+                      class="styled-table"
+                      aria-label="Imported usage by model"
+                    >
+                      <thead>
+                        <tr>
+                          ${columns.map((column) =>
+                            this.renderSortableHeader(
+                              column,
+                              this.importedSort,
+                              (key) =>
+                                (this.importedSort = this.toggleSort(
+                                  this.importedSort,
+                                  key
+                                ))
+                            )
+                          )}
+                        </tr>
+                      </thead>
+                      <tbody>
+                        ${rows.map(
+                          (row) => html`
+                            <tr>
+                              <td>${row.model_alias || 'Unknown'}</td>
+                              <td>${row.source || 'Unknown'}</td>
+                              <td>${this.formatNumber(row.request_count)}</td>
+                              <td>${this.formatNumber(row.total_tokens)}</td>
+                              <td>
+                                ${html`<span title=${formatUsdExact(row.imported_cost)}>${formatUsd(row.imported_cost)}</span>`}
+                              </td>
+                              <td>
+                                ${
+                                  row.last_event_at
+                                    ? parseUTCDate(
+                                        row.last_event_at
+                                      ).toLocaleString()
+                                    : '-'
+                                }
+                              </td>
+                            </tr>
+                          `
                         )}
-                      </tr>
-                    </thead>
-                    <tbody>
-                      ${rows.map(
-                        (row) => html`
-                          <tr>
-                            <td>${row.model_alias || 'Unknown'}</td>
-                            <td>${row.source || 'Unknown'}</td>
-                            <td>${this.formatNumber(row.request_count)}</td>
-                            <td>${this.formatNumber(row.total_tokens)}</td>
-                            <td>${this.formatCurrency(row.imported_cost)}</td>
-                            <td>
-                              ${
-                                row.last_event_at
-                                  ? new Date(row.last_event_at).toLocaleString()
-                                  : '-'
-                              }
-                            </td>
-                          </tr>
-                        `
-                      )}
-                    </tbody>
-                  </table>
+                      </tbody>
+                    </table>
+                  </div>
                 </div>`
               : html`<div class="empty">No per-model imported usage yet.</div>`
         }
@@ -2029,21 +2563,26 @@ export class CostView extends AuthedElement {
         export) are shown separately and are never summed together.
       </div>
       <div class="analytics-table-wrap">
-        <table class="styled-table" aria-label="Imported usage by conversation">
-          <thead>
-            <tr>
-              <th scope="col">Conversation</th>
-              <th scope="col">Events</th>
-              <th scope="col">Tokens</th>
-              <th scope="col">Estimated cost</th>
-              <th scope="col">Reconciled cost</th>
-              <th scope="col">Last event</th>
-            </tr>
-          </thead>
-          <tbody>
-            ${threads.map((thread) => this.renderConversationThread(thread))}
-          </tbody>
-        </table>
+        <div class="table-scroll">
+          <table
+            class="styled-table"
+            aria-label="Imported usage by conversation"
+          >
+            <thead>
+              <tr>
+                <th scope="col">Conversation</th>
+                <th scope="col">Events</th>
+                <th scope="col">Tokens</th>
+                <th scope="col">Estimated cost</th>
+                <th scope="col">Reconciled cost</th>
+                <th scope="col">Last event</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${threads.map((thread) => this.renderConversationThread(thread))}
+            </tbody>
+          </table>
+        </div>
       </div>
     `;
   }
@@ -2130,7 +2669,7 @@ export class CostView extends AuthedElement {
         <td>
           ${
             row.last_event_at
-              ? new Date(row.last_event_at).toLocaleString()
+              ? parseUTCDate(row.last_event_at).toLocaleString()
               : html`<span class="not-reported">not reported</span>`
           }
         </td>
@@ -2157,7 +2696,7 @@ export class CostView extends AuthedElement {
   private renderReportedCurrency(value?: number | null) {
     return value === null || value === undefined
       ? html`<span class="not-reported">not reported</span>`
-      : html`${this.formatCurrency(value)}`;
+      : html`${formatUsd(value)}`;
   }
 
   private renderBreakdown() {
@@ -2173,6 +2712,12 @@ export class CostView extends AuthedElement {
             ?active=${this.activeTab === 'agents'}
             >Agents</sl-tab
           >
+          <sl-tab
+            slot="nav"
+            panel="models"
+            ?active=${this.activeTab === 'models'}
+            >Models</sl-tab
+          >
           <sl-tab slot="nav" panel="tools" ?active=${this.activeTab === 'tools'}
             >Tools</sl-tab
           >
@@ -2186,6 +2731,26 @@ export class CostView extends AuthedElement {
             >Users</sl-tab
           >
           ${
+            this.copilotTabShown
+              ? html`<sl-tab
+                  slot="nav"
+                  panel="copilot"
+                  ?active=${this.activeTab === 'copilot'}
+                  >Copilot</sl-tab
+                >`
+              : nothing
+          }
+          ${
+            this.teamBudgetsEnabled
+              ? html`<sl-tab
+                  slot="nav"
+                  panel="teams"
+                  ?active=${this.activeTab === 'teams'}
+                  >Teams</sl-tab
+                >`
+              : nothing
+          }
+          ${
             this.reconciliationEnabled
               ? html`<sl-tab slot="nav" panel="reconciliation"
                   >Reconciliation</sl-tab
@@ -2194,6 +2759,9 @@ export class CostView extends AuthedElement {
           }
           <sl-tab-panel name="agents"
             >${this.renderTab('agents', () => this.renderAgentsTab())}</sl-tab-panel
+          >
+          <sl-tab-panel name="models"
+            >${this.renderTab('models', () => this.renderModelsTab())}</sl-tab-panel
           >
           <sl-tab-panel name="tools"
             >${this.renderTab('tools', () => this.renderToolsTab())}</sl-tab-panel
@@ -2204,6 +2772,20 @@ export class CostView extends AuthedElement {
           <sl-tab-panel name="users"
             >${this.renderTab('users', () => this.renderUsersTab())}</sl-tab-panel
           >
+          ${
+            this.copilotTabShown
+              ? html`<sl-tab-panel name="copilot"
+                  >${this.renderTab('copilot', () => this.renderCopilotTab())}</sl-tab-panel
+                >`
+              : nothing
+          }
+          ${
+            this.teamBudgetsEnabled
+              ? html`<sl-tab-panel name="teams"
+                  >${this.renderTab('teams', () => this.renderTeamsTab())}</sl-tab-panel
+                >`
+              : nothing
+          }
           ${
             this.reconciliationEnabled
               ? html`<sl-tab-panel name="reconciliation"
@@ -2275,6 +2857,214 @@ export class CostView extends AuthedElement {
     `;
   }
 
+  // Imported GitHub Copilot spend. Rendered in its own tab and never merged
+  // into the gateway totals above (it is not metered by the gateway).
+  private renderTeamsTab() {
+    return html`<div class="tab-panel-body">
+      <team-budgets-panel
+        .readOnly=${!this.editPermissions.allows('manage_budgets')}
+        .startDate=${this.currentPeriod?.startDate}
+        .endDate=${this.currentPeriod?.endDate}
+        @team-budgets-changed=${() => void this.refreshBudgetsAfterTeamChange()}
+      ></team-budgets-panel>
+    </div>`;
+  }
+
+  private async refreshBudgetsAfterTeamChange(): Promise<void> {
+    const generation = this.loadGeneration;
+    await this.loadTeamNames(generation);
+    try {
+      const policies = await getBudgetPolicies();
+      if (generation === this.loadGeneration) this.budgetPolicies = policies;
+    } catch {
+      // The health card keeps its last list; the next load refreshes it.
+    }
+  }
+
+  private renderModelsTab() {
+    const columns: SortColumn<GatewayUsageByModel>[] = [
+      {
+        key: 'model',
+        label: 'Model',
+        numeric: false,
+        value: (r) => r.model_alias || '',
+      },
+      {
+        key: 'requests',
+        label: 'Requests',
+        numeric: true,
+        value: (r) => r.request_count,
+      },
+      {
+        key: 'tokens',
+        label: 'Tokens',
+        numeric: true,
+        value: (r) => r.token_usage?.total_tokens ?? 0,
+      },
+      {
+        key: 'cost',
+        label: 'Cost',
+        numeric: true,
+        value: (r) => r.estimated_cost,
+      },
+    ];
+    const rows = this.sortRows(
+      this.summary?.usage_by_model ?? [],
+      columns,
+      this.modelSort
+    );
+    if (!rows.length) {
+      return html`<div class="empty">
+        No model-level usage is available for this period.
+      </div>`;
+    }
+    return html`<div class="analytics-table-wrap">
+      <div class="table-scroll">
+        <table class="styled-table" aria-label="Spend by model">
+          <thead>
+            <tr>
+              ${columns.map((column) =>
+                this.renderSortableHeader(
+                  column,
+                  this.modelSort,
+                  (key) =>
+                    (this.modelSort = this.toggleSort(this.modelSort, key))
+                )
+              )}
+            </tr>
+          </thead>
+          <tbody>
+            ${rows.map(
+              (row) =>
+                html`<tr>
+                  <td>
+                    <div class="model-name">
+                      ${row.model_alias || 'Unnamed model'}
+                    </div>
+                    <div class="model-provider">
+                      ${row.provider_name || 'Unknown provider'}
+                    </div>
+                  </td>
+                  <td>${this.formatNumber(row.request_count)}</td>
+                  <td>
+                    <token-figures
+                      .usage=${row.token_usage}
+                      expanded
+                    ></token-figures>
+                  </td>
+                  <td>
+                    <span title=${formatUsdExact(row.estimated_cost)}
+                      >${formatUsd(row.estimated_cost)}</span
+                    >
+                  </td>
+                </tr>`
+            )}
+          </tbody>
+        </table>
+      </div>
+    </div>`;
+  }
+
+  // A small per-day strip above the tabs: one bar per day, height by
+  // estimated cost, with the window's total spend and requests beside it.
+  private renderDailySpend() {
+    const days: GatewayUsageByDay[] = this.summary?.requests_by_day ?? [];
+    if (!this.readyBreakdowns.has('days') || !days.length) return nothing;
+    const peak = Math.max(...days.map((day) => day.estimated_cost), 0);
+    const totalCost = days.reduce((sum, day) => sum + day.estimated_cost, 0);
+    const totalRequests = days.reduce((sum, day) => sum + day.request_count, 0);
+    return html`<div
+      class="daily-spend"
+      data-testid="daily-spend"
+      role="group"
+      aria-label="Daily spend"
+    >
+      <div class="daily-spend-summary">
+        <span class="daily-spend-title">Daily spend</span>
+        <span
+          >${formatUsd(totalCost)} across ${this.formatNumber(totalRequests)}
+          ${totalRequests === 1 ? 'request' : 'requests'}</span
+        >
+      </div>
+      <div class="daily-bars">
+        ${days.map((day) => {
+          const label = `${day.date}: ${formatUsd(day.estimated_cost)}, ${this.formatNumber(day.request_count)} ${day.request_count === 1 ? 'request' : 'requests'}`;
+          const height = peak > 0 ? (day.estimated_cost / peak) * 100 : 0;
+          return html`<div
+            class="daily-bar"
+            role="img"
+            aria-label=${label}
+            title=${label}
+          >
+            <span style="height: ${Math.max(height, 2)}%"></span>
+          </div>`;
+        })}
+      </div>
+    </div>`;
+  }
+
+  private openSpendSetting(destination: string) {
+    if (destination === 'outliers') {
+      Router.go(SPEND_OUTLIERS_HREF);
+      return;
+    }
+    if (destination === 'imports') {
+      this.copilotRevealed = true;
+      this.activeTab = 'copilot';
+      void this.loadTab('copilot');
+      // The Copilot tab is created in this same update, so the ?active
+      // binding alone does not reach sl-tab-group: show() syncs the panels.
+      void this.updateComplete.then(() => {
+        const group = this.renderRoot.querySelector('sl-tab-group') as
+          (HTMLElement & { show?: (panel: string) => void }) | null;
+        group?.show?.('copilot');
+        group?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      });
+      return;
+    }
+    const target = this.renderRoot.querySelector(
+      destination === 'budgets' ? '#panel-budgets' : '#panel-pricing'
+    ) as HTMLElement | null;
+    target?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    target?.focus({ preventScroll: true });
+  }
+
+  private renderSpendSettings() {
+    const pricingAvailable =
+      this.pricingContextReady && this.modelPriceOverridesEnabled;
+    return html`<sl-dropdown class="spend-settings" hoist>
+      <sl-button slot="trigger" size="small" caret>
+        <sl-icon slot="prefix" name="sliders"></sl-icon>
+        Spend settings
+      </sl-button>
+      <sl-menu
+        aria-label="Spend settings"
+        @sl-select=${(event: CustomEvent<{ item: { value: string } }>) =>
+          this.openSpendSetting(event.detail.item.value)}
+      >
+        <sl-menu-item value="budgets" ?disabled=${!this.budgetContextReady}
+          >Budget limits</sl-menu-item
+        >
+        <sl-menu-item value="pricing" ?disabled=${!pricingAvailable}
+          >Price overrides</sl-menu-item
+        >
+        <sl-menu-item value="imports">Imports</sl-menu-item>
+        <sl-menu-item value="outliers" data-href=${SPEND_OUTLIERS_HREF}
+          >Outlier alerts</sl-menu-item
+        >
+      </sl-menu>
+    </sl-dropdown>`;
+  }
+
+  private renderCopilotTab() {
+    return html`<div class="tab-panel-body">
+      <copilot-usage-panel
+        .startDate=${this.currentPeriod?.startDate}
+        .endDate=${this.currentPeriod?.endDate}
+      ></copilot-usage-panel>
+    </div>`;
+  }
+
   private renderReconciliationTab() {
     if (this.reconciliationLoading) {
       return html`<div class="loading-state" role="status" aria-busy="true">
@@ -2326,59 +3116,63 @@ export class CostView extends AuthedElement {
           rows.length
             ? html`
                 <div class="analytics-table-wrap">
-                  <table
-                    class="styled-table"
-                    aria-label="Estimated vs provider-reported spend"
-                  >
-                    <thead>
-                      <tr>
-                        <th scope="col">Date</th>
-                        <th scope="col">Provider</th>
-                        <th scope="col">Preloop estimate</th>
-                        <th scope="col">Provider actual</th>
-                        <th scope="col">Drift</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      ${rows.map(
-                        (row) => html`
-                          <tr>
-                            <td>${new Date(row.date).toLocaleDateString()}</td>
-                            <td>${row.provider}</td>
-                            <td>${this.formatCurrency(row.preloop_cost)}</td>
-                            <td>${this.formatCurrency(row.provider_cost)}</td>
-                            <td>${this.renderDriftBadge(row)}</td>
-                          </tr>
-                        `
-                      )}
-                    </tbody>
-                    ${
-                      totals
-                        ? html`<tfoot>
+                  <div class="table-scroll">
+                    <table
+                      class="styled-table"
+                      aria-label="Estimated vs provider-reported spend"
+                    >
+                      <thead>
+                        <tr>
+                          <th scope="col">Date</th>
+                          <th scope="col">Provider</th>
+                          <th scope="col">Preloop estimate</th>
+                          <th scope="col">Provider actual</th>
+                          <th scope="col">Drift</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        ${rows.map(
+                          (row) => html`
                             <tr>
-                              <th scope="row" colspan="2">Total</th>
                               <td>
-                                ${this.formatCurrency(
-                                  totals.total_preloop_cost
-                                )}
+                                ${parseUTCDate(row.date).toLocaleDateString()}
+                              </td>
+                              <td>${row.provider}</td>
+                              <td>
+                                ${html`<span title=${formatUsdExact(row.preloop_cost)}>${formatUsd(row.preloop_cost)}</span>`}
                               </td>
                               <td>
-                                ${this.formatCurrency(
-                                  totals.total_provider_cost
-                                )}
+                                ${html`<span title=${formatUsdExact(row.provider_cost)}>${formatUsd(row.provider_cost)}</span>`}
                               </td>
-                              <td>
-                                ${
-                                  totals.total_drift_pct !== null
-                                    ? `${totals.total_drift_pct > 0 ? '+' : ''}${totals.total_drift_pct.toFixed(1)}%`
-                                    : 'n/a'
-                                }
-                              </td>
+                              <td>${this.renderDriftBadge(row)}</td>
                             </tr>
-                          </tfoot>`
-                        : nothing
-                    }
-                  </table>
+                          `
+                        )}
+                      </tbody>
+                      ${
+                        totals
+                          ? html`<tfoot>
+                              <tr>
+                                <th scope="row" colspan="2">Total</th>
+                                <td>
+                                  ${html`<span title=${formatUsdExact(totals.total_preloop_cost)}>${formatUsd(totals.total_preloop_cost)}</span>`}
+                                </td>
+                                <td>
+                                  ${html`<span title=${formatUsdExact(totals.total_provider_cost)}>${formatUsd(totals.total_provider_cost)}</span>`}
+                                </td>
+                                <td>
+                                  ${
+                                    totals.total_drift_pct !== null
+                                      ? `${totals.total_drift_pct > 0 ? '+' : ''}${totals.total_drift_pct.toFixed(1)}%`
+                                      : 'n/a'
+                                  }
+                                </td>
+                              </tr>
+                            </tfoot>`
+                          : nothing
+                      }
+                    </table>
+                  </div>
                 </div>
                 <div class="metric-detail">
                   Positive drift means the provider reported more spend than
@@ -2424,51 +3218,55 @@ export class CostView extends AuthedElement {
     return html`
       <div class="tab-panel-body">
         <div class="analytics-table-wrap">
-          <table class="styled-table" aria-label="Spend by agent">
-            <thead>
-              <tr>
-                ${columns.map((column) =>
-                  this.renderSortableHeader(
-                    column,
-                    this.agentSort,
-                    (key) =>
-                      (this.agentSort = this.toggleSort(this.agentSort, key))
-                  )
-                )}
-              </tr>
-            </thead>
-            <tbody>
-              ${rows.map(
-                (row) => html`
-                  <tr>
-                    <td>
-                      ${
-                        row.agentId
-                          ? html`<a
-                              href=${`/console/agents/${encodeURIComponent(row.agentId)}`}
-                              >${row.name}</a
-                            >`
-                          : row.flowId
+          <div class="table-scroll">
+            <table class="styled-table" aria-label="Spend by agent">
+              <thead>
+                <tr>
+                  ${columns.map((column) =>
+                    this.renderSortableHeader(
+                      column,
+                      this.agentSort,
+                      (key) =>
+                        (this.agentSort = this.toggleSort(this.agentSort, key))
+                    )
+                  )}
+                </tr>
+              </thead>
+              <tbody>
+                ${rows.map(
+                  (row) => html`
+                    <tr>
+                      <td>
+                        ${
+                          row.agentId
                             ? html`<a
-                                href=${`/console/flows/${encodeURIComponent(row.flowId)}`}
+                                href=${`/console/agents/${encodeURIComponent(row.agentId)}`}
                                 >${row.name}</a
                               >`
-                            : row.name
-                      }
-                    </td>
-                    <td>${this.formatNumber(row.requests)}</td>
-                    <td>
-                      <token-figures
-                        .usage=${row.tokenUsage}
-                        expanded
-                      ></token-figures>
-                    </td>
-                    <td>${this.formatCurrency(row.cost)}</td>
-                  </tr>
-                `
-              )}
-            </tbody>
-          </table>
+                            : row.flowId
+                              ? html`<a
+                                  href=${`/console/flows/${encodeURIComponent(row.flowId)}`}
+                                  >${row.name}</a
+                                >`
+                              : row.name
+                        }
+                      </td>
+                      <td>${this.formatNumber(row.requests)}</td>
+                      <td>
+                        <token-figures
+                          .usage=${row.tokenUsage}
+                          expanded
+                        ></token-figures>
+                      </td>
+                      <td>
+                        ${html`<span title=${formatUsdExact(row.cost)}>${formatUsd(row.cost)}</span>`}
+                      </td>
+                    </tr>
+                  `
+                )}
+              </tbody>
+            </table>
+          </div>
         </div>
       </div>
     `;
@@ -2538,57 +3336,61 @@ export class CostView extends AuthedElement {
           rows.length
             ? html`
                 <div class="analytics-table-wrap">
-                  <table class="styled-table" aria-label="Tool schema cost">
-                    <thead>
-                      <tr>
-                        ${columns.map((column) =>
-                          this.renderSortableHeader(
-                            column,
-                            this.toolSort,
-                            (key) =>
-                              (this.toolSort = this.toggleSort(
-                                this.toolSort,
-                                key
-                              ))
-                          )
+                  <div class="table-scroll">
+                    <table class="styled-table" aria-label="Tool schema cost">
+                      <thead>
+                        <tr>
+                          ${columns.map((column) =>
+                            this.renderSortableHeader(
+                              column,
+                              this.toolSort,
+                              (key) =>
+                                (this.toolSort = this.toggleSort(
+                                  this.toolSort,
+                                  key
+                                ))
+                            )
+                          )}
+                        </tr>
+                      </thead>
+                      <tbody>
+                        ${rows.map(
+                          (row) => html`
+                            <tr>
+                              <td>
+                                <div>${row.tool_name}</div>
+                                ${
+                                  row.server_name
+                                    ? html`<div class="cell-subtitle">
+                                        ${row.server_name}
+                                      </div>`
+                                    : nothing
+                                }
+                              </td>
+                              <td>
+                                ${this.formatNumber(row.invocation_count)}
+                              </td>
+                              <td>
+                                ${this.formatNumber(row.failed_invocations)}
+                              </td>
+                              <td>
+                                ${this.formatNumber(row.schema_tokens_total)}
+                              </td>
+                              <td>
+                                ${html`<span title=${formatUsdExact(row.estimated_schema_cost)}>${formatUsd(row.estimated_schema_cost)}</span>`}
+                              </td>
+                              <td>
+                                ${html`<span title=${formatUsdExact(this.perDefinitionCost(row))}>${formatUsd(this.perDefinitionCost(row))}</span>`}
+                              </td>
+                              <td>
+                                ${html`<span title=${formatUsdExact(row.avg_cost_per_invocation)}>${formatUsd(row.avg_cost_per_invocation)}</span>`}
+                              </td>
+                            </tr>
+                          `
                         )}
-                      </tr>
-                    </thead>
-                    <tbody>
-                      ${rows.map(
-                        (row) => html`
-                          <tr>
-                            <td>
-                              <div>${row.tool_name}</div>
-                              ${
-                                row.server_name
-                                  ? html`<div class="cell-subtitle">
-                                      ${row.server_name}
-                                    </div>`
-                                  : nothing
-                              }
-                            </td>
-                            <td>${this.formatNumber(row.invocation_count)}</td>
-                            <td>
-                              ${this.formatNumber(row.failed_invocations)}
-                            </td>
-                            <td>
-                              ${this.formatNumber(row.schema_tokens_total)}
-                            </td>
-                            <td>
-                              ${this.formatCurrency(row.estimated_schema_cost)}
-                            </td>
-                            <td>
-                              ${this.formatCurrency(this.perDefinitionCost(row))}
-                            </td>
-                            <td>
-                              ${this.formatCurrency(row.avg_cost_per_invocation)}
-                            </td>
-                          </tr>
-                        `
-                      )}
-                    </tbody>
-                  </table>
+                      </tbody>
+                    </table>
+                  </div>
                 </div>
               `
             : html`<div class="empty">No tool usage recorded yet.</div>`
@@ -2635,7 +3437,7 @@ export class CostView extends AuthedElement {
         numeric: true,
         value: (r) =>
           r.last_activity_at || r.last_request_at
-            ? new Date(
+            ? parseUTCDate(
                 (r.last_activity_at || r.last_request_at) as string
               ).getTime()
             : 0,
@@ -2652,60 +3454,64 @@ export class CostView extends AuthedElement {
     return html`
       <div class="tab-panel-body">
         <div class="analytics-table-wrap">
-          <table class="styled-table" aria-label="Session spend">
-            <thead>
-              <tr>
-                ${columns.map((column) =>
-                  this.renderSortableHeader(
-                    column,
-                    this.sessionSort,
-                    (key) =>
-                      (this.sessionSort = this.toggleSort(
-                        this.sessionSort,
-                        key
-                      ))
-                  )
+          <div class="table-scroll">
+            <table class="styled-table" aria-label="Session spend">
+              <thead>
+                <tr>
+                  ${columns.map((column) =>
+                    this.renderSortableHeader(
+                      column,
+                      this.sessionSort,
+                      (key) =>
+                        (this.sessionSort = this.toggleSort(
+                          this.sessionSort,
+                          key
+                        ))
+                    )
+                  )}
+                </tr>
+              </thead>
+              <tbody>
+                ${rows.map(
+                  (row) => html`
+                    <tr>
+                      <td>
+                        ${
+                          row.runtime_session_id
+                            ? html`<a
+                                href="/console/runtime-sessions?sessionId=${row.runtime_session_id}"
+                                >${this.getSessionTitle(row)}</a
+                              >`
+                            : this.getSessionTitle(row)
+                        }
+                      </td>
+                      <td>${this.renderSessionSubjects(row)}</td>
+                      <td>${this.formatNumber(row.request_count)}</td>
+                      <td>
+                        <token-figures
+                          .usage=${row.token_usage || null}
+                          expanded
+                        ></token-figures>
+                      </td>
+                      <td>
+                        ${html`<span title=${formatUsdExact(row.estimated_cost)}>${formatUsd(row.estimated_cost)}</span>`}
+                      </td>
+                      <td>
+                        ${
+                          row.last_activity_at || row.last_request_at
+                            ? parseUTCDate(
+                                (row.last_activity_at ||
+                                  row.last_request_at) as string
+                              ).toLocaleString()
+                            : '—'
+                        }
+                      </td>
+                    </tr>
+                  `
                 )}
-              </tr>
-            </thead>
-            <tbody>
-              ${rows.map(
-                (row) => html`
-                  <tr>
-                    <td>
-                      ${
-                        row.runtime_session_id
-                          ? html`<a
-                              href="/console/runtime-sessions?sessionId=${row.runtime_session_id}"
-                              >${this.getSessionTitle(row)}</a
-                            >`
-                          : this.getSessionTitle(row)
-                      }
-                    </td>
-                    <td>${this.renderSessionSubjects(row)}</td>
-                    <td>${this.formatNumber(row.request_count)}</td>
-                    <td>
-                      <token-figures
-                        .usage=${row.token_usage || null}
-                        expanded
-                      ></token-figures>
-                    </td>
-                    <td>${this.formatCurrency(row.estimated_cost)}</td>
-                    <td>
-                      ${
-                        row.last_activity_at || row.last_request_at
-                          ? new Date(
-                              (row.last_activity_at ||
-                                row.last_request_at) as string
-                            ).toLocaleString()
-                          : '—'
-                      }
-                    </td>
-                  </tr>
-                `
-              )}
-            </tbody>
-          </table>
+              </tbody>
+            </table>
+          </div>
         </div>
       </div>
     `;
@@ -2756,37 +3562,41 @@ export class CostView extends AuthedElement {
             : nothing
         }
         <div class="analytics-table-wrap">
-          <table class="styled-table" aria-label="Spend by user">
-            <thead>
-              <tr>
-                ${columns.map((column) =>
-                  this.renderSortableHeader(
-                    column,
-                    this.userSort,
-                    (key) =>
-                      (this.userSort = this.toggleSort(this.userSort, key))
-                  )
+          <div class="table-scroll">
+            <table class="styled-table" aria-label="Spend by user">
+              <thead>
+                <tr>
+                  ${columns.map((column) =>
+                    this.renderSortableHeader(
+                      column,
+                      this.userSort,
+                      (key) =>
+                        (this.userSort = this.toggleSort(this.userSort, key))
+                    )
+                  )}
+                </tr>
+              </thead>
+              <tbody>
+                ${rows.map(
+                  (row) => html`
+                    <tr>
+                      <td>${row.username}</td>
+                      <td>${this.formatNumber(row.requests)}</td>
+                      <td>
+                        <token-figures
+                          .usage=${row.tokenUsage}
+                          expanded
+                        ></token-figures>
+                      </td>
+                      <td>
+                        ${html`<span title=${formatUsdExact(row.cost)}>${formatUsd(row.cost)}</span>`}
+                      </td>
+                    </tr>
+                  `
                 )}
-              </tr>
-            </thead>
-            <tbody>
-              ${rows.map(
-                (row) => html`
-                  <tr>
-                    <td>${row.username}</td>
-                    <td>${this.formatNumber(row.requests)}</td>
-                    <td>
-                      <token-figures
-                        .usage=${row.tokenUsage}
-                        expanded
-                      ></token-figures>
-                    </td>
-                    <td>${this.formatCurrency(row.cost)}</td>
-                  </tr>
-                `
-              )}
-            </tbody>
-          </table>
+              </tbody>
+            </table>
+          </div>
         </div>
       </div>
     `;
@@ -2795,9 +3605,12 @@ export class CostView extends AuthedElement {
   private renderBudgets() {
     return html`
       <budget-health-card
+        id="panel-budgets"
+        tabindex="-1"
         .summary=${this.summary}
         .policies=${this.budgetPolicies}
-        .configurable=${true}
+        .teamNames=${this.teamNames}
+        .configurable=${this.editPermissions.allows('manage_budgets')}
         .timeRange=${'month'}
         @configure=${() => (this.budgetDialogOpen = true)}
       ></budget-health-card>
@@ -2817,13 +3630,13 @@ export class CostView extends AuthedElement {
     const now = Date.now();
     if (
       override.effective_until &&
-      new Date(override.effective_until).getTime() <= now
+      parseUTCDate(override.effective_until).getTime() <= now
     ) {
       return 'expired';
     }
     if (
       override.effective_from &&
-      new Date(override.effective_from).getTime() > now
+      parseUTCDate(override.effective_from).getTime() > now
     ) {
       return 'pending';
     }
@@ -2865,12 +3678,12 @@ export class CostView extends AuthedElement {
   /** Stored rates are per 1,000 tokens; every price on this page is per 1M. */
   private formatPer1m(value: number | null | undefined) {
     if (typeof value !== 'number') return nothing;
-    return html`${this.formatCurrency(value * 1000)}`;
+    return html`${formatUsd(value * 1000)}`;
   }
 
   private formatOverrideDate(value: string | null | undefined): string {
     if (!value) return '';
-    const date = new Date(value);
+    const date = parseUTCDate(value);
     if (Number.isNaN(date.getTime())) return '';
     return date.toLocaleDateString(undefined, {
       month: 'short',
@@ -2883,7 +3696,7 @@ export class CostView extends AuthedElement {
   private describeOverrideRates(override: ModelPriceOverride): string {
     const parts: string[] = [];
     const per1m = (value: number | null) =>
-      typeof value === 'number' ? this.formatCurrency(value * 1000) : null;
+      typeof value === 'number' ? formatUsd(value * 1000) : null;
     const input = per1m(override.input_price_per_1k);
     const output = per1m(override.output_price_per_1k);
     const cached = per1m(override.cache_read_input_price_per_1k);
@@ -2895,7 +3708,7 @@ export class CostView extends AuthedElement {
     if (creation) parts.push(`cache creation ${creation} per 1M`);
     if (blended) parts.push(`blended ${blended} per 1M`);
     if (typeof override.request_price === 'number') {
-      parts.push(`${this.formatCurrency(override.request_price)} per request`);
+      parts.push(`${formatUsd(override.request_price)} per request`);
     }
     if (typeof override.discount_percent === 'number') {
       parts.push(`${override.discount_percent}% off list`);
@@ -2944,7 +3757,9 @@ export class CostView extends AuthedElement {
         <td>
           ${
             typeof override.request_price === 'number'
-              ? this.formatCurrency(override.request_price)
+              ? html`<span title=${formatUsdExact(override.request_price)}
+                  >${formatUsd(override.request_price)}</span
+                >`
               : nothing
           }
         </td>
@@ -2955,20 +3770,28 @@ export class CostView extends AuthedElement {
           ${notes.length > 40 ? `${notes.slice(0, 40)}...` : notes}
         </td>
         <td class="override-actions">
-          <sl-button
-            size="small"
-            data-testid="edit-override"
-            @click=${() => this.openPriceOverrideEditor(override)}
-            >Edit</sl-button
+          <sl-tooltip
+            content=${!this.editPermissions.allows('edit_ai_models') ? 'Requires edit_ai_models' : ''}
+            ><sl-button
+              ?disabled=${!this.editPermissions.allows('edit_ai_models')}
+              size="small"
+              data-testid="edit-override"
+              @click=${() => this.openPriceOverrideEditor(override)}
+              >Edit</sl-button
+            ></sl-tooltip
           >
-          <sl-button
-            size="small"
-            data-testid="remove-override"
-            @click=${() => {
-              this.overrideActionError = null;
-              this.overrideRemoveTarget = override;
-            }}
-            >Remove</sl-button
+          <sl-tooltip
+            content=${!this.editPermissions.allows('edit_ai_models') ? 'Requires edit_ai_models' : ''}
+            ><sl-button
+              ?disabled=${!this.editPermissions.allows('edit_ai_models')}
+              size="small"
+              data-testid="remove-override"
+              @click=${() => {
+                this.overrideActionError = null;
+                this.overrideRemoveTarget = override;
+              }}
+              >Remove</sl-button
+            ></sl-tooltip
           >
         </td>
       </tr>
@@ -2984,26 +3807,28 @@ export class CostView extends AuthedElement {
     }
     return html`
       <div class="analytics-table-wrap">
-        <table class="styled-table" aria-label="Price overrides">
-          <thead>
-            <tr>
-              <th scope="col">Model</th>
-              <th scope="col">Input / 1M</th>
-              <th scope="col">Output / 1M</th>
-              <th scope="col">Cached input / 1M</th>
-              <th scope="col">Cache creation / 1M</th>
-              <th scope="col">Per request</th>
-              <th scope="col">Effective from</th>
-              <th scope="col">Effective until</th>
-              <th scope="col">Created</th>
-              <th scope="col">Notes</th>
-              <th scope="col">Actions</th>
-            </tr>
-          </thead>
-          <tbody>
-            ${overrides.map((override) => this.renderOverrideRow(override))}
-          </tbody>
-        </table>
+        <div class="table-scroll">
+          <table class="styled-table" aria-label="Price overrides">
+            <thead>
+              <tr>
+                <th scope="col">Model</th>
+                <th scope="col">Input / 1M</th>
+                <th scope="col">Output / 1M</th>
+                <th scope="col">Cached input / 1M</th>
+                <th scope="col">Cache creation / 1M</th>
+                <th scope="col">Per request</th>
+                <th scope="col">Effective from</th>
+                <th scope="col">Effective until</th>
+                <th scope="col">Created</th>
+                <th scope="col">Notes</th>
+                <th scope="col">Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${overrides.map((override) => this.renderOverrideRow(override))}
+            </tbody>
+          </table>
+        </div>
       </div>
     `;
   }
@@ -3052,7 +3877,7 @@ export class CostView extends AuthedElement {
       this.isOverrideInForce(override)
     ).length;
     return html`
-      <sl-card id="panel-pricing">
+      <sl-card id="panel-pricing" tabindex="-1">
         ${this.renderSectionHeader('tags', 'Pricing overrides')}
         <div class="action-card-body">
           <div>
@@ -3077,13 +3902,17 @@ export class CostView extends AuthedElement {
               : nothing
           }
           ${this.renderOverrideRemovedNotice()} ${this.renderOverridesTable()}
-          <sl-button
-            variant="primary"
-            @click=${() => this.openPriceOverrideEditor(null)}
+          <sl-tooltip
+            content=${!this.editPermissions.allows('edit_ai_models') ? 'Requires edit_ai_models' : ''}
+            ><sl-button
+              ?disabled=${!this.editPermissions.allows('edit_ai_models')}
+              variant="primary"
+              @click=${() => this.openPriceOverrideEditor(null)}
+            >
+              <sl-icon slot="prefix" name="plus"></sl-icon>
+              Add price override
+            </sl-button></sl-tooltip
           >
-            <sl-icon slot="prefix" name="plus"></sl-icon>
-            Add price override
-          </sl-button>
         </div>
       </sl-card>
     `;
@@ -3182,14 +4011,18 @@ export class CostView extends AuthedElement {
           >
             Cancel
           </sl-button>
-          <sl-button
-            variant="danger"
-            data-testid="confirm-remove-override"
-            .loading=${this.overrideRemoving}
-            @click=${() => void this.removeOverride()}
+          <sl-tooltip
+            content=${!this.editPermissions.allows('edit_ai_models') ? 'Requires edit_ai_models' : ''}
+            ><sl-button
+              ?disabled=${!this.editPermissions.allows('edit_ai_models')}
+              variant="danger"
+              data-testid="confirm-remove-override"
+              .loading=${this.overrideRemoving}
+              @click=${() => void this.removeOverride()}
+            >
+              Remove override
+            </sl-button></sl-tooltip
           >
-            Remove override
-          </sl-button>
         </div>
       </sl-dialog>
     `;
@@ -3418,19 +4251,23 @@ export class CostView extends AuthedElement {
           >
             Cancel
           </sl-button>
-          <sl-button
-            variant="primary"
-            data-testid="save-override"
-            .loading=${this.saving}
-            @click=${async () => {
-              await this.savePriceOverride();
-              if (!this.priceFormError) {
-                this.priceDialogOpen = false;
-              }
-            }}
+          <sl-tooltip
+            content=${!this.editPermissions.allows('edit_ai_models') ? 'Requires edit_ai_models' : ''}
+            ><sl-button
+              ?disabled=${!this.editPermissions.allows('edit_ai_models')}
+              variant="primary"
+              data-testid="save-override"
+              .loading=${this.saving}
+              @click=${async () => {
+                await this.savePriceOverride();
+                if (!this.priceFormError) {
+                  this.priceDialogOpen = false;
+                }
+              }}
+            >
+              Save override
+            </sl-button></sl-tooltip
           >
-            Save override
-          </sl-button>
         </div>
       </sl-dialog>
     `;
@@ -3452,6 +4289,7 @@ export class CostView extends AuthedElement {
             this.budgetDialogOpen
               ? html`
                   <budget-policy-editor
+                    .readOnly=${!this.editPermissions.allows('manage_budgets')}
                     billingEnabled
                     @budget-policies-changed=${this.handleBudgetPoliciesChanged}
                   ></budget-policy-editor>
@@ -3484,19 +4322,26 @@ export class CostView extends AuthedElement {
       <div class="page">
         <view-header
           headerText="Cost"
-          description="Understand gateway spend by agent, tool, session and user."
+          description="Understand gateway spend by agent, tool, session and user, plus imported GitHub Copilot spend."
         ></view-header>
+        <hosted-allowance></hosted-allowance>
 
+        ${this.activeAccountLabel ? html`<p class="active-account">Active account: ${this.activeAccountLabel}</p>` : nothing}
+        ${this.renderDigestNotice()}
         <div class="toolbar">
           <time-range-select
             ariaLabel="Cost date range"
-            .value=${this.selectedRange}
-            .options=${DATE_RANGE_OPTIONS}
+            .value=${this.digestPeriod ? 'digest' : this.selectedRange}
+            .options=${this.digestPeriod ? [{ value: 'digest', label: 'Digest period' }, ...DATE_RANGE_OPTIONS] : DATE_RANGE_OPTIONS}
             @range-change=${this.handleRangeChange}
           ></time-range-select>
           <span class="range-window" title=${this.rangeWindowTitle()}
             >${this.rangeWindowLabel()}</span
           >
+          <a class="issue-cost-link" href="/console/cost/by-issue"
+            >Cost per issue</a
+          >
+          ${this.renderSpendSettings()}
         </div>
 
         ${
@@ -3531,11 +4376,13 @@ export class CostView extends AuthedElement {
                     class="results ${updating ? 'is-updating' : ''}"
                     aria-busy=${updating ? 'true' : 'false'}
                   >
-                    ${this.renderMetrics()} ${this.renderCatalogInfo()}
-                    ${this.renderUnpricedNotice()}
+                    ${this.renderMetrics()} ${this.renderSubscriptionUsage()}
+                    ${this.renderCatalogInfo()} ${this.renderUnpricedNotice()}
+                    ${this.renderAccountingFindings()}
                     <div class="column-layout dashboard extra-wide">
                       <div class="main-column">
-                        ${this.renderBreakdown()} ${this.renderImportedUsage()}
+                        ${this.renderDailySpend()} ${this.renderBreakdown()}
+                        ${this.renderImportedUsage()}
                       </div>
                       <div class="side-column">${this.renderControls()}</div>
                     </div>

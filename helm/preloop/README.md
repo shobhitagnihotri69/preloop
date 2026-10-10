@@ -18,11 +18,23 @@ To install the chart with the release name `preloop`:
 # helm repo add preloop https://charts.preloop.ai
 # helm repo update
 
-# Install the chart from local path
-helm install preloop ./helm/preloop
+# Install the chart from local path. The JWT signing key is required: the
+# chart refuses to install with an empty or placeholder value.
+helm install preloop ./helm/preloop \
+  --set environment.jwtSecret="$(openssl rand -hex 32)"
 ```
 
 The command deploys Preloop on the Kubernetes cluster in the default configuration. The [Parameters](#parameters) section lists the parameters that can be configured during installation.
+
+Installing on Azure Kubernetes Service? Start from one of the tier overlays
+(`values-aks-small.yaml`, `values-aks-medium.yaml`, `values-aks-large.yaml`)
+and read [Reference sizing for Helm on AKS](../../docs/operations/sizing-aks.md)
+for node pools, Azure Database for PostgreSQL with pgvector, NATS storage
+and what to monitor.
+
+Alternatively, keep the key out of Helm values entirely by creating a
+Kubernetes Secret and pointing `existingSecret` at it; see
+[Application secrets](#application-secrets).
 
 ## Private cluster
 
@@ -255,7 +267,9 @@ Preloop resolves that alias to the model record whose `api_endpoint` is
 ### Resources (small production)
 
 Chart defaults are sized for a small production instance. Raise them under
-load with `--set` or a values overlay:
+load with `--set` or a values overlay. For node pool and database sizing
+derived from these values, see
+[Reference sizing for Helm on AKS](../../docs/operations/sizing-aks.md).
 
 | Component | Default request | Default limit |
 |-----------|-----------------|---------------|
@@ -396,7 +410,7 @@ The `pre-upgrade` hook runs against the pods that are still serving. See
 | `environment.host`             | Server host                                           | `0.0.0.0`   |
 | `environment.port`             | Server port                                           | `8000`      |
 | `environment.debug`            | Enable debug mode                                     | `false`     |
-| `environment.jwtSecret`        | JWT secret key                                        | `change-this-in-production` |
+| `environment.jwtSecret`        | JWT signing key. Required unless `existingSecret` is set; empty and placeholder values refuse to install | `""` (fails closed) |
 | `environment.jwtAlgorithm`     | JWT algorithm                                         | `HS256`     |
 | `environment.jwtExpireMinutes` | JWT expiration time in minutes                        | `60`        |
 | `environment.requireEmailVerification` | Require a verified email before a password user may sign in (`REQUIRE_EMAIL_VERIFICATION`) | `false` |
@@ -467,6 +481,7 @@ helm install preloop ./helm/preloop \
 | `serviceAccount.annotations`   | Annotations for the service account                   | `{}`        |
 | `serviceAccount.name`          | The name of the service account                       | `""`        |
 | `podAnnotations`               | Annotations for pods                                  | `{}`        |
+| `podLabels`                    | Extra labels on the api, gateway, frontend, and spacesync-* deployments (not health-monitor or Jobs). For Azure OpenAI with Microsoft Entra ID on AKS workload identity, set `azure.workload.identity/use: "true"` and annotate the service account with `azure.workload.identity/client-id` | `{}`        |
 | `podSecurityContext`           | Pod security context                                  | `{}`        |
 | `securityContext`              | Container security context                            | `{}`        |
 | `nodeSelector`                 | Node selector                                         | `{}`        |
@@ -476,6 +491,14 @@ helm install preloop ./helm/preloop \
 | `autoscaling.minReplicas`      | Minimum number of replicas                            | `1`         |
 | `autoscaling.maxReplicas`      | Maximum number of replicas                            | `5`         |
 | `autoscaling.targetCPUUtilizationPercentage` | Target CPU utilization percentage      | `80`        |
+
+### Agent runtime placement parameters
+
+| Name                                                        | Description                                                       | Value           |
+|-------------------------------------------------------------|-------------------------------------------------------------------|-----------------|
+| `agentExecution.runtimeClassName`                            | RuntimeClass for agent pods (Kata Containers, gVisor, Firecracker); empty uses the node default | `""`            |
+| `agentExecution.nodeSelector`                                | Node selector applied to agent pods only                          | `{}`            |
+| `agentExecution.tolerations`                                 | Tolerations applied to agent pods only                            | `[]`            |
 
 ### Agent isolation parameters
 
@@ -640,11 +663,21 @@ database:
 
 ### JWT Authentication
 
-Preloop uses JWT for authentication. By default, it uses a placeholder JWT secret. For production deployments, you should set a proper JWT secret:
+Preloop uses JWT for authentication. There is no default signing key: the
+chart fails closed and refuses to install while `environment.jwtSecret` is
+empty or one of the published placeholders (unless `existingSecret` supplies
+the key). Generate a real one:
+
+```bash
+helm install preloop ./helm/preloop \
+  --set environment.jwtSecret="$(openssl rand -hex 32)"
+```
+
+Or in a values file:
 
 ```yaml
 environment:
-  jwtSecret: your-secure-jwt-secret
+  jwtSecret: <output of openssl rand -hex 32>
 ```
 
 ### Ingress Configuration
@@ -935,6 +968,9 @@ and merge the overlay entries into your full `extraEnv` list. The overlay sets a
 64 MiB compressed upload cap and an 80 MiB `gateway.proxy.bodySize` for ingress
 and the console proxy. Measure representative archives and adjust both limits
 together. The legacy 2 MiB pod-log cap applies only while
-`FLOW_ARTIFACT_DIRECT_UPLOAD` is disabled. See the
+`FLOW_ARTIFACT_DIRECT_UPLOAD` is disabled and `FLOW_EVIDENCE_LOG_PLAINTEXT`
+stays at its default (`true`). This overlay sets the plaintext switch to
+`false` so a job without an upload token does not emit artifact bytes.
+See the
 [deployment prerequisites](../../docs/guide/flows/durable-implementation-feedback.md#deployment-prerequisites)
 for retention, quota, egress, rollback and validation requirements.

@@ -7,19 +7,23 @@ import {
   type TemplateResult,
 } from 'lit';
 import { customElement, query, state } from 'lit/decorators.js';
-import '@shoelace-style/shoelace/dist/components/menu/menu.js';
-import '@shoelace-style/shoelace/dist/components/menu-item/menu-item.js';
 import '@shoelace-style/shoelace/dist/components/icon/icon.js';
 import '@shoelace-style/shoelace/dist/components/icon-button/icon-button.js';
-import '@shoelace-style/shoelace/dist/components/details/details.js';
 import '@shoelace-style/shoelace/dist/components/dialog/dialog.js';
+import '@shoelace-style/shoelace/dist/components/badge/badge.js';
 import '@shoelace-style/shoelace/dist/components/button/button.js';
 import '../../components/logo-component';
 import '../../components/global-notice';
-import '../../components/console-header';
+import { PENDING_APPROVALS_EVENT } from '../../components/console-header';
 import '../../components/approval-bypass-banner';
 import '../../components/kill-switch-banner';
 import '../../components/usage-nudge-banner';
+import '../../components/capability-extension';
+import {
+  ciAdministration,
+  completeCiCapabilities,
+} from '../../ci-administration-api';
+import { hasCapability } from '../../capabilities';
 import consoleStyles from '../../styles/console-styles.css?inline';
 import {
   getFeatures,
@@ -32,6 +36,8 @@ import {
   type UserProfile,
 } from '../../api';
 import '../../components/permission-denied';
+import '../../components/route-loading';
+import { showToast } from '../../components/confirm-dialog';
 import '../../components/plan-choice-screen';
 import { consoleDialogStyles } from '../../styles/console-dialog';
 import { LOCATION_CHANGED, Router } from '../../router';
@@ -48,21 +54,46 @@ const NAV_PERMISSIONS: Record<string, string[]> = {
   '/console/trackers': ['view_trackers'],
   '/console/ai-models': ['view_ai_models'],
   '/console/runtime-sessions': ['view_runtime_sessions'],
+  '/console/artifacts': ['view_runtime_sessions'],
   '/console/cost': ['view_cost'],
+  '/console/api-usage': ['view_cost'],
   '/console/approvals': ['view_approvals'],
+  // One request, opened from a notification, Slack or email. A link that
+  // carries a decision token is exempt (see _deniedPermissionForPath).
+  '/console/approval': ['view_approvals'],
   '/console/audit': ['view_audit_logs'],
   '/console/settings/users': ['view_users'],
   '/console/settings/teams': ['view_teams'],
   '/console/settings/invitations': ['invite_users', 'view_users'],
   '/console/settings/account': ['manage_account', 'view_billing'],
   '/console/settings/plan': ['manage_account', 'view_billing'],
+  // Audit integrity and exports use view_audit_logs. Retention and holds
+  // use view_policies. Either permission is enough to open the page.
+  '/console/settings/records': ['view_audit_logs', 'view_policies'],
   // Halting an account is the kill switch permission, not the billing one.
   // The controls used to sit on the account page, where a reader who could
   // not use them still saw them.
   '/console/settings/emergency': ['manage_kill_switch'],
 };
 
+/**
+ * Pages with no nav entry of their own, and the nav item that owns them.
+ * `/console/approval/:id` is a single approval opened from a notification
+ * or email; it highlights Approvals.
+ */
+const NAV_ALIASES: Record<string, string[]> = {
+  '/console/approvals': ['/console/approval'],
+};
+
 const SIDEBAR_BREAKPOINT = 768;
+
+const TOAST_VARIANTS = [
+  'primary',
+  'success',
+  'neutral',
+  'warning',
+  'danger',
+] as const;
 
 /**
  * A view asks for popup chrome with `?window=1` in the URL.
@@ -103,6 +134,9 @@ export class ConsoleShell extends LitElement {
   private _featuresLoaded = false;
 
   @state()
+  private _ciSetupAvailable = false;
+
+  @state()
   private _permissions: UserPermissions = undefined;
 
   @state()
@@ -128,6 +162,7 @@ export class ConsoleShell extends LitElement {
   /** Configured trial length, from the plugin, for the screen's own copy. */
   @state()
   private _planChoiceTrialDays = 0;
+  private _planChoiceEmail = '';
 
   @state()
   private _sidebarOpen = false;
@@ -143,6 +178,16 @@ export class ConsoleShell extends LitElement {
 
   @state()
   private _windowMode = isWindowChromeRequested(window.location.search);
+
+  /** The path the content area was last scrolled for (see below). */
+  private _scrolledPath = window.location.pathname;
+
+  /** Set by a back/forward popstate until the router announces it. */
+  private _historyTraversal = false;
+
+  /** Unexpired pending approvals, published by the header for the badge. */
+  @state()
+  private _pendingApprovalsCount = 0;
 
   private _mediaQuery?: MediaQueryList;
   private _mediaQueryHandler?: (e: MediaQueryListEvent) => void;
@@ -233,20 +278,6 @@ export class ConsoleShell extends LitElement {
         }
       }
 
-      .sign-out-menu {
-        flex-grow: 0;
-      }
-
-      .sign-out-menu sl-menu-item::part(base) {
-        background-color: transparent;
-        color: var(--console-link-color);
-      }
-
-      .sign-out-menu sl-menu-item:hover::part(base) {
-        background-color: var(--console-hover-tint);
-        color: var(--sl-color-primary-700);
-      }
-
       .main-view {
         flex-grow: 1;
         display: grid;
@@ -280,6 +311,67 @@ export class ConsoleShell extends LitElement {
       .main-content.full-bleed {
         padding: 0;
         overflow: hidden;
+      }
+
+      /* The skip target takes focus programmatically only; a ring around the
+         whole page would be noise. */
+      .main-content:focus {
+        outline: none;
+      }
+
+      /* Visually hidden until focused, then pinned over the top-left corner
+         as the first thing a keyboard user reaches. */
+      .skip-link {
+        position: absolute;
+        left: var(--sl-spacing-small);
+        top: var(--sl-spacing-small);
+        z-index: 1000;
+        padding: var(--sl-spacing-x-small) var(--sl-spacing-small);
+        border-radius: var(--sl-border-radius-medium);
+        background: var(--console-surface-raised, var(--sl-color-neutral-0));
+        color: var(--console-link-color, var(--sl-color-primary-600));
+        box-shadow: var(--sl-shadow-medium);
+        font-weight: 600;
+        transform: translateY(calc(-100% - var(--sl-spacing-large)));
+      }
+
+      .skip-link:focus {
+        transform: none;
+        outline: var(--sl-focus-ring);
+        outline-offset: var(--sl-focus-ring-offset);
+      }
+
+      @media (prefers-reduced-motion: no-preference) {
+        .skip-link {
+          transition: transform 0.15s ease;
+        }
+      }
+
+      /* A native button, not sl-icon-button, so aria-expanded and
+         aria-controls sit on the element that actually takes focus. Matches
+         sl-icon-button's look. */
+      .nav-toggle-button {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        padding: var(--sl-spacing-x-small);
+        border: 0;
+        border-radius: var(--sl-border-radius-medium);
+        background: none;
+        color: var(--sl-color-neutral-600);
+        font-size: 1.5rem;
+        line-height: 1;
+        cursor: pointer;
+        transition: color var(--sl-transition-x-fast) ease;
+      }
+
+      .nav-toggle-button:hover {
+        color: var(--sl-color-primary-600);
+      }
+
+      .nav-toggle-button:focus-visible {
+        outline: var(--sl-focus-ring);
+        outline-offset: var(--sl-focus-ring-offset);
       }
 
       .main-content > ::slotted(*) {
@@ -317,99 +409,157 @@ export class ConsoleShell extends LitElement {
         margin-left: 0.5rem;
       }
 
-      sl-menu {
-        flex-grow: 1;
-        border-width: 0;
-        background-color: transparent;
+      #console-nav {
+        --nav-row-inset: 1.25rem;
+      }
+
+      .nav-subitem {
+        padding-left: var(--sl-spacing-medium);
+      }
+
+      .nav-text {
+        display: flex;
+        flex-direction: column;
+        min-width: 0;
+      }
+
+      .nav-subtitle {
+        margin-left: 0.5rem;
+        font-size: var(--console-text-caption, 0.75rem);
+        color: var(--sl-color-neutral-600);
+        white-space: normal;
+      }
+
+      .nav-list {
+        list-style: none;
+        margin: 0;
         padding: 0;
-        margin-left: -2px;
+        font-size: var(--console-text-body);
       }
-
-      sl-details::part(base) {
-        width: 100%;
-        border-width: 0;
-        background-color: transparent;
-      }
-
-      sl-details::part(content) {
-        padding-top: 0;
-        padding-left: 1.5rem;
-      }
-
       .sidebar-link {
-        display: block;
+        display: flex;
+        align-items: center;
+        padding: 0.5em 0.5em 0.5em var(--nav-row-inset);
         color: inherit;
         text-decoration: none;
         border-radius: var(--sl-border-radius-medium);
-        /* Reserved so the active rule appears without shifting the label. */
         border-left: 3px solid transparent;
       }
-
       .sidebar-link:hover {
         background-color: var(--console-hover-tint);
       }
-
-      /* Style the anchor, not ::part — Shoelace shadow styles override ::part rules */
-      /* A translucent mix of one primary token is the same tint in both
-         themes; a named step (primary-50) is the palest blue in light and the
-         darkest navy in dark, which is how the active item became a block. */
       .sidebar-link.active {
-        background-color: color-mix(
-          in srgb,
-          var(--sl-color-primary-500) 14%,
-          transparent
-        );
-        border-left-color: var(--sl-color-primary-600);
-      }
-
-      /* The active item is stated once, in colour and weight; bold on top of
-         a tinted rule was three signals for one fact. */
-      .sidebar-link.active .sidebar-label,
-      .sidebar-link.active sl-menu-item::part(label),
-      .sidebar-link.active sl-icon {
-        color: var(--sl-color-primary-700);
+        background-color: var(--console-selected-tint);
+        border-left-color: var(--console-link-color);
+        color: var(--console-link-color);
         font-weight: 600;
       }
-
-      /* No dark-mode override here on purpose: Shoelace's dark theme inverts
-         the palette scale, so primary-50 is already the dark tint and
-         primary-700 already the light ink. Hard-coding primary-950/300 for
-         dark inverted it twice and painted the active item near-white. */
-
-      .sidebar-link sl-icon,
-      sl-details.nav-section sl-icon {
-        font-size: 18px;
+      .nav-row {
+        display: flex;
+        align-items: center;
+        gap: var(--sl-spacing-x-small);
+        width: 100%;
       }
-
+      .sidebar-link sl-icon,
+      details.nav-section sl-icon {
+        font-size: 18px;
+        flex: 0 0 auto;
+      }
       .sidebar-label {
         font-size: var(--console-text-body);
       }
-
-      sl-menu-item::part(base) {
+      details.nav-section {
+        width: 100%;
+      }
+      details.nav-section > summary {
+        display: flex;
+        align-items: center;
+        cursor: pointer;
+        padding: 0.5em 0.5em 0.5em var(--nav-row-inset);
+        border-left: 3px solid transparent;
+        min-height: calc(
+          var(--sl-font-size-medium) * var(--sl-line-height-normal)
+        );
+      }
+      details.nav-section > summary::before {
+        content: '›';
+        width: 0.9em;
+        margin-left: -0.9em;
+      }
+      details.nav-section[open] > summary::before {
+        content: '⌄';
+      }
+      details.nav-section > summary::marker {
+        content: '';
+      }
+      details.nav-section > summary::-webkit-details-marker {
+        display: none;
+      }
+      details.nav-section > summary .sidebar-label {
+        margin-left: calc(0.5rem + var(--sl-spacing-x-small));
+      }
+      details.nav-section > .nav-list {
+        padding-left: 1.5rem;
+      }
+      .nav-section-badge {
+        margin-left: auto;
+        margin-right: var(--sl-spacing-x-small);
+      }
+      details.nav-section[open] .nav-section-badge {
+        display: none;
+      }
+      .nav-group-label {
+        padding: var(--sl-spacing-small) 0.5em var(--sl-spacing-3x-small);
+        font-size: var(--sl-font-size-x-small);
+        letter-spacing: 0.04em;
+        text-transform: uppercase;
+        color: var(--console-meta-color);
+      }
+      .route-announcement {
+        position: absolute;
+        width: 1px;
+        height: 1px;
         padding: 0;
-        background-color: transparent;
-        border-radius: inherit;
+        margin: -1px;
+        overflow: hidden;
+        clip-path: inset(50%);
+        white-space: nowrap;
+        border: 0;
       }
 
-      sl-menu-item {
-        padding: 0.5em;
-      }
-
-      sl-details {
-        padding-left: 1em;
-      }
-
-      sl-details.nav-section[open]::part(summary) {
-        font-weight: var(--sl-font-weight-bold);
+      .nav-emergency sl-icon,
+      .nav-emergency .sidebar-label {
+        color: var(--sl-color-danger-600);
       }
     `,
   ];
 
   private _handleShowUpgradeModal = (event: Event) => {
+    // Plans exist only where something is sold. Without the billing plugin
+    // the dialog would offer "Upgrade now" to a page that says there is
+    // nothing to buy, so the shell drops the request whatever raised it.
+    if (this.features['billing'] !== true) return;
     const detail = (event as CustomEvent).detail;
     this._upgradeFeature =
       detail?.code === 'upgrade_required' ? String(detail.feature || '') : '';
     (this._upgradeModal as any).show();
+  };
+
+  /**
+   * Render a `show-toast` request as the console's toast.
+   *
+   * Views and the API layer ask for a toast with this event (`detail.message`
+   * and an optional `detail.variant`) instead of each importing the toast
+   * helper. The shell is the one place that turns it into a visible alert.
+   */
+  private _handleShowToast = (event: Event) => {
+    const detail = (event as CustomEvent).detail as
+      { message?: unknown; variant?: unknown } | undefined;
+    const message =
+      typeof detail?.message === 'string' ? detail.message.trim() : '';
+    if (!message) return;
+    const variant = TOAST_VARIANTS.find((v) => v === detail?.variant);
+    showToast(message, variant ?? 'primary');
   };
 
   /**
@@ -445,7 +595,18 @@ export class ConsoleShell extends LitElement {
   async connectedCallback() {
     super.connectedCallback();
     window.addEventListener('show-upgrade-modal', this._handleShowUpgradeModal);
+    window.addEventListener('show-toast', this._handleShowToast);
+    this.addEventListener('keydown', this._handleKeydown);
+    this.addEventListener(
+      'console-view-heading-ready',
+      this._handleHeadingReady
+    );
+    this.addEventListener('console-view-updated', this._handleHeadingReady);
     window.addEventListener(LOCATION_CHANGED, this._handleLocationChanged);
+    window.addEventListener(
+      PENDING_APPROVALS_EVENT,
+      this._handlePendingApprovals
+    );
     this._mediaQuery = window.matchMedia(
       `(max-width: ${SIDEBAR_BREAKPOINT}px)`
     );
@@ -463,6 +624,18 @@ export class ConsoleShell extends LitElement {
     this._mediaQuery.addEventListener('change', this._mediaQueryHandler);
     window.addEventListener('popstate', this._handleLocationChanged);
     this._currentPath = window.location.pathname;
+
+    void ciAdministration
+      .capabilities()
+      .then((capabilities) => {
+        if (this.isConnected)
+          this._ciSetupAvailable =
+            completeCiCapabilities(capabilities) &&
+            capabilities.can_view === true;
+      })
+      .catch(() => {
+        this._ciSetupAvailable = false;
+      });
 
     // Fetch enabled features and current-user permissions in parallel
     try {
@@ -514,6 +687,7 @@ export class ConsoleShell extends LitElement {
   private _startPlanChoiceCheck(profile: UserProfile | null): void {
     if (this.features['billing'] !== true) return;
     if (profile?.plan_choice_made !== false) return;
+    this._planChoiceEmail = profile.email;
     this._planChoice = 'checking';
     void (async () => {
       const decision = await getPlanChoice();
@@ -569,7 +743,15 @@ export class ConsoleShell extends LitElement {
     ) {
       return 'view_policies';
     }
+    // A decision-token link authorizes exactly one request, for somebody
+    // who may not hold view_approvals at all (an escalation recipient). The
+    // approval page falls back to the token itself, so the shell must not
+    // refuse it first.
+    const tokenLink =
+      normalized.startsWith('/console/approval/') &&
+      new URLSearchParams(window.location.search).has('token');
     for (const [href, required] of Object.entries(NAV_PERMISSIONS)) {
+      if (tokenLink && href === '/console/approval') continue;
       if (
         normalized === href ||
         normalized.startsWith(`${href}/`) ||
@@ -583,8 +765,14 @@ export class ConsoleShell extends LitElement {
     return null;
   }
 
-  private _handleSidebarToggle = () => {
+  private _handleSidebarToggle = async () => {
     this._sidebarOpen = !this._sidebarOpen;
+    // The mobile drawer overlays the page, so opening it moves focus in;
+    // otherwise the next Tab lands behind the backdrop.
+    if (this._sidebarOpen && this._isMobile) {
+      await this.updateComplete;
+      this.renderRoot.querySelector<HTMLElement>('.sidebar a[href]')?.focus();
+    }
   };
 
   private _closeSidebar = () => {
@@ -593,11 +781,125 @@ export class ConsoleShell extends LitElement {
     }
   };
 
-  private _handleLocationChanged = () => {
+  /** Close the mobile drawer and hand focus back to the toggle. */
+  private _dismissDrawer = async () => {
+    if (!this._isMobile || !this._sidebarOpen) return;
+    this._sidebarOpen = false;
+    await this.updateComplete;
+    this.renderRoot.querySelector<HTMLElement>('#console-nav-toggle')?.focus();
+  };
+
+  private _handleKeydown = (event: KeyboardEvent) => {
+    if (event.key === 'Escape' && this._isMobile && this._sidebarOpen) {
+      event.preventDefault();
+      void this._dismissDrawer();
+    }
+  };
+
+  /**
+   * "Skip to content": move focus to the content area. The target lives in
+   * this shadow root, which a fragment link cannot reach, so the click is
+   * handled here instead of by the browser.
+   */
+  private _skipToContent = (event: Event) => {
+    event.preventDefault();
+    const main = this.renderRoot.querySelector<HTMLElement>('#console-main');
+    main?.focus();
+  };
+
+  @state() private _navigationAnnouncement = '';
+  private _lastNavigationPath = window.location.pathname;
+  private _pendingFocusPath: string | null = null;
+
+  private _focusedHeading: HTMLElement | null = null;
+  private _focusedPath = '';
+  private _handleHeadingReady = () => {
+    if (
+      !this._pendingFocusPath &&
+      this._focusedHeading &&
+      !this._focusedHeading.isConnected &&
+      this._focusedPath === window.location.pathname
+    ) {
+      let active = document.activeElement;
+      while (active?.shadowRoot?.activeElement)
+        active = active.shadowRoot.activeElement;
+      if (
+        active === document.body ||
+        active === this.firstElementChild ||
+        active?.matches('lit-app, console-shell')
+      )
+        this._pendingFocusPath = this._focusedPath;
+    }
+    void this._focusNewView();
+  };
+
+  private async _focusNewView(): Promise<void> {
+    if (
+      !this._pendingFocusPath ||
+      this._pendingFocusPath !== window.location.pathname
+    )
+      return;
+    await this.updateComplete;
+    if (!this.isConnected || !this._pendingFocusPath) return;
+    const view = this.firstElementChild as
+      (HTMLElement & { updateComplete?: Promise<unknown> }) | null;
+    if (view?.updateComplete) await view.updateComplete;
+    await new Promise<void>((resolve) =>
+      requestAnimationFrame(() => resolve())
+    );
+    if (
+      !this._pendingFocusPath ||
+      this._pendingFocusPath !== window.location.pathname
+    )
+      return;
+    const find = (root: Element | DocumentFragment): HTMLElement | null => {
+      if (root instanceof Element && root.tagName === 'VIEW-HEADER') {
+        return root.shadowRoot?.querySelector<HTMLElement>('h1') ?? null;
+      }
+      for (const child of root.children) {
+        const heading =
+          (child.shadowRoot && find(child.shadowRoot)) || find(child);
+        if (heading) return heading;
+      }
+      return null;
+    };
+    const denied = this._deniedPermissionForPath(this._currentPath);
+    const heading = find(denied ? this.renderRoot : this);
+    if (!heading) return; // A loading view will emit heading-ready after it renders.
+    heading.focus({ preventScroll: true });
+    this._focusedHeading = heading;
+    this._focusedPath = this._pendingFocusPath;
+    this._navigationAnnouncement = `${heading.textContent?.trim() || 'Page'} page.`;
+    this._pendingFocusPath = null;
+  }
+
+  private _handleLocationChanged = (event?: Event) => {
     this._fullBleed = false;
     this._currentPath = window.location.pathname;
     this._windowMode = isWindowChromeRequested(window.location.search);
     this._publishMainOffset();
+    if (event?.type === 'popstate') {
+      this._historyTraversal = true;
+      return;
+    }
+    // The shell is reused across child routes and `.main-content` is the
+    // scroll port, so the router's window.scrollTo does nothing here: a new
+    // page opened at the scroll offset of the last one. Back and forward
+    // keep their place, like the router does for the window.
+    const path = window.location.pathname;
+    if (path !== this._scrolledPath) {
+      if (!this._historyTraversal) {
+        const main = this.renderRoot?.querySelector('.main-content');
+        if (main) main.scrollTop = 0;
+      }
+      this._scrolledPath = path;
+    }
+    this._historyTraversal = false;
+    if (path !== this._lastNavigationPath) {
+      this._lastNavigationPath = path;
+      this._pendingFocusPath = path;
+      void this._focusNewView();
+    }
   };
 
   private _handleNavClick = (e: Event) => {
@@ -606,6 +908,10 @@ export class ConsoleShell extends LitElement {
       this._currentPath = new URL(anchor.href).pathname;
     }
     this._closeSidebar();
+  };
+
+  private _handlePendingApprovals = (event: Event) => {
+    this._pendingApprovalsCount = (event as CustomEvent<number>).detail ?? 0;
   };
 
   private _normalizePath(path: string): string {
@@ -621,19 +927,42 @@ export class ConsoleShell extends LitElement {
     if (exact) {
       return current === target;
     }
-    return current === target || current.startsWith(`${target}/`);
+    return [target, ...(NAV_ALIASES[target] ?? [])].some(
+      (prefix) => current === prefix || current.startsWith(`${prefix}/`)
+    );
   }
 
   private _isSettingsActive(): boolean {
-    return this._isNavActive('/console/settings');
+    return (
+      this._isNavActive('/console/settings') &&
+      !this._isNavActive('/console/settings/emergency') &&
+      !this._isNavActive('/console/settings/records')
+    );
+  }
+
+  /**
+   * One labelled block of the Settings menu. The label renders only when at
+   * least one of its links survives the edition and permission gates, so a
+   * deployment never shows a heading over nothing.
+   */
+  private _renderNavGroup(
+    label: string,
+    links: ReadonlyArray<unknown>
+  ): TemplateResult | typeof nothing {
+    const visible = links.filter((link) => link !== nothing);
+    if (visible.length === 0) return nothing;
+    return html`<li class="nav-group-label">${label}</li>
+      ${visible}`;
   }
 
   /** True when any Audit child is visible for this user/edition. */
   private _hasAuditSection(): boolean {
     return (
-      this._canShowAuditEvents() ||
+      this._canAccess('/console/approvals') ||
       this._canAccess('/console/runtime-sessions') ||
-      this._canAccess('/console/approvals')
+      this._canShowAuditEvents() ||
+      this._canAccess('/console/artifacts') ||
+      this._canAccess('/console/settings/records')
     );
   }
 
@@ -647,9 +976,11 @@ export class ConsoleShell extends LitElement {
 
   private _isAuditActive(): boolean {
     return (
-      this._isNavActive('/console/audit') ||
+      this._isNavActive('/console/approvals') ||
       this._isNavActive('/console/runtime-sessions') ||
-      this._isNavActive('/console/approvals')
+      this._isNavActive('/console/audit') ||
+      this._isNavActive('/console/artifacts') ||
+      this._isNavActive('/console/settings/records')
     );
   }
 
@@ -663,14 +994,16 @@ export class ConsoleShell extends LitElement {
     }
     const active = this._isNavActive(href, exact);
     return html`
-      <a
-        href=${href}
-        class="sidebar-link ${active ? 'active' : ''}"
-        aria-current=${active ? 'page' : nothing}
-        @click=${this._handleNavClick}
-      >
-        ${content}
-      </a>
+      <li>
+        <a
+          href=${href}
+          class="sidebar-link ${active ? 'active' : ''}"
+          aria-current=${active ? 'page' : nothing}
+          @click=${this._handleNavClick}
+        >
+          ${content}
+        </a>
+      </li>
     `;
   }
 
@@ -707,8 +1040,19 @@ export class ConsoleShell extends LitElement {
       'show-upgrade-modal',
       this._handleShowUpgradeModal
     );
+    window.removeEventListener('show-toast', this._handleShowToast);
+    this.removeEventListener('keydown', this._handleKeydown);
+    this.removeEventListener(
+      'console-view-heading-ready',
+      this._handleHeadingReady
+    );
+    this.removeEventListener('console-view-updated', this._handleHeadingReady);
     window.removeEventListener(LOCATION_CHANGED, this._handleLocationChanged);
     window.removeEventListener('popstate', this._handleLocationChanged);
+    window.removeEventListener(
+      PENDING_APPROVALS_EVENT,
+      this._handlePendingApprovals
+    );
     this._mediaQuery?.removeEventListener('change', this._mediaQueryHandler!);
     super.disconnectedCallback();
   }
@@ -724,6 +1068,8 @@ export class ConsoleShell extends LitElement {
       return html`
         <plan-choice-screen
           .trialDays=${this._planChoiceTrialDays}
+          .email=${this._planChoiceEmail}
+          .checking=${this._planChoice === 'checking'}
           @plan-choice-made=${this._handlePlanChoiceMade}
         ></plan-choice-screen>
       `;
@@ -759,6 +1105,25 @@ export class ConsoleShell extends LitElement {
 
       <global-notice></global-notice>
 
+      ${
+        this._windowMode
+          ? nothing
+          : html`<a
+              class="skip-link"
+              href="#console-main"
+              router-ignore
+              @click=${this._skipToContent}
+              >Skip to content</a
+            >`
+      }
+
+      <span
+        class="route-announcement"
+        role="status"
+        aria-live="polite"
+        aria-atomic="true"
+        >${this._navigationAnnouncement}</span
+      >
       <div class="console-container">
         ${
           this._windowMode
@@ -766,67 +1131,71 @@ export class ConsoleShell extends LitElement {
             : html`<div class="sidebar-wrapper">
                 <div
                   class="sidebar-backdrop ${this._sidebarOpen ? 'visible' : ''}"
-                  @click=${this._closeSidebar}
+                  @click=${this._dismissDrawer}
                   aria-hidden="true"
                 ></div>
-                <div
+                <!-- Hidden means out of the tab order too: a collapsed
+                     sidebar (desktop) or a closed drawer (mobile) is inert,
+                     so focus never lands on a link nobody can see. -->
+                <nav
+                  id="console-nav"
                   class="sidebar ${this._sidebarOpen ? 'open' : 'closed'}"
-                  role="navigation"
                   aria-label="Console navigation"
+                  ?inert=${!this._sidebarOpen}
                 >
                   <div class="logo">
                     <a href="/console" @click=${this._closeSidebar}
                       ><logo-component></logo-component
                     ></a>
                   </div>
-                  <sl-menu style="font-size: var(--console-text-body);">
+                  <ul class="nav-list">
                     ${this._renderNavLink(
                       '/console',
                       html`
-                        <sl-menu-item>
+                        <span class="nav-row">
                           <sl-icon name="house" slot="prefix"></sl-icon>
                           <span class="sidebar-label">Overview</span>
-                        </sl-menu-item>
+                        </span>
                       `,
                       true
                     )}
                     ${this._renderNavLink(
                       '/console/agents',
                       html`
-                        <sl-menu-item>
+                        <span class="nav-row">
                           <sl-icon name="robot" slot="prefix"></sl-icon>
                           <span class="sidebar-label">Agents</span>
-                        </sl-menu-item>
+                        </span>
                       `
                     )}
                     ${this._renderNavLink(
                       '/console/flows',
                       html`
-                        <sl-menu-item>
+                        <span class="nav-row">
                           <sl-icon
                             src="/images/flow.svg"
                             slot="prefix"
                           ></sl-icon>
                           <span class="sidebar-label">Flows</span>
-                        </sl-menu-item>
+                        </span>
                       `
                     )}
                     ${this._renderNavLink(
                       '/console/ai-models',
                       html`
-                        <sl-menu-item>
+                        <span class="nav-row">
                           <sl-icon name="cpu" slot="prefix"></sl-icon>
                           <span class="sidebar-label">Models</span>
-                        </sl-menu-item>
+                        </span>
                       `
                     )}
                     ${this._renderNavLink(
                       '/console/tools',
                       html`
-                        <sl-menu-item>
+                        <span class="nav-row">
                           <sl-icon name="tools" slot="prefix"></sl-icon>
                           <span class="sidebar-label">Tools</span>
-                        </sl-menu-item>
+                        </span>
                       `
                     )}
                     ${
@@ -834,13 +1203,13 @@ export class ConsoleShell extends LitElement {
                         ? this._renderNavLink(
                             '/console/policies',
                             html`
-                              <sl-menu-item>
+                              <span class="nav-row">
                                 <sl-icon
                                   name="shield-lock"
                                   slot="prefix"
                                 ></sl-icon>
                                 <span class="sidebar-label">Policies</span>
-                              </sl-menu-item>
+                              </span>
                             `
                           )
                         : nothing
@@ -848,170 +1217,248 @@ export class ConsoleShell extends LitElement {
                     ${this._renderNavLink(
                       '/console/trackers',
                       html`
-                        <sl-menu-item>
+                        <span class="nav-row">
                           <sl-icon
                             src="/images/git.svg"
                             slot="prefix"
                           ></sl-icon>
                           <span class="sidebar-label">Trackers</span>
-                        </sl-menu-item>
+                        </span>
                       `
                     )}
                     ${this._renderNavLink(
                       '/console/cost',
                       html`
-                        <sl-menu-item>
+                        <span class="nav-row">
                           <sl-icon name="cash-coin" slot="prefix"></sl-icon>
                           <span class="sidebar-label">Cost</span>
-                        </sl-menu-item>
+                        </span>
+                      `
+                    )}
+                    ${this._renderNavLink(
+                      '/console/api-usage',
+                      html`
+                        <span class="nav-row nav-subitem">
+                          <sl-icon name="activity" slot="prefix"></sl-icon>
+                          <span class="nav-text">
+                            <span class="sidebar-label">API usage</span>
+                            <span class="nav-subtitle"
+                              >Gateway traffic and rate limits</span
+                            >
+                          </span>
+                        </span>
                       `
                     )}
                     ${
                       this._hasAuditSection()
                         ? html`
-                            <sl-details
-                              class="nav-section"
-                              ?open=${this._isAuditActive()}
-                            >
-                              <span slot="summary">
-                                <sl-icon
-                                  name="journal-text"
-                                  style="padding-right: 6px;"
-                                ></sl-icon>
-                                <span class="sidebar-label">Audit</span>
-                              </span>
-                              <sl-menu>
-                                ${
-                                  this._canShowAuditEvents()
-                                    ? this._renderNavLink(
-                                        '/console/audit',
-                                        html`<sl-menu-item
-                                          >All events</sl-menu-item
+                            <li class="nav-section-item">
+                              <details
+                                class="nav-section"
+                                ?open=${this._isAuditActive()}
+                              >
+                                <summary>
+                                  <sl-icon name="journal-text"></sl-icon>
+                                  <span class="sidebar-label">Audit</span>
+                                  ${
+                                    // The Approvals badge sits inside the
+                                    // group, so a closed group repeats the
+                                    // count on its header.
+                                    this._pendingApprovalsCount > 0 &&
+                                    this._canAccess('/console/approvals')
+                                      ? html`<sl-badge
+                                          class="nav-section-badge"
+                                          variant="primary"
+                                          pill
+                                          >${this._pendingApprovalsCount}</sl-badge
                                         >`
-                                      )
-                                    : nothing
-                                }
-                                ${this._renderNavLink(
-                                  '/console/runtime-sessions',
-                                  html`<sl-menu-item>Sessions</sl-menu-item>`
-                                )}
-                                ${this._renderNavLink(
-                                  '/console/approvals',
-                                  html`<sl-menu-item>Approvals</sl-menu-item>`
-                                )}
-                              </sl-menu>
-                            </sl-details>
+                                      : nothing
+                                  }
+                                </summary>
+                                <ul class="nav-list">
+                                  ${this._renderNavLink(
+                                    '/console/approvals',
+                                    html`<span class="nav-row"
+                                      >Approvals${
+                                        this._pendingApprovalsCount > 0
+                                          ? html`<sl-badge
+                                              slot="suffix"
+                                              variant="primary"
+                                              pill
+                                              >${this._pendingApprovalsCount}</sl-badge
+                                            >`
+                                          : nothing
+                                      }</span
+                                    >`
+                                  )}
+                                  ${this._renderNavLink(
+                                    '/console/runtime-sessions',
+                                    html`<span class="nav-row">Sessions</span>`
+                                  )}
+                                  ${
+                                    this._canShowAuditEvents()
+                                      ? this._renderNavLink(
+                                          '/console/audit',
+                                          html`<span class="nav-row"
+                                            >All events</span
+                                          >`
+                                        )
+                                      : nothing
+                                  }
+                                  ${this._renderNavLink(
+                                    '/console/artifacts',
+                                    html`<span class="nav-row">Artifacts</span>`
+                                  )}
+                                  ${
+                                    this._permissionsLoaded
+                                      ? this._renderNavLink(
+                                          '/console/settings/records',
+                                          html`<span class="nav-row"
+                                            >Records</span
+                                          >`
+                                        )
+                                      : ''
+                                  }
+                                </ul>
+                              </details>
+                            </li>
                           `
                         : nothing
                     }
-                    <sl-details
-                      class="nav-section"
-                      ?open=${this._isSettingsActive()}
-                    >
-                      <span slot="summary">
+                    <li class="nav-section-item">
+                      <details
+                        class="nav-section"
+                        ?open=${this._isSettingsActive()}
+                      >
+                        <summary>
+                          <sl-icon name="gear"></sl-icon>
+                          <span class="sidebar-label">Settings</span>
+                        </summary>
+                        <ul class="nav-list">
+                          ${this._renderNavGroup('Account', [
+                            // Account holds the account name and the session
+                            // artifact storage card, which every edition has
+                            // and core pages link to. It used to hang off
+                            // user_management, a flag only plugins set, so an
+                            // open-source install had no way in from the nav.
+                            this._renderNavLink(
+                              '/console/settings/account',
+                              html`<span class="nav-row">Account</span>`
+                            ),
+                            // Plans exist only where something is sold. Without
+                            // the billing plugin the deployment has no catalog,
+                            // no subscription and nothing for this page to say.
+                            // It sits under Account because that is what it is
+                            // about: what this account pays for.
+                            this.features.billing
+                              ? this._renderNavLink(
+                                  '/console/settings/plan',
+                                  html`<span class="nav-row">Plan</span>`
+                                )
+                              : nothing,
+                          ])}
+                          ${this._renderNavGroup('People & access', [
+                            this.features.user_management
+                              ? this._renderNavLink(
+                                  '/console/settings/users',
+                                  html`<span class="nav-row">Users</span>`
+                                )
+                              : nothing,
+                            this.features.team_management
+                              ? this._renderNavLink(
+                                  '/console/settings/teams',
+                                  html`<span class="nav-row">Teams</span>`
+                                )
+                              : nothing,
+                            this.features.user_management ||
+                            this.features.team_management
+                              ? this._renderNavLink(
+                                  '/console/settings/invitations',
+                                  html`<span class="nav-row">Invitations</span>`
+                                )
+                              : nothing,
+                            // Served by an extension plugin; the capability in
+                            // /features is the only switch. Subaccounts have no
+                            // entry: they are created from the Account page,
+                            // and people and teams get access to them from the
+                            // Users and Teams pages. This page is the overview
+                            // of every grant.
+                            hasCapability(this.features, 'account_hierarchy')
+                              ? this._renderNavLink(
+                                  '/console/settings/access-grants',
+                                  html`<span class="nav-row"
+                                    >Access grants</span
+                                  >`
+                                )
+                              : nothing,
+                          ])}
+                          ${this._renderNavGroup('Developers', [
+                            this._ciSetupAvailable
+                              ? this._renderNavLink(
+                                  '/console/settings/ci-identities',
+                                  html`<span class="nav-row"
+                                    >Restricted CI</span
+                                  >`
+                                )
+                              : nothing,
+                            this._renderNavLink(
+                              '/console/settings/api-keys',
+                              html`<span class="nav-row">API keys</span>`
+                            ),
+                            this._renderNavLink(
+                              '/console/settings/runners',
+                              html`<span class="nav-row">Runners</span>`
+                            ),
+                            this._renderNavLink(
+                              '/console/settings/webhooks',
+                              html`<span class="nav-row">Webhooks</span>`
+                            ),
+                            hasCapability(this.features, 'chat_connections')
+                              ? this._renderNavLink(
+                                  '/console/settings/chat',
+                                  html`<span class="nav-row"
+                                    >Chat connections</span
+                                  >`
+                                )
+                              : nothing,
+                          ])}
+                          ${this._renderNavGroup('Personal', [
+                            this._renderNavLink(
+                              '/console/settings/profile',
+                              html`<span class="nav-row">Profile</span>`
+                            ),
+                            this._renderNavLink(
+                              '/console/settings/security',
+                              html`<span class="nav-row">Security</span>`
+                            ),
+                            this._renderNavLink(
+                              '/console/settings/appearance',
+                              html`<span class="nav-row">Appearance</span>`
+                            ),
+                            this._renderNavLink(
+                              '/console/settings/notification-preferences',
+                              html`<span class="nav-row">Notifications</span>`
+                            ),
+                          ])}
+                        </ul>
+                      </details>
+                    </li>
+                    <!-- The kill switch sits outside Settings, at the foot of
+                         the nav: an operator in an incident reaches it in one
+                         click instead of expanding Settings and scanning past
+                         a dozen configuration pages. -->
+                    ${this._renderNavLink(
+                      '/console/settings/emergency',
+                      html`<span class="nav-row nav-emergency">
                         <sl-icon
-                          name="gear"
-                          style="padding-right: 6px;"
+                          name="exclamation-octagon"
+                          slot="prefix"
                         ></sl-icon>
-                        <span class="sidebar-label">Settings</span>
-                      </span>
-                      <sl-menu>
-                        ${
-                          this.features.user_management
-                            ? this._renderNavLink(
-                                '/console/settings/account',
-                                html`<sl-menu-item>Account</sl-menu-item>`
-                              )
-                            : ''
-                        }
-                        ${
-                          // Plans exist only where something is sold. Without
-                          // the billing plugin the deployment has no catalog,
-                          // no subscription and nothing for this page to say.
-                          //
-                          // It sits directly under Account and above Users
-                          // because that is what it is about: what this
-                          // account pays for. Below Users it read as a
-                          // per-person setting, which is the one thing a plan
-                          // is not. The two conditions stay separate so a
-                          // deployment without user management still reaches
-                          // its plan.
-                          this.features.billing
-                            ? this._renderNavLink(
-                                '/console/settings/plan',
-                                html`<sl-menu-item>Plan</sl-menu-item>`
-                              )
-                            : ''
-                        }
-                        ${
-                          this.features.user_management
-                            ? this._renderNavLink(
-                                '/console/settings/users',
-                                html`<sl-menu-item>Users</sl-menu-item>`
-                              )
-                            : ''
-                        }
-                        ${
-                          this.features.team_management
-                            ? this._renderNavLink(
-                                '/console/settings/teams',
-                                html`<sl-menu-item>Teams</sl-menu-item>`
-                              )
-                            : ''
-                        }
-                        ${
-                          this.features.user_management ||
-                          this.features.team_management
-                            ? this._renderNavLink(
-                                '/console/settings/invitations',
-                                html`<sl-menu-item>Invitations</sl-menu-item>`
-                              )
-                            : ''
-                        }
-                        ${this._renderNavLink(
-                          '/console/settings/api-keys',
-                          html`<sl-menu-item>API Keys</sl-menu-item>`
-                        )}
-                        ${this._renderNavLink(
-                          '/console/settings/runners',
-                          html`<sl-menu-item>Runners</sl-menu-item>`
-                        )}
-                        ${this._renderNavLink(
-                          '/console/settings/webhooks',
-                          html`<sl-menu-item>Webhooks</sl-menu-item>`
-                        )}
-                        <!-- The four personal pages had routes and a place in
-                             the avatar menu, but no way in from the sidebar,
-                             so Appearance in particular was unreachable for
-                             anyone who did not know the URL. -->
-                        ${this._renderNavLink(
-                          '/console/settings/profile',
-                          html`<sl-menu-item>Profile</sl-menu-item>`
-                        )}
-                        ${this._renderNavLink(
-                          '/console/settings/security',
-                          html`<sl-menu-item>Security</sl-menu-item>`
-                        )}
-                        ${this._renderNavLink(
-                          '/console/settings/appearance',
-                          html`<sl-menu-item>Appearance</sl-menu-item>`
-                        )}
-                        ${this._renderNavLink(
-                          '/console/settings/notification-preferences',
-                          html`<sl-menu-item>Notifications</sl-menu-item>`
-                        )}
-                        <!-- The kill switch. Last in the list and reachable
-                             in one click, rather than halfway down the
-                             account page where an operator in a hurry has to
-                             scroll past an organisation name to find it. -->
-                        ${this._renderNavLink(
-                          '/console/settings/emergency',
-                          html`<sl-menu-item>Emergency</sl-menu-item>`
-                        )}
-                      </sl-menu>
-                    </sl-details>
-                  </sl-menu>
-                </div>
+                        <span class="sidebar-label">Emergency</span>
+                      </span>`
+                    )}
+                  </ul>
+                </nav>
               </div>`
         }
 
@@ -1020,27 +1467,50 @@ export class ConsoleShell extends LitElement {
             this._windowMode
               ? nothing
               : html`<console-header>
-                    <sl-icon-button
+                    <button
+                      id="console-nav-toggle"
+                      class="nav-toggle-button"
                       slot="nav-toggle"
-                      name="list"
-                      label="Open menu"
+                      type="button"
+                      aria-controls="console-nav"
+                      aria-expanded=${this._sidebarOpen ? 'true' : 'false'}
+                      aria-label=${
+                        this._sidebarOpen
+                          ? 'Hide navigation'
+                          : 'Show navigation'
+                      }
                       @click=${this._handleSidebarToggle}
-                    ></sl-icon-button>
+                    >
+                      <sl-icon name="list" aria-hidden="true"></sl-icon>
+                    </button>
+                    ${
+                      hasCapability(this.features, 'multi_account')
+                        ? html`<capability-extension
+                            slot="account-switcher"
+                            name="account-switcher"
+                          ></capability-extension>`
+                        : nothing
+                    }
                   </console-header>
-                  <!-- Sits directly under the header so a relaxed governance
-                       state is visible on every console page, not just the
-                       approvals view. -->
-                  <approval-bypass-banner></approval-bypass-banner>
-                  <!-- The kill-switch banner sits above the bypass banner: a
-                       halted account is the most severe state and must be
-                       impossible to miss on any console page (#157). -->
+                  <!-- The kill-switch banner sits directly under the header,
+                       above the bypass banner: a halted account is the most
+                       severe state and must be impossible to miss on any
+                       console page (#157). -->
                   <kill-switch-banner></kill-switch-banner>
+                  <!-- A relaxed governance state is visible on every console
+                       page, not just the approvals view. -->
+                  <approval-bypass-banner></approval-bypass-banner>
                   <!-- Usage sits under both governance banners: it is
                        information, not a fault, and it renders nothing at
                        all on OSS, where the endpoint does not exist. -->
                   <usage-nudge-banner></usage-nudge-banner>`
           }
+          <!-- The skip-link target. Not a <main>: lit-app's router outlet
+               is already the document's <main>, and this shell renders
+               inside it, so a second one would nest main in main. -->
           <div
+            id="console-main"
+            tabindex="-1"
             class="main-content ${
               this._fullBleed || this._windowMode ? 'full-bleed' : ''
             }"
@@ -1055,7 +1525,7 @@ export class ConsoleShell extends LitElement {
               // A routed view is a light-DOM child, so dropping the slot only
               // hides it: views that carry data also check before fetching.
               if (!this._featuresLoaded || !this._permissionsLoaded) {
-                return nothing;
+                return html`<route-loading></route-loading>`;
               }
               const denied = this._deniedPermissionForPath(this._currentPath);
               return denied

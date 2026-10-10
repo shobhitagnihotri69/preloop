@@ -1,5 +1,7 @@
 # Operator notes
 
+Editions: OSS, Cloud, Enterprise. Unless stated otherwise, everything on this page ships in OSS.
+
 An operator note is a short instruction from an identified human to a running
 agent. You type it in the console, the CLI or the API; the agent receives it at
 its next turn boundary; the note is recorded as a human decision, with who sent
@@ -65,6 +67,42 @@ reason, including an unresolvable target and the rate limit, and exits
 non-zero. The CLI sends notes and does not read them: listing a note's
 delivery state and cancelling one stay in the console and the API.
 
+### Finding the session to steer
+
+`--session` needs a session id. `preloop sessions list` shows them, most
+recently active first, with the short id, the agent, when it started and last
+did something, whether it is live, idle or ended, its tool and model call
+counts, how many approvals are waiting on a human, and a title:
+
+```bash
+preloop sessions list --active
+```
+
+```text
+ID        AGENT   STARTED  LAST ACTIVITY  STATE  TOOLS  MODEL  PENDING  TITLE
+aaaaaaaa  Worker  9m ago   30s ago        live   7      12     1        claude_code alpha 2026-10-02 11:50:07Z
+bbbbbbbb  Worker  9m ago   5m ago         idle   2      3      0        claude_code beta 2026-10-02 11:50:07Z
+Steer: preloop notes send --session <id>. Watch: preloop sessions attach <id>.
+```
+
+A session the server has not titled yet is labelled with its agent kind, the
+working directory its hook last reported and its start time, so two workers
+started in the same second are still two different rows. `--wide` prints the
+full id that `notes send --session` takes, and `-o id` prints only full ids,
+one per line, for a pipe:
+
+```bash
+preloop sessions list --agent "Release worker" --active -o id | head -1 \
+  | xargs -I{} preloop notes send --session {} "Ship the fix, leave the tests."
+```
+
+Narrow the list with `--agent <id|name>`, `--kind claude-code`, `--since 2h`,
+`--parent <session-id>` (the sessions a conductor spawned) and
+`--execution <id>`. The server applies every filter across the account. See
+[the CLI reference](cli.md#sessions). To watch the session and steer it from
+the same terminal, attach to it:
+[Attaching to a session from the terminal](sessions-attach.md).
+
 API:
 
 ```bash
@@ -120,6 +158,69 @@ firewall, the gateway and the approval policy as before.
 
 An agent cannot note whatever it likes inside the account. What it can reach is
 [the runs it started](#which-agent-may-note-which-target).
+
+### Steering the runs you started
+
+A conductor agent that starts workers from a shell (`claude -p "..." &`) can
+steer them with `send_note` under the default scope, with no grant and no
+lookup through the API. Three pieces make that work once the Preloop hooks are
+installed (`preloop agents onboard`):
+
+1. **Lineage.** The SessionStart hook registers each run and exports its
+   runtime session id to the commands the run starts, as
+   `PRELOOP_PARENT_SESSION_ID`. A child whose own SessionStart hook sees that
+   variable records the spawner as its `parent_session_id`, so the child is a
+   descendant of the conductor exactly like a child flow execution. The
+   parent must be in the same account, and the field is write-once.
+2. **The id at spawn.** SessionStart writes
+   `~/.preloop/sessions/<external_session_id>.json` with the
+   `runtime_session_id`, `started_at`, `agent_kind` and `cwd`, and in
+   non-interactive mode (`claude -p`) prints one line to stderr:
+   `preloop runtime_session_id=<id>`.
+3. **Discovery.** The `list_sessions` builtin (off by default, enable it like
+   `send_note`) returns the caller's live children with no arguments: id,
+   start time, agent kind, cwd, parent, title and whether it is active now.
+   Listing another session's children, or the whole account
+   (`parent_session_id: "any"`), needs the same operator grant as
+   `search_sessions` scope `account` and is refused by name without it.
+
+The spawn recipe, from inside the conductor's Bash tool:
+
+```bash
+SID=$(uuidgen)
+nohup claude -p --session-id "$SID" "Fix the flaky test in api/" \
+  >"/tmp/worker-$SID.log" 2>&1 &
+sleep 5
+jq -r .runtime_session_id ~/.preloop/sessions/"$SID".json
+```
+
+Then any of these reaches that worker at its next turn boundary, recorded with
+the conductor as author:
+
+```json
+{"text": "Skip the docs, only the test.", "runtime_session_id": "<id from the file>"}
+{"text": "Skip the docs, only the test.", "external_session_id": "<SID>"}
+{"text": "Wrap up and push.", "children": "all"}
+```
+
+`external_session_id` is the harness's own session id (the Claude Code
+`session_id`, which is also its transcript file name). It resolves inside your
+account and is refused as `target_ambiguous` if more than one run carries it.
+`children` takes `latest` (the newest live run your session started) or `all`
+(one note each, at most 20, each checked and rate limited on its own). Exactly
+one target field is still the rule.
+
+The hook also sends the first prompt once, so the server sets a redacted title
+of at most 120 characters and a principal name of agent kind plus working
+directory. Two workers started in the same second show distinct titles in the
+console, `preloop sessions list` and `GET /api/v1/runtime-sessions`.
+
+`send_note` knows which session called it from the credential, or, for a
+durable enrolled-agent key, from the harness session header on the MCP request
+matched against that key's own runs. A call that cannot be tied to a session
+is refused with `note_scope_no_lineage`; name the target by
+`runtime_session_id` from a session that can be, or use
+`preloop notes send --session` as the operator.
 
 ## Which agent may note which target
 

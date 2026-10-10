@@ -68,6 +68,7 @@ class GitHubTracker(BaseTracker):
     """
 
     tracker_type: str = "github"
+    hosts_repositories: bool = True
     API_BASE_URL = "https://api.github.com"
 
     def __init__(
@@ -2055,6 +2056,7 @@ class GitHubTracker(BaseTracker):
         state: str = "open",
         limit: int = 20,
         page: int = 1,
+        head_branch: Optional[str] = None,
     ) -> Dict[str, Any]:
         """List pull requests for the connected repository.
 
@@ -2062,6 +2064,8 @@ class GitHubTracker(BaseTracker):
             state: GitHub PR state (open, closed, all).
             limit: Page size (per_page).
             page: 1-based page number.
+            head_branch: Only PRs whose head is this branch of the connected
+                repository (GitHub ``head=owner:branch``).
 
         Returns:
             Dict with normalized ``items`` and ``has_more`` from the Link header.
@@ -2079,6 +2083,8 @@ class GitHubTracker(BaseTracker):
             "sort": "updated",
             "direction": "desc",
         }
+        if head_branch:
+            params["head"] = f"{owner}:{head_branch}"
         raw, headers = await self._request_with_headers("GET", path, params=params)
         if not isinstance(raw, list):
             raise TrackerResponseError("GitHub pull request list was not an array")
@@ -2089,6 +2095,32 @@ class GitHubTracker(BaseTracker):
                 headers.get("Link") or headers.get("link")
             ),
         }
+
+    async def list_open_pull_requests_by_source_branch(
+        self, branch: str
+    ) -> Dict[str, Any]:
+        """Open pull requests whose head is ``branch``, in the shared shape."""
+        return await self.list_pull_requests(
+            state="open", limit=5, page=1, head_branch=branch
+        )
+
+    async def branch_exists(self, branch: str) -> bool:
+        """Whether ``branch`` exists on the connected repository.
+
+        Raises on anything other than a clean found / not-found answer so a
+        caller can tell "absent" from "could not check".
+        """
+        owner = self.connection_details.get("owner")
+        repo = self.connection_details.get("repo")
+        if not owner or not repo:
+            raise TrackerResponseError("Owner/repo not found in connection details")
+        try:
+            await self._request("GET", f"/repos/{owner}/{repo}/git/ref/heads/{branch}")
+        except TrackerResponseError as error:
+            if getattr(error, "status_code", None) == 404:
+                return False
+            raise
+        return True
 
     def _normalize_listed_pull_request(self, pr_data: Dict[str, Any]) -> Dict[str, Any]:
         """Map a GitHub pulls-list item to the shared PR list shape."""
@@ -2113,6 +2145,82 @@ class GitHubTracker(BaseTracker):
             "created_at": pr_data.get("created_at"),
             "updated_at": pr_data.get("updated_at"),
         }
+
+    async def find_pull_requests_by_branch(
+        self, source_branch: str, target_branch: str
+    ) -> List[Dict[str, Any]]:
+        """Pull requests in any state from ``source_branch`` into ``target_branch``.
+
+        Only branches of the connected repository are matched (``head`` is
+        qualified with the owner), so a fork with the same branch name is
+        never mistaken for this repository's pull request.
+
+        Args:
+            source_branch: Head branch name.
+            target_branch: Base branch name.
+
+        Returns:
+            Normalized pull requests (see ``list_pull_requests``), newest
+            first. ``state`` is ``merged`` for a merged pull request.
+        """
+        owner = self.connection_details.get("owner")
+        repo = self.connection_details.get("repo")
+        if not owner or not repo:
+            raise TrackerResponseError("Owner/repo not found in connection details")
+
+        raw, _headers = await self._request_with_headers(
+            "GET",
+            f"/repos/{owner}/{repo}/pulls",
+            params={
+                "state": "all",
+                "head": f"{owner}:{source_branch}",
+                "base": target_branch,
+                "per_page": 20,
+                "sort": "created",
+                "direction": "desc",
+            },
+        )
+        if not isinstance(raw, list):
+            raise TrackerResponseError("GitHub pull request list was not an array")
+        matches: List[Dict[str, Any]] = []
+        for pr in raw:
+            item = self._normalize_listed_pull_request(pr)
+            if (
+                item["source_branch"] != source_branch
+                or item["target_branch"] != target_branch
+            ):
+                continue
+            if pr.get("merged_at"):
+                item["state"] = "merged"
+            matches.append(item)
+        return matches
+
+    async def request_pull_request_reviewers(
+        self, pr_number: int, reviewers: List[str]
+    ) -> None:
+        """Ask ``reviewers`` to review a pull request, keeping existing requests.
+
+        Unlike ``create_pull_request``, a failure is raised to the caller so
+        it can be recorded, instead of being logged and dropped.
+
+        Args:
+            pr_number: Pull request number.
+            reviewers: GitHub usernames.
+
+        Raises:
+            TrackerResponseError: GitHub refused the request.
+        """
+        owner = self.connection_details.get("owner")
+        repo = self.connection_details.get("repo")
+        if not owner or not repo:
+            raise TrackerResponseError("Owner/repo not found in connection details")
+        if not reviewers:
+            return
+        await self._request(
+            "POST",
+            f"/repos/{owner}/{repo}/pulls/{int(pr_number)}/requested_reviewers",
+            data={"reviewers": list(reviewers)},
+        )
 
     async def update_pull_request(
         self,
@@ -3570,6 +3678,7 @@ class GitHubTracker(BaseTracker):
         context: str = "preloop",
         description: Optional[str] = None,
         target_url: Optional[str] = None,
+        refname: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Create a commit status (check) on a specific commit.
 
@@ -3582,10 +3691,13 @@ class GitHubTracker(BaseTracker):
                      Default is "preloop".
             description: A short description of the status (max 140 chars).
             target_url: URL to link to for more details (e.g., flow execution page).
+            refname: Pull request source branch. Unused: GitHub associates a
+                status with every pull request whose head is ``sha``.
 
         Returns:
             Dictionary with status details.
         """
+        del refname
         owner = self.connection_details.get("owner")
         repo = self.connection_details.get("repo")
 

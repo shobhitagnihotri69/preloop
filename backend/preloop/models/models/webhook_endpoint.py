@@ -43,6 +43,21 @@ class WebhookEndpoint(Base):
 
     __tablename__ = "webhook_endpoint"
 
+    ci_principal_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("ci_principal.id", ondelete="RESTRICT"),
+        nullable=True,
+        index=True,
+    )
+    initiating_ci_key_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("api_key.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    ci_subscription_binding: Mapped[Optional[dict[str, Any]]] = mapped_column(
+        JSONB, nullable=True
+    )
     account_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
         ForeignKey("account.id", ondelete="CASCADE"),

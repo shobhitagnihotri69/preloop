@@ -1,8 +1,8 @@
 import uuid
-from datetime import datetime, UTC
+from datetime import UTC, datetime
 from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, Field, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from preloop.schemas.gateway_usage import GatewayTokenUsage
 
@@ -21,6 +21,22 @@ class ExecutionModelUsage(BaseModel):
     )
 
     model_config = ConfigDict(from_attributes=True, protected_namespaces=())
+
+
+class ExecutionResumeTotals(BaseModel):
+    """Combined tokens and cost for a publishing execution and its repairs."""
+
+    total_tokens: int = Field(0, description="Summed tokens across the resume chain")
+    estimated_cost: Optional[float] = Field(
+        0.0,
+        description=(
+            "Summed estimated cost across the resume chain. Null when a member "
+            "spent gateway tokens that could not be priced, matching that "
+            "member's own null (unknown, not free) cost."
+        ),
+    )
+
+    model_config = ConfigDict(from_attributes=True)
 
 
 class ExecutionModelProjection(BaseModel):
@@ -56,6 +72,29 @@ class ExecutionModelProjection(BaseModel):
             "Tokens this execution's gateway traffic consumed, split by "
             "direction and cache participation. Null when the run has no "
             "attributable gateway usage, which is not the same as zero."
+        ),
+    )
+    cost_priced_at: Optional[datetime] = Field(
+        None,
+        description=(
+            "When the usage rows behind ``estimated_cost`` were last priced "
+            "or repriced. Null when the run has no attributable gateway usage."
+        ),
+    )
+    resume_of: Optional[uuid.UUID] = Field(
+        None,
+        description=(
+            "Publishing execution this repair resumes. Null when the row is "
+            "not a review/CI resumption. Distinct from parent_execution_id "
+            "(delegation)."
+        ),
+    )
+    resume_totals: Optional[ExecutionResumeTotals] = Field(
+        None,
+        description=(
+            "Summed total_tokens and estimated_cost for the publishing "
+            "execution and every repair that points at it. Null when the "
+            "execution is not part of a multi-turn resume chain."
         ),
     )
 
@@ -230,9 +269,11 @@ class FlowExecutionBase(BaseModel):
             "Coarse machine-readable reason a terminal execution did not "
             "succeed: one of runner_conflict, runner_error, model_transient, "
             "model_auth, provider_billing, model_quota (legacy, superseded "
-            "by provider_billing), model_config, no_confirmation, "
-            "agent_no_progress, setup_failed, tool_error, agent_error, "
-            "timeout, cancelled, "
+            "by provider_billing), budget_exceeded, model_config, "
+            "no_confirmation, agent_no_progress, publication_missing, setup_failed, "
+            "verification_failed, verification_blocked, tool_error, "
+            "agent_error, model_stream_idle (timed out while the model "
+            "stream was silent), timeout, cancelled, "
             "unknown. Null for successful or still-running executions, and "
             "for executions that predate this field."
         ),
@@ -293,7 +334,10 @@ class FlowExecutionBase(BaseModel):
 
 # Pydantic model for creating a FlowExecution (API input - likely internal)
 class FlowExecutionCreate(FlowExecutionBase):
-    pass  # Most fields will be set by the system during creation
+    # Internal creation only; public triggers never accept these fields.
+    ci_principal_id: Optional[uuid.UUID] = None
+    initiating_ci_key_id: Optional[uuid.UUID] = None
+    ci_review_binding: Optional[Dict[str, Any]] = None
 
 
 # Pydantic model for updating a FlowExecution (API input - likely internal for status changes)
@@ -314,6 +358,24 @@ class FlowExecutionUpdate(BaseModel):
 
 
 # Pydantic model for representing a FlowExecution in API responses (includes DB fields)
+class ExecutionFollowUp(BaseModel):
+    """A repair execution linked from its publishing execution."""
+
+    id: uuid.UUID
+    status: str
+    start_time: datetime
+
+
+class ExecutionContinuationNavigation(BaseModel):
+    """Navigation shared by a publisher and its review/CI continuations."""
+
+    original_execution_id: uuid.UUID
+    issue_url: Optional[str] = None
+    pr_url: Optional[str] = None
+    follow_ups: List[ExecutionFollowUp] = Field(default_factory=list)
+    follow_ups_truncated: bool = False
+
+
 class FlowExecutionResponse(FlowExecutionBase, ExecutionModelProjection):
     id: uuid.UUID
     created_at: datetime
@@ -321,6 +383,7 @@ class FlowExecutionResponse(FlowExecutionBase, ExecutionModelProjection):
 
     # Include flow name for display purposes
     flow_name: Optional[str] = None
+    continuation_navigation: Optional[ExecutionContinuationNavigation] = None
     park: Optional[ExecutionPark] = Field(
         None,
         description=(
@@ -406,6 +469,21 @@ class FlowExecutionListResponse(ExecutionModelProjection):
             "Link to the resource that triggered this execution (e.g. the "
             "pull request or merge request), when the trigger payload "
             "carries one."
+        ),
+    )
+    trigger_subject_ci: Optional[str] = Field(
+        None,
+        description=(
+            "Human-readable CI provider that dispatched this execution (e.g. "
+            "'GitHub Actions'), when a CI job triggered it with a 'ci' "
+            "provenance block. Null for runs a person or webhook started."
+        ),
+    )
+    trigger_subject_ci_url: Optional[str] = Field(
+        None,
+        description=(
+            "Link to the CI run that dispatched this execution, when the CI "
+            "provenance block carries a run URL."
         ),
     )
     runner: ExecutionRunnerSummary = Field(

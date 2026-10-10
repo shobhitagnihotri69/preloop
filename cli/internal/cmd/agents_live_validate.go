@@ -4,12 +4,14 @@
 // gateway-probe helpers that the orchestrator calls after CLI onboarding
 // completes. Each helper sends a real, account-bound model request through
 // the Preloop gateway, then waits for the request to be indexed in the
-// gateway-usage search so we can prove end-to-end that:
+// gateway-usage search to verify the direct gateway route and accounting, independently of application behavior:
 //
-//   - the durable credential the CLI installed actually authenticates,
+//   - the durable credential read from managed config authenticates,
 //   - the managed model alias is bound to a working AI model,
 //   - the upstream provider returns a non-error response, and
 //   - the request was logged on the account's audit/usage trail.
+//
+// These helpers do not launch the application or prove it consumed its config.
 //
 // Historically only OpenClaw and Codex CLI had bespoke implementations;
 // every other agent kind silently reported ``Live check: unsupported`` and
@@ -272,6 +274,7 @@ func runGatewayLiveValidation(
 	} else if isUpstreamTransientValidationError(requestErr) {
 		liveValidationStatus = "upstream_transient"
 	}
+	budgetDenied := !passed && isPreloopBudgetDenialValidationError(requestErr)
 	result := mergeStringMaps(validationResult, map[string]interface{}{
 		"live_validation_attempted":      true,
 		"live_validation_attempts":       probeAttempts,
@@ -291,6 +294,9 @@ func runGatewayLiveValidation(
 		result["live_validation_failure_reason"] = "upstream_billing"
 	case "upstream_transient":
 		result["live_validation_failure_reason"] = "upstream_transient"
+	}
+	if budgetDenied {
+		result["live_validation_failure_reason"] = "preloop_budget_exceeded"
 	}
 	// Intentionally omit api key ids from the result map so they cannot
 	// flow into validation status logging (go/clear-text-logging).
@@ -328,8 +334,30 @@ func runGatewayLiveValidation(
 	}, validationErr
 }
 
+// isPreloopBudgetDenialValidationError reports whether the probe was refused
+// by a Preloop budget hard limit. Since #1447 the gateway answers those with
+// 429 (“insufficient_quota“ / “billing_error“ / “RESOURCE_EXHAUSTED“ and
+// “x-should-retry: false“); older gateways used 403. Either way it is a
+// spend limit the operator set, not an upstream rate limit or an empty
+// provider wallet, and retrying cannot clear it.
+func isPreloopBudgetDenialValidationError(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "model gateway budget exceeded") ||
+		strings.Contains(message, "execution budget exceeded") ||
+		strings.Contains(message, "budget_limit_exceeded") ||
+		strings.Contains(message, "execution_budget_exceeded") ||
+		strings.Contains(message, "budget enforcement requires pricing information")
+}
+
 func isUpstreamRateLimitedValidationError(err error) bool {
 	if err == nil {
+		return false
+	}
+	// A Preloop budget denial is a 429 too, but it is not a rate limit.
+	if isPreloopBudgetDenialValidationError(err) {
 		return false
 	}
 	// Prefer the typed HTTP status from the API client. Once we have an
@@ -355,6 +383,10 @@ func isUpstreamRateLimitedValidationError(err error) bool {
 // operator's provider account that needs attention, not their onboarding.
 func isUpstreamBillingValidationError(err error) bool {
 	if err == nil {
+		return false
+	}
+	// The gateway's own budget 429 carries ``insufficient_quota`` too.
+	if isPreloopBudgetDenialValidationError(err) {
 		return false
 	}
 	// Trust the typed status when we have one: 402 is unambiguous.
@@ -881,16 +913,7 @@ func claudeSelectionFallbackModelAlias(selection string) string {
 }
 
 func resolveClaudeSelectionFromAnthropicModels(selection string) string {
-	credential, _ := resolveClaudeOAuthCredential()
-	token := ""
-	if credential != nil {
-		token = strings.TrimSpace(credential.AccessToken)
-	}
-	if token == "" {
-		if managedKey, _ := resolveClaudeManagedAPIKey(); managedKey != "" {
-			token = managedKey
-		}
-	}
+	token := resolveClaudeLiveAccessToken()
 	if token == "" {
 		return ""
 	}
@@ -901,8 +924,29 @@ func resolveClaudeSelectionFromAnthropicModels(selection string) string {
 	return selectHighestClaudeModelAlias(selection, models)
 }
 
+// resolveClaudeLiveAccessToken returns the Anthropic credential the CLI uses
+// to query the live Anthropic models API: the local Claude Code OAuth access
+// token when present, otherwise the managed API key. It returns "" when no
+// local Anthropic credential is available.
+func resolveClaudeLiveAccessToken() string {
+	credential, _ := resolveClaudeOAuthCredential()
+	if credential != nil {
+		if token := strings.TrimSpace(credential.AccessToken); token != "" {
+			return token
+		}
+	}
+	if managedKey, _ := resolveClaudeManagedAPIKey(); managedKey != "" {
+		return managedKey
+	}
+	return ""
+}
+
+// anthropicModelsURL is the Anthropic models endpoint. It is a package
+// variable so tests can point the live-list lookup at an httptest server.
+var anthropicModelsURL = "https://api.anthropic.com/v1/models"
+
 func fetchAnthropicModelIDs(token string) ([]string, error) {
-	req, err := http.NewRequest(http.MethodGet, "https://api.anthropic.com/v1/models", nil)
+	req, err := http.NewRequest(http.MethodGet, anthropicModelsURL, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -1291,7 +1335,7 @@ func runDeferredLiveValidationsParallel(
 
 	fmt.Fprintf(
 		output,
-		"\nSending test prompts through gateway for %d agent(s) in parallel...\n",
+		"\nSending direct gateway route/accounting probes for %d agent(s) in parallel...\n",
 		len(supported),
 	)
 
@@ -1522,7 +1566,7 @@ func printDeferredLiveValidationLine(
 				label = "failed (transient upstream error after retries)"
 			}
 			fmt.Fprint(output, formatCLIError(fmt.Sprintf(
-				"  ✗ %s: round-trip FAILED (%s), model=%s, latency=%.1fs: %v\n",
+				"  ✗ %s: direct gateway route/accounting probe FAILED (%s), model=%s, latency=%.1fs: %v\n",
 				name,
 				label,
 				deferredLiveValidationModelAlias(result),
@@ -1592,12 +1636,14 @@ func applyLiveValidationOutcomesToSummary(
 	}
 }
 
-// liveValidationSummaryReason renders the one-line summary Reason for an
-// attempted-but-not-passed live validation, or "" when there is nothing to
-// warn about (passed, skipped, or unsupported).
+// liveValidationSummaryReason renders direct gateway probe evidence or failure.
+// Success still leaves application behavior unverified; skipped probes add no evidence.
 func liveValidationSummaryReason(result deferredLiveValidationResult) string {
-	if result.Outcome == nil || !result.Outcome.Attempted || result.Outcome.Passed {
+	if result.Outcome == nil || !result.Outcome.Attempted {
 		return ""
+	}
+	if result.Outcome.Passed {
+		return directGatewayProbeEvidence
 	}
 	quotedName := shellQuoteAgentName(resolveAgentDisplayName(result.Agent))
 	revalidate := fmt.Sprintf(

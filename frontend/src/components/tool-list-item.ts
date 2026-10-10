@@ -1,3 +1,4 @@
+import { formatUsd, formatUsdExact } from '../utils/money';
 import { LitElement, html, css } from 'lit';
 import { customElement, property, state } from 'lit/decorators.js';
 import '@shoelace-style/shoelace/dist/components/icon/icon.js';
@@ -18,6 +19,7 @@ import type { Tool, ApprovalWorkflow } from './tool-card';
 import type { AccessRuleSummary } from './governance-rule-set-editor';
 import type { GatewayUsageByTool } from '../types';
 import { consoleDialogStyles } from '../styles/console-dialog';
+import { ruleActionMeta } from '../utils/rule-actions';
 
 @customElement('tool-list-item')
 export class ToolListItem extends LitElement {
@@ -76,8 +78,40 @@ export class ToolListItem extends LitElement {
         background: var(--sl-color-neutral-50);
       }
 
+      .sr-only {
+        position: absolute;
+        width: 1px;
+        height: 1px;
+        padding: 0;
+        margin: -1px;
+        overflow: hidden;
+        clip: rect(0, 0, 0, 0);
+        white-space: nowrap;
+        border: 0;
+      }
+
+      .expand-toggle {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        flex-shrink: 0;
+        padding: 2px;
+        margin: -2px;
+        border: 0;
+        border-radius: var(--sl-border-radius-small);
+        background: none;
+        color: inherit;
+        font: inherit;
+        cursor: pointer;
+      }
+
+      .expand-toggle:focus-visible {
+        outline: var(--sl-focus-ring);
+        outline-offset: var(--sl-focus-ring-offset);
+      }
+
       .expand-icon {
-        color: var(--sl-color-neutral-500);
+        color: var(--console-meta-color);
         transition: transform 0.2s ease;
         flex-shrink: 0;
       }
@@ -98,7 +132,7 @@ export class ToolListItem extends LitElement {
 
       .tool-description {
         font-size: var(--sl-font-size-x-small);
-        color: var(--sl-color-neutral-500);
+        color: var(--console-meta-color);
         min-width: 0;
         overflow: hidden;
         text-overflow: ellipsis;
@@ -131,14 +165,14 @@ export class ToolListItem extends LitElement {
       }
 
       .usage-stat {
-        color: var(--sl-color-neutral-500);
+        color: var(--console-meta-color);
         font-size: var(--sl-font-size-x-small);
         white-space: nowrap;
         flex-shrink: 0;
       }
 
       .schema-tokens {
-        color: var(--sl-color-neutral-500);
+        color: var(--console-meta-color);
         font-size: var(--sl-font-size-x-small);
         white-space: nowrap;
         flex-shrink: 0;
@@ -162,23 +196,24 @@ export class ToolListItem extends LitElement {
         font-weight: 500;
       }
 
-      .rule-count.deny {
+      /* Classes are the shared rule-action variants (utils/rule-actions.ts). */
+      .rule-count.danger {
         background: var(--sl-color-danger-100);
         color: var(--sl-color-danger-700);
       }
 
-      .rule-count.approval {
-        background: var(--sl-color-primary-100);
-        color: var(--sl-color-primary-700);
+      .rule-count.warning {
+        background: var(--sl-color-warning-100);
+        color: var(--sl-color-warning-700);
       }
 
-      .rule-count.allow {
+      .rule-count.success {
         background: var(--sl-color-success-100);
         color: var(--sl-color-success-700);
       }
 
       .no-rules {
-        color: var(--sl-color-neutral-400);
+        color: var(--console-meta-color);
         font-size: var(--sl-font-size-x-small);
       }
 
@@ -199,7 +234,7 @@ export class ToolListItem extends LitElement {
       }
 
       .unsupported-overlay {
-        color: var(--sl-color-neutral-500);
+        color: var(--console-meta-color);
         font-size: var(--sl-font-size-x-small);
         font-style: italic;
       }
@@ -212,7 +247,7 @@ export class ToolListItem extends LitElement {
           flex-wrap: wrap;
           row-gap: var(--sl-spacing-2x-small);
         }
-        .expand-icon {
+        .expand-toggle {
           order: 0;
         }
         .tool-name {
@@ -309,13 +344,15 @@ export class ToolListItem extends LitElement {
 
   private _handleSaveRule(e: CustomEvent) {
     e.stopPropagation();
-    const { existingRule, formData } = e.detail;
+    const { existingRule, formData, resolve, reject } = e.detail;
     this.dispatchEvent(
       new CustomEvent('save-rule', {
         detail: {
           tool: this.tool,
           existingRule,
           formData,
+          resolve,
+          reject,
         },
         bubbles: true,
         composed: true,
@@ -383,41 +420,29 @@ export class ToolListItem extends LitElement {
       return html`<span class="no-rules">No rules</span>`;
     }
 
-    return html`
-      ${
-        summary.deny > 0
-          ? html`<span class="rule-count deny"
-              ><sl-icon
-                name="x-octagon-fill"
-                style="font-size: 0.8em;"
-              ></sl-icon>
-              ${summary.deny} deny</span
-            >`
-          : ''
-      }
-      ${
-        summary.approval > 0
-          ? html`<span class="rule-count approval"
-              ><sl-icon
-                name="shield-lock-fill"
-                style="font-size: 0.8em;"
-              ></sl-icon>
-              ${summary.approval} approval</span
-            >`
-          : ''
-      }
-      ${
-        summary.allow > 0
-          ? html`<span class="rule-count allow"
-              ><sl-icon
-                name="check-circle-fill"
-                style="font-size: 0.8em;"
-              ></sl-icon>
-              ${summary.allow} allow</span
-            >`
-          : ''
-      }
-    `;
+    // Same order, words, icons and colours as the rule list and Policies
+    // (utils/rule-actions.ts): require approval is amber everywhere.
+    const counts: Array<[string, number]> = [
+      ['deny', summary.deny],
+      ['require_approval', summary.approval],
+      ['allow', summary.allow],
+    ];
+    return html`${counts.map(([action, count]) => {
+      if (count === 0) return '';
+      const meta = ruleActionMeta(action);
+      const rulesWord = count === 1 ? 'rule' : 'rules';
+      return html`<span
+        class="rule-count ${meta.variant}"
+        data-action=${action}
+        title=${`${count} ${meta.label.toLowerCase()} ${rulesWord}`}
+        ><sl-icon
+          name=${meta.icon}
+          style="font-size: 0.8em;"
+          aria-hidden="true"
+        ></sl-icon>
+        ${count} ${meta.label.toLowerCase()}</span
+      >`;
+    })}`;
   }
 
   private _openJustificationDialog() {
@@ -524,9 +549,14 @@ export class ToolListItem extends LitElement {
           .features=${this.features}
           .emptyMessage=${this._emptyRulesMessage()}
           @save-rule=${this._handleSaveRule}
-          @delete-rule=${(event: CustomEvent) =>
-            this._handleDeleteRule(event.detail.rule)}
-          @reorder-rules=${(event: CustomEvent) =>
+          @delete-rule=${(event: CustomEvent) => {
+            // Re-dispatched with the tool attached; letting the editor's own
+            // composed event through as well asked to delete the rule twice.
+            event.stopPropagation();
+            this._handleDeleteRule(event.detail.rule);
+          }}
+          @reorder-rules=${(event: CustomEvent) => {
+            event.stopPropagation();
             this.dispatchEvent(
               new CustomEvent('reorder-rules', {
                 detail: {
@@ -536,7 +566,8 @@ export class ToolListItem extends LitElement {
                 bubbles: true,
                 composed: true,
               })
-            )}
+            );
+          }}
           @workflow-created=${this._handleWorkflowCreated}
         ></governance-rule-set-editor>
       </div>
@@ -553,10 +584,25 @@ export class ToolListItem extends LitElement {
         }"
       >
         <div class="tool-header" @click=${this._toggleExpanded}>
-          <sl-icon
-            class="expand-icon ${this.expanded ? 'open' : ''}"
-            name="chevron-right"
-          ></sl-icon>
+          <!-- The row stays clickable for the mouse; this button is how a
+               keyboard or screen-reader user opens the rules. It stops the
+               click so the row does not toggle twice. -->
+          <button
+            type="button"
+            class="expand-toggle"
+            aria-expanded=${this.expanded ? 'true' : 'false'}
+            aria-label=${`Rules for ${this.tool.name}`}
+            @click=${(e: Event) => {
+              e.stopPropagation();
+              this._toggleExpanded();
+            }}
+          >
+            <sl-icon
+              class="expand-icon ${this.expanded ? 'open' : ''}"
+              name="chevron-right"
+              aria-hidden="true"
+            ></sl-icon>
+          </button>
 
           <span class="tool-name">${this.tool.name}</span>
 
@@ -589,11 +635,29 @@ export class ToolListItem extends LitElement {
               (this.usageStat.invocation_count > 0 ||
                 this.usageStat.estimated_schema_cost > 0)
                 ? html`<sl-tooltip
-                    content=${`${this.usageStat.invocation_count} invocations · ${this.usageStat.estimated_schema_cost.toFixed(4)} schema cost (30d)`}
+                    content=${`${this.usageStat.invocation_count} invocations · ${formatUsdExact(this.usageStat.estimated_schema_cost)} schema cost (30d)`}
                   >
                     <span class="usage-stat"
                       >${this.usageStat.invocation_count} calls ·
-                      $${this.usageStat.estimated_schema_cost >= 0.01 ? this.usageStat.estimated_schema_cost.toFixed(2) : this.usageStat.estimated_schema_cost.toFixed(4)}</span
+                      ${html`<span title=${formatUsdExact(this.usageStat.estimated_schema_cost)}>${formatUsd(this.usageStat.estimated_schema_cost)}</span>`}</span
+                    >
+                  </sl-tooltip>`
+                : ''
+            }
+            ${
+              this.tool.shadowed
+                ? html`<sl-tooltip
+                    content=${
+                      (this.tool.warnings || []).join(' ') ||
+                      'An older MCP server exposes the same tool name.'
+                    }
+                  >
+                    <sl-badge
+                      class="shadowed-badge"
+                      variant="warning"
+                      pill
+                      data-testid="tool-shadowed-badge"
+                      >Shadowed</sl-badge
                     >
                   </sl-tooltip>`
                 : ''
@@ -629,6 +693,7 @@ export class ToolListItem extends LitElement {
 
           <div class="tool-toggle" @click=${(e: Event) => e.stopPropagation()}>
             <sl-switch
+              aria-label="Tool availability"
               size="small"
               ?checked=${
                 this._isNativeTool()
@@ -637,7 +702,18 @@ export class ToolListItem extends LitElement {
               }
               ?disabled=${isUnsupported}
               @sl-change=${this._handleToggleEnabled}
-              >${this._isNativeTool() ? 'Block' : ''}</sl-switch
+              ><span
+                class="switch-label ${this._isNativeTool() ? '' : 'sr-only'}"
+                >${
+                  // The two tabs keep their own polarity (native rows switch
+                  // a block on, MCP rows switch the tool on), so each switch
+                  // says what "on" means rather than leaving one unlabelled.
+                  // MCP rows carry it for assistive tech only: a visible
+                  // "Enabled" beside every switch, on or off, read as a
+                  // status and was wrong for every disabled tool.
+                  this._isNativeTool() ? 'Block' : 'Enabled'
+                }</span
+              ><span class="sr-only"> ${this.tool.name}</span></sl-switch
             >
           </div>
 

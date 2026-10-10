@@ -13,12 +13,14 @@ Report vulnerabilities privately to [security@preloop.ai](mailto:security@preloo
 
 We will acknowledge receipt as soon as possible and work with you on validation, impact, and disclosure timing.
 
+For maintainers: the operational runbooks for CRA Article 14 reporting (early warning within 24 hours, notification within 72 hours, final report, with fill-in templates and a rehearsal checklist) are in [docs/security/article-14-runbooks.md](./docs/security/article-14-runbooks.md).
+
 ## Support Period
 
-> **PROPOSED WORDING, DATES NOT YET CONFIRMED.** Everything in this section is
-> a drafted proposal awaiting sign-off. The end date below is a placeholder
-> with a defensible rationale, not a commitment, until it is confirmed. Once it
-> is, delete this notice. Nothing else in this file is draft.
+> Signed off by the Preloop release manager on 2026-09-27. The end date below
+> is a commitment under the extension rules in this section, not a proposal.
+> Changes to it follow the announcement rules below and are recorded in
+> `CHANGELOG.md`.
 
 The previous wording said security fixes were "generally applied to the latest
 supported release line". CRA Article 13(8) and Annex II require a stated
@@ -116,3 +118,12 @@ Preloop emits a small, fixed set of opt-out adoption events. All of them are pse
 - `PRELOOP_DISABLE_TELEMETRY=true` in the instance `.env` suppresses all server-side events: version check-ins, `install_completed`, and `first_session_seen`. (`DISABLE_VERSION_CHECK` is honored as a legacy alias.)
 - The same variable in the CLI's environment suppresses all CLI events: the check-in, `cli_first_run`, and command counters. Update notifications stop too — they are derived from the check-in response.
 - The bash installer itself never phones home.
+
+## OpenSSF Best Practices
+
+Scorecard's OpenSSF Best Practices check reads the
+[bestpractices.dev](https://www.bestpractices.dev/) record for this repository.
+It does not read a badge URL in this file or in the README. There is no project
+entry yet. A maintainer has to register one. Steps, the Scorecard lookup, and
+the passing-criteria map are in
+[docs/security/openssf-best-practices.md](./docs/security/openssf-best-practices.md).

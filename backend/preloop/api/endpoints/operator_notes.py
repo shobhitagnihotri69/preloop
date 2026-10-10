@@ -181,7 +181,7 @@ def _create_note(
         author_auth_method=auth_method,
         created_by_user_id=current_user.id,
         expires_at=expires_at,
-        source="api",
+        source=payload.source,
         commit=False,
     )
     # Written before the note can be delivered, and before the author is told
@@ -197,6 +197,10 @@ def _create_note(
         ip_address=request.client.host if request.client else None,
         user_agent=request.headers.get("user-agent"),
         details={
+            "source": payload.source,
+            "correlation_id": str(payload.correlation_id)
+            if payload.correlation_id
+            else None,
             "note_id": note_id,
             "managed_agent_id": str(managed_agent_id) if managed_agent_id else None,
             "runtime_session_id": (
@@ -327,7 +331,7 @@ def _claim_for_hook(
         )
         notes = operator_notes.claim_pending_notes(
             db,
-            account_id=str(context.user.account_id),
+            account_id=str(context.api_key.account_id),
             managed_agent_id=str(context.managed_agent.id),
             runtime_session_id=(
                 str(context.runtime_session.id)

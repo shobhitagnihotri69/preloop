@@ -4,13 +4,15 @@ import logging
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, status
-from pydantic import UUID4, BaseModel, ConfigDict, Field
-from sqlalchemy.exc import IntegrityError
+from pydantic import UUID4, BaseModel, ConfigDict, Field, ValidationError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from preloop.api.auth.jwt import get_current_active_user
+from preloop.api.loop_safety import run_db_off_loop
 from preloop.schemas.auth import AuthUserResponse
 from preloop.schemas.tracker import (
+    BitbucketDCConnectionDetails,
     TrackerResponse,
     TrackerUpdate,
     TrackerTestResponse,
@@ -27,24 +29,39 @@ from preloop.sync.services.event_bus import event_bus_service
 from preloop.models.db.session import get_db_session
 
 
-from preloop.models.models.tracker import Tracker, TrackerType, TrackerScopeRule
+from preloop.models import models
 
 
 from preloop.models.crud import (
     crud_account,
+    crud_oauth_app_installation,
     crud_tracker,
     crud_tracker_scope_rule,
     crud_tool_configuration,
 )
 
 from preloop.services.dynamic_mcp_server import get_tracker_types, has_tracker
+from preloop.services.managed_credentials import (
+    MANAGED_AUTH_TYPE,
+    is_managed_tracker,
+    tracker_credential_source,
+)
 from preloop.services.tracker_tool_unlock import (
     enabled_map_from_configs,
     unlocked_tool_names_after_tracker,
 )
 from preloop.utils.audit import log_config_change
+from preloop.utils.bitbucket import BitbucketConfigError, validate_bitbucket_config
+from preloop.utils.bitbucket_dc import (
+    BitbucketDCConfigError,
+    validate_bitbucket_dc_config,
+)
 from preloop.utils.permissions import require_permission
 
+
+Tracker = models.Tracker
+TrackerType = models.TrackerType
+TrackerScopeRule = models.TrackerScopeRule
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -52,6 +69,101 @@ router = APIRouter()
 # Auth types that authenticate through an OAuth App installation instead of a
 # stored API token.
 OAUTH_AUTH_TYPES = ("github_app", "oauth_app")
+
+MANAGED_TRACKER_CREATE_DETAIL = (
+    "Managed Bitbucket Cloud connections are created through the browser "
+    "consent flow (Connect Bitbucket), not by pasting a token."
+)
+MANAGED_TRACKER_TOKEN_DETAIL = (
+    "This tracker authenticates through a managed Bitbucket Cloud connection. "
+    "It has no pasted token to replace: reconnect or disconnect it instead."
+)
+
+# OAuthAppInstallation.external_id is a BigInteger, so an id outside the signed
+# 64-bit range can never match a stored installation.
+_BIGINT_MAX = 2**63 - 1
+
+
+def _connection_details_from_body(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Resolve tracker connection details from a registration body.
+
+    Registration historically read ``config``. The console now also sends
+    ``connection_details``, which is what updates persist. Both keys are
+    accepted during the deprecation window. A null ``connection_details``
+    is absent and falls back to ``config``, matching tracker updates.
+    When ``connection_details`` is an object, that object wins.
+
+    Args:
+        data: Parsed JSON body.
+
+    Returns:
+        The connection details mapping. Missing keys yield an empty dict.
+
+    Raises:
+        HTTPException: If the chosen value is present and not an object.
+    """
+    if "connection_details" in data and data["connection_details"] is not None:
+        details = data["connection_details"]
+        if not isinstance(details, dict):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="connection_details must be an object",
+            )
+        return details
+    config = data.get("config")
+    if config is None:
+        return {}
+    if not isinstance(config, dict):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="config must be an object (deprecated; send connection_details)",
+        )
+    logger.info("Tracker payload used deprecated 'config'; send 'connection_details'")
+    return config
+
+
+def _invalid_installation_id() -> HTTPException:
+    """Build the bounded 400 shared by every malformed installation id."""
+    return HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail=(
+            "github_installation_id must be the numeric installation ID "
+            "returned by the GitHub App installation"
+        ),
+    )
+
+
+def _installation_id_from_body(value: Any) -> int:
+    """Normalise a ``github_installation_id`` request value to an int.
+
+    The console carries the id as a string because it is read from the OAuth
+    callback URL query string, while ``OAuthAppInstallation.external_id`` is a
+    ``BigInteger``. Querying the column with the raw string makes PostgreSQL
+    evaluate ``bigint = character varying`` and fail with an operator error, so
+    the value is coerced here, at the request boundary, and a malformed value
+    is rejected before it ever reaches the database.
+
+    Args:
+        value: The raw ``github_installation_id`` value from the request body.
+
+    Returns:
+        The installation id as a positive int.
+
+    Raises:
+        HTTPException: 400 if the value is not a positive integer.
+    """
+    # bool is an int subclass but is never a valid installation id.
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        raise _invalid_installation_id()
+    if isinstance(value, str) and (not value.isascii() or not value.isdecimal()):
+        raise _invalid_installation_id()
+    try:
+        installation_id = int(value)
+    except ValueError:
+        raise _invalid_installation_id() from None
+    if not 0 < installation_id <= _BIGINT_MAX:
+        raise _invalid_installation_id()
+    return installation_id
 
 
 def _apply_tracker_auth(
@@ -76,6 +188,28 @@ def _apply_tracker_auth(
     Raises:
         HTTPException: If an OAuth App tracker lost its installation binding.
     """
+    if (
+        tracker.tracker_type == TrackerType.BITBUCKET_DC.value
+        or request_data.tracker_type == TrackerType.BITBUCKET_DC
+    ):
+        if tracker.tracker_type != request_data.tracker_type.value:
+            raise HTTPException(
+                status_code=400, detail="Tracker type cannot change during discovery"
+            )
+        stored = (tracker.connection_details or {}).get("instance_url") or tracker.url
+        requested = (request_data.connection_details or {}).get(
+            "instance_url"
+        ) or request_data.url
+        if str(stored).rstrip("/") != str(requested).rstrip("/"):
+            raise HTTPException(
+                status_code=400,
+                detail="Stored credentials are bound to the Data Center instance",
+            )
+    if is_managed_tracker(tracker):
+        # No token exists for a managed grant; the client resolves one per
+        # request through the provider plugin bound to this tracker.
+        request_data.api_key = ""
+        return {"auth_type": MANAGED_AUTH_TYPE}
     if tracker.auth_type in OAUTH_AUTH_TYPES:
         installation = tracker.oauth_installation
         if installation is None:
@@ -96,6 +230,101 @@ def _apply_tracker_auth(
     if request_data.api_key == "unchanged":
         request_data.api_key = tracker.resolved_api_key
     return {}
+
+
+def _bitbucket_dc_details(
+    *,
+    api_key: str,
+    auth_type: str,
+    url: Optional[str],
+    details: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Validate DC deployment policy before credentials reach any transport."""
+    config = dict(details or {})
+    instance_url = config.get("instance_url") or url
+    if url and instance_url and str(url).rstrip("/") != str(instance_url).rstrip("/"):
+        raise HTTPException(
+            status_code=400, detail="Instance URL must match tracker URL"
+        )
+    config["instance_url"] = instance_url
+    try:
+        config = BitbucketDCConnectionDetails.model_validate(config).model_dump(
+            exclude_none=True
+        )
+    except ValidationError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid Data Center connection details; use instance_url, version, project_key, repository_id, repository_slug and username only",
+        ) from exc
+    try:
+        config = validate_bitbucket_dc_config(
+            api_key=api_key, auth_type=auth_type, connection_details=config
+        )
+    except BitbucketDCConfigError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return config
+
+
+def _bitbucket_auth_details(
+    tracker_type: TrackerType,
+    request_data: TrackerTestRequest,
+    tracker: Optional[Tracker],
+) -> Dict[str, Any]:
+    """Validate a Bitbucket test request and return its auth details.
+
+    Args:
+        tracker_type: The requested tracker type.
+        request_data: The test request, with the stored token already
+            substituted for ``"unchanged"``.
+        tracker: The persisted tracker when editing, else None.
+
+    Returns:
+        ``{"auth_type": ...}`` for Bitbucket, empty for other types.
+
+    Raises:
+        HTTPException: 400 when the Bitbucket configuration is invalid.
+    """
+    if tracker_type == TrackerType.BITBUCKET_DC:
+        auth_type = (
+            tracker.auth_type if tracker else (request_data.auth_type or "api_token")
+        )
+        request_data.connection_details = _bitbucket_dc_details(
+            api_key=request_data.api_key,
+            auth_type=auth_type,
+            url=str(request_data.url) if request_data.url else None,
+            details=request_data.connection_details,
+        )
+        return {"auth_type": auth_type}
+    if tracker_type != TrackerType.BITBUCKET:
+        return {}
+    auth_type = (
+        tracker.auth_type
+        if tracker is not None
+        else (request_data.auth_type or "api_token")
+    )
+    if tracker is None and auth_type == MANAGED_AUTH_TYPE:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=MANAGED_TRACKER_CREATE_DETAIL,
+        )
+    if tracker is not None and is_managed_tracker(tracker):
+        if not str(
+            (request_data.connection_details or {}).get("workspace") or ""
+        ).strip():
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Bitbucket tracker requires 'workspace' in connection_details.",
+            )
+        return {"auth_type": MANAGED_AUTH_TYPE}
+    try:
+        validate_bitbucket_config(
+            api_key=request_data.api_key,
+            auth_type=auth_type,
+            connection_details=request_data.connection_details,
+        )
+    except BitbucketConfigError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    return {"auth_type": auth_type}
 
 
 def _unique_tracker_name(db: Session, *, base_name: str, account_id: str) -> str:
@@ -154,7 +383,7 @@ async def register_tracker(
         tracker_type_str = data.get("type")
         url_str = data.get("url")
         api_key = data.get("api_key")
-        config = data.get("config")
+        config = _connection_details_from_body(data)
         scope_rules_data = data.get("scope_rules") or []
         auth_type = data.get("auth_type", "api_token")
         github_installation_id = data.get("github_installation_id")
@@ -166,6 +395,15 @@ async def register_tracker(
                 detail="Missing required fields: name, type",
             )
 
+        # A managed grant is created by the provider's consent completion
+        # endpoint; registering one here would need a token that must never be
+        # pasted, and a pasted token is never silently converted either.
+        if auth_type == MANAGED_AUTH_TYPE:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=MANAGED_TRACKER_CREATE_DETAIL,
+            )
+
         # For github_app auth, api_key is not required
         if auth_type == "api_token" and not api_key:
             raise HTTPException(
@@ -174,11 +412,19 @@ async def register_tracker(
             )
 
         # For OAuth auth types, github_installation_id is required
-        if auth_type in ("github_app", "oauth_app") and not github_installation_id:
+        if auth_type in ("github_app", "oauth_app") and github_installation_id is None:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Missing required field: github_installation_id (required for OAuth authentication)",
             )
+
+        # The console sends the id as a string (it comes from the OAuth
+        # callback URL) and the installation column is a BIGINT, so normalise
+        # it before it reaches the installation query.
+        if auth_type in ("github_app", "oauth_app"):
+            github_installation_id = _installation_id_from_body(github_installation_id)
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error parsing request data: {str(e)}")
         raise HTTPException(
@@ -202,11 +448,31 @@ async def register_tracker(
             detail="Jira tracker requires 'username' in connection_details",
         )
 
+    # Bitbucket: reject app passwords and incomplete configs before any
+    # network call. create_tracker_client swallows errors, so validate here.
+    extra_connection_details: Dict[str, Any] = {}
+    if tracker_type == TrackerType.BITBUCKET_DC:
+        config = _bitbucket_dc_details(
+            api_key=api_key, auth_type=auth_type, url=url_str, details=config
+        )
+        url_str = config["instance_url"]
+        extra_connection_details["auth_type"] = auth_type
+    if tracker_type == TrackerType.BITBUCKET:
+        try:
+            validate_bitbucket_config(
+                api_key=api_key, auth_type=auth_type, connection_details=config
+            )
+        except BitbucketConfigError as e:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+        extra_connection_details["auth_type"] = auth_type
+
     # Create a tracker client to test the connection
     # For github_app auth, we need to resolve the installation_id to the actual GitHub installation ID
     resolved_github_installation_id = None
     permission_warnings = []
-    installation = None  # Will be set for OAuth auth types
+    installation: Optional[models.OAuthAppInstallation] = (
+        None  # Set for OAuth auth types
+    )
 
     try:
         if auth_type in ("github_app", "oauth_app"):
@@ -218,18 +484,37 @@ async def register_tracker(
                 )
 
             # Look up the OAuth App installation to get the actual installation ID
-            from preloop.models.models.github_app_installation import (
-                OAuthAppInstallation,
-            )
+            # Rollback expires ORM attributes; retain the scope for error logging.
+            installation_account_id = current_user.account_id
 
-            installation = (
-                db.query(OAuthAppInstallation)
-                .filter(
-                    OAuthAppInstallation.external_id == github_installation_id,
-                    OAuthAppInstallation.account_id == current_user.account_id,
-                )
-                .first()
-            )
+            def lookup_installation() -> Optional[models.OAuthAppInstallation]:
+                try:
+                    return crud_oauth_app_installation.get_by_provider_and_external_id(
+                        db,
+                        provider="github",
+                        external_id=github_installation_id,
+                        account_id=installation_account_id,
+                    )
+                except SQLAlchemyError:
+                    # The session is unusable after a driver error. Reset it and
+                    # answer without echoing driver text back to the console.
+                    try:
+                        db.rollback()
+                    except SQLAlchemyError:
+                        logger.exception("Failed to roll back installation lookup")
+                    logger.exception(
+                        "Failed to look up the GitHub App installation for account %s",
+                        installation_account_id,
+                    )
+                    raise HTTPException(
+                        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                        detail=(
+                            "Could not verify the GitHub App installation. "
+                            "Please try again."
+                        ),
+                    )
+
+            installation = await run_db_off_loop(lookup_installation)
 
             if not installation:
                 raise HTTPException(
@@ -261,8 +546,13 @@ async def register_tracker(
                 connection_details={
                     "url": str(url_str) if url_str else None,
                     **(config or {}),
+                    **extra_connection_details,
                 },
             )
+            if client is None:
+                raise ValueError(
+                    f"Could not create a client for tracker type {tracker_type.value}"
+                )
 
         # Test the connection
         connection_result = await client.test_connection()
@@ -272,6 +562,22 @@ async def register_tracker(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"Failed to connect to tracker: {connection_result.message}",
             )
+
+        if tracker_type == TrackerType.BITBUCKET_DC:
+            # Persist the immutable ID learned from the server, so a later
+            # slug rename cannot silently bind this PAT tracker to a new repo.
+            resolved = getattr(client, "connection_details", None)
+            if isinstance(resolved, dict):
+                config = _bitbucket_dc_details(
+                    api_key=api_key,
+                    auth_type=auth_type,
+                    url=url_str,
+                    details={
+                        key: value
+                        for key, value in resolved.items()
+                        if key in BitbucketDCConnectionDetails.model_fields
+                    },
+                )
 
         # For GitHub trackers with api_token auth, validate token permissions and warn about missing scopes
         if (
@@ -579,6 +885,27 @@ async def update_tracker(
         )
     update_data = tracker_update.model_dump(exclude_unset=True)
 
+    # Validate before scope or credential mutations; do not send a stored PAT
+    # to a changed destination merely because its instance is also approved.
+    if tracker.tracker_type == TrackerType.BITBUCKET_DC.value:
+        config = _bitbucket_dc_details(
+            api_key=(
+                tracker.resolved_api_key
+                if update_data.get("api_key") in (None, "unchanged")
+                else update_data["api_key"]
+            ),
+            auth_type=tracker.auth_type,
+            url=str(update_data.get("url") or tracker.url or ""),
+            details=update_data.get("connection_details", tracker.connection_details),
+        )
+        previous = (tracker.connection_details or {}).get("instance_url") or tracker.url
+        if str(config["instance_url"]).rstrip("/") != str(previous).rstrip("/"):
+            raise HTTPException(
+                status_code=400,
+                detail="Create a new tracker to change the Data Center instance",
+            )
+        update_data["connection_details"] = config
+
     # Handle scope_rules separately
     if "scope_rules" in update_data:
         # Validate new scope rules before updating
@@ -610,6 +937,66 @@ async def update_tracker(
     if update_data.get("api_key") == "unchanged":
         del update_data["api_key"]
 
+    if is_managed_tracker(tracker):
+        # A managed grant has no pasted token and keeps its managed identity:
+        # editing scope or metadata never converts it, and a token cannot be
+        # pasted over it. Reconnect/disconnect belong to the provider endpoints.
+        if update_data.get("api_key"):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=MANAGED_TRACKER_TOKEN_DETAIL,
+            )
+        details = update_data.get("connection_details")
+        if details is not None:
+            previous = dict(tracker.connection_details or {})
+            merged = dict(details)
+            # Managed metadata (actor, state, token kind) is owned by the
+            # provider service; keep it across console edits of other fields.
+            for key in (
+                "managed_oauth",
+                "managed_state",
+                "reconnect_reason",
+                "actor",
+                "token_kind",
+                "provider",
+            ):
+                if key in previous and key not in merged:
+                    merged[key] = previous[key]
+            merged["auth_type"] = (
+                previous.get("auth_type") or merged.get("auth_type") or "oauth_token"
+            )
+            merged.pop("token_expires_at", None)
+            merged.pop("email", None)
+            if (merged.get("api_url") or "").rstrip("/") not in (
+                "",
+                "https://api.bitbucket.org/2.0",
+            ):
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Managed Bitbucket connections are pinned to the Bitbucket Cloud API origin.",
+                )
+            if not str(merged.get("workspace") or "").strip():
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Bitbucket tracker requires 'workspace' in connection_details.",
+                )
+            update_data["connection_details"] = merged
+    elif tracker.tracker_type == TrackerType.BITBUCKET.value and (
+        "api_key" in update_data or "connection_details" in update_data
+    ):
+        try:
+            validate_bitbucket_config(
+                api_key=update_data.get("api_key") or tracker.resolved_api_key,
+                auth_type=tracker.auth_type,
+                connection_details=(
+                    update_data.get("connection_details")
+                    if update_data.get("connection_details") is not None
+                    else tracker.connection_details
+                ),
+            )
+        except BitbucketConfigError as e:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
     # Special handling if api_key is updated - revalidate connection.
     api_key_updated = "api_key" in update_data
     if api_key_updated:
@@ -621,7 +1008,7 @@ async def update_tracker(
         )
 
     try:
-        logger.info("Updating tracker %s with data: %s", tracker_id, update_data)
+        logger.info("Updating tracker %s fields: %s", tracker_id, sorted(update_data))
         # Route through CRUD so credential fields encrypt via Secret Service.
         tracker = crud_tracker.update(db, db_obj=tracker, obj_in=update_data)
 
@@ -794,6 +1181,16 @@ async def test_connection_and_list_orgs(
             )
         auth_details = _apply_tracker_auth(tracker, test_data)
     try:
+        auth_details.update(
+            _bitbucket_auth_details(
+                test_data.tracker_type,
+                test_data,
+                tracker if test_data.tracker_id else None,
+            )
+        )
+    except HTTPException as e:
+        return TrackerTestResponse(success=False, message=str(e.detail), orgs=[])
+    try:
         client = await create_tracker_client(
             tracker_type=test_data.tracker_type.value,
             tracker_id="test-connection",
@@ -803,6 +1200,9 @@ async def test_connection_and_list_orgs(
                 **(test_data.connection_details or {}),
                 **auth_details,
             },
+            credential_source=(
+                tracker_credential_source(tracker) if test_data.tracker_id else None
+            ),
         )
         if not client:
             raise ValueError(
@@ -825,13 +1225,21 @@ async def test_connection_and_list_orgs(
             projects = await client.get_projects(orgs[0]["id"])
             orgs[0]["children"] = [
                 ProjectIdentifier(
-                    id=p["id"], name=p["name"], identifier=p["id"], type="project"
+                    id=p["id"],
+                    name=p["name"],
+                    identifier=p["id"],
+                    type="project",
+                    group=p.get("group"),
                 )
                 for p in projects
             ]
         return TrackerTestResponse(
             success=True,
-            message="Connection successful!",
+            message=(
+                connection_result.message
+                if test_data.tracker_type == TrackerType.BITBUCKET_DC
+                else "Connection successful!"
+            ),
             orgs=orgs,
         )
 
@@ -876,6 +1284,13 @@ async def list_projects_for_org(
                 detail="Tracker not found or access denied",
             )
         auth_details = _apply_tracker_auth(tracker, project_data)
+    auth_details.update(
+        _bitbucket_auth_details(
+            project_data.tracker_type,
+            project_data,
+            tracker if project_data.tracker_id else None,
+        )
+    )
     try:
         if project_data.url and not project_data.url.endswith("/"):
             project_data.url = project_data.url + "/"
@@ -888,6 +1303,9 @@ async def list_projects_for_org(
                 **(project_data.connection_details or {}),
                 **auth_details,
             },
+            credential_source=(
+                tracker_credential_source(tracker) if project_data.tracker_id else None
+            ),
         )
         if not client:
             raise HTTPException(

@@ -2,7 +2,9 @@ import { html, fixture, expect, waitUntil } from '@open-wc/testing';
 import sinon from 'sinon';
 
 import { invalidateApiCaches } from '../../api';
-import { Router } from '../../router';
+import { PENDING_APPROVALS_EVENT } from '../../components/console-header';
+import { LOCATION_CHANGED, Router } from '../../router';
+import { publishAttentionSummary } from '../../utils/attention-summary';
 import './console-shell';
 import type { ConsoleShell } from './console-shell';
 
@@ -112,6 +114,7 @@ describe('ConsoleShell', () => {
     fetchStub.restore();
     matchMediaStub?.restore();
     localStorage.clear();
+    sessionStorage.removeItem('preloop:attention-summary');
     delete (window as any).BRAND_CONFIG;
     invalidateApiCaches();
   });
@@ -192,14 +195,33 @@ describe('ConsoleShell', () => {
     )) as ConsoleShell;
 
     await waitUntil(
-      () => el.shadowRoot?.querySelector('[role="navigation"]') !== null,
+      () => el.shadowRoot?.querySelector('nav') !== null,
       'Navigation did not render'
     );
 
     const sidebar = el.shadowRoot?.querySelector('.sidebar');
     expect(sidebar).to.exist;
-    expect(sidebar?.getAttribute('role')).to.equal('navigation');
+    expect(sidebar?.tagName).to.equal('NAV');
     expect(sidebar?.getAttribute('aria-label')).to.equal('Console navigation');
+  });
+
+  it('stacks the kill-switch banner above the bypass banner', async () => {
+    // A halted account is the most severe governance state, so it reads
+    // first when both are active.
+    const el = (await fixture(
+      html`<console-shell></console-shell>`
+    )) as ConsoleShell;
+    await el.updateComplete;
+    const order = Array.from(
+      el.shadowRoot!.querySelectorAll(
+        'kill-switch-banner, approval-bypass-banner, usage-nudge-banner'
+      )
+    ).map((node) => node.localName);
+    expect(order).to.eql([
+      'kill-switch-banner',
+      'approval-bypass-banner',
+      'usage-nudge-banner',
+    ]);
   });
 
   it('has main view with header and content area', async () => {
@@ -333,7 +355,7 @@ describe('ConsoleShell', () => {
     const originalPath = window.location.pathname;
     window.history.replaceState({}, '', '/console/tools');
     document.documentElement.style.setProperty(
-      '--sl-color-primary-600',
+      '--console-link-color',
       'rgb(4, 5, 6)'
     );
 
@@ -364,7 +386,7 @@ describe('ConsoleShell', () => {
       expect(labelStyles.fontWeight).to.equal('600');
       expect(labelStyles.fontSize).to.equal('14px');
     } finally {
-      document.documentElement.style.removeProperty('--sl-color-primary-600');
+      document.documentElement.style.removeProperty('--console-link-color');
       window.history.replaceState({}, '', originalPath);
     }
   });
@@ -404,10 +426,16 @@ describe('ConsoleShell', () => {
     )) as ConsoleShell;
 
     await waitUntil(
-      () => el.shadowRoot?.querySelector('sl-menu') !== null,
+      () => el.shadowRoot?.querySelector('#console-nav > ul') !== null,
       'Sidebar menu did not render'
     );
 
+    expect(el.shadowRoot?.querySelector('#console-nav')?.tagName).to.equal(
+      'NAV'
+    );
+    expect(el.shadowRoot?.querySelector('sl-menu, sl-menu-item')).to.equal(
+      null
+    );
     const overviewLink = el.shadowRoot?.querySelector('a[href="/console"]');
     expect(overviewLink).to.exist;
 
@@ -616,7 +644,7 @@ describe('ConsoleShell', () => {
     });
   });
 
-  it('nests Sessions and Approvals under Audit without All events when audit_logs is off', async () => {
+  it('keeps Approvals and Sessions under Audit, not top-level', async () => {
     const el = (await fixture(
       html`<console-shell></console-shell>`
     )) as ConsoleShell;
@@ -628,21 +656,213 @@ describe('ConsoleShell', () => {
       'Sessions link did not render'
     );
 
-    const auditSections = Array.from(
-      el.shadowRoot?.querySelectorAll('sl-details.nav-section') ?? []
+    const approvals = el.shadowRoot?.querySelector(
+      'a[href="/console/approvals"]'
     );
-    const auditSection = auditSections.find((section) =>
-      section.textContent?.includes('Audit')
+    const sessions = el.shadowRoot?.querySelector(
+      'a[href="/console/runtime-sessions"]'
     );
-    expect(auditSection).to.exist;
-
-    expect(el.shadowRoot?.querySelector('a[href="/console/runtime-sessions"]'))
-      .to.exist;
-    expect(el.shadowRoot?.querySelector('a[href="/console/approvals"]')).to
-      .exist;
+    const audit = approvals?.closest('details.nav-section');
+    expect(audit?.textContent).to.contain('Audit');
+    expect(sessions?.closest('details.nav-section')).to.equal(audit);
+    // Without audit_logs there is no All events entry.
     expect(el.shadowRoot?.querySelector('a[href="/console/audit"]')).to.not
       .exist;
-    expect(el.shadowRoot?.querySelector('a[href="/console/cost"]')).to.exist;
+  });
+
+  it('orders the top level as Overview, the product pages, Audit, Settings, Emergency', async () => {
+    fetchStub.callsFake(async (input: RequestInfo | URL) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      if (url.endsWith('/api/v1/features')) {
+        return new Response(
+          JSON.stringify({
+            plugins: [],
+            features: { audit_logs: true, policies_console: true },
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        );
+      }
+      return new Response(JSON.stringify([]), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    });
+    const el = (await fixture(
+      html`<console-shell></console-shell>`
+    )) as ConsoleShell;
+    await waitUntil(
+      () => el.shadowRoot?.querySelector('a[href="/console/policies"]'),
+      'Policies link did not render'
+    );
+
+    const menu = el.shadowRoot!.querySelector('#console-nav > ul')!;
+    const rows = Array.from(menu.children)
+      .map((child) =>
+        child.matches('details.nav-section')
+          ? child.querySelector('summary .sidebar-label')?.textContent
+          : child.querySelector('.sidebar-label')?.textContent
+      )
+      .filter((label): label is string => !!label)
+      .map((label) => label.trim());
+    expect(rows).to.deep.equal([
+      'Overview',
+      'Agents',
+      'Flows',
+      'Models',
+      'Tools',
+      'Policies',
+      'Trackers',
+      'Cost',
+      'API usage',
+      'Audit',
+      'Settings',
+      'Emergency',
+    ]);
+  });
+
+  it('orders the Audit group Approvals, Sessions, All events, Artifacts, Records', async () => {
+    fetchStub.callsFake(async (input: RequestInfo | URL) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      if (url.endsWith('/api/v1/features')) {
+        return new Response(
+          JSON.stringify({ plugins: [], features: { audit_logs: true } }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        );
+      }
+      return new Response(JSON.stringify([]), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    });
+    const el = (await fixture(
+      html`<console-shell></console-shell>`
+    )) as ConsoleShell;
+    await waitUntil(
+      () =>
+        el.shadowRoot?.querySelector('a[href="/console/audit"]') &&
+        el.shadowRoot?.querySelector('a[href="/console/settings/records"]'),
+      'Audit links did not render'
+    );
+
+    const audit = el
+      .shadowRoot!.querySelector('a[href="/console/audit"]')!
+      .closest('details.nav-section')!;
+    const hrefs = Array.from(audit.querySelectorAll('a.sidebar-link')).map(
+      (a) => a.getAttribute('href')
+    );
+    expect(hrefs).to.deep.equal([
+      '/console/approvals',
+      '/console/runtime-sessions',
+      '/console/audit',
+      '/console/artifacts',
+      '/console/settings/records',
+    ]);
+  });
+
+  it('has no Needs attention entry; the Overview banner links there', async () => {
+    publishAttentionSummary([
+      {
+        id: 'flow:flow-1',
+        kind: 'flow',
+        severity: 'critical',
+        title: 'Pull Request Reviewer',
+        detail: '11 failed runs',
+        href: '/console/flows',
+        at: null,
+        fingerprint: 'flow-1:11',
+        dismissable: true,
+      },
+    ]);
+
+    const el = (await fixture(
+      html`<console-shell></console-shell>`
+    )) as ConsoleShell;
+    await waitUntil(
+      () => el.shadowRoot?.querySelector('a[href="/console/cost"]') !== null,
+      'nav did not render'
+    );
+
+    expect(el.shadowRoot?.querySelector('a[href="/console/attention"]')).to.not
+      .exist;
+    expect(
+      el.shadowRoot?.querySelector('#console-nav')?.textContent
+    ).to.not.contain('Needs attention');
+  });
+
+  it('badges Approvals with the pending count published by the header', async () => {
+    const el = (await fixture(
+      html`<console-shell></console-shell>`
+    )) as ConsoleShell;
+
+    await waitUntil(
+      () =>
+        el.shadowRoot?.querySelector('a[href="/console/approvals"]') !== null,
+      'Approvals link did not render'
+    );
+
+    // The real header child also publishes its (empty) count; wait for its
+    // initial load to settle so a later dispatch is not overwritten by it.
+    const header = el.shadowRoot?.querySelector(
+      'console-header'
+    ) as unknown as { loadingPendingApprovals: boolean } & HTMLElement;
+    await waitUntil(
+      () => !header.loadingPendingApprovals,
+      'header approval load never settled'
+    );
+    await header.updateComplete;
+
+    // No pending approvals: no badge.
+    expect(
+      el.shadowRoot
+        ?.querySelector('a[href="/console/approvals"]')
+        ?.querySelector('sl-badge')
+    ).to.not.exist;
+
+    window.dispatchEvent(
+      new CustomEvent<number>(PENDING_APPROVALS_EVENT, { detail: 3 })
+    );
+    await el.updateComplete;
+
+    const badge = el.shadowRoot
+      ?.querySelector('a[href="/console/approvals"]')
+      ?.querySelector('sl-badge');
+    expect(badge?.textContent).to.contain('3');
+
+    // The closed Audit group repeats the count on its header, so it stays
+    // visible without opening the group; an open group hides the copy.
+    const audit = el
+      .shadowRoot!.querySelector('a[href="/console/approvals"]')!
+      .closest('details.nav-section') as HTMLElement & { open: boolean };
+    const headerBadge = audit.querySelector(
+      'summary sl-badge.nav-section-badge'
+    ) as HTMLElement;
+    expect(headerBadge?.textContent).to.contain('3');
+    expect(audit.open).to.equal(false);
+    expect(getComputedStyle(headerBadge).display).to.not.equal('none');
+    audit.open = true;
+    await el.updateComplete;
+    expect(getComputedStyle(headerBadge).display).to.equal('none');
+  });
+
+  it('highlights Approvals for a single approval route', async () => {
+    const originalPath = window.location.pathname;
+    window.history.replaceState({}, '', '/console/approval/123');
+
+    try {
+      const el = (await fixture(
+        html`<console-shell></console-shell>`
+      )) as ConsoleShell;
+
+      await waitUntil(
+        () =>
+          el.shadowRoot?.querySelector(
+            'a.sidebar-link.active[href="/console/approvals"]'
+          ) !== null,
+        'Active approvals link did not render'
+      );
+    } finally {
+      window.history.replaceState({}, '', originalPath);
+    }
   });
 
   it('nests Runners under Settings instead of the top-level nav', async () => {
@@ -661,7 +881,7 @@ describe('ConsoleShell', () => {
       .exist;
 
     const settingsSections = Array.from(
-      el.shadowRoot?.querySelectorAll('sl-details.nav-section') ?? []
+      el.shadowRoot?.querySelectorAll('details.nav-section') ?? []
     );
     const settingsSection = settingsSections.find((section) =>
       section.textContent?.includes('Settings')
@@ -791,6 +1011,107 @@ describe('ConsoleShell', () => {
     expect(order[2]).to.equal(order[1] + 1);
   });
 
+  describe('Records placement', () => {
+    /** Re-stub fetch with a chosen permission set; audit_logs stays off. */
+    function stubRecords(permissions: string[]) {
+      invalidateApiCaches();
+      fetchStub.callsFake(async (input: RequestInfo | URL) => {
+        const url = typeof input === 'string' ? input : input.toString();
+        if (url.endsWith('/api/v1/features')) {
+          return new Response(
+            JSON.stringify({
+              plugins: [],
+              features: { user_management: true },
+            }),
+            { status: 200, headers: { 'Content-Type': 'application/json' } }
+          );
+        }
+        if (url.endsWith('/api/v1/auth/users/me')) {
+          return new Response(
+            JSON.stringify({
+              username: 'test',
+              email: 'test@example.com',
+              email_verified: true,
+              permissions,
+            }),
+            { status: 200, headers: { 'Content-Type': 'application/json' } }
+          );
+        }
+        if (
+          url.includes('approval-requests') ||
+          url.endsWith('/api/v1/trackers')
+        ) {
+          return new Response(JSON.stringify([]), {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' },
+          });
+        }
+        return new Response(JSON.stringify({}), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      });
+    }
+
+    async function mountShell() {
+      const el = (await fixture(
+        html`<console-shell></console-shell>`
+      )) as ConsoleShell;
+      await waitUntil(
+        () =>
+          (el as unknown as { _featuresLoaded: boolean })._featuresLoaded &&
+          (el as unknown as { _permissionsLoaded: boolean })._permissionsLoaded,
+        'Features and permissions did not load'
+      );
+      await el.updateComplete;
+      return el;
+    }
+
+    function recordsLink(el: ConsoleShell): Element | null | undefined {
+      return el.shadowRoot?.querySelector(
+        'a[href="/console/settings/records"]'
+      );
+    }
+
+    it('hides Records unless the operator can read the audit or policies', async () => {
+      stubRecords(['view_flows']);
+      const el = await mountShell();
+
+      expect(recordsLink(el)).to.not.exist;
+      // Artifacts and Sessions share the view_runtime_sessions gate.
+      expect(el.shadowRoot?.querySelector('a[href="/console/artifacts"]')).to
+        .not.exist;
+      expect(
+        el.shadowRoot?.querySelector('a[href="/console/runtime-sessions"]')
+      ).to.not.exist;
+      // Approvals is gated on view_approvals, which this user does not have.
+      expect(el.shadowRoot?.querySelector('a[href="/console/approvals"]')).to
+        .not.exist;
+    });
+
+    it('shows Records under Audit, not Settings, with view_audit_logs', async () => {
+      stubRecords(['view_audit_logs']);
+      const el = await mountShell();
+
+      const link = recordsLink(el);
+      expect(link).to.exist;
+      const group = link?.closest('details.nav-section');
+      expect(group?.textContent).to.contain('Audit');
+      expect(group?.textContent).to.not.contain('Settings');
+    });
+
+    it('shows Records under Audit with view_policies', async () => {
+      stubRecords(['view_policies']);
+      const el = await mountShell();
+
+      const link = recordsLink(el);
+      expect(link).to.exist;
+      expect(link?.closest('details.nav-section')?.textContent).to.contain(
+        'Audit'
+      );
+    });
+  });
+
   it('still offers the plan page where there is no user management', async () => {
     // The two conditions are separate: a deployment that sells plans but does
     // not manage users keeps its way in.
@@ -832,10 +1153,66 @@ describe('ConsoleShell', () => {
         null,
       'Plan link did not render'
     );
+    // Account is core (account name, artifact storage), so it stays; the
+    // people pages need user management and do not.
     expect(el.shadowRoot?.querySelector('a[href="/console/settings/account"]'))
-      .to.not.exist;
+      .to.exist;
     expect(el.shadowRoot?.querySelector('a[href="/console/settings/users"]')).to
       .not.exist;
+  });
+
+  it('offers Account on an open-source install without user management', async () => {
+    // Default stub: no plugins. The account page holds the account name and
+    // the session artifact storage card, which core pages deep-link to.
+    const el = (await fixture(
+      html`<console-shell></console-shell>`
+    )) as ConsoleShell;
+    await waitUntil(
+      () =>
+        el.shadowRoot?.querySelector('a[href="/console/settings/api-keys"]') !==
+        null,
+      'Settings links did not render'
+    );
+    expect(el.shadowRoot?.querySelector('a[href="/console/settings/account"]'))
+      .to.exist;
+  });
+
+  it('groups Settings under labels and hides a label with nothing under it', async () => {
+    const el = (await fixture(
+      html`<console-shell></console-shell>`
+    )) as ConsoleShell;
+    await waitUntil(
+      () =>
+        el.shadowRoot?.querySelector('a[href="/console/settings/api-keys"]') !==
+        null,
+      'Settings links did not render'
+    );
+    const labels = Array.from(
+      el.shadowRoot?.querySelectorAll('li.nav-group-label') ?? []
+    ).map((label) => label.textContent?.trim());
+    // No user or team management in the default stub: no people heading.
+    expect(labels).to.deep.equal(['Account', 'Developers', 'Personal']);
+    expect(
+      el.shadowRoot?.querySelector('a[href="/console/settings/api-keys"]')
+        ?.textContent
+    ).to.contain('API keys');
+  });
+
+  it('puts the kill switch outside Settings, one click from any page', async () => {
+    const el = (await fixture(
+      html`<console-shell></console-shell>`
+    )) as ConsoleShell;
+    await waitUntil(
+      () =>
+        el.shadowRoot?.querySelector(
+          'a[href="/console/settings/emergency"]'
+        ) !== null,
+      'Emergency link did not render'
+    );
+    const emergency = el.shadowRoot?.querySelector(
+      'a[href="/console/settings/emergency"]'
+    );
+    expect(emergency?.closest('details')).to.equal(null);
   });
 
   it('shows All events under Audit when audit_logs is enabled', async () => {
@@ -887,29 +1264,161 @@ describe('ConsoleShell', () => {
 
   it('opens the Audit section when a nested route is active', async () => {
     const originalPath = window.location.pathname;
-    window.history.replaceState({}, '', '/console/approvals');
+    window.history.replaceState({}, '', '/console/artifacts');
 
-    const el = (await fixture(
-      html`<console-shell></console-shell>`
-    )) as ConsoleShell;
+    try {
+      const el = (await fixture(
+        html`<console-shell></console-shell>`
+      )) as ConsoleShell;
 
-    await waitUntil(
-      () =>
-        el.shadowRoot?.querySelector(
-          'a.sidebar-link.active[href="/console/approvals"]'
-        ) !== null,
-      'Active approvals link did not render'
-    );
+      await waitUntil(
+        () =>
+          el.shadowRoot?.querySelector(
+            'a.sidebar-link.active[href="/console/artifacts"]'
+          ) !== null,
+        'Active artifacts link did not render'
+      );
 
-    const auditSections = Array.from(
-      el.shadowRoot?.querySelectorAll('sl-details.nav-section') ?? []
-    );
-    const auditSection = auditSections.find((section) =>
-      section.textContent?.includes('Audit')
-    ) as HTMLElement | undefined;
-    expect(auditSection?.hasAttribute('open')).to.be.true;
+      const auditSections = Array.from(
+        el.shadowRoot?.querySelectorAll('details.nav-section') ?? []
+      );
+      const auditSection = auditSections.find((section) =>
+        section.textContent?.includes('Audit')
+      ) as HTMLElement | undefined;
+      expect(auditSection?.hasAttribute('open')).to.be.true;
+    } finally {
+      window.history.replaceState({}, '', originalPath);
+    }
+  });
 
-    window.history.replaceState({}, '', originalPath);
+  describe('wayfinding on pages without a nav entry', () => {
+    let originalPath: string;
+    let originalSearch: string;
+
+    beforeEach(() => {
+      originalPath = window.location.pathname;
+      originalSearch = window.location.search;
+    });
+
+    afterEach(() => {
+      window.history.replaceState({}, '', originalPath + originalSearch);
+    });
+
+    function auditSection(el: ConsoleShell): HTMLElement | undefined {
+      return Array.from(
+        el.shadowRoot?.querySelectorAll('details.nav-section') ?? []
+      ).find((section) => section.textContent?.includes('Audit')) as
+        HTMLElement | undefined;
+    }
+
+    /** RBAC on, with the given permissions. */
+    function withPermissions(permissions: string[]) {
+      invalidateApiCaches();
+      fetchStub.callsFake(async (input: RequestInfo | URL) => {
+        const url = typeof input === 'string' ? input : input.toString();
+        if (url.endsWith('/api/v1/features')) {
+          return new Response(JSON.stringify({ plugins: [], features: {} }), {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' },
+          });
+        }
+        if (url.endsWith('/api/v1/auth/users/me')) {
+          return new Response(
+            JSON.stringify({
+              username: 'test',
+              email: 'test@example.com',
+              email_verified: true,
+              permissions,
+            }),
+            { status: 200, headers: { 'Content-Type': 'application/json' } }
+          );
+        }
+        return new Response(JSON.stringify({}), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      });
+    }
+
+    async function loaded(): Promise<ConsoleShell> {
+      const el = (await fixture(
+        html`<console-shell></console-shell>`
+      )) as ConsoleShell;
+      await waitUntil(
+        () => (el as any)._featuresLoaded && (el as any)._permissionsLoaded,
+        'features and permissions did not load'
+      );
+      await el.updateComplete;
+      return el;
+    }
+
+    it('highlights Approvals and opens Audit on a single approval', async () => {
+      // The deep-link target of every approval notification, Slack and email.
+      // Approvals lives under Audit, so the group opens to show where you are.
+      window.history.replaceState({}, '', '/console/approval/req-123');
+      const el = await loaded();
+      const approvals = el.shadowRoot!.querySelector(
+        'a.sidebar-link.active[href="/console/approvals"]'
+      );
+      expect(approvals).to.exist;
+      expect(approvals?.closest('details.nav-section')).to.equal(
+        auditSection(el)
+      );
+      expect(auditSection(el)?.hasAttribute('open')).to.be.true;
+    });
+
+    it('gives API usage its own entry under Cost', async () => {
+      window.history.replaceState({}, '', '/console/api-usage');
+      const el = await loaded();
+      const link = el.shadowRoot!.querySelector(
+        'a.sidebar-link[href="/console/api-usage"]'
+      );
+      expect(link).to.exist;
+      expect(link!.classList.contains('active')).to.be.true;
+      expect(link!.getAttribute('aria-current')).to.equal('page');
+      expect(link!.textContent).to.contain('Gateway traffic and rate limits');
+      // It sits right after Cost, and Cost no longer claims the page.
+      const cost = el.shadowRoot!.querySelector(
+        'a.sidebar-link[href="/console/cost"]'
+      )!;
+      expect(cost.classList.contains('active')).to.be.false;
+      expect(cost.closest('li')!.nextElementSibling).to.equal(
+        link!.closest('li')
+      );
+    });
+
+    it('does not mistake Approvals for the single-approval alias the other way', async () => {
+      window.history.replaceState({}, '', '/console/approvals');
+      const el = await loaded();
+      expect(
+        el.shadowRoot!.querySelectorAll('a.sidebar-link.active')
+      ).to.have.length(1);
+    });
+
+    it('gates a single approval on the same permission as the list', async () => {
+      window.history.replaceState({}, '', '/console/approval/req-123');
+      withPermissions(['view_agents']);
+      const el = await loaded();
+      const denied = el.shadowRoot!.querySelector('permission-denied');
+      expect(denied).to.exist;
+      expect(denied!.getAttribute('required-permission')).to.equal(
+        'view_approvals'
+      );
+    });
+
+    it('lets a decision-token link through to the approval page', async () => {
+      // An escalation recipient may hold no view_approvals at all; the page
+      // falls back to the token, which authorizes exactly this request.
+      window.history.replaceState(
+        {},
+        '',
+        '/console/approval/req-123?token=example-token'
+      );
+      withPermissions(['view_agents']);
+      const el = await loaded();
+      expect(el.shadowRoot!.querySelector('permission-denied')).to.not.exist;
+      expect(el.shadowRoot!.querySelector('.main-content slot')).to.exist;
+    });
   });
 
   describe('responsive sidebar', () => {
@@ -939,7 +1448,7 @@ describe('ConsoleShell', () => {
       );
 
       const hamburger = el.shadowRoot?.querySelector(
-        'sl-icon-button[name="list"]'
+        '#console-nav-toggle'
       ) as HTMLElement;
       expect(hamburger).to.exist;
 
@@ -1011,7 +1520,7 @@ describe('ConsoleShell', () => {
 
       const sidebar = el.shadowRoot?.querySelector('.sidebar');
       const hamburger = el.shadowRoot?.querySelector(
-        'sl-icon-button[name="list"]'
+        '#console-nav-toggle'
       ) as HTMLElement;
       const toolsLink = el.shadowRoot?.querySelector(
         'a[href="/console/tools"]'
@@ -1030,17 +1539,283 @@ describe('ConsoleShell', () => {
       expect(sidebar?.classList.contains('closed')).to.be.true;
     });
   });
+  describe('keyboard and landmarks', () => {
+    function useMobile() {
+      const mockMediaQuery = createMatchMediaStub(true);
+      matchMediaStub.restore();
+      matchMediaStub = sinon
+        .stub(window, 'matchMedia')
+        .callsFake((query: string) => {
+          if (query.includes(`${SIDEBAR_BREAKPOINT}`)) {
+            return mockMediaQuery as unknown as MediaQueryList;
+          }
+          return {
+            matches: false,
+            addEventListener: () => {},
+            removeEventListener: () => {},
+          } as unknown as MediaQueryList;
+        });
+    }
+
+    async function mount(): Promise<ConsoleShell> {
+      const el = (await fixture(
+        html`<console-shell></console-shell>`
+      )) as ConsoleShell;
+      await waitUntil(
+        () => el.shadowRoot?.querySelector('a[href="/console/tools"]') !== null,
+        'Sidebar menu did not render'
+      );
+      return el;
+    }
+
+    const toggle = (el: ConsoleShell) =>
+      el.shadowRoot!.querySelector('#console-nav-toggle') as HTMLButtonElement;
+    const sidebar = (el: ConsoleShell) =>
+      el.shadowRoot!.querySelector('#console-nav') as HTMLElement;
+
+    it('offers "Skip to content" first, landing focus on the content area', async () => {
+      const el = await mount();
+      const first = el.shadowRoot!.querySelector('a, button') as HTMLElement;
+      expect(first.textContent?.trim()).to.equal('Skip to content');
+      expect(first.getAttribute('href')).to.equal('#console-main');
+
+      first.click();
+      const main = el.shadowRoot!.querySelector('#console-main') as HTMLElement;
+      expect(main.getAttribute('tabindex')).to.equal('-1');
+      expect(el.shadowRoot!.activeElement).to.equal(main);
+      // The click is handled, not followed: no stray fragment in the URL.
+      expect(window.location.hash).to.equal('');
+    });
+
+    it('never nests a second <main> inside the app outlet', async () => {
+      const el = await mount();
+      expect(el.shadowRoot!.querySelector('main')).to.not.exist;
+    });
+
+    it('states the sidebar state on the toggle and keeps a hidden sidebar inert', async () => {
+      const el = await mount();
+      expect(toggle(el).getAttribute('aria-controls')).to.equal('console-nav');
+      expect(toggle(el).getAttribute('aria-expanded')).to.equal('true');
+      expect(toggle(el).getAttribute('aria-label')).to.equal('Hide navigation');
+      expect(sidebar(el).hasAttribute('inert')).to.be.false;
+
+      toggle(el).click();
+      await el.updateComplete;
+
+      expect(toggle(el).getAttribute('aria-expanded')).to.equal('false');
+      expect(toggle(el).getAttribute('aria-label')).to.equal('Show navigation');
+      // Collapsed to zero width, so its links must leave the tab order.
+      expect(sidebar(el).hasAttribute('inert')).to.be.true;
+    });
+
+    it('keeps the closed mobile drawer inert', async () => {
+      useMobile();
+      const el = await mount();
+      expect(sidebar(el).hasAttribute('inert')).to.be.true;
+      expect(toggle(el).getAttribute('aria-expanded')).to.equal('false');
+    });
+
+    it('moves focus into the mobile drawer, and Escape closes it back to the toggle', async () => {
+      useMobile();
+      const el = await mount();
+      toggle(el).click();
+      await waitUntil(
+        () =>
+          (el.shadowRoot!.activeElement as HTMLElement | null)?.closest?.(
+            '#console-nav'
+          ),
+        'focus did not move into the drawer'
+      );
+
+      el.shadowRoot!.activeElement!.dispatchEvent(
+        new KeyboardEvent('keydown', {
+          key: 'Escape',
+          bubbles: true,
+          composed: true,
+        })
+      );
+      await waitUntil(
+        () => sidebar(el).classList.contains('closed'),
+        'Escape did not close the drawer'
+      );
+      await el.updateComplete;
+      expect(el.shadowRoot!.activeElement).to.equal(toggle(el));
+    });
+
+    it('ignores Escape on desktop, where the sidebar is not a drawer', async () => {
+      const el = await mount();
+      el.dispatchEvent(
+        new KeyboardEvent('keydown', { key: 'Escape', bubbles: true })
+      );
+      await el.updateComplete;
+      expect(sidebar(el).classList.contains('open')).to.be.true;
+    });
+
+    it('starts a newly opened page at the top of the content area', async () => {
+      const originalPath = window.location.pathname;
+      const el = await mount();
+      await waitUntil(
+        () => el.shadowRoot!.querySelector('.main-content slot'),
+        'outlet did not render'
+      );
+      const main = el.shadowRoot!.querySelector('.main-content') as HTMLElement;
+      // A tall routed child, so the content area really scrolls.
+      const filler = document.createElement('div');
+      filler.style.minHeight = '5000px';
+      el.appendChild(filler);
+      await el.updateComplete;
+      main.scrollTop = 500;
+      expect(main.scrollTop).to.be.greaterThan(0);
+
+      window.history.pushState({}, '', '/console/agents');
+      window.dispatchEvent(new CustomEvent(LOCATION_CHANGED));
+      expect(main.scrollTop).to.equal(0);
+
+      // Back keeps the place it had, like the router does for the window.
+      main.scrollTop = 400;
+      window.history.pushState({}, '', '/console/tools');
+      window.dispatchEvent(new PopStateEvent('popstate'));
+      window.dispatchEvent(new CustomEvent(LOCATION_CHANGED));
+      expect(main.scrollTop).to.equal(400);
+
+      window.history.replaceState({}, '', originalPath);
+    });
+
+    it('shows the loading line, not a blank page, while features load', async () => {
+      const el = (await fixture(
+        html`<console-shell></console-shell>`
+      )) as ConsoleShell;
+      (el as unknown as { _featuresLoaded: boolean })._featuresLoaded = false;
+      el.requestUpdate();
+      await el.updateComplete;
+      expect(el.shadowRoot!.querySelector('.main-content route-loading')).to
+        .exist;
+      expect(el.shadowRoot!.querySelector('.main-content slot')).to.not.exist;
+    });
+  });
+
+  describe('toasts', () => {
+    afterEach(() => {
+      document.body.querySelectorAll('sl-alert').forEach((a) => a.remove());
+    });
+
+    it('turns a show-toast request into a visible toast', async () => {
+      const el = (await fixture(
+        html`<console-shell></console-shell>`
+      )) as ConsoleShell;
+      await el.updateComplete;
+      window.dispatchEvent(
+        new CustomEvent('show-toast', {
+          detail: { message: 'Slow down a little.', variant: 'warning' },
+        })
+      );
+      const alert = Array.from(document.querySelectorAll('sl-alert')).find(
+        (a) => a.textContent?.includes('Slow down a little.')
+      ) as (HTMLElement & { variant: string }) | undefined;
+      expect(alert, 'toast rendered').to.exist;
+      expect(alert!.variant).to.equal('warning');
+    });
+
+    it('accepts a request that bubbles up from a routed view', async () => {
+      const el = (await fixture(
+        html`<console-shell><div id="child"></div></console-shell>`
+      )) as ConsoleShell;
+      await el.updateComplete;
+      el.querySelector('#child')!.dispatchEvent(
+        new CustomEvent('show-toast', {
+          bubbles: true,
+          composed: true,
+          detail: { message: 'Logs copied.', variant: 'bogus' },
+        })
+      );
+      const alert = Array.from(document.querySelectorAll('sl-alert')).find(
+        (a) => a.textContent?.includes('Logs copied.')
+      ) as (HTMLElement & { variant: string }) | undefined;
+      expect(alert).to.exist;
+      // An unknown variant falls back rather than rendering unstyled.
+      expect(alert!.variant).to.equal('primary');
+    });
+
+    it('ignores a request with nothing to say', async () => {
+      const el = (await fixture(
+        html`<console-shell></console-shell>`
+      )) as ConsoleShell;
+      await el.updateComplete;
+      const before = document.querySelectorAll('sl-alert').length;
+      window.dispatchEvent(
+        new CustomEvent('show-toast', { detail: { message: '  ' } })
+      );
+      expect(document.querySelectorAll('sl-alert').length).to.equal(before);
+    });
+
+    it('stops listening once the shell is gone', async () => {
+      const el = (await fixture(
+        html`<console-shell></console-shell>`
+      )) as ConsoleShell;
+      await el.updateComplete;
+      el.remove();
+      const before = document.querySelectorAll('sl-alert').length;
+      window.dispatchEvent(
+        new CustomEvent('show-toast', { detail: { message: 'Gone.' } })
+      );
+      expect(document.querySelectorAll('sl-alert').length).to.equal(before);
+    });
+  });
+
   describe('upgrade modal', () => {
     /** Collapse Lit's template line breaks so assertions test copy, not layout. */
     function copy(el: ConsoleShell): string {
       return (el.shadowRoot?.textContent ?? '').replace(/\s+/g, ' ').trim();
     }
 
-    async function openGate(feature: string) {
+    /** Serve /features with the billing plugin on or off. */
+    function withBilling(billing: boolean) {
+      invalidateApiCaches();
+      fetchStub.callsFake(async (input: RequestInfo | URL) => {
+        const url = typeof input === 'string' ? input : input.toString();
+        if (url.endsWith('/api/v1/features')) {
+          return new Response(
+            JSON.stringify({
+              plugins: billing ? ['billing'] : [],
+              features: billing ? { billing: true } : {},
+            }),
+            { status: 200, headers: { 'Content-Type': 'application/json' } }
+          );
+        }
+        if (url.endsWith('/api/v1/auth/users/me')) {
+          return new Response(
+            JSON.stringify({
+              username: 'test',
+              email: 'test@example.com',
+              email_verified: true,
+              permissions: null,
+            }),
+            { status: 200, headers: { 'Content-Type': 'application/json' } }
+          );
+        }
+        return new Response(JSON.stringify({}), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      });
+    }
+
+    async function mountShell(): Promise<ConsoleShell> {
       const el = (await fixture(
         html`<console-shell></console-shell>`
       )) as ConsoleShell;
+      await waitUntil(
+        () => (el as any)._featuresLoaded,
+        'features did not load'
+      );
       await el.updateComplete;
+      return el;
+    }
+
+    beforeEach(() => withBilling(true));
+
+    async function openGate(feature: string) {
+      const el = await mountShell();
       // show() would open a real dialog and animate; the copy under test is
       // rendered from _upgradeFeature either way.
       sinon.stub((el as any)._upgradeModal, 'show');
@@ -1144,10 +1919,7 @@ describe('ConsoleShell', () => {
 
     it('offers the plan page without a feature when the gate names none', async () => {
       const go = sinon.stub(Router, 'go').returns(true);
-      const el = (await fixture(
-        html`<console-shell></console-shell>`
-      )) as ConsoleShell;
-      await el.updateComplete;
+      const el = await mountShell();
       sinon.stub((el as any)._upgradeModal, 'show');
       window.dispatchEvent(
         new CustomEvent('show-upgrade-modal', { detail: {} })
@@ -1156,6 +1928,33 @@ describe('ConsoleShell', () => {
       footer(el, 'upgrade-now').click();
       await el.updateComplete;
       expect(go.lastCall.args[0]).to.equal('/console/settings/plan');
+    });
+
+    it('never opens where nothing is sold (OSS)', async () => {
+      // Without the billing plugin "Upgrade now" leads to a page that says
+      // every feature is already available, so the dialog stays shut no
+      // matter what raised it.
+      withBilling(false);
+      const el = await mountShell();
+      const show = sinon.stub((el as any)._upgradeModal, 'show');
+      window.dispatchEvent(
+        new CustomEvent('show-upgrade-modal', {
+          detail: { code: 'upgrade_required', feature: 'rbac' },
+        })
+      );
+      await el.updateComplete;
+      expect(show).to.not.have.been.called;
+    });
+
+    it('opens where the billing plugin sells plans', async () => {
+      const el = await mountShell();
+      const show = sinon.stub((el as any)._upgradeModal, 'show');
+      window.dispatchEvent(
+        new CustomEvent('show-upgrade-modal', {
+          detail: { code: 'upgrade_required', feature: 'rbac' },
+        })
+      );
+      expect(show).to.have.been.calledOnce;
     });
 
     it('falls back to a full page load where no router is mounted', async () => {

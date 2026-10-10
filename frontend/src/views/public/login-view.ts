@@ -1,3 +1,4 @@
+import { consumeLoginReturn } from '../../utils/login-return';
 import { LitElement, html, css, nothing } from 'lit';
 import { customElement, state } from 'lit/decorators.js';
 import { Router } from '../../router';
@@ -8,6 +9,8 @@ import {
   resendVerificationEmail,
 } from '../../api';
 import { formStyles } from '../../styles/form-styles';
+import { hasCapability } from '../../capabilities';
+import type { Membership } from '../../hierarchy-api';
 import { getBrandConfig } from '../../brand-config';
 import '@shoelace-style/shoelace/dist/components/input/input.js';
 import '@shoelace-style/shoelace/dist/components/button/button.js';
@@ -51,6 +54,20 @@ export class LoginView extends LitElement {
   @state()
   private resending = false;
 
+  /** True while the username/password request is in flight. */
+  @state()
+  private submitting = false;
+
+  /** Capability `multi_account` from /features (off in OSS). */
+  private multiAccount = false;
+
+  /**
+   * Memberships to choose from after sign-in, set only when the person has
+   * several accounts and none was used last. Null renders the sign-in form.
+   */
+  @state()
+  private chooserMemberships: Membership[] | null = null;
+
   static styles = [
     formStyles,
     css`
@@ -92,7 +109,7 @@ export class LoginView extends LitElement {
         display: flex;
         align-items: center;
         margin: 1.5rem 0;
-        color: var(--sl-color-neutral-500);
+        color: var(--console-meta-color);
         font-size: var(--sl-font-size-small);
       }
 
@@ -134,6 +151,7 @@ export class LoginView extends LitElement {
       this.registrationEnabled = features.features['registration'] !== false;
       this.passkeysEnabled =
         features.features['passkeys'] !== false && passkeysSupported();
+      this.multiAccount = hasCapability(features.features, 'multi_account');
     } catch (error) {
       this.oauthProviders = [];
       // Fail open, matching the /register route guard.
@@ -143,9 +161,8 @@ export class LoginView extends LitElement {
   }
 
   private _navigateAfterLogin() {
-    const redirectPath = localStorage.getItem('loginRedirect');
+    const redirectPath = consumeLoginReturn();
     if (redirectPath) {
-      localStorage.removeItem('loginRedirect');
       if (redirectPath.startsWith('/admin')) {
         // The admin dashboard is a separate SPA that the console's
         // client-side router cannot reach; do a hard navigation.
@@ -156,6 +173,32 @@ export class LoginView extends LitElement {
     } else {
       Router.go('/console');
     }
+  }
+
+  /**
+   * After tokens are stored: open the account chooser when the person has
+   * several accounts and no last used one, otherwise continue as before.
+   * Any failure here falls back to the normal redirect.
+   */
+  private async _continueAfterSignIn(data: object) {
+    const lastActive = (data as { last_active_account_id?: unknown })
+      .last_active_account_id;
+    if (this.multiAccount && !lastActive) {
+      try {
+        const [{ getMemberships }] = await Promise.all([
+          import('../../hierarchy-api'),
+          import('../authed/hierarchy/account-login-chooser'),
+        ]);
+        const memberships = await getMemberships();
+        if (memberships.length > 1) {
+          this.chooserMemberships = memberships;
+          return;
+        }
+      } catch {
+        // No memberships endpoint: a single account, carry on.
+      }
+    }
+    this._navigateAfterLogin();
   }
 
   private async handlePasskeySignIn() {
@@ -170,7 +213,7 @@ export class LoginView extends LitElement {
       window.dispatchEvent(
         new CustomEvent('auth-change', { bubbles: true, composed: true })
       );
-      this._navigateAfterLogin();
+      await this._continueAfterSignIn(data);
     } catch (error) {
       // A cancelled ceremony (user dismissed the prompt) is not an error
       // worth showing.
@@ -185,11 +228,15 @@ export class LoginView extends LitElement {
 
   private async handleLogin(event: SubmitEvent) {
     event.preventDefault();
+    // Enter in a field submits too, so the button's loading state alone does
+    // not stop a second request on a slow server.
+    if (this.submitting) return;
     const form = event.target as HTMLFormElement;
     const formData = new FormData(form);
     const username = formData.get('username') as string;
     const password = formData.get('password') as string;
 
+    this.submitting = true;
     try {
       const data = await post('/api/v1/auth/token/json', {
         username,
@@ -209,7 +256,7 @@ export class LoginView extends LitElement {
       window.dispatchEvent(
         new CustomEvent('auth-change', { bubbles: true, composed: true })
       );
-      this._navigateAfterLogin();
+      await this._continueAfterSignIn(data);
     } catch (error) {
       if (error instanceof Error) {
         this.error = error.message;
@@ -225,6 +272,8 @@ export class LoginView extends LitElement {
         this.unverifiedEmail = '';
       }
       console.error('Sign in failed', error);
+    } finally {
+      this.submitting = false;
     }
   }
 
@@ -301,7 +350,9 @@ export class LoginView extends LitElement {
           `;
         })}
       </div>
-      <div class="divider">or sign in with email</div>
+      <!-- The backend signs in by username only, so the divider must not
+           promise an email sign-in that would then fail as a bad password. -->
+      <div class="divider">or sign in with your username</div>
     `;
   }
 
@@ -316,68 +367,87 @@ export class LoginView extends LitElement {
         <div class="form-container">
           <h2>Sign in to ${getBrandConfig().name}</h2>
           ${
-            this.successMessage
-              ? html`<div class="success-message">${this.successMessage}</div>`
-              : ''
+            this.chooserMemberships
+              ? html`<account-login-chooser
+                  .memberships=${this.chooserMemberships}
+                  .navigate=${() => this._navigateAfterLogin()}
+                ></account-login-chooser>`
+              : this._renderSignInForm()
           }
-          ${
-            this.error
-              ? html`<div class="error-message">
-                  ${this.error}
-                  ${
-                    this.unverifiedEmail
-                      ? html`<div class="resend-row">
-                          <sl-button
-                            id="resend-verification"
-                            size="small"
-                            variant="default"
-                            ?loading=${this.resending}
-                            @click=${this._handleResend}
-                          >
-                            Send a new verification email
-                          </sl-button>
-                        </div>`
-                      : nothing
-                  }
-                </div>`
-              : ''
-          }
-          ${this._renderOAuthButtons()}
-          <form @submit=${this.handleLogin}>
-            <div class="form-group">
-              <sl-input
-                label="Username"
-                id="username"
-                name="username"
-                required
-              ></sl-input>
-            </div>
-            <div class="form-group">
-              <sl-input
-                type="password"
-                label="Password"
-                id="password"
-                name="password"
-                required
-                password-toggle
-              ></sl-input>
-            </div>
-            <div class="form-actions">
-              <sl-button type="submit" variant="primary" style="width: 100%;"
-                >Sign in</sl-button
-              >
-            </div>
-            <div class="form-links">
-              <a href="/forgot-password">Forgot Password?</a>
-              ${
-                this.registrationEnabled
-                  ? html` &middot; <a href="/register">Create Account</a>`
-                  : nothing
-              }
-            </div>
-          </form>
         </div>
       </div>
+    `;
+  }
+
+  private _renderSignInForm() {
+    return html`
+      ${
+        this.successMessage
+          ? html`<div class="success-message">${this.successMessage}</div>`
+          : ''
+      }
+      ${
+        this.error
+          ? html`<div class="error-message" role="alert">
+              ${this.error}
+              ${
+                this.unverifiedEmail
+                  ? html`<div class="resend-row">
+                      <sl-button
+                        id="resend-verification"
+                        size="small"
+                        variant="default"
+                        ?loading=${this.resending}
+                        @click=${this._handleResend}
+                      >
+                        Send a new verification email
+                      </sl-button>
+                    </div>`
+                  : nothing
+              }
+            </div>`
+          : ''
+      }
+      ${this._renderOAuthButtons()}
+      <form @submit=${this.handleLogin}>
+        <div class="form-group">
+          <sl-input
+            label="Username"
+            id="username"
+            name="username"
+            autocomplete="username"
+            required
+          ></sl-input>
+        </div>
+        <div class="form-group">
+          <sl-input
+            type="password"
+            label="Password"
+            id="password"
+            name="password"
+            autocomplete="current-password"
+            required
+            password-toggle
+          ></sl-input>
+        </div>
+        <div class="form-actions">
+          <sl-button
+            type="submit"
+            variant="primary"
+            style="width: 100%;"
+            ?loading=${this.submitting}
+            >Sign in</sl-button
+          >
+        </div>
+        <div class="form-links">
+          <a href="/forgot-password">Forgot password?</a>
+          ${
+            this.registrationEnabled
+              ? html` &middot; <a href="/register">Create account</a>`
+              : nothing
+          }
+        </div>
+      </form>
     `;
   }
 }

@@ -157,6 +157,19 @@ describe('MCPServerForm', () => {
 
       expect((el as any).errorMessage).to.equal('Server name is required');
       expect(fetchStub).not.to.have.been.called;
+      // Announced to screen readers, not only painted red.
+      const error = el.shadowRoot?.querySelector('.error');
+      expect(error?.getAttribute('role')).to.equal('alert');
+    });
+
+    it('explains the transport in plain words, without roadmap jargon', async () => {
+      const el = await createForm(null);
+      const text = el.shadowRoot?.textContent ?? '';
+      expect(text).to.not.contain('Phase 1B');
+      expect(text).to.contain('Streamable HTTP');
+      // No disabled field that cannot be changed.
+      expect(el.shadowRoot?.querySelector('sl-input[name="transport"]')).to.not
+        .exist;
     });
 
     it('shows error when server URL is empty on submit', async () => {
@@ -306,6 +319,61 @@ describe('MCPServerForm', () => {
       const listener = oneEvent(el, 'close-modal');
       dialog?.dispatchEvent(new CustomEvent('sl-request-close'));
       await listener;
+    });
+  });
+  describe('Tool prefix and collisions (#1135)', () => {
+    it('sends an explicit prefix and null when left empty', async () => {
+      stubApi();
+      const el = await createForm(null);
+      (el as any).serverName = 'crm';
+      (el as any).serverUrl = 'http://localhost:8001';
+      await (el as any).handleSave();
+      const first = fetchStub
+        .getCalls()
+        .find((c) => String(c.args[0]).includes('/api/v1/mcp-servers'));
+      expect(JSON.parse(first!.args[1].body).tool_prefix).to.equal(null);
+
+      fetchStub.resetHistory();
+      const second = await createForm(null);
+      (second as any).serverName = 'crm';
+      (second as any).serverUrl = 'http://localhost:8001';
+      (second as any).toolPrefix = 'crm';
+      await (second as any).handleSave();
+      const call = fetchStub
+        .getCalls()
+        .find((c) => String(c.args[0]).includes('/api/v1/mcp-servers'));
+      expect(JSON.parse(call!.args[1].body).tool_prefix).to.equal('crm');
+    });
+
+    it('rejects an invalid prefix before any request', async () => {
+      const el = await createForm(null);
+      (el as any).serverName = 'crm';
+      (el as any).serverUrl = 'http://localhost:8001';
+      (el as any).toolPrefix = 'CRM-1';
+      await (el as any).handleSave();
+      expect((el as any).errorMessage).to.contain('Tool prefix');
+      expect(fetchStub).not.to.have.been.called;
+    });
+
+    it('shows the server warnings in the edit dialog', async () => {
+      const warning =
+        "Tool 'read_scope' on MCP server 'newer' is shadowed by MCP server 'older'.";
+      const el = await createForm({
+        id: 'server-2',
+        name: 'newer',
+        url: 'http://localhost:8002',
+        auth_type: 'none',
+        tool_prefix: null,
+        warnings: [warning],
+      });
+      const box = el.shadowRoot?.querySelector(
+        '[data-testid="mcp-server-warnings"]'
+      );
+      expect(box?.textContent).to.contain(warning);
+      const prefix = el.shadowRoot?.querySelector(
+        'sl-input[name="tool_prefix"]'
+      );
+      expect((prefix as any)?.value).to.equal('');
     });
   });
 });

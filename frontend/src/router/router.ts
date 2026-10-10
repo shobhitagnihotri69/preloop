@@ -13,6 +13,8 @@
  * wrapper around one.
  */
 
+import { historyStateForNavigation, inAppDepth } from '../utils/in-app-history';
+
 /** The `location` object handed to actions, guards and routed elements. */
 export interface RouterLocation {
   /** Pathname of the resolved URL, without search or hash. */
@@ -192,7 +194,13 @@ export function baseHrefPrefix(): string {
 function compilePath(path: string): { pattern: RegExp; keys: string[] } {
   const keys: string[] = [];
   if (path.includes('(.*)')) {
-    return { pattern: /^\/.*$/u, keys };
+    // The wildcard is relative to where it sits: `/(.*)` matches anything,
+    // `/console/(.*)` only what is under the console. Treating every `(.*)`
+    // as match-all let a nested catch-all swallow unrelated top-level paths.
+    const escape = (text: string) =>
+      text.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&');
+    const source = normalizePath(path).split('(.*)').map(escape).join('.*');
+    return { pattern: new RegExp('^' + source + '$', 'u'), keys };
   }
   const source = normalizePath(path)
     .split('/')
@@ -295,6 +303,7 @@ const activeRouters = new Set<Router>();
 export class Router {
   #outlet: Element | null = null;
   #flat: CompiledRoute[] = [];
+  #routes: readonly Route[] = [];
   #chain: Route[] = [];
   /**
    * The rendered element per chain level, `null` where the route at that level
@@ -304,6 +313,8 @@ export class Router {
    */
   #elements: (RoutedElement | null)[] = [];
   #renderId = 0;
+  #renderedHistoryState: unknown = null;
+  #restoringHistoryUrl: string | null = null;
   #listening = false;
   #loading: LoadingRenderer | null = null;
   #loaded = new WeakMap<Route, Promise<unknown>>();
@@ -372,6 +383,7 @@ export class Router {
    * app's bootstrap both want to know when the first view exists.
    */
   async setRoutes(routes: readonly Route[], skipRender = false): Promise<void> {
+    this.#routes = routes;
     this.#flat = flattenRoutes(routes);
     this.#chain = [];
     this.#elements = [];
@@ -380,6 +392,24 @@ export class Router {
       const { pathname, search, hash } = window.location;
       await this.render({ pathname, search, hash }, { history: 'replace' });
     }
+  }
+
+  /**
+   * Re-read the installed route table after routes were added to it.
+   *
+   * Unlike `setRoutes` this keeps the rendered chain, so the shell around the
+   * current view is reused rather than rebuilt. With `render` the current URL
+   * is drawn again, but only when the table now resolves it to a different
+   * route (a path that rendered not-found before its route existed).
+   */
+  async refreshRoutes(options: { render?: boolean } = {}): Promise<void> {
+    const before = this.match(window.location.pathname)?.chain ?? [];
+    this.#flat = flattenRoutes(this.#routes);
+    if (!options.render || !this.#outlet) return;
+    const after = this.match(window.location.pathname)?.chain ?? [];
+    if (before[before.length - 1] === after[after.length - 1]) return;
+    const { pathname, search, hash } = window.location;
+    await this.render({ pathname, search, hash }, { history: 'replace' });
   }
 
   /**
@@ -460,7 +490,12 @@ export class Router {
         }
         return;
       }
-      if (outcome.stale || outcome.cancelled) return;
+      if (outcome.stale) return;
+      if (outcome.cancelled) {
+        if (renderId === this.#renderId && options.history === 'none')
+          this.#restoreCancelledHistory();
+        return;
+      }
       if (outcome.redirect) {
         current = splitUrl(outcome.redirect);
         continue;
@@ -629,6 +664,7 @@ export class Router {
     this.#chain = hit.chain.slice(0, next.length);
     this.#elements = next;
     this.location = context;
+    this.#renderedHistoryState = window.history.state;
     rendered.onAfterEnter?.(context, commands, this);
     return { location: context };
   }
@@ -730,8 +766,12 @@ export class Router {
       window.location.hash === final.hash;
     if (same) return;
     const url = final.pathname + final.search + final.hash;
+    // The entry carries its in-app depth so Back buttons can tell an entry
+    // this router wrote from the page the tab was opened on (see
+    // utils/in-app-history.ts); `document.referrer` never changes on a
+    // `pushState`, so it cannot.
     window.history[mode === 'push' ? 'pushState' : 'replaceState'](
-      null,
+      historyStateForNavigation(mode),
       '',
       url
     );
@@ -761,8 +801,32 @@ export class Router {
     document.removeEventListener('click', this.#onClick);
   }
 
+  #restoreCancelledHistory(): void {
+    if (!this.location) return;
+    const previous =
+      this.location.pathname + this.location.search + this.location.hash;
+    const current =
+      window.location.pathname + window.location.search + window.location.hash;
+    if (previous === current) return;
+    const delta = inAppDepth(this.#renderedHistoryState) - inAppDepth();
+    if (Number.isInteger(delta) && delta !== 0) {
+      // Reverse the browser traversal so its history entry remains usable.
+      // The returning popstate needs no guard: its view is already mounted.
+      this.#restoringHistoryUrl = previous;
+      window.history.go(delta);
+    } else {
+      // Older/unmarked entries have no usable traversal index.
+      window.history.replaceState(this.#renderedHistoryState, '', previous);
+    }
+  }
+
   #onPopstate = (): void => {
     const { pathname, search, hash } = window.location;
+    if (this.#restoringHistoryUrl !== null) {
+      const expected = this.#restoringHistoryUrl;
+      this.#restoringHistoryUrl = null;
+      if (pathname + search + hash === expected) return;
+    }
     void this.render({ pathname, search, hash }, { history: 'none' });
   };
 

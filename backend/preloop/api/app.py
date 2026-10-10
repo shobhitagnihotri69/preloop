@@ -9,42 +9,42 @@ import logging
 import os
 import sys
 import time
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from contextlib import asynccontextmanager
-from typing import AsyncGenerator, Any
+from typing import Any, AsyncGenerator, Optional
 from urllib.parse import quote
 from uuid import UUID
-from fastapi import Depends, FastAPI, Request, HTTPException, WebSocket
+
+from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket
+from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
 from fastapi.openapi.docs import get_redoc_html, get_swagger_ui_html
 from fastapi.openapi.utils import get_openapi
-from fastapi.responses import FileResponse, RedirectResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
+from fastapi.staticfiles import StaticFiles
 from sqlalchemy.exc import TimeoutError as SQLAlchemyPoolTimeout
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.websockets import WebSocketState
 
 from preloop import __version__
-from fastapi.encoders import jsonable_encoder
 from preloop.config import settings
-from preloop.services.litellm_cost_map import pin_local_litellm_cost_map
-from preloop.services.model_gateway_errors import ModelGatewayAPIError
-from preloop.models.sentry import init_sentry
 from preloop.models.db.session import get_db_session
 from preloop.models.db.setup import setup_database
+from preloop.models.sentry import init_sentry
 from preloop.services.api_usage_recorder import (
     ApiUsageRecord,
     record_api_usage,
     shutdown_api_usage_recorder,
 )
-from preloop.sync.services.event_bus import connect_nats, close_nats  # NATS integration
+from preloop.services.litellm_cost_map import pin_local_litellm_cost_map
+from preloop.services.model_gateway_errors import ModelGatewayAPIError
+from preloop.sync.services.event_bus import close_nats, connect_nats  # NATS integration
 
 # Pin before create_app's role-gated imports can pull litellm.
 pin_local_litellm_cost_map()
 
-# Enterprise endpoints (impersonation, issue_compliance, issue_duplicates, issue_dependencies)
-# are now loaded exclusively via the plugin system - see plugins/admin and plugins/analytics
+# Enterprise endpoints are loaded exclusively via the plugin system.
 
 
 logger = logging.getLogger(__name__)
@@ -127,6 +127,37 @@ class PyinstrumentMiddleware(BaseHTTPMiddleware):
         return response
 
 
+_ISSUE_COLLECTION_PATH = "/api/v1/issues"
+
+
+def api_usage_action_type(method: str, path: str) -> Optional[str]:
+    """Classify issue create, update and delete usage.
+
+    ``create_issue`` is only ``POST /api/v1/issues``. A POST whose path
+    merely contains ``/issues`` (a comment, a lifecycle call, a search)
+    is not issue creation. Item updates and deletes are ``PUT``,
+    ``PATCH`` or ``DELETE`` on a path under ``/api/v1/issues/``.
+
+    Args:
+        method: HTTP method.
+        path: Request path, without the query string.
+
+    Returns:
+        The usage action, or None when this request is not that kind of
+        issue mutation.
+    """
+    normalized = path.rstrip("/") or "/"
+    if method == "POST" and normalized == _ISSUE_COLLECTION_PATH:
+        return "create_issue"
+    if not normalized.startswith(f"{_ISSUE_COLLECTION_PATH}/"):
+        return None
+    if method in ("PUT", "PATCH"):
+        return "update_issue"
+    if method == "DELETE":
+        return "delete_issue"
+    return None
+
+
 class ApiUsageMiddleware(BaseHTTPMiddleware):
     """Middleware to track API usage."""
 
@@ -167,23 +198,17 @@ class ApiUsageMiddleware(BaseHTTPMiddleware):
         # Extract tracking information
         method = request.method
         status_code = response.status_code
-        action_type = None
-
-        # Determine the action type based on the path and method
-        if "/issues" in path:
-            if method == "POST":
-                action_type = "create_issue"
-            elif method == "PUT" or method == "PATCH":
-                action_type = "update_issue"
-            elif method == "DELETE":
-                action_type = "delete_issue"
+        # create_issue is the collection route only. Nested POSTs such as
+        # comments must not be counted as issue creation.
+        action_type = api_usage_action_type(method, path)
 
         # Get user_id from auth token if available
         user_id = None
         auth_header = request.headers.get("Authorization")
         if auth_header and auth_header.startswith("Bearer "):
-            from preloop.api.auth.jwt import decode_token
             from uuid import UUID
+
+            from preloop.api.auth.jwt import decode_token
 
             try:
                 token = auth_header.replace("Bearer ", "")
@@ -222,7 +247,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     service_role = os.getenv("PRELOOP_SERVICE_ROLE", "all").lower()
     is_testing = os.getenv("TESTING") == "true"
     is_api_role = service_role in {"all", "api"}
-    is_gateway_role = service_role in {"all", "gateway"}
+    is_gateway_role = service_role in {"all", "gateway", "chat"}
 
     # Initialize Sentry if DSN is configured
     init_sentry()
@@ -369,6 +394,43 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             service_role,
         )
 
+    # Purge discovery candidates unseen for 90 days. Always on: the window
+    # is part of the discovery reporting privacy promise, not an opt-in.
+    discovery_candidate_purge_sweeper = None
+    if not is_testing and is_api_role:
+        from preloop.services.discovery_candidate_purge import (
+            get_discovery_candidate_purge_sweeper,
+        )
+
+        discovery_candidate_purge_sweeper = get_discovery_candidate_purge_sweeper()
+        await discovery_candidate_purge_sweeper.start()
+
+    # Start the scheduled issue cost rebuild (skip in testing mode). It records
+    # finished executions that no terminal hook recorded and refreshes issue
+    # estimates. Idempotent, additive and per-account locked, so several API
+    # replicas running it at once is safe.
+    issue_cost_rebuild_sweeper = None
+    if not is_testing and is_api_role and settings.issue_cost_rebuild_enabled:
+        from preloop.services.issue_cost_rebuild_sweeper import (
+            get_issue_cost_rebuild_sweeper,
+        )
+
+        issue_cost_rebuild_sweeper = get_issue_cost_rebuild_sweeper()
+        await issue_cost_rebuild_sweeper.start()
+    else:
+        logger.info(
+            "Issue cost rebuild sweeper not started (enabled=%s, role=%s).",
+            settings.issue_cost_rebuild_enabled,
+            service_role,
+        )
+
+    readiness_sweeper = None
+    if not is_testing and is_api_role and settings.ticket_readiness_enabled:
+        from preloop.services.readiness.scheduler import ReadinessSweeper
+
+        readiness_sweeper = ReadinessSweeper()
+        await readiness_sweeper.start()
+
     # Start the session search backfill sweeper (skip in testing mode). It
     # walks existing session history into the search corpus, newest first,
     # inside a row and wall-clock budget. Disabled unless
@@ -425,10 +487,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # Recover orphaned flow executions (skip in testing mode)
     recovery_service = None
     if not is_testing and is_api_role:
+        from preloop.services.execution_recovery import get_recovery_service
         from preloop.services.flow_execution_dispatcher import (
             flow_execution_worker_enabled,
         )
-        from preloop.services.execution_recovery import get_recovery_service
 
         # When flow orchestration runs on sync workers, API must not start
         # in-process orchestrators (unsafe with multiple API replicas).
@@ -591,13 +653,16 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             )
 
     # All roles, including a dedicated gateway, need the same current prices.
+    from preloop.services.model_content_policy import set_model_io_approval_loop
+    from preloop.services.model_price_catalog import start_price_map_refresh
     from preloop.services.reviewed_model_price_refresh import (
         start_reviewed_price_refresh,
     )
 
-    from preloop.services.model_content_policy import set_model_io_approval_loop
-
     price_refresher = start_reviewed_price_refresh()
+    # Merge the upstream price map on startup and every TTL so a model the
+    # vendored snapshot lacks is priced without waiting for a miss (#801).
+    price_map_refresher = start_price_map_refresh()
     set_model_io_approval_loop(asyncio.get_running_loop())
     try:
         yield
@@ -605,6 +670,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         set_model_io_approval_loop(None)
         if price_refresher is not None:
             await price_refresher.stop()
+        if price_map_refresher is not None:
+            await price_map_refresher.stop()
 
     # Shutdown logic
 
@@ -682,6 +749,26 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         except Exception as e:
             logger.error(
                 f"Error stopping session search backfill sweeper: {e}", exc_info=True
+            )
+
+    if not is_testing and discovery_candidate_purge_sweeper:
+        try:
+            await discovery_candidate_purge_sweeper.stop()
+        except Exception as e:
+            logger.error(
+                f"Error stopping discovery candidate purge: {e}", exc_info=True
+            )
+
+    if readiness_sweeper:
+        await readiness_sweeper.stop()
+
+    if not is_testing and issue_cost_rebuild_sweeper:
+        try:
+            await issue_cost_rebuild_sweeper.stop()
+            logger.info("Issue cost rebuild sweeper stopped.")
+        except Exception as e:
+            logger.error(
+                f"Error stopping issue cost rebuild sweeper: {e}", exc_info=True
             )
 
     # Stop the retention purge sweeper. A pass in flight finishes its current
@@ -798,22 +885,34 @@ def _register_control_plane_routes(
     from preloop.api.auth import auth_router, get_current_active_user
     from preloop.api.endpoints import (
         account,
-        issue_lifecycle,
         agent_control,
+        agent_deployments,
+        agent_discovery,
         agent_permission,
-        audio,
+        ai_models,
         approval_bypass,
-        audit_chain,
-        budget,
         approval_requests,
+        artifact_search,
+        audio,
+        audit_chain,
+        bitbucket_dc_webhooks,
+        budget,
+        ci_identities,
         comments,
+        copilot_usage,
         cost,
+    )
+    from preloop.api.endpoints import embedding as embedding_router
+    from preloop.api.endpoints import (
+        employee_events,
         event_webhooks,
         exports,
         features,
+        flows,
+        issue_costs,
+        issue_lifecycle,
         issues,
         kill_switch,
-        agent_deployments,
         mcp_servers,
         notification_preferences,
         operator_notes,
@@ -824,27 +923,29 @@ def _register_control_plane_routes(
         pull_requests,
         retention,
         roles,
-        search as search_router,
+        runners,
+        runtime_session_artifacts,
+        runtime_session_browser_steps,
+    )
+    from preloop.api.endpoints import search as search_router
+    from preloop.api.endpoints import (
         security_maintenance,
         security_screen,
         session_embedding_settings,
         session_optimization,
         session_saved_searches,
         session_search,
+        spend_outliers,
         tools,
         trackers,
         usage_import,
-        embedding as embedding_router,
         webhooks,
-        flows,
-        runners,
-        ai_models,
         websockets,
     )
-    from preloop.services.mcp_http import setup_mcp_routes
 
     # OAuth consent page (login form for CLI and MCP OAuth flows)
     from preloop.api.endpoints.oauth_consent import router as oauth_consent_router
+    from preloop.services.mcp_http import setup_mcp_routes
 
     app.include_router(oauth_consent_router)
     logger.info("OAuth consent routes registered")
@@ -877,6 +978,14 @@ def _register_control_plane_routes(
         prefix="/api/v1/auth/webauthn",
         tags=["Auth", "Passkeys"],
     )
+    # Before account.router: its "/agents/{agent_id}" routes would otherwise
+    # capture "/agents/discovery-candidates".
+    app.include_router(
+        agent_discovery.router,
+        prefix="/api/v1",
+        tags=["Agent discovery"],
+        dependencies=[Depends(get_current_active_user)],
+    )
     app.include_router(
         account.router,
         prefix="/api/v1",
@@ -899,6 +1008,12 @@ def _register_control_plane_routes(
     )  # No auth required
     app.include_router(
         trackers.router,
+        prefix="/api/v1",
+        tags=["Trackers"],
+        dependencies=[Depends(get_current_active_user)],
+    )
+    app.include_router(
+        bitbucket_dc_webhooks.router,
         prefix="/api/v1",
         tags=["Trackers"],
         dependencies=[Depends(get_current_active_user)],
@@ -945,10 +1060,17 @@ def _register_control_plane_routes(
         dependencies=[Depends(get_current_active_user)],
     )
     app.include_router(
-        event_webhooks.router,
+        ci_identities.router,
         prefix="/api/v1",
         dependencies=[Depends(get_current_active_user)],
     )
+    # Every webhook handler declares its own actor dependency: the five
+    # principal-owned subscription operations use get_current_actor so a
+    # restricted CI credential classified by the ASGI guard can reach them,
+    # and the human-only operations keep get_current_active_user. A router
+    # level human dependency would run first and reject the machine token
+    # with 401 (see tests/api/test_ci_subscription_app_wiring.py).
+    app.include_router(event_webhooks.router, prefix="/api/v1")
     app.include_router(
         retention.router,
         prefix="/api/v1",
@@ -1046,7 +1168,25 @@ def _register_control_plane_routes(
         dependencies=[Depends(get_current_active_user)],
     )
     app.include_router(
+        spend_outliers.router,
+        prefix="/api/v1",
+        tags=["Attention"],
+        dependencies=[Depends(get_current_active_user)],
+    )
+    app.include_router(
         cost.router,
+        prefix="/api/v1",
+        tags=["Cost Analytics"],
+        dependencies=[Depends(get_current_active_user)],
+    )
+    app.include_router(
+        issue_costs.router,
+        prefix="/api/v1",
+        tags=["Cost Analytics"],
+        dependencies=[Depends(get_current_active_user)],
+    )
+    app.include_router(
+        copilot_usage.router,
         prefix="/api/v1",
         tags=["Cost Analytics"],
         dependencies=[Depends(get_current_active_user)],
@@ -1065,9 +1205,11 @@ def _register_control_plane_routes(
     )
     # Note: Issue duplicates endpoint is now loaded via plugins/analytics
     app.include_router(webhooks.router, prefix="/api/v1", tags=["Webhooks"])
-    from preloop.api.endpoints import flow_artifacts
+    app.include_router(employee_events.router, prefix="/api/v1")
+    from preloop.api.endpoints import flow_artifacts, publication_credentials
 
     app.include_router(flow_artifacts.router, prefix="/api/v1", tags=["Flow artifacts"])
+    app.include_router(publication_credentials.router, prefix="/api/v1")
     app.include_router(
         flows.router,
         prefix="/api/v1",
@@ -1083,6 +1225,14 @@ def _register_control_plane_routes(
     # Policies router for policy-as-code YAML import/export
     app.include_router(
         policies.router,
+        prefix="/api/v1",
+        tags=["Policies"],
+        dependencies=[Depends(get_current_active_user)],
+    )
+    from preloop.api.endpoints import policy_notices
+
+    app.include_router(
+        policy_notices.router,
         prefix="/api/v1",
         tags=["Policies"],
         dependencies=[Depends(get_current_active_user)],
@@ -1108,6 +1258,10 @@ def _register_control_plane_routes(
         prefix="/api/v1",
         tags=["Agent Permissions"],
     )
+    from preloop.api.endpoints import chat
+
+    app.include_router(chat.router, prefix="/api/v1")
+
     # Operator notes: authored on the console/CLI half (session auth), and
     # pulled on the harness half (runtime bearer, authenticated in-route).
     app.include_router(
@@ -1122,6 +1276,25 @@ def _register_control_plane_routes(
         prefix="/api/v1",
         tags=["Runtime Sessions"],
         dependencies=[Depends(get_current_active_user)],
+    )
+    # Browser steps authenticate with the agent bearer inside the route.
+    # A console-user dependency would reject the runtime key this exists for.
+    app.include_router(
+        runtime_session_browser_steps.router,
+        prefix="/api/v1",
+        tags=["Runtime Sessions"],
+    )
+    # Artifact deposit and list authenticate inside the route for the same
+    # reason: the agent's runtime key is the main caller.
+    app.include_router(
+        runtime_session_artifacts.router,
+        prefix="/api/v1",
+        tags=["Runtime Sessions"],
+    )
+    app.include_router(
+        artifact_search.router,
+        prefix="/api/v1",
+        tags=["Artifacts"],
     )
     # Saved searches for that endpoint. They sit under the search path, not
     # beside it, because a two segment sibling of /runtime-sessions would be
@@ -1142,9 +1315,6 @@ def _register_control_plane_routes(
         tags=["Runtime Sessions"],
         dependencies=[Depends(get_current_active_user)],
     )
-
-    # Impersonation router - Enterprise feature (loaded via admin plugin)
-    # No longer loaded from core - handled by plugins/admin
 
     app.include_router(
         roles.router,
@@ -1332,8 +1502,8 @@ def create_app() -> FastAPI:
     )
 
     service_role = os.getenv("PRELOOP_SERVICE_ROLE", "all").lower()
-    is_api_role = service_role in {"all", "api"}
-    is_gateway_role = service_role in {"all", "gateway"}
+    is_api_role = service_role in {"all", "api", "chat"}
+    is_gateway_role = service_role in {"all", "gateway", "chat"}
 
     # Add profiling middleware only for core API
     if is_api_role:
@@ -1363,33 +1533,61 @@ def create_app() -> FastAPI:
 
         app.add_middleware(MCPPathRewriteMiddleware)
 
+    # Registered last so all API/gateway roles deny restricted credentials
+    # before legacy authentication, routing, body parsing or downstream work.
+    from preloop.api.middleware.ci_auth import RestrictedCiAuthMiddleware
+
+    app.add_middleware(RestrictedCiAuthMiddleware)
+
+    # --- Local API docs assets ---
+    # Serve the pinned Swagger UI and ReDoc bundles from the API origin so the
+    # documentation pages render on air-gapped installs and under a strict CSP
+    # that blocks third-party CDNs. The files live in ``preloop/static/vendor``
+    # with their provenance and SHA-256 hashes; see the README next to them.
+    app.mount(
+        "/static",
+        StaticFiles(directory=str(base_dir / "preloop" / "static")),
+        name="static",
+    )
+
     # --- Custom API Docs Routes (Moved to /docs/api and /docs/redoc) ---
+    # FastAPI caches route callables. Resolve the serving app from the request
+    # so those caches cannot retain each application created by tests or reloads.
     @app.get("/docs/api", include_in_schema=False)  # Changed path
-    async def custom_swagger_ui_html() -> Any:
+    async def custom_swagger_ui_html(request: Request) -> Any:
         return get_swagger_ui_html(
-            openapi_url=app.openapi_url,
-            title=f"{app.title} - Swagger UI",
-            oauth2_redirect_url=app.swagger_ui_oauth2_redirect_url,
-            swagger_js_url="https://cdn.jsdelivr.net/npm/swagger-ui-dist@5.9.0/swagger-ui-bundle.js",
-            swagger_css_url="https://cdn.jsdelivr.net/npm/swagger-ui-dist@5.9.0/swagger-ui.css",
+            openapi_url=request.app.openapi_url,
+            title=f"{request.app.title} - Swagger UI",
+            oauth2_redirect_url=request.app.swagger_ui_oauth2_redirect_url,
+            swagger_js_url="/static/vendor/swagger-ui-bundle.js",
+            swagger_css_url="/static/vendor/swagger-ui.css",
+            # FastAPI's default favicon points at fastapi.tiangolo.com.
+            swagger_favicon_url="/static/vendor/favicon.png",
         )
 
     @app.get("/api/v1/openapi.yaml", include_in_schema=False)
     @app.get("/api/v1/spec", include_in_schema=False)
-    async def get_openapi_yaml() -> Any:
+    async def get_openapi_yaml(request: Request) -> Any:
         import yaml  # type: ignore
         from fastapi.responses import PlainTextResponse
 
-        schema = app.openapi()
+        schema = request.app.openapi()
         yaml_str = yaml.dump(schema, sort_keys=False)
         return PlainTextResponse(yaml_str, media_type="application/x-yaml")
 
     @app.get("/docs/redoc", include_in_schema=False)  # Changed path
-    async def custom_redoc_html() -> Any:
+    async def custom_redoc_html(request: Request) -> Any:
         return get_redoc_html(
-            openapi_url=app.openapi_url,
-            title=f"{app.title} - ReDoc",
-            redoc_js_url="https://cdn.jsdelivr.net/npm/redoc@2.0.0/bundles/redoc.standalone.js",
+            openapi_url=request.app.openapi_url,
+            title=f"{request.app.title} - ReDoc",
+            redoc_js_url="/static/vendor/redoc.standalone.js",
+            redoc_favicon_url="/static/vendor/favicon.png",
+            # ReDoc injects a fonts.googleapis.com stylesheet by default; the
+            # self-hosted bundle renders with system fonts instead.
+            # The pinned ReDoc 2.0.0 bundle also hardcodes a sidebar logo at
+            # cdn.redoc.ly and hides it on error. get_redoc_html cannot
+            # override that URL, and the page still renders without it.
+            with_google_fonts=False,
         )
 
     # Add custom OpenAPI schema
@@ -1421,6 +1619,8 @@ def create_app() -> FastAPI:
             "/api/v1/billing/plans",
             "/api/v1/billing/create-checkout-session",
             "/api/v1/webhooks/flows",
+            "/api/v1/employee-events/",
+            "/api/v1/chat/ingress/",
             "/",
             "/static",
             "/register",
@@ -1446,6 +1646,79 @@ def create_app() -> FastAPI:
                         openapi_schema["paths"][path][method]["security"] = [
                             {"bearerAuth": []}
                         ]
+
+        from preloop.api.middleware.ci_auth import CI_ROUTE_POLICIES
+        from preloop.schemas.ci_execution import CiReviewRequest, CiStopRequest
+        from preloop.schemas.ci_subscription import (
+            CiSubscriptionCreate,
+            CiSubscriptionUpdate,
+        )
+
+        for path, operations in openapi_schema["paths"].items():
+            for method, operation in operations.items():
+                if method.upper() not in {
+                    "GET",
+                    "POST",
+                    "PUT",
+                    "PATCH",
+                    "DELETE",
+                    "HEAD",
+                    "OPTIONS",
+                }:
+                    continue
+                action = CI_ROUTE_POLICIES.get((method.upper(), path))
+                operation["x-restricted-ci"] = action.value if action else "deny"
+                if (
+                    method.upper() == "POST"
+                    and path == "/api/v1/flows/{flow_id}/trigger"
+                ):
+                    operation["x-restricted-ci-request-schema"] = (
+                        CiReviewRequest.model_json_schema()
+                    )
+                elif (
+                    method.upper() == "POST"
+                    and path == "/api/v1/flows/executions/{execution_id}/command"
+                ):
+                    operation["x-restricted-ci-request-schema"] = (
+                        CiStopRequest.model_json_schema()
+                    )
+                if (
+                    path == "/api/v1/event-webhooks/endpoints"
+                    and method.upper() == "POST"
+                ):
+                    operation["x-restricted-ci-request-schema"] = (
+                        CiSubscriptionCreate.model_json_schema()
+                    )
+                elif (
+                    path == "/api/v1/event-webhooks/endpoints/{endpoint_id}"
+                    and method.upper() == "PATCH"
+                ):
+                    operation["x-restricted-ci-request-schema"] = (
+                        CiSubscriptionUpdate.model_json_schema()
+                    )
+                elif (
+                    path
+                    == "/api/v1/event-webhooks/endpoints/{endpoint_id}/secret/rotate"
+                    and method.upper() == "POST"
+                ):
+                    operation["x-restricted-ci-request-schema"] = {
+                        "type": "object",
+                        "properties": {},
+                        "additionalProperties": False,
+                    }
+                responses = operation.setdefault("responses", {})
+                responses.setdefault(
+                    "401", {"description": "Invalid or expired credential"}
+                )
+                responses.setdefault(
+                    "403",
+                    {
+                        "description": "Operation or resource denied for restricted CI credentials"
+                    },
+                )
+                responses.setdefault(
+                    "503", {"description": "Credential verification unavailable"}
+                )
 
         app.openapi_schema = openapi_schema  # type: ignore
         return app.openapi_schema  # type: ignore

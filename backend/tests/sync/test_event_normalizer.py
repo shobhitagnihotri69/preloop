@@ -742,6 +742,111 @@ class TestExtractTriggerSubject:
 
         assert subject["text"] == "Manual Test Run"
 
+    def test_ci_dispatched_github_run_keeps_the_event_label(self):
+        """A GitHub Actions run keeps 'Pull Request Updated' and names the CI."""
+        subject = extract_trigger_subject(
+            {
+                **GITHUB_PULL_REQUEST_UPDATED,
+                "test_mode": True,
+                "triggered_by": "ci",
+                "ci": {
+                    "provider": "github-actions",
+                    "run_url": "https://github.com/preloop/preloop/actions/runs/1",
+                },
+            }
+        )
+
+        assert subject["text"] == (
+            "preloop/preloop #78 · Pull Request Updated · 5167595c"
+        )
+        assert subject["ci"] == "GitHub Actions"
+        assert subject["ci_url"] == "https://github.com/preloop/preloop/actions/runs/1"
+        assert "Manual Test Run" not in subject["text"]
+
+    def test_ci_dispatched_gitlab_run_names_the_ci(self):
+        """A GitLab CI run keeps 'Merge Request Updated' and names the CI."""
+        subject = extract_trigger_subject(
+            {
+                **GITLAB_MERGE_REQUEST_UPDATED,
+                "test_mode": True,
+                "triggered_by": "ci",
+                "ci": {
+                    "provider": "gitlab-ci",
+                    "run_url": "https://gitlab.com/acme/backend/-/pipelines/9",
+                },
+            }
+        )
+
+        assert subject["text"] == "acme/backend !45 · Merge Request Updated · a1b2c3d4"
+        assert subject["ci"] == "GitLab CI"
+        assert subject["ci_url"] == "https://gitlab.com/acme/backend/-/pipelines/9"
+
+    def test_ci_provenance_without_run_url_still_names_the_provider(self):
+        """A provider without a run URL shows the hint, just not linked."""
+        subject = extract_trigger_subject(
+            {
+                **GITHUB_PULL_REQUEST_UPDATED,
+                "test_mode": True,
+                "ci": {"provider": "github-actions"},
+            }
+        )
+
+        assert subject["ci"] == "GitHub Actions"
+        assert "ci_url" not in subject
+
+    def test_unknown_ci_provider_falls_back_to_title_case(self):
+        """A provider outside the curated map still renders readably."""
+        subject = extract_trigger_subject(
+            {
+                **GITHUB_PULL_REQUEST_UPDATED,
+                "test_mode": True,
+                "ci": {"provider": "my-internal-bot"},
+            }
+        )
+
+        assert subject["ci"] == "My Internal Bot"
+
+    def test_ci_dispatched_api_run_keeps_the_event_label(self):
+        """An ``api``-source run with a ``ci`` block is not a manual test run.
+
+        The generic CLI route does not require a tracker ``source``, so a CI
+        job that triggers with ``source: "api"`` and a ``ci`` block must keep
+        its real event label and name the CI instead of falling into the
+        manual early return that would render "Manual Test Run".
+        """
+        subject = extract_trigger_subject(
+            {
+                "source": "api",
+                "type": "pull_request_updated",
+                "test_mode": True,
+                "ci": {
+                    "provider": "github-actions",
+                    "run_url": "https://github.com/preloop/preloop/actions/runs/1",
+                },
+            }
+        )
+
+        assert subject["text"] == "Pull Request Updated"
+        assert subject["ci"] == "GitHub Actions"
+        assert subject["ci_url"] == "https://github.com/preloop/preloop/actions/runs/1"
+        assert "Manual Test Run" not in subject["text"]
+
+    def test_ci_dispatched_run_without_source_keeps_the_event_label(self):
+        """A source-less payload carrying ``ci`` is not a manual run either."""
+        subject = extract_trigger_subject(
+            {
+                "type": "pull_request_updated",
+                "test_mode": True,
+                "triggered_by": "ci",
+                "ci": {"provider": "github-actions"},
+            }
+        )
+
+        assert subject["text"] == "Pull Request Updated"
+        assert subject["ci"] == "GitHub Actions"
+        assert "ci_url" not in subject
+        assert "Manual Test Run" not in subject["text"]
+
     def test_unknown_source_still_yields_event_label(self):
         """An unrecognised trigger source degrades to the event label alone."""
         subject = extract_trigger_subject(
@@ -865,3 +970,99 @@ def test_matching_event_types_includes_legacy_dotted_issue_names() -> None:
         "issue.updated",
     )
     assert matching_event_types("comment_created") == ("comment_created",)
+
+
+class TestPullRequestLifecycleStops:
+    """Which normalized events end, or move, a pull request (#1032)."""
+
+    @pytest.mark.parametrize(
+        ("tracker", "raw", "payload", "normalized", "stop_source"),
+        [
+            (
+                "github",
+                "pull_request",
+                {"action": "closed", "pull_request": {"merged": True, "number": 1}},
+                "pull_request_merged",
+                "pr_merged",
+            ),
+            (
+                "github",
+                "pull_request",
+                {"action": "closed", "pull_request": {"merged": False, "number": 1}},
+                "pull_request_closed",
+                "pr_closed",
+            ),
+            (
+                "gitlab",
+                "Merge Request Hook",
+                {"object_attributes": {"action": "merge", "iid": 7}},
+                "merge_request_merged",
+                "pr_merged",
+            ),
+            (
+                "gitlab",
+                "Merge Request Hook",
+                {"object_attributes": {"action": "close", "iid": 7}},
+                "merge_request_closed",
+                "pr_closed",
+            ),
+            (
+                "bitbucket",
+                "pullrequest:fulfilled",
+                {},
+                "pull_request_merged",
+                "pr_merged",
+            ),
+            (
+                "bitbucket",
+                "pullrequest:rejected",
+                {},
+                "pull_request_closed",
+                "pr_closed",
+            ),
+        ],
+    )
+    def test_end_of_a_request_maps_to_a_stop_source(
+        self, tracker, raw, payload, normalized, stop_source
+    ):
+        from preloop.sync.event_normalizer import pr_close_stop_source
+
+        assert normalize_event_type(tracker, raw, payload) == normalized
+        assert pr_close_stop_source(normalized) == stop_source
+
+    @pytest.mark.parametrize(
+        ("tracker", "raw", "payload", "normalized"),
+        [
+            (
+                "github",
+                "pull_request",
+                {"action": "synchronize"},
+                "pull_request_updated",
+            ),
+            (
+                "gitlab",
+                "Merge Request Hook",
+                {"object_attributes": {"action": "update", "iid": 7}},
+                "merge_request_updated",
+            ),
+            ("bitbucket", "pullrequest:updated", {}, "pull_request_updated"),
+        ],
+    )
+    def test_new_head_maps_to_an_update_type(self, tracker, raw, payload, normalized):
+        from preloop.sync.event_normalizer import (
+            PR_HEAD_UPDATE_EVENT_TYPES,
+            pr_close_stop_source,
+        )
+
+        assert normalize_event_type(tracker, raw, payload) == normalized
+        assert normalized in PR_HEAD_UPDATE_EVENT_TYPES
+        assert pr_close_stop_source(normalized) is None
+
+    @pytest.mark.parametrize(
+        "event_type",
+        [None, "", "pull_request_opened", "issue_closed", "comment_created"],
+    )
+    def test_other_events_stop_nothing(self, event_type):
+        from preloop.sync.event_normalizer import pr_close_stop_source
+
+        assert pr_close_stop_source(event_type) is None

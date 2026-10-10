@@ -33,6 +33,7 @@ from preloop.services.policy.schema import (
     PolicyValidationError,
     PolicyValidationResult,
     PolicyVersion,
+    SensitiveDataConfig,
     ToolCondition,
     ToolDefinition,
     is_known_tool_source,
@@ -98,6 +99,39 @@ def _detect_condition_type(expression: str) -> str:
             return "cel"
 
     return "simple"
+
+
+def _model_io_condition_type(condition: ToolCondition) -> str:
+    """Return the condition type to persist for a model I/O condition.
+
+    Model I/O conditions default to ``simple`` when the YAML omits
+    ``condition_type``. The simple evaluator raises on CEL syntax, and a
+    mis-typed deny rule then fails closed, so upgrade such a condition to
+    ``cel`` instead of storing one that can never evaluate. This mirrors
+    :meth:`PolicyApplier._apply_tool_conditions`; it also catches forms the
+    simple parser rejects that ``_detect_condition_type`` does not know, such
+    as a parenthesised comparison or a bare fact.
+
+    Args:
+        condition: Condition parsed from the policy document.
+
+    Returns:
+        ``"cel"`` or ``"simple"``.
+    """
+    from preloop.services.policy_evaluator import is_simple_expression
+
+    explicit_raw: Any = condition.condition_type
+    if hasattr(explicit_raw, "value"):
+        explicit_raw = explicit_raw.value
+    explicit = str(explicit_raw or "simple")
+
+    if explicit == "cel":
+        return "cel"
+    if _detect_condition_type(condition.expression) == "cel":
+        return "cel"
+    if not is_simple_expression(condition.expression):
+        return "cel"
+    return explicit
 
 
 def _get_cel_validation_service():
@@ -557,6 +591,22 @@ def compute_policy_diff(
 
     # Compare tools
     diff_named_lists("$.tools", current.tools, incoming.tools)
+    diff_named_lists("$.access_rules", current.access_rules, incoming.access_rules)
+    diff_named_lists(
+        "$.resource_shares",
+        current.resource_shares,
+        incoming.resource_shares,
+        name_field="id",
+    )
+    if current.access_rule_mode != incoming.access_rule_mode:
+        changes.append(
+            PolicyDiffItem(
+                path="$.access_rule_mode",
+                operation="modify",
+                old_value=current.access_rule_mode,
+                new_value=incoming.access_rule_mode,
+            )
+        )
 
     # Compare model I/O rules by id
     def _model_io_name(item: Any) -> str:
@@ -594,6 +644,33 @@ def compute_policy_diff(
                     new_value=incoming_dict,
                 )
             )
+
+    # Compare the sensitive_data block as one unit
+    current_sensitive = (
+        current.sensitive_data.model_dump(exclude_none=True)
+        if current.sensitive_data
+        else {}
+    )
+    incoming_sensitive = (
+        incoming.sensitive_data.model_dump(exclude_none=True)
+        if incoming.sensitive_data
+        else {}
+    )
+    if current_sensitive != incoming_sensitive:
+        if not incoming_sensitive:
+            operation = "remove"
+        elif not current_sensitive:
+            operation = "add"
+        else:
+            operation = "modify"
+        changes.append(
+            PolicyDiffItem(
+                path="$.sensitive_data",
+                operation=operation,
+                old_value=current_sensitive or None,
+                new_value=incoming_sensitive or None,
+            )
+        )
 
     # Compare defaults
     current_defaults = (
@@ -769,6 +846,28 @@ class PolicyApplier:
                     self._result.errors.append(error)
                 return self._result
 
+            if policy.access_rules is not None or policy.access_rule_mode is not None:
+                from preloop.models.crud.access_rule import validate_policy_section
+
+                validate_policy_section(
+                    self.db,
+                    UUID(self.account_id),
+                    policy.access_rules,
+                    policy.access_rule_mode,
+                )
+
+            if policy.resource_shares is not None:
+                from preloop.models.crud.resource_share import (
+                    validate_policy_section as validate_shares,
+                )
+
+                validate_shares(
+                    self.db,
+                    UUID(self.account_id),
+                    UUID(self.actor_id) if self.actor_id else None,
+                    policy.resource_shares,
+                )
+
             # Resolve and authorize every workflow before mutating any policy object.
             self._prepare_approval_workflows(policy.approval_workflows or [])
 
@@ -785,8 +884,36 @@ class PolicyApplier:
             if policy.model_io is not None:
                 self._apply_model_io(policy.model_io, dry_run)
 
+            if policy.sensitive_data is not None:
+                self._apply_sensitive_data(policy.sensitive_data, dry_run)
+
             if policy.defaults and not self._apply_defaults(policy.defaults, dry_run):
                 return self._result
+
+            if not dry_run and (
+                policy.access_rules is not None or policy.access_rule_mode is not None
+            ):
+                from preloop.models.crud.access_rule import apply_policy_section
+
+                apply_policy_section(
+                    self.db,
+                    UUID(self.account_id),
+                    UUID(self.actor_id) if self.actor_id else None,
+                    policy.access_rules,
+                    policy.access_rule_mode,
+                )
+
+            if not dry_run and policy.resource_shares is not None:
+                from preloop.models.crud.resource_share import (
+                    apply_policy_section as apply_shares,
+                )
+
+                apply_shares(
+                    self.db,
+                    UUID(self.account_id),
+                    UUID(self.actor_id),
+                    policy.resource_shares,
+                )
 
             if not dry_run:
                 self.db.commit()
@@ -825,6 +952,9 @@ class PolicyApplier:
         """
         from preloop.models.crud import crud_approval_workflow, crud_mcp_server
 
+        from preloop.models.schemas.grant_introspection import IntrospectionConfig
+        from .schema import references_grant
+
         errors: List[str] = []
 
         # Build set of servers defined in the policy file
@@ -841,14 +971,17 @@ class PolicyApplier:
         existing_servers = crud_mcp_server.get_active_by_account(
             self.db, account_id=self.account_id
         )
+        server_auth_configs = {s.name.lower(): s.auth_config for s in existing_servers}
+        server_auth_configs.update(
+            {s.name.lower(): s.auth_config for s in policy.mcp_servers or []}
+        )
         existing_server_names = {s.name.lower() for s in existing_servers}
         all_available_servers = policy_servers | existing_server_names
 
         # Get existing policies from the database
-        existing_workflows = crud_approval_workflow.get_multi_by_account(
+        existing_workflow_names = crud_approval_workflow.get_names_by_account(
             self.db, account_id=self.account_id
         )
-        existing_workflow_names = {p.name for p in existing_workflows}
         all_available_workflows = policy_approval_workflows | existing_workflow_names
 
         # Validate tool references
@@ -859,6 +992,18 @@ class PolicyApplier:
             for tool in policy.tools:
                 # Check MCP server references
                 source_lower = tool.source.lower()
+                if any(
+                    references_grant(condition.expression)
+                    for condition in tool.conditions or []
+                ):
+                    auth = server_auth_configs.get(source_lower) or {}
+                    try:
+                        IntrospectionConfig.model_validate(auth.get("introspection"))
+                    except ValidationError:
+                        errors.append(
+                            f"Tool '{tool.name}' uses grant bindings but its named "
+                            f"MCP server '{tool.source}' has no valid introspection configuration"
+                        )
                 if not is_known_tool_source(source_lower):
                     # It's a custom MCP server name reference
                     if source_lower not in all_available_servers:
@@ -920,6 +1065,27 @@ class PolicyApplier:
                             f"not defined. {suggestion}"
                         )
 
+        if policy.sensitive_data is not None:
+            for sensitive_rule in policy.sensitive_data.rules:
+                if (
+                    sensitive_rule.approval_workflow
+                    and sensitive_rule.approval_workflow not in all_available_workflows
+                ):
+                    suggestion = self._get_workflow_suggestion(
+                        sensitive_rule.approval_workflow, all_available_workflows
+                    )
+                    errors.append(
+                        f"sensitive_data rule '{sensitive_rule.id}' references "
+                        f"approval workflow '{sensitive_rule.approval_workflow}' "
+                        f"which is not defined. {suggestion}"
+                    )
+
+        if policy.sensitive_data is not None and policy.model_io is None:
+            # The block replaces the stored one while the stored model_io
+            # rules stay. A rule that scans a custom type the new block no
+            # longer declares would silently stop detecting and break export.
+            errors.extend(self._stored_model_io_type_conflicts(policy.sensitive_data))
+
         # Validate defaults.default_approval_workflow
         if policy.defaults and policy.defaults.default_approval_workflow:
             if policy.defaults.default_approval_workflow not in all_available_workflows:
@@ -931,7 +1097,43 @@ class PolicyApplier:
                     f"is not defined. {suggestion}"
                 )
 
+        # Validate escalation_workflow references on approval workflows
+        for workflow in policy.approval_workflows or []:
+            if (
+                workflow.escalation_workflow
+                and workflow.escalation_workflow not in all_available_workflows
+            ):
+                suggestion = self._get_workflow_suggestion(
+                    workflow.escalation_workflow, all_available_workflows
+                )
+                errors.append(
+                    f"Approval workflow '{workflow.name}' references escalation "
+                    f"workflow '{workflow.escalation_workflow}' which is not "
+                    f"defined. {suggestion}"
+                )
+
         return errors
+
+    def _stored_model_io_type_conflicts(self, block: SensitiveDataConfig) -> List[str]:
+        """Stored model_io rules whose PII types the new block does not declare."""
+        from preloop.services.model_content_policy import load_model_io_rules
+        from preloop.services.policy.schema import PIIDetectorConfig
+
+        known = set(block.known_types())
+        conflicts: List[str] = []
+        for rule in load_model_io_rules(self.db, self.account_id):
+            detectors = rule.detectors
+            if detectors is None or not isinstance(detectors.pii, PIIDetectorConfig):
+                continue
+            missing = [item for item in detectors.pii.types if item not in known]
+            if missing:
+                conflicts.append(
+                    f"Stored model_io rule '{rule.id}' scans types {missing} that "
+                    "the new sensitive_data block does not declare. Keep those "
+                    "custom patterns or keyword lists, or import the model_io "
+                    "rules in the same policy."
+                )
+        return conflicts
 
     def _get_server_suggestion(self, server_name: str, available_servers: set) -> str:
         """Generate a helpful suggestion for missing server references.
@@ -987,6 +1189,7 @@ class PolicyApplier:
         """Apply MCP server definitions."""
         from preloop.models.crud import crud_mcp_server
         from preloop.models.models.mcp_server import MCPServer
+        from preloop.models.schemas.mcp_server import merge_auth_config
 
         for server_def in servers:
             # Check if server exists by name
@@ -1012,7 +1215,10 @@ class PolicyApplier:
                     # 2. It's NOT a redaction marker
                     # This prevents rollbacks from wiping credentials
                     if server_def.auth_config and not auth_config_is_redacted:
-                        existing.auth_config = server_def.auth_config
+                        # Per-key markers keep the stored secret for that key.
+                        existing.auth_config = merge_auth_config(
+                            server_def.auth_config, existing.auth_config
+                        )
                     elif auth_config_is_redacted:
                         logger.debug(
                             f"Skipping auth_config update for {server_def.name} "
@@ -1027,7 +1233,9 @@ class PolicyApplier:
                     # For new servers with redacted auth, set to None
                     # (user will need to configure credentials)
                     actual_auth_config = (
-                        None if auth_config_is_redacted else server_def.auth_config
+                        None
+                        if auth_config_is_redacted
+                        else merge_auth_config(server_def.auth_config, None)
                     )
                     if auth_config_is_redacted:
                         logger.warning(
@@ -1453,15 +1661,52 @@ class PolicyApplier:
         rules: List[ModelIORule],
         dry_run: bool,
     ) -> None:
-        """Persist model I/O rules onto account.meta_data."""
+        """Persist model I/O rules onto account.meta_data.
+
+        Conditions are normalised first so a YAML rule written in CEL but left
+        with the default ``simple`` type is upgraded rather than stored in a
+        form the evaluator cannot read.
+        """
         from preloop.services.model_content_policy import replace_model_io_rules
 
+        upgraded = [
+            rule.model_copy(
+                update={
+                    "conditions": [
+                        condition.model_copy(
+                            update={
+                                "condition_type": _model_io_condition_type(condition)
+                            }
+                        )
+                        for condition in rule.conditions
+                    ]
+                }
+            )
+            for rule in rules
+        ]
+
         if dry_run:
-            self._result.model_io_rules_applied = len(rules)
+            self._result.model_io_rules_applied = len(upgraded)
             return
-        replace_model_io_rules(self.db, self.account_id, rules)
-        self._result.model_io_rules_applied = len(rules)
-        logger.info("Applied %s model I/O content rules", len(rules))
+        replace_model_io_rules(self.db, self.account_id, upgraded)
+        self._result.model_io_rules_applied = len(upgraded)
+        logger.info("Applied %s model I/O content rules", len(upgraded))
+
+    def _apply_sensitive_data(
+        self,
+        config: SensitiveDataConfig,
+        dry_run: bool,
+    ) -> None:
+        """Persist the sensitive_data block onto account.meta_data."""
+        from preloop.services.sensitive_data.policy_store import (
+            replace_sensitive_data_config,
+        )
+
+        self._result.sensitive_data_applied = True
+        if dry_run:
+            return
+        replace_sensitive_data_config(self.db, self.account_id, config)
+        logger.info("Applied sensitive_data policy block")
 
 
 def export_current_policy(
@@ -1640,12 +1885,22 @@ def export_current_policy(
         parse_model_io_rules,
     )
 
-    account = crud_account.get(db, id=account_id_str)
-    model_io_rules = parse_model_io_rules(
-        ((account.meta_data or {}) if account else {}).get(MODEL_IO_META_KEY)
+    from preloop.services.sensitive_data.policy_store import (
+        SENSITIVE_DATA_META_KEY,
+        parse_sensitive_data_config,
     )
 
-    return PolicyDocument(
+    account = crud_account.get(db, id=account_id_str)
+    account_meta = ((account.meta_data or {}) if account else {}) or {}
+    model_io_rules = parse_model_io_rules(account_meta.get(MODEL_IO_META_KEY))
+    sensitive_data = parse_sensitive_data_config(
+        account_meta.get(SENSITIVE_DATA_META_KEY)
+    )
+    has_sensitive_data = bool(
+        sensitive_data.model_dump(exclude_none=True, exclude_defaults=True)
+    )
+
+    document_fields = dict(
         version=PolicyVersion.V1_0,
         metadata=PolicyMetadata(
             name=policy_name,
@@ -1656,5 +1911,27 @@ def export_current_policy(
         approval_workflows=policy_defs if policy_defs else None,
         tools=tool_defs if tool_defs else None,
         model_io=model_io_rules if model_io_rules else None,
+        sensitive_data=sensitive_data if has_sensitive_data else None,
         defaults=DefaultsDefinition(),  # Default settings
     )
+    from preloop.models.crud.resource_share import policy_section as share_section
+
+    if account:
+        resource_shares = share_section(db, UUID(account_id_str))
+        if resource_shares:
+            document_fields["resource_shares"] = resource_shares
+    from preloop.models.crud.access_rule import policy_section
+
+    account_access = policy_section(db, UUID(account_id_str)) if account else {}
+    if account_access.get("access_rules"):
+        document_fields["access_rules"] = account_access["access_rules"]
+    if account_access.get("access_rule_mode"):
+        document_fields["access_rule_mode"] = account_access["access_rule_mode"]
+    try:
+        return PolicyDocument(**document_fields)
+    except ValidationError as exc:
+        # Stored state that no longer validates as one document (for example
+        # a model_io rule naming a custom type the block has lost). Export
+        # must still show the operator what is stored so it can be fixed.
+        logger.warning("Exported policy does not validate as a whole: %s", exc)
+        return PolicyDocument.model_construct(**document_fields)

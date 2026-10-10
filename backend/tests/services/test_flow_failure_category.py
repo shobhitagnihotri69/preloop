@@ -331,3 +331,141 @@ class TestRobustness:
             )
             == "model_transient"
         )
+
+
+class TestModelStreamIdle:
+    """A timeout on a silent model stream is named, not lumped in (#872)."""
+
+    STALL = (
+        "Execution timed out after 900 seconds (this flow's timeout budget) "
+        "while waiting on a silent model stream. The model provider sent "
+        "nothing for 450 seconds at a time. Codex reconnected once after the "
+        "stream sent nothing."
+    )
+
+    def test_in_the_vocabulary_and_fits_the_column(self):
+        assert "model_stream_idle" in FAILURE_CATEGORIES
+        assert len("model_stream_idle") <= FAILURE_CATEGORY_MAX_LENGTH
+
+    def test_stall_sentence_wins_over_the_plain_timeout(self):
+        assert (
+            derive_failure_category(status="FAILED", error_message=self.STALL)
+            == "model_stream_idle"
+        )
+
+    def test_stall_sentence_wins_over_a_transient_verdict(self):
+        """The log also says 'stream disconnected'; the stall is the cause."""
+        assert (
+            derive_failure_category(
+                status="FAILED",
+                error_message=self.STALL,
+                failure_analysis={"error_class": "network", "transient": True},
+            )
+            == "model_stream_idle"
+        )
+
+    def test_plain_timeout_is_still_a_timeout(self):
+        message = (
+            "Execution timed out after 900 seconds (this flow's timeout "
+            "budget). Raise timeout_seconds on the flow if the work "
+            "genuinely needs longer."
+        )
+        assert (
+            derive_failure_category(status="FAILED", error_message=message) == "timeout"
+        )
+
+    def test_codex_idle_text_alone_does_not_claim_a_timeout(self):
+        """Codex giving up on its own is a non-timeout failure."""
+        message = "stream disconnected before completion: idle timeout waiting for SSE"
+        assert (
+            derive_failure_category(status="FAILED", error_message=message)
+            == "model_transient"
+        )
+
+    def test_classifier_follows_the_message_marker(self, monkeypatch):
+        """Rewording the marker must not silently demote the stall to timeout.
+
+        The rule is built from stream_stall.STALL_MESSAGE_MARKER, so a new
+        wording is classified without anyone touching the regex.
+        """
+        import importlib
+
+        categories = importlib.import_module(derive_failure_category.__module__)
+        stream_stall = importlib.import_module("preloop.services.stream_stall")
+
+        reworded = "while the model stream stayed silent"
+        monkeypatch.setattr(stream_stall, "STALL_MESSAGE_MARKER", reworded)
+        try:
+            importlib.reload(categories)
+            message = (
+                "Execution timed out after 900 seconds (this flow's timeout "
+                f"budget) {reworded}. The model provider sent nothing."
+            )
+            assert (
+                categories.derive_failure_category(
+                    status="FAILED", error_message=message
+                )
+                == "model_stream_idle"
+            )
+        finally:
+            monkeypatch.undo()
+            importlib.reload(categories)
+
+
+class TestApiDescription:
+    def test_field_description_lists_the_whole_vocabulary(self):
+        """API clients read the closed vocabulary from the schema text."""
+        from preloop.models.schemas.flow_execution import FlowExecutionBase
+
+        description = FlowExecutionBase.model_fields["failure_category"].description
+
+        missing = [c for c in FAILURE_CATEGORIES if c not in description]
+        assert missing == []
+
+
+# The gateway's budget denial is a 429 since #1447. Whatever status and body
+# shape the harness logs, it is Preloop's budget, never an upstream rate limit
+# or an upstream billing failure.
+GATEWAY_BUDGET_429_MESSAGES = [
+    "APIError: 429 {'error': {'message': 'Model gateway budget exceeded: "
+    "account monthly limit reached', 'type': 'insufficient_quota', 'code': "
+    "'insufficient_quota', 'preloop_code': 'budget_limit_exceeded'}}",
+    'API Error: 429 {"type":"error","error":{"type":"billing_error","message":'
+    '"Model gateway budget exceeded: flow monthly limit reached"}}',
+    "exceeded retry limit, last status: 429 Too Many Requests, "
+    "preloop_code execution_budget_exceeded",
+    '[API Error: {"error":{"code":429,"message":"Model gateway budget exceeded",'
+    '"status":"RESOURCE_EXHAUSTED"}}]',
+    "429 {'error': {'message': 'Preloop trial limit for hosted model reached. "
+    "Please configure your own OpenAI/Anthropic API key.', 'type': "
+    "'insufficient_quota', 'code': 'insufficient_quota'}}",
+    'API Error: 429 {"type":"error","error":{"type":"billing_error","message":'
+    '"Preloop free-tier limit for hosted models reached."}}',
+]
+
+
+@pytest.mark.parametrize("message", GATEWAY_BUDGET_429_MESSAGES)
+def test_gateway_budget_429_is_budget_not_rate_limit(message):
+    assert (
+        derive_failure_category(status="FAILED", error_message=message)
+        == "budget_exceeded"
+    )
+
+
+def test_budget_error_class_wins_over_generated_rate_limit_sentence():
+    """Review finding on #1458: the analysis path, not only the raw text."""
+    from preloop.services.upstream_errors import is_terminal_error_class
+
+    assert is_terminal_error_class("budget_exceeded")
+    assert (
+        derive_failure_category(
+            status="FAILED",
+            error_message="Upstream model provider rate limited us (HTTP 429).",
+            failure_analysis={
+                "error_class": "budget_exceeded",
+                "transient": True,
+                "upstream_status": 429,
+            },
+        )
+        == "budget_exceeded"
+    )

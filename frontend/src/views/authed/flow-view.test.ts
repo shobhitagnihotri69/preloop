@@ -1,8 +1,21 @@
-import { expect } from '@open-wc/testing';
+import { expect, fixture, html, waitUntil } from '@open-wc/testing';
+import sinon from 'sinon';
 
 import './flow-view';
 import type { FlowView } from './flow-view';
-import { flowRuntimeLabel } from './flow-view';
+import { flowRuntimeLabel, referenceListsSentence } from './flow-view';
+
+describe('FlowView reference list names', () => {
+  it('names one, two or more failed lists as a sentence start', () => {
+    expect(referenceListsSentence(['projects'])).to.equal('Projects');
+    expect(referenceListsSentence(['trackers', 'projects'])).to.equal(
+      'Trackers and projects'
+    );
+    expect(
+      referenceListsSentence(['models', 'mcpServers', 'organizations'])
+    ).to.equal('Models, MCP servers and organizations');
+  });
+});
 
 describe('FlowView model selection', () => {
   function createElement(): FlowView {
@@ -357,6 +370,597 @@ describe('FlowView detail page language', () => {
       );
     } finally {
       element.remove();
+    }
+  });
+});
+
+describe('FlowView production logging', () => {
+  function createElement(): FlowView {
+    return document.createElement('flow-view') as FlowView;
+  }
+
+  afterEach(() => {
+    document.body.querySelectorAll('sl-alert').forEach((node) => node.remove());
+    localStorage.clear();
+  });
+
+  it('confirms enablement in a toast and does not use console.log', async () => {
+    localStorage.setItem('accessToken', 'test-access-token');
+    const fetchStub = sinon.stub(window, 'fetch').resolves(
+      new Response(JSON.stringify({ id: 'flow-1', is_enabled: true }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      })
+    );
+    const log = sinon.spy(console, 'log');
+    const element = createElement() as any;
+    element.flowId = 'flow-1';
+    element.flow = { name: 'Test', is_enabled: false };
+
+    try {
+      await element.toggleFlowEnabled();
+      expect(log.called, 'no console.log').to.equal(false);
+      expect(element.flow.is_enabled).to.equal(true);
+      const alert = document.body.querySelector('sl-alert');
+      expect(alert?.textContent).to.contain('Flow enabled successfully');
+    } finally {
+      log.restore();
+      fetchStub.restore();
+    }
+  });
+
+  it('toasts the server reason when enabling a flow fails', async () => {
+    localStorage.setItem('accessToken', 'test-access-token');
+    const alertStub = sinon.stub(window, 'alert');
+    const fetchStub = sinon
+      .stub(window, 'fetch')
+      .callsFake(async (input, init) => {
+        const url = String(input);
+        const method = (init?.method || 'GET').toUpperCase();
+        if (url.includes('/api/v1/flows/') && method === 'PUT') {
+          return new Response(
+            JSON.stringify({ detail: 'Schedule is invalid' }),
+            {
+              status: 400,
+              headers: { 'Content-Type': 'application/json' },
+            }
+          );
+        }
+        return new Response('{}', {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      });
+    const element = createElement() as any;
+    element.flowId = 'flow-1';
+    element.flow = { name: 'Test', is_enabled: false };
+
+    try {
+      await element.toggleFlowEnabled();
+      expect(alertStub.called).to.equal(false);
+      expect(element.flow.is_enabled).to.equal(false);
+      const toast = document.body.querySelector('sl-alert');
+      expect(toast?.textContent).to.contain('Schedule is invalid');
+    } finally {
+      alertStub.restore();
+      fetchStub.restore();
+    }
+  });
+
+  it('keeps console.log and console.debug out of the flow view', async () => {
+    const response = await fetch(new URL('./flow-view.ts', import.meta.url));
+    const source = await response.text();
+    expect(source).to.not.match(/console\.log\s*\(/);
+    expect(source).to.not.match(/console\.debug\s*\(/);
+  });
+});
+
+describe('FlowView review instructions', () => {
+  async function renderDetail(overrides: Record<string, unknown> = {}) {
+    const element = document.createElement('flow-view') as any;
+    element.flowReady = true;
+    element.isNew = false;
+    element.isEditing = false;
+    element.initialized = true;
+    element.flowId = 'flow-1';
+    element.flow = {
+      id: 'flow-1',
+      name: 'Pull Request Reviewer',
+      agent_type: 'codex',
+      is_enabled: true,
+      trigger_event_source: 'webhook',
+      ...overrides,
+    };
+    element.recentExecutions = [];
+    document.body.appendChild(element);
+    await element.updateComplete;
+    return element;
+  }
+
+  it('shows review instructions read-only when they are set', async () => {
+    const element = await renderDetail({
+      review_instructions: 'Keep the declared runtime.',
+    });
+    try {
+      const card = element.shadowRoot.querySelector(
+        '[data-review-instructions]'
+      );
+      expect(card).to.exist;
+      expect(card.textContent).to.include('Review instructions');
+      expect(card.textContent).to.include('Keep the declared runtime.');
+      expect(card.querySelector('sl-textarea')).to.equal(null);
+    } finally {
+      element.remove();
+    }
+  });
+
+  it('hides review instructions when they are unset or blank', async () => {
+    const unset = await renderDetail();
+    const blank = await renderDetail({ review_instructions: '   ' });
+    try {
+      expect(
+        unset.shadowRoot.querySelector('[data-review-instructions]')
+      ).to.equal(null);
+      expect(
+        blank.shadowRoot.querySelector('[data-review-instructions]')
+      ).to.equal(null);
+    } finally {
+      unset.remove();
+      blank.remove();
+    }
+  });
+});
+
+describe('FlowView progressive detail', () => {
+  it('shows flow details without waiting for executions and avoids editor-only catalogs', async () => {
+    localStorage.setItem('accessToken', 'test-token');
+    let release!: () => void;
+    const pending = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const fetchStub = sinon
+      .stub(window, 'fetch')
+      .callsFake(async (input: RequestInfo | URL) => {
+        const url = input.toString();
+        if (url.includes('/flows/executions')) await pending;
+        const data = url.startsWith('/api/v1/account/governance/flows/flow-1')
+          ? { config: {}, has_override: false, account_defaults: {} }
+          : url.startsWith('/api/v1/flows/flow-1')
+            ? {
+                id: 'flow-1',
+                name: 'Nightly sweep',
+                agent_type: 'codex',
+                trigger_event_source: 'webhook',
+                allowed_mcp_servers: [],
+                allowed_mcp_tools: [],
+              }
+            : url.endsWith('/auth/users/me')
+              ? { id: 'user-1' }
+              : [];
+        return new Response(JSON.stringify(data), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      });
+    try {
+      const el = await fixture<FlowView>(
+        html`<flow-view flowId="flow-1"></flow-view>`
+      );
+      await waitUntil(() => (el as any).flowReady);
+      await el.updateComplete;
+      expect(el.shadowRoot!.textContent).to.include('Nightly sweep');
+      expect(
+        fetchStub
+          .getCalls()
+          .filter((call) =>
+            /\/(tools|mcp-servers|agents)(?:\?|$)/.test(call.args[0].toString())
+          )
+      ).to.have.length(0);
+      expect(
+        fetchStub
+          .getCalls()
+          .filter((call) => (call.args[1]?.method || 'GET') !== 'GET')
+      ).to.have.length(0);
+      expect(
+        fetchStub
+          .getCalls()
+          .some((call) =>
+            call.args[0].toString().includes('/account/governance/flows/')
+          )
+      ).to.equal(false);
+      const disclosure = el.shadowRoot!.querySelector(
+        '.flow-governance-disclosure'
+      ) as HTMLDetailsElement;
+      disclosure.open = true;
+      await waitUntil(() =>
+        fetchStub
+          .getCalls()
+          .some((call) => call.args[0].toString() === '/api/v1/tools')
+      );
+      expect(el.shadowRoot!.querySelector('flow-governance-card')).to.exist;
+      const card = el.shadowRoot!.querySelector('flow-governance-card') as any;
+      await waitUntil(() => !card.loading);
+      const catalogCalls = fetchStub
+        .getCalls()
+        .filter((call) => call.args[0].toString() === '/api/v1/tools').length;
+      disclosure.open = false;
+      await el.updateComplete;
+      disclosure.open = true;
+      await el.updateComplete;
+      expect(
+        fetchStub
+          .getCalls()
+          .filter((call) => call.args[0].toString() === '/api/v1/tools')
+      ).to.have.length(catalogCalls);
+    } finally {
+      release();
+      fetchStub.restore();
+      localStorage.clear();
+    }
+  });
+});
+
+describe('FlowView governance card', () => {
+  let fetchStub: sinon.SinonStub;
+
+  beforeEach(() => {
+    fetchStub = sinon
+      .stub(window, 'fetch')
+      .resolves(new Response('{}', { status: 404 }));
+  });
+
+  afterEach(() => {
+    fetchStub.restore();
+  });
+
+  it('passes the flow allowed tools to the governance card', async () => {
+    const { render } = await import('lit');
+    const element = document.createElement('flow-view') as any;
+    element.flowId = 'flow-1';
+    element.flow = {
+      name: 'Test',
+      allowed_mcp_tools: [
+        { server_name: 'preloop', tool_name: 'search_issues' },
+      ],
+    };
+    const container = document.createElement('div');
+    render(element.renderGovernanceCard(), container);
+    const card = container.querySelector('flow-governance-card') as any;
+    expect(card).to.exist;
+    expect(card.flowId).to.equal('flow-1');
+    expect(card.allowedToolNames).to.deep.equal(['search_issues']);
+  });
+
+  it('renders no governance card for an unsaved flow', () => {
+    const element = document.createElement('flow-view') as any;
+    element.flowId = undefined;
+    expect(element.renderGovernanceCard()).to.equal('');
+  });
+});
+
+describe('FlowView all-of labels filter', () => {
+  it('round-trips labels_all through trigger_config', async () => {
+    const { render } = await import('lit');
+    const element = document.createElement('flow-view') as any;
+    element.trackers = [
+      { id: 'tracker-1', name: 'GitHub', tracker_type: 'github' },
+    ];
+    element.flow = {
+      trigger_event_source: 'tracker-1',
+      trigger_event_types: ['issue_labeled'],
+      trigger_config: {
+        labels: ['agent-ready'],
+        labels_all: ['complexity:low'],
+      },
+    };
+    element.requestUpdate = () => {};
+    const host = document.createElement('div');
+    document.body.appendChild(host);
+    try {
+      render(element.renderEventFilters(), host);
+      const input = [...host.querySelectorAll('sl-input')].find(
+        (el: any) =>
+          el.getAttribute('label') ===
+          'Issue must also carry all of these labels'
+      ) as any;
+      expect(input).to.exist;
+      await input.updateComplete;
+      expect(input.value).to.equal('complexity:low');
+
+      input.value = ' complexity:medium, risk:low ';
+      input.dispatchEvent(new CustomEvent('sl-input'));
+      expect(element.flow.trigger_config).to.deep.equal({
+        labels: ['agent-ready'],
+        labels_all: ['complexity:medium', 'risk:low'],
+      });
+
+      input.value = '';
+      input.dispatchEvent(new CustomEvent('sl-input'));
+      expect(element.flow.trigger_config).to.deep.equal({
+        labels: ['agent-ready'],
+      });
+    } finally {
+      host.remove();
+    }
+  });
+});
+
+describe('FlowView webhook URL', () => {
+  it('names the read-only webhook URL field', async () => {
+    const element = document.createElement('flow-view') as any;
+    element.flowReady = true;
+    element.isNew = false;
+    element.isEditing = false;
+    element.initialized = true;
+    element.flowId = 'flow-1';
+    element.flow = {
+      id: 'flow-1',
+      name: 'Inbound hook',
+      agent_type: 'codex',
+      trigger_event_source: 'webhook',
+      webhook_config: { webhook_secret: 'example-secret' },
+    };
+    document.body.appendChild(element);
+    try {
+      await element.updateComplete;
+      const input = element.shadowRoot.querySelector('sl-input[readonly]');
+      expect(input?.getAttribute('label')).to.equal('Webhook URL');
+    } finally {
+      element.remove();
+    }
+  });
+});
+
+describe('FlowView load failure', () => {
+  afterEach(() => {
+    localStorage.clear();
+  });
+
+  it('shows an error with Back to Flows and Try again instead of spinning', async () => {
+    localStorage.setItem('accessToken', 'test-token');
+    let flowFails = true;
+    const fetchStub = sinon
+      .stub(window, 'fetch')
+      .callsFake(async (input: RequestInfo | URL) => {
+        const url = input.toString();
+        if (url.startsWith('/api/v1/flows/flow-1')) {
+          return flowFails
+            ? new Response(JSON.stringify({ detail: 'Flow not found' }), {
+                status: 404,
+                headers: { 'Content-Type': 'application/json' },
+              })
+            : new Response(
+                JSON.stringify({
+                  id: 'flow-1',
+                  name: 'Nightly sweep',
+                  agent_type: 'codex',
+                  trigger_event_source: 'webhook',
+                  allowed_mcp_servers: [],
+                  allowed_mcp_tools: [],
+                }),
+                { status: 200, headers: { 'Content-Type': 'application/json' } }
+              );
+        }
+        return new Response('[]', {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      });
+    try {
+      const el = await fixture<FlowView>(
+        html`<flow-view flowId="flow-1"></flow-view>`
+      );
+      await waitUntil(() => (el as any).flowReady);
+      await el.updateComplete;
+      const root = el.shadowRoot!;
+      expect(root.querySelector('sl-spinner')).to.equal(null);
+      const alert = root.querySelector('[data-flow-load-error]');
+      expect(alert?.getAttribute('role')).to.equal('alert');
+      expect(alert?.textContent).to.include('Could not load this flow');
+      const back = root.querySelector('sl-button[href="/console/flows"]');
+      expect(back?.textContent).to.include('Back to Flows');
+
+      flowFails = false;
+      const retry = [...alert!.querySelectorAll('sl-button')].find((b) =>
+        b.textContent?.includes('Try again')
+      ) as HTMLElement;
+      retry.click();
+      await waitUntil(() => (el as any).flowReady && !(el as any).loadError);
+      await el.updateComplete;
+      expect(root.textContent).to.include('Nightly sweep');
+    } finally {
+      fetchStub.restore();
+    }
+  });
+
+  it('warns inline when trackers and models could not be loaded', async () => {
+    const element = document.createElement('flow-view') as any;
+    element.flowReady = true;
+    element.isNew = false;
+    element.isEditing = false;
+    element.initialized = true;
+    element.referenceListsFailed = ['trackers', 'models'];
+    element.flow = {
+      id: 'flow-1',
+      name: 'PR Reviewer',
+      agent_type: 'codex',
+      trigger_event_source: 'webhook',
+    };
+    document.body.appendChild(element);
+    try {
+      await element.updateComplete;
+      const warning = element.shadowRoot.querySelector(
+        '[data-reference-data-warning]'
+      );
+      expect(warning?.textContent).to.include(
+        'Trackers and models could not be loaded'
+      );
+    } finally {
+      element.remove();
+    }
+  });
+
+  it('names the lists that failed and retries only those', async () => {
+    localStorage.setItem('accessToken', 'test-token');
+    const failing = new Set(['/api/v1/trackers', '/api/v1/projects']);
+    const requested: string[] = [];
+    const json = (body: unknown, status = 200) =>
+      new Response(JSON.stringify(body), {
+        status,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    const fetchStub = sinon
+      .stub(window, 'fetch')
+      .callsFake(async (input: RequestInfo | URL) => {
+        const url = input.toString();
+        requested.push(url);
+        if (url.startsWith('/api/v1/flows/flow-1/executions')) {
+          return json([]);
+        }
+        if (url.startsWith('/api/v1/flows/flow-1')) {
+          return json({
+            id: 'flow-1',
+            name: 'Nightly sweep',
+            agent_type: 'codex',
+            trigger_event_source: 'webhook',
+            allowed_mcp_servers: [],
+            allowed_mcp_tools: [],
+          });
+        }
+        const path = url.split('?')[0];
+        if (failing.has(path)) {
+          return json({ detail: 'Unavailable' }, 503);
+        }
+        if (path === '/api/v1/trackers') {
+          return json([{ id: 'tracker-1', name: 'Example tracker' }]);
+        }
+        return json([]);
+      });
+    try {
+      const el = await fixture<FlowView>(
+        html`<flow-view flowId="flow-1"></flow-view>`
+      );
+      const view = el as any;
+      await waitUntil(() => view.flowReady && !view._loadingReferenceData);
+      await el.updateComplete;
+      const warning = () =>
+        el.shadowRoot!.querySelector('[data-reference-data-warning]');
+      expect(warning()?.textContent).to.include(
+        'Trackers and projects could not be loaded.'
+      );
+      expect(warning()?.textContent).not.to.include('models');
+
+      // Trackers come back; projects are still down.
+      failing.delete('/api/v1/trackers');
+      requested.length = 0;
+      const retry = () =>
+        [...warning()!.querySelectorAll('sl-button')].find((b) =>
+          b.textContent?.includes('Try again')
+        ) as HTMLElement;
+      retry().click();
+      await waitUntil(
+        () => requested.length > 0 && !view.retryingReferenceLists
+      );
+      await el.updateComplete;
+      expect(requested.map((url) => url.split('?')[0]).sort()).to.deep.equal([
+        '/api/v1/projects',
+        '/api/v1/trackers',
+      ]);
+      expect(view.trackers.map((t: any) => t.id)).to.deep.equal(['tracker-1']);
+      expect(warning()?.textContent).to.include(
+        'Projects could not be loaded.'
+      );
+
+      failing.clear();
+      requested.length = 0;
+      retry().click();
+      await waitUntil(
+        () => requested.length > 0 && !view.retryingReferenceLists
+      );
+      await el.updateComplete;
+      expect(requested.map((url) => url.split('?')[0])).to.deep.equal([
+        '/api/v1/projects',
+      ]);
+      expect(warning()).to.equal(null);
+    } finally {
+      fetchStub.restore();
+    }
+  });
+});
+
+describe('FlowView saving from the form', () => {
+  afterEach(() => {
+    localStorage.clear();
+  });
+
+  it('hands the save back to the form and puts a server error on it', async () => {
+    localStorage.setItem('accessToken', 'test-access-token');
+    const fetchStub = sinon.stub(window, 'fetch').callsFake(async () => {
+      return new Response(JSON.stringify({ detail: 'Name already taken' }), {
+        status: 400,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    });
+    const element = document.createElement('flow-view') as any;
+    element.isNew = false;
+    element.flowId = 'flow-1';
+
+    // The form lives in the view's shadow root, so once dispatch ends the
+    // event's target is cleared. The error must still reach the form.
+    const host = document.createElement('div');
+    const root = host.attachShadow({ mode: 'open' });
+    const form = document.createElement('div') as HTMLElement & {
+      formError?: string;
+    };
+    root.appendChild(form);
+    document.body.appendChild(host);
+    const waited: Promise<unknown>[] = [];
+    form.addEventListener('flow-submit', (event) => {
+      const save = element.saveFlowFromForm(event as CustomEvent);
+      (event as CustomEvent).detail.waitUntil(save);
+    });
+
+    try {
+      form.dispatchEvent(
+        new CustomEvent('flow-submit', {
+          bubbles: true,
+          composed: true,
+          detail: {
+            flow: { name: 'Example flow' },
+            waitUntil: (work: Promise<unknown>) => waited.push(work),
+          },
+        })
+      );
+      expect(waited).to.have.length(1);
+      await waited[0];
+      expect(form.formError).to.equal('Name already taken');
+    } finally {
+      host.remove();
+      fetchStub.restore();
+    }
+  });
+});
+
+describe('FlowView leave guard', () => {
+  it('prevents route leave when the mounted form declines discard', async () => {
+    const element = document.createElement('flow-view') as FlowView;
+    const root = element.shadowRoot || element.attachShadow({ mode: 'open' });
+    const form = document.createElement('preloop-flow-form') as any;
+    root.append(form);
+    const confirm = sinon.stub(form, 'confirmLeave').resolves(false);
+    const prevent = sinon.stub().returns({ prevented: true });
+    try {
+      expect(
+        await element.onBeforeLeave({} as any, { prevent } as any)
+      ).to.deep.equal({ prevented: true });
+      expect(prevent.calledOnce).to.equal(true);
+      confirm.resolves(true);
+      expect(
+        await element.onBeforeLeave({} as any, { prevent } as any)
+      ).to.equal(undefined);
+      expect(prevent.calledOnce).to.equal(true);
+    } finally {
+      confirm.restore();
     }
   });
 });

@@ -6,7 +6,7 @@ import secrets
 from datetime import UTC, datetime, timedelta
 from typing import Any, Optional
 
-from sqlalchemy import and_, case, func, or_, tuple_
+from sqlalchemy import DateTime, and_, case, cast, func, or_, tuple_
 from sqlalchemy.orm import Session
 
 from preloop.utils.agent_kind import normalize_agent_kind
@@ -367,6 +367,22 @@ def _usage_aggregate_for_principal(
 class CRUDManagedAgent(CRUDBase[ManagedAgent]):
     """CRUD helpers for account-scoped managed-agent registry entries."""
 
+    def get_visible_target(self, db: Session, *, account_id: Any, agent_id: Any) -> Any:
+        """Resolve an own or currently shared target for execution only."""
+        from preloop.models.crud.resource_share import crud_resource_share
+
+        own = self.get_for_account(
+            db, account_id=str(account_id), agent_id=str(agent_id)
+        )
+        if own is not None:
+            return own
+        return crud_resource_share.visible_resource(
+            db,
+            account_id=account_id,
+            resource_type="managed_agent",
+            resource_id=agent_id,
+        )
+
     def get_by_source(
         self,
         db: Session,
@@ -481,6 +497,37 @@ class CRUDManagedAgent(CRUDBase[ManagedAgent]):
         if for_update:
             query = query.with_for_update()
         return query.first()
+
+    def latest_merge_into_at(
+        self, db: Session, *, account_id: str, survivor_id: str
+    ) -> Optional[datetime]:
+        """Return when the most recent duplicate was merged into an agent.
+
+        A merge tags the duplicate with ``merged_into`` and ``merged_at``.
+        ``merged_at`` is the merge time. Duplicates merged before that tag
+        existed fall back to ``lifecycle_updated_at``, which the merge also
+        stamped but a later lifecycle write can move.
+
+        Args:
+            db: Database session.
+            account_id: Account the agents belong to.
+            survivor_id: Agent that absorbed the duplicates.
+
+        Returns:
+            The latest merge time, or ``None`` when nothing was merged in.
+        """
+        merged_at = func.coalesce(
+            cast(self.model.tags["merged_at"].astext, DateTime(timezone=True)),
+            func.timezone("UTC", self.model.lifecycle_updated_at),
+        )
+        return (
+            db.query(func.max(merged_at))
+            .filter(
+                self.model.account_id == account_id,
+                self.model.tags["merged_into"].astext == str(survivor_id),
+            )
+            .scalar()
+        )
 
     def touch_last_seen_for_principal(
         self,
@@ -875,7 +922,25 @@ class CRUDManagedAgent(CRUDBase[ManagedAgent]):
             )
             .outerjoin(User, self.model.owner_user_id == User.id)
         )
-        base_query = base_query.filter(self.model.account_id == account_id)
+        from preloop.plugins.account_hooks import (
+            VISIBLE_MANAGED_AGENT,
+            extra_visible_ids,
+        )
+
+        shared_ids = {
+            str(shared)
+            for shared in extra_visible_ids(db, account_id, VISIBLE_MANAGED_AGENT)
+        }
+        if shared_ids:
+            # Agents another account shares here (account hook H3).
+            base_query = base_query.filter(
+                or_(
+                    self.model.account_id == account_id,
+                    self.model.id.in_(list(shared_ids)),
+                )
+            )
+        else:
+            base_query = base_query.filter(self.model.account_id == account_id)
 
         if query:
             normalized_query = f"%{' '.join(query.strip().split())}%"
@@ -1008,6 +1073,17 @@ class CRUDManagedAgent(CRUDBase[ManagedAgent]):
         items = []
         for row in rows:
             summary = self._row_to_summary(row)
+            if str(row.id) in shared_ids:
+                from preloop.models.crud.resource_share import crud_resource_share
+
+                agent = self.get(db, id=row.id)
+                if agent is None:
+                    continue
+                public = crud_resource_share.public_projection(
+                    db, resource_type="managed_agent", row=agent
+                )
+                items.append(public.model_dump(mode="json"))
+                continue
             aggregate = aggregates.get(
                 (row.session_source_type, row.session_source_id),
                 _empty_usage_aggregate(),

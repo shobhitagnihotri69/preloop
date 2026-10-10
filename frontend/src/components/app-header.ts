@@ -1,7 +1,7 @@
 import { LitElement, html, css } from 'lit';
 import { customElement, property, state } from 'lit/decorators.js';
 import { Router, LOCATION_CHANGED } from '../router';
-import { getUserProfile, getFeatures } from '../api';
+import { getUserProfile, getFeatures, signOut } from '../api';
 import { getBrandConfig, isSaaS } from '../brand-config';
 import { trackGoal } from '../services/web-analytics';
 
@@ -31,6 +31,16 @@ export class AppHeader extends LitElement {
 
   @state()
   private registrationEnabled = true;
+
+  // The same callback identity must be removed when the header disconnects.
+  // Window otherwise keeps the header (and its detached parent tree) alive.
+  private readonly handleAuthChange = (): void => {
+    void this.checkAuth();
+  };
+
+  private readonly handleLocationChange = (): void => {
+    this.requestUpdate();
+  };
 
   static styles = css`
     :host {
@@ -107,8 +117,8 @@ export class AppHeader extends LitElement {
     super.connectedCallback();
     this.checkAuth();
     this.checkBillingEnabled();
-    window.addEventListener('auth-change', () => this.checkAuth());
-    window.addEventListener(LOCATION_CHANGED, () => this.requestUpdate());
+    window.addEventListener('auth-change', this.handleAuthChange);
+    window.addEventListener(LOCATION_CHANGED, this.handleLocationChange);
   }
 
   async checkBillingEnabled() {
@@ -132,8 +142,8 @@ export class AppHeader extends LitElement {
   }
 
   disconnectedCallback() {
-    window.removeEventListener('auth-change', () => this.checkAuth());
-    window.removeEventListener(LOCATION_CHANGED, () => this.requestUpdate());
+    window.removeEventListener('auth-change', this.handleAuthChange);
+    window.removeEventListener(LOCATION_CHANGED, this.handleLocationChange);
     super.disconnectedCallback();
   }
 
@@ -152,17 +162,10 @@ export class AppHeader extends LitElement {
     }
   }
 
-  logout() {
-    localStorage.removeItem('accessToken');
-    localStorage.removeItem('refreshToken');
+  async logout() {
     this.isAuthenticated = false;
     this.user = null;
-    const event = new CustomEvent('auth-change', {
-      bubbles: true,
-      composed: true,
-    });
-    window.dispatchEvent(event);
-    Router.go('/login');
+    await signOut({ destination: '/login', navigate: (url) => Router.go(url) });
   }
 
   render() {
@@ -173,6 +176,7 @@ export class AppHeader extends LitElement {
             ${
               this.showDrawerToggle
                 ? html`<sl-icon-button
+                    aria-label="Open navigation"
                     name="menu"
                     @click=${() =>
                       this.dispatchEvent(

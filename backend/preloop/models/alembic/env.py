@@ -17,7 +17,7 @@ from preloop.models.models.base import Base
 # Modules loaded for metadata registration:
 #   issue, organization, project, tracker, account, agent_control_command,
 #   api_key, api_usage, client_version_log, comment, ai_model, issue_duplicate,
-#   model_price_override, provider_billing
+#   model_price_override, provider_billing, copilot_import
 import importlib
 
 _MODEL_MODULES = (
@@ -35,6 +35,7 @@ _MODEL_MODULES = (
     "issue_duplicate",
     "model_price_override",
     "provider_billing",
+    "copilot_import",
 )
 for _model_module in _MODEL_MODULES:
     importlib.import_module(f"preloop.models.models.{_model_module}")
@@ -71,7 +72,7 @@ if not database_url:
     # but ideally, migrations should fail if the URL isn't explicitly set.
     print(
         "Warning: DATABASE_URL not found in environment. "
-        "Using default postgresql+psycopg://postgres:postgres@localhost/preloop. "
+        "Using default postgresql+psycopg://postgres:***@localhost/preloop. "
         "Ensure DATABASE_URL is set in your .env file or environment."
     )
     database_url = "postgresql+psycopg://postgres:postgres@localhost/preloop"

@@ -1,5 +1,6 @@
 import { fixture, html, expect, waitUntil } from '@open-wc/testing';
 import sinon from 'sinon';
+import { getAccountRuntimeSessionActivityTimeline } from '../../../api';
 
 import { unifiedWebSocketManager } from '../../../services/unified-websocket-manager';
 import '../../../setup-tests';
@@ -22,8 +23,12 @@ describe('AIModelDetailView', () => {
   let repriceCalls: any[];
   let repriceResponse: any;
   let modelPayload: any;
+  let sessionsGate: Promise<void> | null = null;
+  let sessionsFail = false;
 
   beforeEach(() => {
+    sessionsGate = null;
+    sessionsFail = false;
     modelPayload = {
       id: 'model-1',
       name: 'Claude Sonnet Primary',
@@ -223,6 +228,8 @@ describe('AIModelDetailView', () => {
         }
 
         if (url.startsWith('/api/v1/ai-models/model-1/runtime-sessions')) {
+          if (sessionsGate) await sessionsGate;
+          if (sessionsFail) return new Response('{}', { status: 500 });
           return new Response(
             JSON.stringify({
               period_start: '2026-02-08T00:00:00Z',
@@ -443,6 +450,45 @@ describe('AIModelDetailView', () => {
     connectStub.restore();
     subscribeStub.restore();
     localStorage.clear();
+  });
+
+  it('renders usage while sessions are pending without mounting a duplicate observer fetch', async () => {
+    let release!: () => void;
+    sessionsGate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const el = await fixture<AIModelDetailView>(
+      html`<ai-model-detail-view .modelId=${'model-1'}></ai-model-detail-view>`
+    );
+    try {
+      await waitUntil(
+        () => !!(el as any).summary && !(el as any).summaryLoading
+      );
+      await el.updateComplete;
+      expect(el.shadowRoot!.textContent).to.include('Claude Sonnet Primary');
+      expect(el.shadowRoot!.textContent).to.include('Usage summary');
+      expect(el.shadowRoot!.textContent).to.include('Loading model sessions');
+      expect(el.shadowRoot!.querySelector('preloop-session-observer')).not.to
+        .exist;
+    } finally {
+      release();
+    }
+    await waitUntil(() => !(el as any).sessionsLoading);
+    await el.updateComplete;
+    expect(el.shadowRoot!.querySelector('preloop-session-observer')).to.exist;
+  });
+
+  it('keeps usage and interactions when sessions fail', async () => {
+    sessionsFail = true;
+    const el = await fixture<AIModelDetailView>(
+      html`<ai-model-detail-view .modelId=${'model-1'}></ai-model-detail-view>`
+    );
+    await waitUntil(() => !!(el as any).sessionsError && !!(el as any).summary);
+    await el.updateComplete;
+    expect((el as any).summary.total_requests).to.equal(18);
+    expect((el as any).interactions.items).to.have.length(1);
+    expect(el.shadowRoot!.querySelector('preloop-session-observer')).not.to
+      .exist;
   });
 
   it('renders model observability summary, sessions, and interactions', async () => {
@@ -1115,8 +1161,8 @@ describe('AIModelDetailView', () => {
       await element.updateComplete;
       const prompt = removeDialog(element).textContent!.replace(/\s+/g, ' ');
       expect(prompt).to.contain('anthropic/claude-sonnet-4');
-      expect(prompt).to.contain('input $0 per 1M');
-      expect(prompt).to.contain('output $0 per 1M');
+      expect(prompt).to.contain('input $0.00 per 1M');
+      expect(prompt).to.contain('output $0.00 per 1M');
       expect(prompt).to.contain('effective from Aug 1, 2026');
       expect(deletes(), 'the confirm alone sends nothing').to.have.length(0);
 
@@ -1229,6 +1275,25 @@ describe('AIModelDetailView', () => {
       expect(removeButton(element), 'nothing was removed').to.exist;
       expect((element as any).repriceSince).to.equal(null);
     });
+  });
+
+  it('explains a plan restriction on disabled price controls', async () => {
+    featureFlags = { model_price_overrides: false };
+    pricingResponse.fetch_supported = true;
+    const element = await mountModel();
+    (element as any).pricingEditOpen = true;
+    await element.updateComplete;
+    const card = pricingCard(element);
+    for (const selector of [
+      '[data-testid="fetch-price"]',
+      '[data-testid="save-price"]',
+    ]) {
+      const button = card.querySelector(selector);
+      expect(button, selector).to.exist;
+      expect(button!.getAttribute('title')).to.equal(
+        'Price overrides are part of Preloop Cloud and Enterprise'
+      );
+    }
   });
 
   it('leaves legacy async completion unconfirmed', async () => {
@@ -1513,8 +1578,11 @@ describe('AIModelDetailView', () => {
     )) as AIModelDetailView;
 
     await waitUntil(
-      () => !(element as any).loading,
-      'AI model detail view did not finish loading',
+      // Progressive rendering releases loading before the initial summary,
+      // sessions and failure-window reads finish. Settle those before taking
+      // the baseline, so the search assertions only count search work.
+      () => !(element as any).loading && !(element as any).refreshInFlight,
+      'AI model detail view did not finish its initial data load',
       { timeout: 5000 }
     );
     await element.updateComplete;
@@ -1522,12 +1590,13 @@ describe('AIModelDetailView', () => {
     // The search field promises a list, so the list is on the page.
     expect(element.shadowRoot?.textContent).to.contain('Captured interactions');
 
-    // Icons are fetched too; only the API calls are counted here.
+    // Count this model's API reads. The embedded observer loads its own
+    // session detail/timeline independently of a model-page reload.
     const apiCalls = () =>
       fetchStub
         .getCalls()
         .map((call) => String(call.args[0]))
-        .filter((url) => url.startsWith('/api/'));
+        .filter((url) => url.startsWith('/api/v1/ai-models/model-1/'));
     const callsAfterLoad = apiCalls().length;
 
     const search = element.shadowRoot?.querySelector(
@@ -1536,22 +1605,75 @@ describe('AIModelDetailView', () => {
     search.value = 'timeout';
     search.dispatchEvent(new CustomEvent('sl-input', { bubbles: true }));
 
+    // Release a concurrent observer timeline read after the request baseline.
+    // It must not be mistaken for a reload of the model's sessions list.
+    const callsBeforeObserverRead = fetchStub.getCalls().length;
+    await getAccountRuntimeSessionActivityTimeline('runtime-session-1').catch(
+      () => undefined
+    );
+    expect(
+      fetchStub
+        .getCalls()
+        .slice(callsBeforeObserverRead)
+        .some((call) =>
+          String(call.args[0]).startsWith(
+            '/api/v1/runtime-sessions/runtime-session-1/activity'
+          )
+        )
+    ).to.equal(true);
+
+    // The debounce is 300ms. A late price, summary, or failure-window read
+    // can land first, so this waits for the interactions request itself and
+    // fails if that request never arrives. Other calls in the same pause
+    // are not this search.
+    const searchCalls = () =>
+      apiCalls()
+        .slice(callsAfterLoad)
+        .filter(
+          (url) =>
+            url.includes('/interactions') && url.includes('query=timeout')
+        );
     await waitUntil(
-      () => apiCalls().length > callsAfterLoad,
+      () => searchCalls().length >= 1,
       'the debounced search never reached the server',
       { timeout: 3000 }
     );
     await waitUntil(
-      () => !(element as any).interactionsLoading,
+      () => searchCalls().length === 1 && !(element as any).interactionsLoading,
       'the search never settled',
       { timeout: 3000 }
     );
     await element.updateComplete;
 
+    expect(searchCalls()).to.have.length(1);
+    expect(searchCalls()[0]).to.contain(
+      '/api/v1/ai-models/model-1/interactions'
+    );
+    expect(searchCalls()[0]).to.contain('query=timeout');
+    // Late price, summary, or sessions reads from the initial load can land
+    // before this search. Only calls after the search request are a reload.
+    const ordered = apiCalls().slice(callsAfterLoad);
+    const searchAt = ordered.findIndex(
+      (url) => url.includes('/interactions') && url.includes('query=timeout')
+    );
+    expect(
+      ordered
+        .slice(searchAt + 1)
+        .filter(
+          (url) => url.includes('/summary') || url.includes('/runtime-sessions')
+        )
+    ).to.have.length(0);
+    expect(element.shadowRoot?.textContent).to.contain(
+      'Deployment risk summary completed'
+    );
+
+    // The scoped search must not reload model-wide summary/session data.
     const newCalls = apiCalls().slice(callsAfterLoad);
-    expect(newCalls).to.have.length(1);
-    expect(newCalls[0]).to.contain('/api/v1/ai-models/model-1/interactions');
-    expect(newCalls[0]).to.contain('query=timeout');
+    expect(
+      newCalls.filter(
+        (url) => url.includes('/summary') || url.includes('/runtime-sessions')
+      )
+    ).to.have.length(0);
 
     // The summary the search did not touch is still on screen.
     expect(element.shadowRoot?.textContent).to.contain('Usage summary');
@@ -1759,8 +1881,8 @@ describe('AIModelDetailView attention dismissals', () => {
       html`<ai-model-detail-view modelId="model-1"></ai-model-detail-view>`
     )) as AIModelDetailView;
     await waitUntil(
-      () => !(element as any).loading,
-      'the model detail view did not finish loading'
+      () => !(element as any).loading && !(element as any).summaryLoading,
+      'the model and usage summary did not finish loading'
     );
     await element.updateComplete;
     return element;
@@ -1830,7 +1952,18 @@ describe('AIModelDetailView attention dismissals', () => {
     ];
 
     let element = await mount();
-    expect(attentionBadge(element).textContent!.trim()).to.equal('Attention');
+    // mount() clears loading when the model row arrives, before the summary
+    // and the dismissals read finish. The next mount asks for the same
+    // dismissals URL. If that read is still in flight, fetch coalescing
+    // hands it the response built from this one-item list.
+    await waitUntil(
+      () =>
+        attentionBadge(element)?.textContent?.trim() === 'Attention' &&
+        (element as unknown as { dismissals: unknown[] }).dismissals.length ===
+          1,
+      'the first alias dismissal never landed'
+    );
+    element.remove();
 
     dismissalsResponse = [
       ...dismissalsResponse,
@@ -1846,7 +1979,10 @@ describe('AIModelDetailView attention dismissals', () => {
       },
     ];
     element = await mount();
-    expect(attentionBadge(element).textContent!.trim()).to.equal('Healthy');
+    await waitUntil(
+      () => attentionBadge(element)?.textContent?.trim() === 'Healthy',
+      'the page stayed flagged after every alias was dismissed'
+    );
   });
 
   it('counts only the failures newer than an overtaken marker', async () => {

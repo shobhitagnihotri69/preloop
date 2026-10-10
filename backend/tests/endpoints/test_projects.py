@@ -120,7 +120,7 @@ class TestCreateProject:
         )
 
         with patch.object(
-            projects.crud_organization, "get", return_value=mock_organization
+            projects, "_get_organization_in_account", return_value=mock_organization
         ):
             with patch.object(
                 projects.crud_project, "get_by_identifier", return_value=None
@@ -158,7 +158,7 @@ class TestCreateProject:
         )
 
         with patch.object(
-            projects.crud_organization, "get", return_value=mock_organization
+            projects, "_get_organization_in_account", return_value=mock_organization
         ):
             with patch.object(
                 projects.crud_project,
@@ -186,7 +186,7 @@ class TestCreateProject:
             organization_id=str(uuid.uuid4()),
         )
 
-        with patch.object(projects.crud_organization, "get", return_value=None):
+        with patch.object(projects, "_get_organization_in_account", return_value=None):
             with pytest.raises(HTTPException) as exc_info:
                 call_endpoint(
                     projects.create_project,
@@ -209,7 +209,7 @@ class TestCreateProject:
         )
 
         with patch.object(
-            projects.crud_organization, "get", return_value=mock_organization
+            projects, "_get_organization_in_account", return_value=mock_organization
         ):
             with patch.object(
                 projects.crud_project, "get_by_identifier", return_value=mock_project
@@ -246,6 +246,43 @@ class TestListProjects:
             assert len(result) == 1
             assert result[0]["name"] == "Test Project"
 
+    def test_list_projects_exposes_bitbucket_project_group(
+        self, mock_user, mock_project, mock_db_session
+    ):
+        """Bitbucket repositories carry their Bitbucket project as ``group``."""
+        mock_project.meta_data = {"project_name": "Platform"}
+        with patch.object(
+            projects, "get_accessible_projects", return_value=[mock_project]
+        ):
+            result = call_endpoint(
+                projects.list_projects,
+                organization_id=None,
+                limit=100,
+                offset=0,
+                db=mock_db_session,
+                current_user=mock_user,
+            )
+
+        assert result[0]["group"] == "Platform"
+
+    def test_list_projects_group_defaults_to_none(
+        self, mock_user, mock_project, mock_db_session
+    ):
+        """Projects without a Bitbucket project name have no group."""
+        with patch.object(
+            projects, "get_accessible_projects", return_value=[mock_project]
+        ):
+            result = call_endpoint(
+                projects.list_projects,
+                organization_id=None,
+                limit=100,
+                offset=0,
+                db=mock_db_session,
+                current_user=mock_user,
+            )
+
+        assert result[0]["group"] is None
+
     def test_list_projects_with_organization_filter(
         self, mock_user, mock_organization, mock_project, mock_db_session
     ):
@@ -254,7 +291,7 @@ class TestListProjects:
             projects, "get_accessible_projects", return_value=[mock_project]
         ):
             with patch.object(
-                projects.crud_organization, "get", return_value=mock_organization
+                projects, "_get_organization_in_account", return_value=mock_organization
             ):
                 result = call_endpoint(
                     projects.list_projects,
@@ -274,7 +311,9 @@ class TestListProjects:
         with patch.object(
             projects, "get_accessible_projects", return_value=[mock_project]
         ):
-            with patch.object(projects.crud_organization, "get", return_value=None):
+            with patch.object(
+                projects, "_get_organization_in_account", return_value=None
+            ):
                 with pytest.raises(HTTPException) as exc_info:
                     call_endpoint(
                         projects.list_projects,
@@ -310,7 +349,7 @@ class TestListOrganizationProjects:
     ):
         """Test successful listing of organization projects."""
         with patch.object(
-            projects.crud_organization, "get", return_value=mock_organization
+            projects, "_get_organization_in_account", return_value=mock_organization
         ):
             with patch.object(
                 projects, "get_accessible_projects", return_value=[mock_project]
@@ -329,7 +368,7 @@ class TestListOrganizationProjects:
 
     def test_list_organization_projects_not_found(self, mock_user, mock_db_session):
         """Test 404 when organization is not found."""
-        with patch.object(projects.crud_organization, "get", return_value=None):
+        with patch.object(projects, "_get_organization_in_account", return_value=None):
             with pytest.raises(HTTPException) as exc_info:
                 call_endpoint(
                     projects.list_organization_projects,
@@ -348,7 +387,9 @@ class TestGetProject:
 
     def test_get_project_success(self, mock_user, mock_project, mock_db_session):
         """Test successful project retrieval."""
-        with patch.object(projects.crud_project, "get", return_value=mock_project):
+        with patch.object(
+            projects, "_get_project_in_account", return_value=mock_project
+        ):
             result = call_endpoint(
                 projects.get_project,
                 project_id=mock_project.id,
@@ -361,7 +402,7 @@ class TestGetProject:
 
     def test_get_project_not_found(self, mock_user, mock_db_session):
         """Test 404 when project is not found."""
-        with patch.object(projects.crud_project, "get", return_value=None):
+        with patch.object(projects, "_get_project_in_account", return_value=None):
             with pytest.raises(HTTPException) as exc_info:
                 call_endpoint(
                     projects.get_project,
@@ -382,7 +423,7 @@ class TestGetProjectByIdentifier:
     ):
         """Test successful project retrieval by identifier."""
         with patch.object(
-            projects.crud_organization, "get", return_value=mock_organization
+            projects, "_get_organization_in_account", return_value=mock_organization
         ):
             with patch.object(
                 projects.crud_project,
@@ -401,7 +442,7 @@ class TestGetProjectByIdentifier:
 
     def test_get_project_by_identifier_org_not_found(self, mock_user, mock_db_session):
         """Test 404 when organization is not found."""
-        with patch.object(projects.crud_organization, "get", return_value=None):
+        with patch.object(projects, "_get_organization_in_account", return_value=None):
             with pytest.raises(HTTPException) as exc_info:
                 call_endpoint(
                     projects.get_project_by_identifier,
@@ -419,7 +460,7 @@ class TestGetProjectByIdentifier:
     ):
         """Test 404 when project is not found."""
         with patch.object(
-            projects.crud_organization, "get", return_value=mock_organization
+            projects, "_get_organization_in_account", return_value=mock_organization
         ):
             with patch.object(
                 projects.crud_project, "get_by_slug_or_identifier", return_value=None
@@ -458,7 +499,9 @@ class TestUpdateProject:
         updated_project.created_at = datetime.now(UTC)
         updated_project.updated_at = datetime.now(UTC)
 
-        with patch.object(projects.crud_project, "get", return_value=mock_project):
+        with patch.object(
+            projects, "_get_project_in_account", return_value=mock_project
+        ):
             with patch.object(
                 projects.crud_project, "update", return_value=updated_project
             ):
@@ -476,7 +519,7 @@ class TestUpdateProject:
         """Test 404 when project is not found."""
         project_update = ProjectUpdate(name="Updated Project")
 
-        with patch.object(projects.crud_project, "get", return_value=None):
+        with patch.object(projects, "_get_project_in_account", return_value=None):
             with pytest.raises(HTTPException) as exc_info:
                 call_endpoint(
                     projects.update_project,
@@ -507,7 +550,9 @@ class TestUpdateProject:
         updated_project.created_at = datetime.now(UTC)
         updated_project.updated_at = datetime.now(UTC)
 
-        with patch.object(projects.crud_project, "get", return_value=mock_project):
+        with patch.object(
+            projects, "_get_project_in_account", return_value=mock_project
+        ):
             with patch.object(
                 projects.crud_project, "update", return_value=updated_project
             ) as mock_update:
@@ -530,7 +575,9 @@ class TestDeleteProject:
 
     def test_delete_project_success(self, mock_user, mock_project, mock_db_session):
         """Test successful project deletion."""
-        with patch.object(projects.crud_project, "get", return_value=mock_project):
+        with patch.object(
+            projects, "_get_project_in_account", return_value=mock_project
+        ):
             with patch.object(projects.crud_project, "delete") as mock_delete:
                 result = call_endpoint(
                     projects.delete_project,
@@ -544,7 +591,7 @@ class TestDeleteProject:
 
     def test_delete_project_not_found(self, mock_user, mock_db_session):
         """Test 404 when project is not found."""
-        with patch.object(projects.crud_project, "get", return_value=None):
+        with patch.object(projects, "_get_project_in_account", return_value=None):
             with pytest.raises(HTTPException) as exc_info:
                 call_endpoint(
                     projects.delete_project,
@@ -575,9 +622,11 @@ class TestTestProjectConnection:
         mock_connection_result.details = {}
 
         with patch.object(
-            projects.crud_organization, "get", return_value=mock_organization
+            projects, "_get_organization_in_account", return_value=mock_organization
         ):
-            with patch.object(projects.crud_project, "get", return_value=mock_project):
+            with patch.object(
+                projects, "_get_project_in_account", return_value=mock_project
+            ):
                 with patch.object(
                     projects, "create_tracker_client", new_callable=AsyncMock
                 ) as mock_create_client:
@@ -602,7 +651,7 @@ class TestTestProjectConnection:
             project=str(uuid.uuid4()),
         )
 
-        with patch.object(projects.crud_organization, "get", return_value=None):
+        with patch.object(projects, "_get_organization_in_account", return_value=None):
             with patch.object(
                 projects.crud_organization, "get_by_identifier", return_value=None
             ):
@@ -629,9 +678,11 @@ class TestTestProjectConnection:
         )
 
         with patch.object(
-            projects.crud_organization, "get", return_value=mock_organization
+            projects, "_get_organization_in_account", return_value=mock_organization
         ):
-            with patch.object(projects.crud_project, "get", return_value=mock_project):
+            with patch.object(
+                projects, "_get_project_in_account", return_value=mock_project
+            ):
                 result = await projects.test_project_connection(
                     request=request,
                     db=mock_db_session,
@@ -652,9 +703,9 @@ class TestTestProjectConnection:
         )
 
         with patch.object(
-            projects.crud_organization, "get", return_value=mock_organization
+            projects, "_get_organization_in_account", return_value=mock_organization
         ):
-            with patch.object(projects.crud_project, "get", return_value=None):
+            with patch.object(projects, "_get_project_in_account", return_value=None):
                 with patch.object(
                     projects.crud_project, "get_by_identifier", return_value=None
                 ):
@@ -679,9 +730,11 @@ class TestTestProjectConnection:
         )
 
         with patch.object(
-            projects.crud_organization, "get", return_value=mock_organization
+            projects, "_get_organization_in_account", return_value=mock_organization
         ):
-            with patch.object(projects.crud_project, "get", return_value=mock_project):
+            with patch.object(
+                projects, "_get_project_in_account", return_value=mock_project
+            ):
                 with patch.object(
                     projects,
                     "create_tracker_client",

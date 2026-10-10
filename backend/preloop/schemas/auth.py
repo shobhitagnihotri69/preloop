@@ -2,7 +2,7 @@
 
 import re
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 from uuid import UUID
 
 from pydantic import BaseModel, EmailStr, Field, field_validator
@@ -30,6 +30,36 @@ class TokenData(BaseModel):
     # Per-user token generation ("gen" claim). None when the token was minted
     # before the claim existed; enforcement treats that as generation 0.
     gen: Optional[int] = None
+    # CLI login session id ("sid" claim, a cli_session row). Only CLI JWTs
+    # minted by /oauth/token carry it; the row can be revoked on its own.
+    sid: Optional[str] = None
+    # Refresh token id ("jti" claim). A CLI refresh token rotates only while
+    # its jti is the one recorded on the cli_session row.
+    jti: Optional[str] = None
+    # Every claim of the token, for extensions that issue their own claims.
+    # Kept out of repr so request logs do not grow with custom claims.
+    claims: Dict[str, Any] = Field(default_factory=dict, repr=False)
+
+
+class LogoutResponse(BaseModel):
+    """Result of ``POST /auth/logout``."""
+
+    # Same-origin path the client navigates to after clearing its tokens.
+    # None means the client's own default destination.
+    redirect_url: Optional[str] = None
+
+
+class CliSessionResponse(BaseModel):
+    """One CLI login session (``preloop auth login``) of the signed-in user."""
+
+    id: UUID
+    created_at: datetime
+    last_seen_at: Optional[datetime] = None
+    user_agent: Optional[str] = None
+    hostname: Optional[str] = None
+    current: bool = Field(
+        False, description="True for the session the request's own token belongs to"
+    )
 
 
 class User(BaseModel):
@@ -209,6 +239,37 @@ class ApiKeyCreate(BaseModel):
     name: str = Field(..., min_length=1, max_length=100)
     expires_at: Optional[datetime] = None
     scopes: List[str] = Field(default_factory=list)
+    trusted_upstream_secret: Optional[str] = Field(
+        default=None,
+        min_length=16,
+        max_length=512,
+        description=(
+            "Only with the model_gateway:trusted_upstream scope. Shared secret "
+            "the upstream gateway sends in x-preloop-upstream-secret; stored "
+            "as a sha256 hash, never returned."
+        ),
+    )
+    per_subject_budget: Optional["PerSubjectBudget"] = Field(
+        default=None,
+        description=(
+            "Only with the model_gateway:trusted_upstream scope. Default "
+            "budget for every developer the upstream gateway names."
+        ),
+    )
+
+
+class PerSubjectBudget(BaseModel):
+    """Default budget per gateway subject on a trusted upstream key."""
+
+    period: Literal["hourly", "daily", "weekly", "monthly", "yearly", "all_time"] = (
+        "monthly"
+    )
+    hard_limit_usd: Optional[float] = Field(default=None, ge=0)
+    soft_limit_usd: Optional[float] = Field(default=None, ge=0)
+    model_alias: Optional[str] = Field(default=None, max_length=255)
+
+
+ApiKeyCreate.model_rebuild()
 
 
 class ApiKeyResponse(BaseModel):
@@ -280,6 +341,9 @@ class RuntimeSessionTokenResponse(BaseModel):
     session_source_type: str
     session_source_id: str
     session_reference: Optional[str] = None
+    #: Non-fatal problems with the request, e.g. a tool restriction that
+    #: resolved to zero tools. The token is still valid.
+    warnings: List[str] = Field(default_factory=list)
 
 
 class ApiUsageStatistics(BaseModel):

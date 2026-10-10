@@ -20,6 +20,7 @@ import '@shoelace-style/shoelace/dist/components/tab-panel/tab-panel.js';
 
 import consoleStyles from '../styles/console-styles.css?inline';
 import { consoleDialogStyles } from '../styles/console-dialog';
+import { showToast } from './confirm-dialog';
 
 type ResolutionStep = 'initial' | 'close' | 'merge' | 'deconflict';
 
@@ -202,7 +203,11 @@ export class ResolveIssueModal extends LitElement {
       this.handleClose();
     } catch (error) {
       console.error('Failed to resolve duplicate:', error);
-      // TODO: Add a user-facing error notification (e.g., a toast)
+      const detail =
+        error instanceof Error && error.message
+          ? error.message
+          : 'Failed to resolve these issues.';
+      showToast(detail, 'danger');
     } finally {
       this._isSubmitting = false;
     }
@@ -331,10 +336,12 @@ export class ResolveIssueModal extends LitElement {
             : html`
                 <div class="form-group">
                   <sl-input
+                    aria-label="Merged issue title"
                     .value=${this._mergedTitle}
                     @sl-input=${(e: any) => (this._mergedTitle = e.target.value)}
                   ></sl-input>
                   <sl-textarea
+                    aria-label="Merged issue description"
                     .value=${this._mergedDescription}
                     @sl-input=${(e: any) =>
                       (this._mergedDescription = e.target.value)}
@@ -408,11 +415,13 @@ export class ResolveIssueModal extends LitElement {
                   <div class="issue-panel form-group">
                     <div class="issue-header">${issueA?.key}</div>
                     <sl-input
+                      aria-label="First issue title"
                       .value=${this._deconflictedTitle1}
                       @sl-input=${(e: any) =>
                         (this._deconflictedTitle1 = e.target.value)}
                     ></sl-input>
                     <sl-textarea
+                      aria-label="First issue description"
                       .value=${this._deconflictedDescription1}
                       @sl-input=${(e: any) =>
                         (this._deconflictedDescription1 = e.target.value)}
@@ -422,11 +431,13 @@ export class ResolveIssueModal extends LitElement {
                   <div class="issue-panel form-group">
                     <div class="issue-header">${issueB?.key}</div>
                     <sl-input
+                      aria-label="Second issue title"
                       .value=${this._deconflictedTitle2}
                       @sl-input=${(e: any) =>
                         (this._deconflictedTitle2 = e.target.value)}
                     ></sl-input>
                     <sl-textarea
+                      aria-label="Second issue description"
                       .value=${this._deconflictedDescription2}
                       @sl-input=${(e: any) =>
                         (this._deconflictedDescription2 = e.target.value)}

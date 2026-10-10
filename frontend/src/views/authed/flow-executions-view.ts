@@ -1,3 +1,5 @@
+import { ConsoleStatus } from '../../controllers/console-status';
+import { tableScrollStyles } from '../../styles/table-scroll';
 import { html, css, nothing, unsafeCSS } from 'lit';
 import { customElement, state } from 'lit/decorators.js';
 import { router } from '../../router';
@@ -47,6 +49,18 @@ import type {
 } from '../../utils/execution-presentation';
 import type { GatewayTokenUsage } from '../../types';
 import { renderFailureCategoryChip } from '../../utils/failure-category';
+import {
+  DEFAULT_FLOW_EXECUTION_FILTERS,
+  FLOW_EXECUTION_QUERY_MAX,
+  FLOW_EXECUTION_STATUSES,
+  FLOW_EXECUTION_STATUS_LABELS,
+  clearFlowExecutionFilters,
+  flowExecutionStatusQuery,
+  isDefaultFlowExecutionFilters,
+  loadFlowExecutionFilters,
+  saveFlowExecutionFilters,
+  type FlowExecutionListFilters,
+} from '../../utils/list-filters';
 import consoleStyles from '../../styles/console-styles.css?inline';
 import { reducedMotionStyles } from '../../styles/reduced-motion';
 import '../../components/view-header.ts';
@@ -89,6 +103,20 @@ interface FlowExecution {
   token_usage?: GatewayTokenUsage | null;
   estimated_cost?: number | null;
   /**
+   * Publishing execution this repair resumes. Absent on a first publication.
+   * Distinct from parent_execution_id (delegation tree).
+   */
+  resume_of?: string | null;
+  /**
+   * Summed tokens and cost for the publishing execution plus every repair
+   * that points at it. Absent when the row is not part of a multi-turn chain.
+   */
+  resume_totals?: {
+    total_tokens: number;
+    /** Null when a member's usage could not be priced (unknown, not free). */
+    estimated_cost: number | null;
+  } | null;
+  /**
    * Short human-readable description of what triggered this execution, e.g.
    * 'preloop/preloop #78 · Pull Request Updated · 5167595c'. Computed when the
    * execution is created; absent on executions that predate subjects.
@@ -96,6 +124,10 @@ interface FlowExecution {
   trigger_subject?: string | null;
   /** Link to the triggering pull/merge request, when the payload carries one. */
   trigger_subject_url?: string | null;
+  /** CI provider that dispatched the run ("GitHub Actions"), when CI triggered it. */
+  trigger_subject_ci?: string | null;
+  /** Link to the CI run, when the provenance block carries one. */
+  trigger_subject_ci_url?: string | null;
   /**
    * Which layer broke a failed run: `runner_conflict`, `model_transient`,
    * `no_confirmation`, ... Derived by the server at failure time (#361) and
@@ -119,7 +151,7 @@ const DURATION_TICK_MS = 1000;
 const SEARCH_DEBOUNCE_MS = 300;
 
 /** The ranges the pill offers, and how far back each one reaches. */
-const RANGE_OPTIONS: Array<{
+export const RANGE_OPTIONS: Array<{
   value: string;
   label: string;
   days: number;
@@ -135,219 +167,257 @@ const RANGE_OPTIONS: Array<{
 
 @customElement('flow-executions-view')
 export class FlowExecutionsView extends AuthedElement {
+  private readonly accessibilityStatus = new ConsoleStatus(this);
   static styles = [
-    reducedMotionStyles,
-    unsafeCSS(consoleStyles),
-    // The sortable header button and the resize handle come from the table
-    // layer now, so every list that adopts it gets one recipe.
-    listTableStyles,
-    unsafeCSS(executionSubjectCss),
-    unsafeCSS(executionModelCss),
-    css`
-      :host {
-        display: block;
-      }
-      .table-wrapper {
-        overflow-x: auto;
-        margin-top: 1rem;
-      }
-      /* Fixed layout, because content-driven widths made this table 1250px
+    tableScrollStyles,
+    [
+      reducedMotionStyles,
+      unsafeCSS(consoleStyles),
+      // The sortable header button and the resize handle come from the table
+      // layer now, so every list that adopts it gets one recipe.
+      listTableStyles,
+      unsafeCSS(executionSubjectCss),
+      unsafeCSS(executionModelCss),
+      css`
+        :host {
+          display: block;
+        }
+        .table-wrapper {
+          overflow-x: auto;
+          margin-top: 1rem;
+        }
+        /* Fixed layout, because content-driven widths made this table 1250px
          wide inside a 1125px wrapper at 1440: the cost column and the kebab
          were off-screen behind a scrollbar that only appeared on hover. The
          widths are declared per column in EXECUTION_COLUMNS and set on the
          cell, so a drag can change them; Subject declares none and takes
-         whatever is left. */
-      table {
-        width: 100%;
-        border-collapse: collapse;
-        min-width: 960px;
-        table-layout: fixed;
-        font-size: var(--console-text-body);
-      }
-      /* A cell grid draws a box around every value in the table (wave 4).
+         whatever is left.
+         The 1080px min-width is the fixed columns (954px) plus a ~120px
+         floor for Subject, so the flexible column that names a run stays
+         readable at the narrowest layout. Below that the wrapper scrolls
+         horizontally rather than squeezing Subject to a sliver. */
+        table {
+          width: 100%;
+          border-collapse: collapse;
+          min-width: 1080px;
+          table-layout: fixed;
+          font-size: var(--console-text-body);
+        }
+        /* A cell grid draws a box around every value in the table (wave 4).
          Rows are separated by a hairline and nothing else, and the header is
          the semibold label, not a filled band. */
-      th,
-      td {
-        border: none;
-        border-bottom: 1px solid var(--console-hairline);
-        padding: 8px;
-        text-align: left;
-        vertical-align: middle;
-      }
-      th {
-        background-color: transparent;
-        color: var(--console-meta-color);
-        font-weight: var(--sl-font-weight-semibold);
-        font-size: var(--console-text-meta);
-        white-space: nowrap;
-      }
-      tbody tr:last-child td {
-        border-bottom: none;
-      }
-      .execution-row {
-        cursor: pointer;
-      }
-      .execution-row:hover td {
-        background-color: var(--console-hover-tint);
-      }
-      /* The flow name is the row's real anchor, so cmd-click opens a tab. */
-      .row-link {
-        color: var(--console-link-color);
-        display: block;
-        font-weight: var(--sl-font-weight-semibold);
-        overflow: hidden;
-        text-decoration: none;
-        text-overflow: ellipsis;
-        white-space: nowrap;
-      }
-      .row-link:hover,
-      .row-link:focus-visible {
-        text-decoration: underline;
-      }
-      /* A table cell, not a flex row: as flex the name and the pool chip
+        th,
+        td {
+          border: none;
+          border-bottom: 1px solid var(--console-hairline);
+          padding: 8px;
+          text-align: left;
+          vertical-align: middle;
+        }
+        th {
+          background-color: transparent;
+          color: var(--console-meta-color);
+          font-weight: var(--sl-font-weight-semibold);
+          font-size: var(--console-text-meta);
+          white-space: nowrap;
+        }
+        tbody tr:last-child td {
+          border-bottom: none;
+        }
+        .execution-row {
+          cursor: pointer;
+        }
+        .execution-row:hover td {
+          background-color: var(--console-hover-tint);
+        }
+        /* The flow name is the row's real anchor, so cmd-click opens a tab. */
+        .row-link {
+          color: var(--console-link-color);
+          display: block;
+          font-weight: var(--sl-font-weight-semibold);
+          overflow: hidden;
+          text-decoration: none;
+          text-overflow: ellipsis;
+          white-space: nowrap;
+        }
+        .row-link:hover,
+        .row-link:focus-visible {
+          text-decoration: underline;
+        }
+        /* A table cell, not a flex row: as flex the name and the pool chip
          shared one line, which pushed the whole row taller and the table
          wider. The chip now sits under the name, as it does on the flows
          list. */
-      .flow-cell {
-        display: table-cell;
-        overflow: hidden;
-      }
-      /* The subject is the primary way to tell executions apart, so it gets
+        .flow-cell {
+          display: table-cell;
+          overflow: hidden;
+        }
+        /* The subject is the primary way to tell executions apart, so it gets
          the width the fixed columns leave over. */
-      .subject-cell {
-        overflow: hidden;
-        text-overflow: ellipsis;
-        white-space: nowrap;
-      }
-      .subject-cell .execution-subject.is-fallback {
-        font-family: var(--sl-font-mono);
-      }
-      .model-cell {
-        overflow: hidden;
-      }
-      .status-cell {
-        display: flex;
-        align-items: center;
-        flex-wrap: wrap;
-        gap: 4px 8px;
-      }
-      /* One of the page's two ambient animations: the dot that says a run is
+        .subject-cell {
+          overflow: hidden;
+          text-overflow: ellipsis;
+          white-space: nowrap;
+        }
+        .subject-cell .execution-subject.is-fallback {
+          font-family: var(--sl-font-mono);
+        }
+        .model-cell {
+          overflow: hidden;
+        }
+        .status-cell {
+          display: flex;
+          align-items: center;
+          flex-wrap: wrap;
+          gap: 4px 8px;
+        }
+        .resume-line {
+          flex-basis: 100%;
+          font-size: var(--console-text-meta);
+          color: var(--console-meta-color);
+          line-height: 1.3;
+        }
+        .resume-line a {
+          color: var(--sl-color-primary-600);
+          text-decoration: none;
+        }
+        .resume-line a:hover {
+          text-decoration: underline;
+        }
+        /* One of the page's two ambient animations: the dot that says a run is
          still going. The chip beside it stays a soft tint. */
-      .status-indicator {
-        width: 8px;
-        height: 8px;
-        border-radius: 50%;
-        flex-shrink: 0;
-        animation: pulse 2s infinite;
-      }
-      .status-indicator.running {
-        background-color: var(--sl-color-primary-600);
-      }
-      .status-indicator.pending {
-        background-color: var(--sl-color-warning-600);
-      }
-      @keyframes pulse {
-        0%,
-        100% {
-          opacity: 1;
+        .status-indicator {
+          width: 8px;
+          height: 8px;
+          border-radius: 50%;
+          flex-shrink: 0;
+          animation: pulse 2s infinite;
         }
-        50% {
-          opacity: 0.5;
+        .status-indicator.running {
+          background-color: var(--sl-color-primary-600);
         }
-      }
-      .started-cell,
-      .duration-cell {
-        color: var(--console-meta-color);
-        font-variant-numeric: tabular-nums;
-        white-space: nowrap;
-      }
-      td.numeric,
-      th.numeric {
-        text-align: right;
-        font-variant-numeric: tabular-nums;
-        white-space: nowrap;
-      }
-      .actions-cell {
-        width: 72px;
-      }
-      .row-actions {
-        display: flex;
-        justify-content: flex-end;
-      }
-      /* Under the bar, not inside it: whether updates are live is a state of
+        .status-indicator.pending {
+          background-color: var(--sl-color-warning-600);
+        }
+        @keyframes pulse {
+          0%,
+          100% {
+            opacity: 1;
+          }
+          50% {
+            opacity: 0.5;
+          }
+        }
+        .started-cell,
+        .duration-cell {
+          color: var(--console-meta-color);
+          font-variant-numeric: tabular-nums;
+          white-space: nowrap;
+        }
+        /* A live label ("Running · 12m 30s") is far wider than a finished one
+         ("4m 32s"), and the Duration column is fixed. Clip rather than paint
+         over the Model cell if a future label outgrows the declared width;
+         the title carries the full text either way. */
+        .duration-cell {
+          overflow: hidden;
+          text-overflow: ellipsis;
+        }
+        td.numeric,
+        th.numeric {
+          text-align: right;
+          font-variant-numeric: tabular-nums;
+          white-space: nowrap;
+        }
+        .actions-cell {
+          width: 72px;
+        }
+        .row-actions {
+          display: flex;
+          justify-content: flex-end;
+        }
+        /* Under the bar, not inside it: whether updates are live is a state of
          the page, not a filter. */
-      .header-controls {
-        display: flex;
-        justify-content: flex-start;
-        align-items: center;
-        gap: 12px;
-        flex-wrap: wrap;
-        margin: 8px 0 16px;
-      }
-      list-toolbar {
-        margin-bottom: 4px;
-      }
-      list-toolbar sl-select {
-        min-width: 180px;
-      }
-      /* The selects carry a label so a screen reader does not meet two
+        .header-controls {
+          display: flex;
+          justify-content: flex-start;
+          align-items: center;
+          gap: 12px;
+          flex-wrap: wrap;
+          margin: 8px 0 16px;
+        }
+        list-toolbar {
+          margin-bottom: 4px;
+        }
+        list-toolbar sl-select {
+          min-width: 180px;
+        }
+        /* The selects carry a label so a screen reader does not meet two
          unnamed comboboxes; the bar has no room to print it. */
-      list-toolbar sl-select::part(form-control-label) {
-        position: absolute;
-        width: 1px;
-        height: 1px;
-        padding: 0;
-        margin: -1px;
-        overflow: hidden;
-        clip: rect(0 0 0 0);
-        white-space: nowrap;
-        border: 0;
-      }
-      .connection-status {
-        display: flex;
-        align-items: center;
-        gap: 8px;
-        font-size: var(--console-text-meta);
-        color: var(--console-meta-color);
-      }
-      .connection-dot {
-        width: 8px;
-        height: 8px;
-        border-radius: 50%;
-        background-color: var(--sl-color-neutral-400);
-      }
-      .connection-dot.live {
-        background-color: var(--sl-color-success-600);
-      }
-      .connection-dot.dropped {
-        background-color: var(--sl-color-danger-600);
-      }
-      .result-count {
-        color: var(--console-meta-color);
-        font-size: var(--console-text-meta);
-        margin-bottom: 12px;
-      }
-      .load-error {
-        margin-bottom: 16px;
-      }
-      .load-error .retry-button {
-        display: block;
-        margin-top: 8px;
-      }
-      .pagination {
-        display: flex;
-        justify-content: space-between;
-        align-items: center;
-        margin-top: 16px;
-        padding-top: 12px;
-        border-top: 1px solid var(--console-hairline);
-      }
-      .pagination-page {
-        color: var(--console-meta-color);
-        font-size: var(--console-text-meta);
-      }
-    `,
+        list-toolbar sl-select::part(form-control-label) {
+          position: absolute;
+          width: 1px;
+          height: 1px;
+          padding: 0;
+          margin: -1px;
+          overflow: hidden;
+          clip: rect(0 0 0 0);
+          white-space: nowrap;
+          border: 0;
+        }
+        .reset-filters {
+          background: none;
+          border: 0;
+          padding: 0;
+          color: var(--sl-color-primary-600);
+          font-size: var(--console-text-meta);
+          cursor: pointer;
+          text-decoration: underline;
+        }
+        .connection-status {
+          display: flex;
+          align-items: center;
+          gap: 8px;
+          font-size: var(--console-text-meta);
+          color: var(--console-meta-color);
+        }
+        .connection-dot {
+          width: 8px;
+          height: 8px;
+          border-radius: 50%;
+          background-color: var(--sl-color-neutral-400);
+        }
+        .connection-dot.live {
+          background-color: var(--sl-color-success-600);
+        }
+        .connection-dot.dropped {
+          background-color: var(--sl-color-danger-600);
+        }
+        .result-count {
+          color: var(--console-meta-color);
+          font-size: var(--console-text-meta);
+          margin-bottom: 12px;
+        }
+        .load-error {
+          margin-bottom: 16px;
+        }
+        .load-error .retry-button {
+          display: block;
+          margin-top: 8px;
+        }
+        .pagination {
+          display: flex;
+          justify-content: space-between;
+          align-items: center;
+          margin-top: 16px;
+          padding-top: 12px;
+          border-top: 1px solid var(--console-hairline);
+        }
+        .pagination-page {
+          color: var(--console-meta-color);
+          font-size: var(--console-text-meta);
+        }
+      `,
+    ],
   ];
 
   @state()
@@ -469,18 +539,43 @@ export class FlowExecutionsView extends AuthedElement {
   private applyQueryParams(): void {
     const params = new URLSearchParams(window.location.search);
     const status = params.get('status');
+    const hasUrlFilters =
+      status !== null ||
+      params.has('flow') ||
+      params.has('flow_id') ||
+      params.has('q') ||
+      params.has('range');
+    if (hasUrlFilters) {
+      this.applyExplicitQueryParams(params, status);
+      return;
+    }
+    const stored = loadFlowExecutionFilters();
+    if (!stored || isDefaultFlowExecutionFilters(stored)) return;
+    // A stored visit keeps the range the operator left, including 30d.
+    // Only a deep link with status or flow and no range opens on All.
+    this.statusFilter = stored.status;
+    this.flowIdFilter = stored.flow;
+    this.range = stored.range;
+    this.searchQuery = stored.q;
+    this.writeFiltersToUrl();
+  }
+
+  /** URL params win over storage so Attention and Overview links stay exact. */
+  private applyExplicitQueryParams(
+    params: URLSearchParams,
+    status: string | null
+  ): void {
     if (status) {
-      const known = [
-        'all',
-        'RUNNING',
-        'PENDING',
-        'SUCCEEDED',
-        'FAILED',
-        'CANCELLED',
-      ];
+      const upper = status.toUpperCase();
+      // TIMED_OUT is the other spelling of a timed-out run; one option
+      // covers both.
       const normalized =
-        status.toLowerCase() === 'all' ? 'all' : status.toUpperCase();
-      if (known.includes(normalized)) {
+        status.toLowerCase() === 'all'
+          ? 'all'
+          : upper === 'TIMED_OUT'
+            ? 'TIMEOUT'
+            : upper;
+      if ((FLOW_EXECUTION_STATUSES as readonly string[]).includes(normalized)) {
         this.statusFilter = normalized;
       }
     }
@@ -488,7 +583,9 @@ export class FlowExecutionsView extends AuthedElement {
     // and the Overview inventory link with. Both mean the same filter.
     this.flowIdFilter = params.get('flow_id') || params.get('flow');
     const search = params.get('q');
-    if (search) this.searchQuery = search;
+    if (search) {
+      this.searchQuery = search.slice(0, FLOW_EXECUTION_QUERY_MAX);
+    }
     const range = params.get('range');
     if (range && RANGE_OPTIONS.some((option) => option.value === range)) {
       this.range = range;
@@ -497,6 +594,93 @@ export class FlowExecutionsView extends AuthedElement {
       // could hide exactly that run, so a filtered entry opens on All.
       this.range = 'all';
     }
+  }
+
+  private currentFilters(): FlowExecutionListFilters {
+    const status = (FLOW_EXECUTION_STATUSES as readonly string[]).includes(
+      this.statusFilter
+    )
+      ? this.statusFilter
+      : DEFAULT_FLOW_EXECUTION_FILTERS.status;
+    const range = RANGE_OPTIONS.some((option) => option.value === this.range)
+      ? this.range
+      : DEFAULT_FLOW_EXECUTION_FILTERS.range;
+    return {
+      status: status as FlowExecutionListFilters['status'],
+      flow: this.flowIdFilter || null,
+      range: range as FlowExecutionListFilters['range'],
+      q: this.searchQuery.slice(0, FLOW_EXECUTION_QUERY_MAX),
+    };
+  }
+
+  /** Any control off its default, so Reset filters has something to undo. */
+  private get filtersActive(): boolean {
+    return !isDefaultFlowExecutionFilters(this.currentFilters());
+  }
+
+  /**
+   * Remember the filters and put them on the URL.
+   *
+   * A refresh and the back button then show the same list. Defaults are
+   * removed from both places.
+   */
+  private persistFilters(): void {
+    const filters = this.currentFilters();
+    this.searchQuery = filters.q;
+    if (isDefaultFlowExecutionFilters(filters)) {
+      clearFlowExecutionFilters();
+    } else {
+      saveFlowExecutionFilters(filters);
+    }
+    this.writeFiltersToUrl();
+  }
+
+  /** Mirror the filters into the URL the way the flow select already did. */
+  private writeFiltersToUrl(): void {
+    const filters = this.currentFilters();
+    const url = new URL(window.location.href);
+    url.searchParams.delete('flow');
+    if (filters.status === 'all') {
+      url.searchParams.delete('status');
+    } else {
+      url.searchParams.set('status', filters.status);
+    }
+    if (filters.flow) {
+      url.searchParams.set('flow_id', filters.flow);
+    } else {
+      url.searchParams.delete('flow_id');
+    }
+    if (filters.q) {
+      url.searchParams.set('q', filters.q);
+    } else {
+      url.searchParams.delete('q');
+    }
+    // A status or flow link with no range opens on All. Write the range
+    // whenever any filter is set so a refresh does not widen a stored 30d.
+    if (isDefaultFlowExecutionFilters(filters)) {
+      url.searchParams.delete('range');
+    } else {
+      url.searchParams.set('range', filters.range);
+    }
+    try {
+      window.history.replaceState({}, '', url.toString());
+    } catch {
+      // Safari throws SecurityError after about 100 history writes in 30s.
+      // The list still uses the filters; the next successful write catches up.
+    }
+  }
+
+  /** Back to the page defaults, including storage and the URL. */
+  private resetFilters(): void {
+    this.statusFilter = DEFAULT_FLOW_EXECUTION_FILTERS.status;
+    this.flowIdFilter = DEFAULT_FLOW_EXECUTION_FILTERS.flow;
+    this.flowNameFilter = null;
+    this.range = DEFAULT_FLOW_EXECUTION_FILTERS.range;
+    this.searchQuery = DEFAULT_FLOW_EXECUTION_FILTERS.q;
+    this.currentPage = 1;
+    clearFlowExecutionFilters();
+    this.writeFiltersToUrl();
+    void this.loadExecutions();
   }
 
   /**
@@ -564,7 +748,7 @@ export class FlowExecutionsView extends AuthedElement {
       const page = await getFlowExecutionsPage({
         limit: this.pageSize + 1,
         skip: (this.currentPage - 1) * this.pageSize,
-        status: this.statusFilter === 'all' ? undefined : this.statusFilter,
+        status: flowExecutionStatusQuery(this.statusFilter),
         flowId: this.flowIdFilter || undefined,
         search: this.searchQuery.trim() || undefined,
         startedAfter: this.startedAfter,
@@ -601,14 +785,7 @@ export class FlowExecutionsView extends AuthedElement {
       ? this.flowOptions.find((flow) => flow.id === flowId)?.name || null
       : null;
     this.currentPage = 1;
-    const url = new URL(window.location.href);
-    url.searchParams.delete('flow');
-    if (flowId) {
-      url.searchParams.set('flow_id', flowId);
-    } else {
-      url.searchParams.delete('flow_id');
-    }
-    window.history.replaceState({}, '', url.toString());
+    this.persistFilters();
     void this.loadExecutions();
   }
 
@@ -617,13 +794,17 @@ export class FlowExecutionsView extends AuthedElement {
    * is that run" for an account with thousands. One request per pause.
    */
   private handleSearchChange(value: string): void {
-    this.searchQuery = value;
+    this.searchQuery = value.slice(0, FLOW_EXECUTION_QUERY_MAX);
     if (this.searchDebounceId !== undefined) {
       clearTimeout(this.searchDebounceId);
     }
+    // Storage and the URL wait for the same pause as the request. A
+    // replaceState per character trips Safari's history throttle, and a
+    // throw there used to skip re-arming this timer.
     this.searchDebounceId = window.setTimeout(() => {
       this.searchDebounceId = undefined;
       this.currentPage = 1;
+      this.persistFilters();
       void this.loadExecutions();
     }, SEARCH_DEBOUNCE_MS);
   }
@@ -631,6 +812,7 @@ export class FlowExecutionsView extends AuthedElement {
   private setRange(range: string): void {
     this.range = range;
     this.currentPage = 1;
+    this.persistFilters();
     void this.loadExecutions();
   }
 
@@ -728,11 +910,26 @@ export class FlowExecutionsView extends AuthedElement {
       {
         id: 'duration',
         header: 'Duration',
-        width: 72,
+        // Tuned to the widest live label the console expects to show in
+        // practice, "Running · 999h 59m" (~131px at the 14px tabular-nums,
+        // plus the cell's 8px padding on each side). `formatDurationBetween`
+        // has no hour cap, so a longer span is deliberately clipped by the
+        // cell ellipsis rather than treated as a formatter bound. Finished
+        // labels ("4m 32s") are far narrower.
+        width: 152,
         sort: 'number',
         cellClass: 'duration-cell',
         value: (row) => durationOf(row),
-        cell: (row) => executionDurationText(row, this.durationNow) || '\u2014',
+        cell: (row) => {
+          const label =
+            executionDurationText(row, this.durationNow) || '\u2014';
+          // The span gives the layout test the text box to measure; the
+          // cell's ellipsis already clips the row when an operator drags the
+          // column narrower.
+          return html`<span class="duration-text">${label}</span>`;
+        },
+        cellTitle: (row) =>
+          executionDurationText(row, this.durationNow) || '\u2014',
       },
       {
         id: 'model',
@@ -829,6 +1026,7 @@ export class FlowExecutionsView extends AuthedElement {
   setStatusFilter(status: string) {
     this.statusFilter = status;
     this.currentPage = 1; // Reset to first page when filter changes
+    this.persistFilters();
     void this.loadExecutions();
   }
 
@@ -1146,12 +1344,22 @@ export class FlowExecutionsView extends AuthedElement {
           }}
         >
           <sl-option value="">Any status</sl-option>
-          <sl-option value="RUNNING">Running</sl-option>
-          <sl-option value="PENDING">Pending</sl-option>
-          <sl-option value="SUCCEEDED">Succeeded</sl-option>
-          <sl-option value="FAILED">Failed</sl-option>
-          <sl-option value="CANCELLED">Cancelled</sl-option>
+          ${Object.entries(FLOW_EXECUTION_STATUS_LABELS).map(
+            ([value, label]) =>
+              html`<sl-option value=${value}>${label}</sl-option>`
+          )}
         </sl-select>
+        ${
+          this.filtersActive
+            ? html`<button
+                type="button"
+                class="reset-filters"
+                @click=${() => this.resetFilters()}
+              >
+                Reset filters
+              </button>`
+            : nothing
+        }
 
         <time-range-select
           ariaLabel="Executions time range"
@@ -1250,19 +1458,21 @@ export class FlowExecutionsView extends AuthedElement {
                 : this.renderEmptyState()
               : html`
                   <div class="table-wrapper">
-                    <table>
-                      <thead>
-                        <tr>
-                          ${renderListHeaders(this.table)}
-                          <th class="actions-cell"></th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        ${this.paginatedExecutions.map((exec) =>
-                          this.renderRow(exec)
-                        )}
-                      </tbody>
-                    </table>
+                    <div class="table-scroll">
+                      <table>
+                        <thead>
+                          <tr>
+                            ${renderListHeaders(this.table)}
+                            <th class="actions-cell"></th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          ${this.paginatedExecutions.map((exec) =>
+                            this.renderRow(exec)
+                          )}
+                        </tbody>
+                      </table>
+                    </div>
                   </div>
 
                   ${
@@ -1354,8 +1564,35 @@ export class FlowExecutionsView extends AuthedElement {
              is the difference between a provider hiccup and a flow that never
              confirms it finished. -->
         ${renderFailureCategoryChip(exec.failure_category)}
+        ${this.renderResumeLine(exec)}
       </div>
     `;
+  }
+
+  /**
+   * Review/CI repair label: not a delegation child. Link the publishing
+   * execution and state the chain total when the server rolled one up.
+   */
+  private renderResumeLine(exec: FlowExecution) {
+    const resumeOf = exec.resume_of;
+    const totals = exec.resume_totals;
+    if (!resumeOf && !totals) return nothing;
+    const chain =
+      totals != null
+        ? html` · ${formatTokenCount(totals.total_tokens)} ·
+          ${formatEstimatedCost(totals.estimated_cost)}`
+        : nothing;
+    if (resumeOf) {
+      const href = router.urlForPath(`/console/flows/executions/${resumeOf}`);
+      return html`<div class="resume-line" data-testid="resume-line">
+        Continuation of original execution
+        <a href=${href} data-testid="resume-of-link">${resumeOf.slice(0, 8)}</a
+        >${chain}
+      </div>`;
+    }
+    return html`<div class="resume-line" data-testid="resume-line">
+      Chain total${chain}
+    </div>`;
   }
 
   /**

@@ -15,6 +15,7 @@ import type { AttentionView } from './attention-view';
 
 describe('AttentionView', () => {
   let fetchStub: sinon.SinonStub;
+  let pendingGatewaySummary: Promise<void> | null = null;
   let connectStub: sinon.SinonStub;
   let subscribeStub: sinon.SinonStub;
   let approvalsResponse: any[];
@@ -29,6 +30,8 @@ describe('AttentionView', () => {
   let usageByModel: any[];
   let agentDeletes: string[];
   let dismissalWrites: { url: string; method: string; body: any }[];
+  let policyNoticesResponse: any[] = [];
+  let spendOutliersResponse: any[];
 
   const json = (data: unknown) =>
     new Response(JSON.stringify(data), {
@@ -38,6 +41,7 @@ describe('AttentionView', () => {
 
   beforeEach(() => {
     localStorage.setItem('accessToken', 'test-access-token');
+    pendingGatewaySummary = null;
     invalidateApiCaches();
     rejectPolicies = false;
     gatePriceOverrides = false;
@@ -48,6 +52,7 @@ describe('AttentionView', () => {
     agentsResponse = [];
     usageByModel = [];
     agentDeletes = [];
+    spendOutliersResponse = [];
     window.location.hash = '';
 
     approvalsResponse = [
@@ -85,6 +90,9 @@ describe('AttentionView', () => {
       .stub(window, 'fetch')
       .callsFake(async (input: RequestInfo | URL, init?: RequestInit) => {
         const url = typeof input === 'string' ? input : input.toString();
+        if (url.includes('/gateway-usage/summary') && pendingGatewaySummary) {
+          await pendingGatewaySummary;
+        }
 
         if (url.startsWith('/api/v1/attention/dismissals')) {
           if (!dismissalsSupported) {
@@ -136,6 +144,22 @@ describe('AttentionView', () => {
         }
         if (url.startsWith('/api/v1/approval-requests')) {
           return json(approvalsResponse);
+        }
+        if (url.startsWith('/api/v1/policies/notices/summary')) {
+          return json({ days: 7, rules: policyNoticesResponse });
+        }
+        if (url.startsWith('/api/v1/attention/spend-outliers/settings')) {
+          return json({
+            daily_multiple: 3,
+            min_history_days: 7,
+            top_tier_model_prefixes: ['top-model'],
+            top_tier_share: 0.5,
+            session_cost_threshold_usd: null,
+            configured: false,
+          });
+        }
+        if (url.startsWith('/api/v1/attention/spend-outliers')) {
+          return json({ items: spendOutliersResponse });
         }
         if (url.startsWith('/api/v1/flows/executions')) {
           return json(executionsResponse);
@@ -200,11 +224,201 @@ describe('AttentionView', () => {
   });
 
   afterEach(() => {
+    policyNoticesResponse = [];
     invalidateApiCaches();
     fetchStub.restore();
     connectStub.restore();
     subscribeStub.restore();
     localStorage.clear();
+  });
+
+  it('explains a permissions failure and retries decisions independently of pending analytics', async () => {
+    let release!: () => void;
+    pendingGatewaySummary = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    fetchStub
+      .withArgs('/api/v1/auth/users/me')
+      .onFirstCall()
+      .resolves(new Response('{}', { status: 500 }));
+    fetchStub
+      .withArgs('/api/v1/auth/users/me')
+      .onSecondCall()
+      .resolves(json({ id: 'user-1', permissions: null }));
+    const el = await fixture<AttentionView>(
+      html`<attention-view></attention-view>`
+    );
+    try {
+      await waitUntil(
+        () => (el as any).approvalsReady && !!(el as any).permissionsError
+      );
+      await el.updateComplete;
+      expect(el.shadowRoot!.textContent).to.include(
+        'Could not load your permissions'
+      );
+      expect(
+        (el.shadowRoot!.querySelector('.row-approve') as any).disabled
+      ).to.equal(true);
+      (
+        el.shadowRoot!.querySelector('.retry-permissions') as HTMLElement
+      ).click();
+      await waitUntil(() => (el as any).permissionsReady);
+      await el.updateComplete;
+      expect((el as any).loading).to.equal(true);
+      expect(el.shadowRoot!.querySelector('.retry-permissions')).to.equal(null);
+      expect(
+        (el.shadowRoot!.querySelector('.row-approve') as any).disabled
+      ).to.equal(false);
+      expect(
+        fetchStub
+          .getCalls()
+          .filter((call) =>
+            call.args[0].toString().includes('/gateway-usage/summary')
+          )
+      ).to.have.length(1);
+      (el.shadowRoot!.querySelector('.row-approve') as HTMLElement).click();
+      await waitUntil(() => (el as any).resolvedApprovalIds.has('approval-1'));
+    } finally {
+      release();
+    }
+    await (el as any).refreshInFlight;
+  });
+
+  it('loads current permissions after reconnect while old profile and analytics remain pending', async () => {
+    let releaseOldProfile!: () => void;
+    let releaseAnalytics!: () => void;
+    const oldProfile = new Promise<void>((resolve) => {
+      releaseOldProfile = resolve;
+    });
+    pendingGatewaySummary = new Promise<void>((resolve) => {
+      releaseAnalytics = resolve;
+    });
+    let profileCalls = 0;
+    fetchStub.withArgs('/api/v1/auth/users/me').callsFake(async () => {
+      if (++profileCalls === 1) {
+        await oldProfile;
+        return json({ id: 'old-user', permissions: [] });
+      }
+      return json({ id: 'current-user', permissions: ['approve_requests'] });
+    });
+    const el = await fixture<AttentionView>(
+      html`<attention-view></attention-view>`
+    );
+    await waitUntil(() => profileCalls === 1 && (el as any).approvalsReady);
+    const parent = el.parentElement!;
+    el.remove();
+    expect((el as any).permissionsLoading).to.equal(false);
+    expect((el as any).permissionsReady).to.equal(false);
+    // Simulate a changed identity on reconnection; normal same-identity
+    // reconnects can reuse the transport but need fresh lifecycle callbacks.
+    invalidateApiCaches();
+    try {
+      parent.append(el);
+      await waitUntil(() => profileCalls === 2 && (el as any).permissionsReady);
+      expect((el as any).permissions).to.deep.equal(['approve_requests']);
+      expect((el as any).loading).to.equal(true);
+      releaseOldProfile();
+      await oldProfile;
+      await aTimeout(0);
+      expect((el as any).permissions).to.deep.equal(['approve_requests']);
+    } finally {
+      releaseOldProfile();
+      releaseAnalytics();
+    }
+    await (el as any).refreshInFlight;
+  });
+
+  it('shows approvals while analytics are pending without claiming all-clear or complete counts', async () => {
+    let release!: () => void;
+    pendingGatewaySummary = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const el = await fixture<AttentionView>(
+      html`<attention-view></attention-view>`
+    );
+    try {
+      await waitUntil(() => (el as any).approvalsReady);
+      await el.updateComplete;
+      expect(el.shadowRoot!.textContent).to.include('refund_order');
+      expect(el.shadowRoot!.textContent).to.include(
+        'Loading other attention items'
+      );
+      expect(el.shadowRoot!.textContent).not.to.include(
+        'Nothing needs you right now'
+      );
+      expect(el.shadowRoot!.querySelector('.chip-strip')).not.to.exist;
+      expect(el.shadowRoot!.querySelector('#approvals')).to.exist;
+    } finally {
+      release();
+    }
+    await (el as any).refreshInFlight;
+  });
+
+  it('holds websocket bursts to one active wave and one trailing refresh', async () => {
+    let release!: () => void;
+    const pending = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    pendingGatewaySummary = pending;
+    const el = await fixture<AttentionView>(
+      html`<attention-view></attention-view>`
+    );
+    await waitUntil(() =>
+      fetchStub
+        .getCalls()
+        .some((call) =>
+          call.args[0].toString().includes('/gateway-usage/summary')
+        )
+    );
+    const clock = sinon.useFakeTimers({
+      toFake: ['setTimeout', 'clearTimeout'],
+    });
+    const count = () =>
+      fetchStub
+        .getCalls()
+        .filter((call) =>
+          call.args[0].toString().includes('/gateway-usage/summary')
+        ).length;
+    try {
+      for (let i = 0; i < 20; i++) {
+        (el as any).scheduleRefresh();
+        await clock.tickAsync(2000);
+      }
+      expect(count()).to.equal(1);
+      const active = (el as any).refreshInFlight;
+      release();
+      await active;
+      expect(count()).to.equal(1);
+      await clock.tickAsync(1499);
+      expect(count()).to.equal(1);
+      await clock.tickAsync(1);
+      if ((el as any).refreshInFlight) await (el as any).refreshInFlight;
+      expect(count()).to.equal(2);
+      await clock.tickAsync(10_000);
+      expect(count()).to.equal(2);
+    } finally {
+      release();
+      clock.restore();
+    }
+  });
+
+  it('ignores a pending wave after disconnect and drops its queued refresh', async () => {
+    let release!: () => void;
+    const pending = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    pendingGatewaySummary = pending;
+    const el = await fixture<AttentionView>(
+      html`<attention-view></attention-view>`
+    );
+    const active = (el as any).refreshInFlight;
+    (el as any).scheduleRefresh();
+    el.remove();
+    release();
+    await active;
+    expect((el as any).lastUpdatedAt).to.equal(null);
+    expect((el as any).refreshTimer).to.equal(null);
+    expect((el as any).refreshQueued).to.equal(false);
   });
 
   const mount = async (): Promise<AttentionView> => {
@@ -453,6 +667,61 @@ describe('AttentionView', () => {
     resetConfirmDialogForTests();
   });
 
+  for (const action of ['approve', 'deny'] as const) {
+    it(`keeps a successful ${action} removed when held analytics return an old approval snapshot`, async () => {
+      let release!: () => void;
+      pendingGatewaySummary = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const el = await fixture<AttentionView>(
+        html`<attention-view></attention-view>`
+      );
+      try {
+        await waitUntil(
+          () => (el as any).approvalsReady && (el as any).permissionsReady
+        );
+        await el.updateComplete;
+        const wave = (el as any).refreshInFlight;
+        const button = el.shadowRoot!.querySelector(
+          `#approvals .row-${action}`
+        ) as HTMLElement;
+        expect(button).to.exist;
+        button.click();
+        if (action === 'deny') {
+          await waitUntil(() => !!document.querySelector('confirm-dialog'));
+          (
+            document
+              .querySelector('confirm-dialog')!
+              .shadowRoot!.querySelector(
+                '[data-testid="confirm-dialog-confirm"]'
+              ) as HTMLElement
+          ).click();
+        }
+        await waitUntil(() =>
+          (el as any).resolvedApprovalIds.has('approval-1')
+        );
+        await el.updateComplete;
+        expect((el as any).busyItemId).to.equal(null);
+        expect((el as any).loading).to.equal(true);
+        expect((el as any).approvals).to.have.length(0);
+        expect(el.shadowRoot!.querySelector('#approvals')).not.to.exist;
+        // The original request deliberately still contains the decided row.
+        expect(approvalsResponse[0].id).to.equal('approval-1');
+        release();
+        await wave;
+        await el.updateComplete;
+        expect((el as any).loading).to.equal(false);
+        expect((el as any).approvals).to.have.length(0);
+        expect(el.shadowRoot!.querySelector('#approvals')).not.to.exist;
+      } finally {
+        release();
+        await (el as any).refreshInFlight;
+        el.remove();
+        resetConfirmDialogForTests();
+      }
+    });
+  }
+
   it('sends a question to its detail page instead of a yes or no', async () => {
     approvalsResponse = [
       {
@@ -582,6 +851,37 @@ describe('AttentionView', () => {
     expect(flowsChip.textContent!.trim()).to.equal('1 flow');
   });
 
+  it('shows a policy notice card with the redacted excerpt', async () => {
+    policyNoticesResponse = [
+      {
+        rule_id: 'notify-codename',
+        rule_description: 'Mentions of the codename',
+        target: 'model.request',
+        count: 2,
+        last_hit_id: 'hit-2',
+        last_hit_at: new Date(Date.now() - 60_000).toISOString(),
+        last_excerpt: 'the project-x plan uses [REDACTED]',
+        last_username: 'alex',
+        last_user_id: 'user-1',
+      },
+    ];
+    const el = await mount();
+
+    const section = el.shadowRoot!.querySelector('#policy-notices')!;
+    expect(section, 'policy notices section').to.exist;
+    const rows = section.querySelectorAll('.attention-row');
+    expect(rows).to.have.length(1);
+    expect(rows[0].textContent).to.contain('Mentions of the codename');
+    const evidence = section.querySelector('.row-evidence')!;
+    expect(
+      evidence.querySelector('.policy-notice-excerpt')!.textContent!.trim()
+    ).to.equal('the project-x plan uses [REDACTED]');
+    expect(evidence.textContent).to.contain('by alex');
+    expect(evidence.querySelector('sl-button')!.getAttribute('href')).to.equal(
+      '/console/policies'
+    );
+  });
+
   it('shows a chip per kind, muted when the kind is empty', async () => {
     const el = await mount();
     const chips = Array.from(el.shadowRoot!.querySelectorAll('.chip')).map(
@@ -593,7 +893,9 @@ describe('AttentionView', () => {
       '1 flow',
       '0 models',
       '1 budget',
+      '0 spend outliers',
       '0 pricing',
+      '0 policy notices',
     ]);
     const agentsChip = el.shadowRoot!.querySelectorAll('.chip')[1];
     expect(agentsChip.classList.contains('empty')).to.be.true;
@@ -612,6 +914,114 @@ describe('AttentionView', () => {
     expect(
       el.shadowRoot!.querySelector('budget-limits-dialog')!.hasAttribute('open')
     ).to.be.true;
+  });
+
+  describe('spend outliers', () => {
+    const spendFinding = (overrides: Record<string, unknown> = {}) => ({
+      id: 'finding-1',
+      item_id: 'spend:daily_spend:user-7',
+      fingerprint: 'daily_spend|user-7|2026-09-01',
+      rule: 'daily_spend',
+      rule_label: 'Daily spend spike',
+      user_id: 'user-7',
+      user_name: 'dev-seven',
+      runtime_session_id: null,
+      session_title: null,
+      day: '2026-09-01',
+      detected_at: new Date().toISOString(),
+      details: {
+        spend_usd: 45,
+        median_usd: 10,
+        multiple: 4.5,
+        threshold_multiple: 3,
+        imported_usd: 15,
+        imported_sources: ['copilot'],
+      },
+      summary: '',
+      ...overrides,
+    });
+
+    it('lists a finding in its own section with the numbers behind it', async () => {
+      spendOutliersResponse = [spendFinding()];
+      const el = await mount();
+
+      const section = el.shadowRoot!.querySelector('#spend-outliers')!;
+      expect(section).to.exist;
+      const sectionText = section.textContent!.replace(/\s+/g, ' ');
+      expect(sectionText).to.contain('dev-seven · Daily spend spike');
+      expect(sectionText).to.contain('28-day median');
+      expect(sectionText).to.contain('not metered by the gateway');
+    });
+
+    it('offers the dismiss menu on a spend card', async () => {
+      permissions = ['view_cost', 'manage_agents'];
+      spendOutliersResponse = [spendFinding()];
+      const el = await mount();
+
+      expect(el.shadowRoot!.querySelector('#spend-outliers .dismiss-dropdown'))
+        .to.exist;
+    });
+
+    it('opens the alert settings from the header for a budget manager', async () => {
+      permissions = ['view_cost', 'manage_budgets'];
+      const el = await mount();
+
+      const button = el.shadowRoot!.querySelector(
+        '.spend-settings-button'
+      ) as HTMLElement;
+      expect(button).to.exist;
+      button.click();
+      await el.updateComplete;
+
+      expect(
+        el
+          .shadowRoot!.querySelector('spend-outlier-settings-dialog')!
+          .hasAttribute('open')
+      ).to.be.true;
+    });
+
+    it('opens the alert settings from the #spend-outliers link', async () => {
+      permissions = ['view_cost', 'manage_budgets'];
+      window.location.hash = '#spend-outliers';
+      try {
+        const el = await mount();
+        await el.updateComplete;
+        await el.updateComplete;
+        expect(
+          el
+            .shadowRoot!.querySelector('spend-outlier-settings-dialog')!
+            .hasAttribute('open')
+        ).to.be.true;
+      } finally {
+        window.location.hash = '';
+      }
+    });
+
+    it('does not open the alert settings from the link without manage_budgets', async () => {
+      permissions = ['view_cost'];
+      window.location.hash = '#spend-outliers';
+      try {
+        const el = await mount();
+        await el.updateComplete;
+        expect(
+          el
+            .shadowRoot!.querySelector('spend-outlier-settings-dialog')
+            ?.hasAttribute('open') ?? false
+        ).to.be.false;
+      } finally {
+        window.location.hash = '';
+      }
+    });
+
+    it('hides the alert settings from a member without manage_budgets', async () => {
+      permissions = ['view_cost'];
+      spendOutliersResponse = [spendFinding()];
+      const el = await mount();
+
+      expect(el.shadowRoot!.querySelector('.spend-settings-button')).to.not
+        .exist;
+      expect(text(el)).to.not.contain('Alert settings');
+    });
   });
 
   it('drops a section when its request fails and keeps the rest', async () => {

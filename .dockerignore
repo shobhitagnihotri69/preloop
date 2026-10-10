@@ -2,6 +2,8 @@
 .git
 .gitignore
 .github
+# environments/preloop/Dockerfile bakes the backend test venv from this lock.
+!.github/requirements/app-dev.txt
 .gitlab-ci.yml
 
 # Python
@@ -54,3 +56,6 @@ LICENSE
 # Local dev files
 .vscode/
 .idea/
+
+# Test and demo fixtures (warehouse-sim MCP server); never in the image
+scripts/fixtures/

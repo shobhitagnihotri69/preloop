@@ -148,7 +148,28 @@ class TestPromptContract:
     def test_implements_tests_lint_and_commits(self, prompt):
         assert "fails before your change and passes after it" in prompt
         assert "the linter" in prompt
-        assert "Commit locally with a message that says why, not only what" in prompt
+        assert "Commit locally at each milestone" in prompt
+        assert "a message that says why, not only what" in prompt
+
+    def test_commits_land_as_the_work_lands(self, prompt):
+        """A run that is cut short should keep the work it already did (#851).
+
+        The old wording invited one commit at the end, so a run that hit the
+        wall left an empty branch behind.
+        """
+        assert "Commit locally at each milestone" in prompt
+        assert "Do not save every commit for the end" in prompt
+        assert "keeps whatever is committed and loses the rest" in prompt
+        assert "first commit within 20 minutes" in prompt
+        assert "WIP commits are fine" in prompt
+
+    def test_reading_is_scoped_to_ranges(self, prompt):
+        """Whole-file reads spend the context that the edits need (#851)."""
+        assert "Read by range, not by whole file" in prompt
+        assert "Your context is finite" in prompt
+        assert "`grep -n`" in prompt
+        assert "sed -n '120,180p'" in prompt
+        assert "Read a whole file only when it is genuinely small" in prompt
 
     def test_unrunnable_checks_are_reported_not_faked(self, prompt):
         assert "do not fake it" in prompt
@@ -159,7 +180,7 @@ class TestPromptContract:
 
         The agent runs in a container with a bounded memory limit, so the
         implementation phase asks for the tests covering the change, selected
-        per directory or per file, and says that CI owns the full suite.
+        by affected files in fresh processes, and says CI owns broad suites.
         """
         assert "the tests for the modules you touched" in prompt
         assert "Select tests by the directory or the file that covers your change" in (
@@ -169,10 +190,14 @@ class TestPromptContract:
         assert "bounded memory limit" in prompt
         assert "CI runs the full suite on the pull request" in prompt
 
-    def test_broad_runs_are_one_directory_at_a_time(self, prompt):
+    def test_broad_runs_use_small_serial_batches(self, prompt):
         """When a wide run is unavoidable it is still bounded and stops early."""
-        assert "run one top-level test directory at a time with `-x` and `-q`" in prompt
-        assert "stop at the first failure" in prompt
+        assert "cgroup memory limit" in prompt
+        assert "directly affected test files in small batches" in prompt
+        assert "each in a fresh process with `-x` and `-q`" in prompt
+        assert "Do not use parallel test workers" in prompt
+        assert "Leave full-suite and broad category coverage to CI" in prompt
+        assert "Stop at the first failure" in prompt
 
     def test_resume_repeats_only_the_affected_scope(self, prompt):
         assert "scoped to the touched modules under the same memory limit" in prompt

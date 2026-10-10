@@ -1,4 +1,6 @@
 export interface GitCloneRepository {
+  /** Dedicated project binding returned by hosted restricted CI flows. */
+  project_id?: string;
   tracker_id: string;
   repository_url?: string;
   clone_path: string;
@@ -23,7 +25,12 @@ export interface FlowCustomCommands {
 }
 
 /**
- * Failure-side keys the server still parses and ignores.
+ * Failure-side keys.
+ *
+ * `alert_after_consecutive_failures` is consumed by the backend: it emails and
+ * pushes the account's owners after that many failed runs in a row (default 3
+ * when unset). This form has no control for it, but it must be carried forward
+ * on save so editing an unrelated field does not silently reset the threshold.
  *
  * `comment_on_trigger_issue` used to post the failure comment and was removed;
  * `attention_item` never did anything (failed executions always become
@@ -31,6 +38,7 @@ export interface FlowCustomCommands {
  * removal still deserializes. The console never renders or submits them.
  */
 export interface FlowFailureNotifications {
+  alert_after_consecutive_failures?: number;
   comment_on_trigger_issue?: boolean;
   attention_item?: boolean;
 }
@@ -54,7 +62,14 @@ export function defaultFlowNotifications(): FlowNotifications {
 }
 
 export interface FlowWebhookConfig {
-  webhook_secret: string;
+  /** Set on webhook-triggered flows only; tracker flows have none. */
+  webhook_secret?: string | null;
+  dedupe_path?: string | null;
+  /**
+   * Stop this flow's run on an older pull request head when a new head
+   * arrives (#1032). Off unless the flow opts in.
+   */
+  supersede_on_update?: boolean;
 }
 
 /** Server-computed schedule state; read-only for the console. */
@@ -104,6 +119,20 @@ export interface Flow {
   icon?: string;
   account_id?: string;
   prompt_template?: string;
+  /**
+   * Blocking review rules for the Pull Request Reviewer. Same markdown as
+   * `.preloop/review-policy.md`. Null or absent means the repository file
+   * is the only source. The reviewer prompt keeps the first 16,384
+   * characters. The API accepts up to 32,768.
+   */
+  review_instructions?: string | null;
+  /**
+   * Catalog identity for a built-in preset. Null on an account flow, whose
+   * name can be edited and is not identity.
+   */
+  slug?: string | null;
+  /** Preset this flow was created from, when it was created from one. */
+  source_preset_id?: string | null;
   agent_type?: string;
   agent_config?: Record<string, unknown>;
   ai_model_id?: string;
@@ -200,6 +229,7 @@ export interface TextToSpeechRequest {
 }
 
 export interface FlowGatewayConversationPreviewMessage {
+  tool_call_ids?: string[];
   source?: string | null;
   role?: string | null;
   text?: string | null;
@@ -228,6 +258,39 @@ export interface FlowGatewayCapturePolicy {
   conversation_preview_available?: boolean;
 }
 
+/**
+ * One tool invocation recovered from a captured gateway body.
+ *
+ * `id` is the provider's own call id (`tool_calls[].id`, `call_id`,
+ * `tool_use.id`), which is the only identity that provably links a call to its
+ * result across events and retries. It is null when the producer had none to
+ * give; `stable_id` says so, and consumers must scope such a row to the event
+ * that produced it rather than merging it with anything.
+ *
+ * `arguments` and `result` are CONTENT. They are null when the gateway's
+ * capture policy withheld them, in which case `redacted` is true — the tool
+ * NAME and ids survive, because a name is structure, not content.
+ */
+export interface GatewayToolActivityEntry {
+  id?: string | null;
+  stable_id?: boolean;
+  direction?: 'call' | 'result' | string;
+  name?: string | null;
+  dialect?: string | null;
+  arguments?: string | null;
+  result?: string | null;
+  is_error?: boolean | null;
+  redacted?: boolean;
+  truncated?: boolean;
+}
+
+export interface GatewayToolActivity {
+  entries?: GatewayToolActivityEntry[];
+  /** True when the producer's entry cap dropped older calls. */
+  truncated?: boolean;
+  dialect?: string | null;
+}
+
 export interface FlowGatewayEventPayload {
   api_usage_id?: string | null;
   endpoint?: string | null;
@@ -249,6 +312,17 @@ export interface FlowGatewayEventPayload {
   gateway_attempt?: number | null;
   is_retry?: boolean | null;
   retry_of_api_usage_id?: string | null;
+  /**
+   * Identity shared with the `model_gateway_request_started` event this call
+   * announced. Consumers pair the two halves by this and never by arrival
+   * order, which is wrong whenever two requests overlap. Absent on rows
+   * recorded before the id existed, and on a start whose completion is not
+   * (yet) observed — an unpaired start must stay unpaired rather than closing
+   * whichever request happened to finish next.
+   */
+  gateway_request_id?: string | null;
+  /** Named tool calls and results recovered from the captured wire bodies. */
+  tool_activity?: GatewayToolActivity | null;
   finish_reason?: string | null;
   prompt_tokens?: number | null;
   completion_tokens?: number | null;
@@ -287,6 +361,8 @@ export interface FlowGatewayEventsResponse {
     total: number;
     has_more: boolean;
   } | null;
+  /** Execution reads only: rows older than the requested `tail` exist. */
+  has_more?: boolean;
 }
 
 /**
@@ -496,6 +572,10 @@ export interface RuntimeSessionSummary {
   latest_note_author_display?: string | null;
   latest_note_author_auth_method?: string | null;
   latest_note_at?: string | null;
+  /** Available artifacts on the session by kind (#1084). */
+  artifact_counts?: Record<string, number>;
+  /** True while a legal hold freezes this session. */
+  legal_hold?: boolean;
 }
 
 export interface AccountRuntimeSessionListResponse {
@@ -526,6 +606,20 @@ export interface AccountRuntimeSessionDetailResponse {
  */
 export type SessionSearchMode = 'keyword' | 'semantic' | 'hybrid';
 
+/** The artifact an `artifact` search chunk came from (#1082). */
+export interface SessionSearchArtifactRef {
+  artifact_id: string;
+  activity_id: string | null;
+  kind: string | null;
+  name: string | null;
+  content_type: string | null;
+  tool_name?: string | null;
+  labels: Record<string, unknown>;
+  /** Start in seconds of the transcript cue the chunk begins in. */
+  cue_start: number | null;
+  text_truncated: boolean;
+}
+
 export interface SessionSearchSnippet {
   document_id: string;
   runtime_session_id: string;
@@ -537,6 +631,7 @@ export interface SessionSearchSnippet {
   rank: number;
   redaction_state: string;
   text: string | null;
+  artifact?: SessionSearchArtifactRef | null;
 }
 
 export interface SessionSearchResult {
@@ -657,6 +752,9 @@ export interface ManagedAgentSummary {
   supports_existing_session?: boolean;
   supports_voice?: boolean;
   supports_interrupt?: boolean;
+  /** Loopback desktop advertised by the runtime plugin. Missing means none. */
+  desktop?: 'vnc' | 'rdp' | 'none';
+  desktop_display?: string | null;
   control_session_mode?: 'local' | 'remote' | 'queued' | 'offline' | string;
   /** Last Agent Control heartbeat, so the age of the presence signal is readable. */
   control_last_heartbeat_at?: string | null;
@@ -856,6 +954,15 @@ export interface AccountGovernanceDefaults {
   approval_workflow_id?: string | null;
 }
 
+/**
+ * Per-flow governance override (subject type "flows") plus the account
+ * defaults it inherits. has_override is false when the flow stores none.
+ */
+export interface FlowGovernanceResponse extends SubjectGovernanceResponse {
+  has_override: boolean;
+  account_defaults: AccountGovernanceDefaults;
+}
+
 export interface AccountGovernanceDefaultsResponse {
   defaults: AccountGovernanceDefaults;
   /** Managed agent ids carrying an explicit per-agent override. */
@@ -868,12 +975,15 @@ export interface RuntimeSessionUpdateRequest {
 }
 
 export interface RuntimeSessionActivityItem {
+  activity_id?: string | null;
   activity_type:
     | 'model_interaction'
     | 'tool_call'
     | 'session_started'
     | 'session_ended'
     | 'agent_control_message'
+    | 'browser_step'
+    | 'artifact'
     | string;
   timestamp: string;
   title: string;
@@ -892,6 +1002,119 @@ export interface RuntimeSessionActivityItem {
   is_retry?: boolean;
   retry_of_api_usage_id?: string | null;
   metadata?: Record<string, unknown>;
+}
+
+/**
+ * Availability of a stored session artifact. `evicted` means the per-session
+ * or account bound dropped the bytes; `expired` means retention did.
+ */
+export type SessionArtifactAvailability = 'available' | 'evicted' | 'expired';
+
+/** Pointer to a browser step's screenshot artifact (bytes fetched separately). */
+export interface BrowserStepScreenshotRef {
+  artifact_id: string;
+  availability: SessionArtifactAvailability | string;
+  content_type?: string | null;
+  size_bytes?: number | null;
+}
+
+/**
+ * `metadata` of a `browser_step` activity item, as stored by the browser-step
+ * ingestion API and the Playwright MCP derivation. A step is an observation of
+ * what the agent says it did, never an approval or proof of page state.
+ */
+export interface BrowserStepMetadata {
+  source?: 'api' | 'browser_use' | 'skyvern' | 'playwright_mcp' | string;
+  source_step_id?: string | null;
+  step_index?: number | null;
+  action?:
+    | 'navigate'
+    | 'click'
+    | 'type'
+    | 'select'
+    | 'scroll'
+    | 'screenshot'
+    | 'extract'
+    | 'wait'
+    | 'done'
+    | 'other'
+    | string;
+  url?: string | null;
+  target?: string | null;
+  reasoning?: string | null;
+  extra?: Record<string, unknown> | null;
+  screenshot?: BrowserStepScreenshotRef | null;
+}
+
+/**
+ * `metadata.artifact` of an `artifact` activity item, written by the deposit
+ * API (#1080) when the artifact is stored.
+ */
+export interface ArtifactRowMetadata {
+  id: string;
+  kind: string;
+  name?: string | null;
+  content_type?: string | null;
+  size_bytes?: number | null;
+  labels?: Record<string, unknown> | null;
+  producer?: string | null;
+}
+
+/**
+ * MCP `ResourceLink` (spec 2026-07-28) pointing at the artifact byte route.
+ * Preloop fields with no MCP slot travel in `_meta["preloop.dev/artifact"]`.
+ */
+export interface McpResourceLink {
+  type: 'resource_link';
+  uri: string;
+  name: string;
+  mimeType: string;
+  size: number;
+  _meta?: Record<string, unknown>;
+}
+
+/** One item of `GET /runtime-sessions/{id}/artifacts`. */
+export interface RuntimeSessionArtifactDescriptor {
+  id: string;
+  runtime_session_id: string;
+  activity_id?: string | null;
+  kind: string;
+  name?: string | null;
+  content_type: string;
+  size_bytes: number;
+  sha256: string;
+  labels: Record<string, unknown>;
+  producer?: string | null;
+  agent_id?: string | null;
+  tool_name?: string | null;
+  parent_artifact_id?: string | null;
+  text_status?: string | null;
+  availability: SessionArtifactAvailability | string;
+  legal_hold: boolean;
+  created_at: string;
+  content_block: McpResourceLink;
+}
+
+/** One item of `GET /api/v1/artifacts` (account-wide search, #1086). */
+export interface ArtifactSearchItem extends RuntimeSessionArtifactDescriptor {
+  session_title?: string | null;
+  agent_name?: string | null;
+  /** Redacted text of the best matching chunk; set only with `q`. */
+  excerpt?: { text: string; highlights: Array<[number, number]> } | null;
+  /** Transcript only: start in seconds of the cue the excerpt is in. */
+  cue_start?: number | null;
+}
+
+export interface ArtifactSearchResponse {
+  items: ArtifactSearchItem[];
+  next_cursor?: string | null;
+  facets: { kind: Record<string, number>; site: Record<string, number> };
+  facets_truncated: boolean;
+}
+
+export interface RuntimeSessionArtifactListResponse {
+  items: RuntimeSessionArtifactDescriptor[];
+  next_cursor?: string | null;
 }
 
 export interface RuntimeSessionActivityListResponse {
@@ -936,6 +1159,7 @@ export interface RuntimeSessionRequestItem {
   total_tokens: number;
   estimated_cost: number;
   endpoint: string | null;
+  auth_subject_type?: string | null;
   tools: RuntimeSessionRequestTool[];
   tools_total_schema_tokens: number;
   cache?: RuntimeSessionRequestCache;
@@ -1260,6 +1484,31 @@ export interface RuntimeSessionOptimizationActionListResponse {
   items: RuntimeSessionOptimizationAppliedAction[];
 }
 
+/**
+ * Session artifact bytes against the account storage budget. ``by_kind``
+ * always has screenshot and recording; newer servers add screencast, audio,
+ * transcript, document, generated_file and trace, and may add more later.
+ */
+export interface SessionArtifactUsage {
+  used_bytes: number;
+  budget_bytes: number;
+  by_kind: {
+    screenshot: number;
+    recording: number;
+    [kind: string]: number;
+  };
+  evicted_count_30d: number;
+}
+
+/** Raw audio storage opt-in (#1102). Off by default; admin only to change. */
+export interface SessionArtifactSettings {
+  audio_storage_enabled: boolean;
+  audio_retention_days: number;
+  audio_retention_max_days: number;
+  updated_by_user_id?: string | null;
+  updated_at?: string | null;
+}
+
 export interface AccountGatewayUsageSummaryResponse {
   period_start: string;
   period_end: string;
@@ -1474,9 +1723,44 @@ export interface UnpricedModelUsage {
   tokens: number;
 }
 
+/**
+ * Subscription-covered gateway workload (#1401). Marginal API spend for these
+ * requests is $0; `api_equivalent_cost` is an ESTIMATE of pay-per-use cost,
+ * never a bill. Billed subscription dollars are not tracked: `billed` is
+ * always null and `billed_available` false.
+ */
+export interface SubscriptionUsageSummary {
+  request_count: number;
+  prompt_tokens: number;
+  completion_tokens: number;
+  total_tokens: number;
+  api_equivalent_cost: number;
+  api_equivalent_cost_is_estimate: true;
+  covered_requests: number;
+  coverage: number | null;
+  billed: null;
+  billed_available: false;
+}
+
+export type CostHealthStatus = 'pass' | 'warn' | 'fail' | 'skip';
+
+export interface CostHealthCheck {
+  key: string;
+  status: CostHealthStatus;
+  detail: string;
+}
+
+export interface CostHealthResponse {
+  window_hours: number;
+  checks: CostHealthCheck[];
+  status: CostHealthStatus;
+}
+
 export interface CostAnalyticsSummaryResponse extends AccountGatewayUsageSummaryResponse {
   // Absent (null) when the window contains no imported usage.
   imported_usage?: ImportedUsageSummary | null;
+  // Absent (null) when the window contains no subscription-covered requests.
+  subscription_usage?: SubscriptionUsageSummary | null;
   // Absent on older servers; the console treats missing as "none named".
   unpriced_models?: UnpricedModelUsage[];
 }
@@ -1507,6 +1791,78 @@ export interface CostReconciliationResponse {
   total_provider_cost: number;
   total_drift_abs: number;
   total_drift_pct: number | null;
+}
+
+// GitHub Copilot usage import (Cost page, Copilot tab). Every figure is
+// imported from GitHub and is never gateway usage.
+export interface CopilotConnection {
+  id: string;
+  organization: string;
+  enterprise: string | null;
+  has_enterprise_token: boolean;
+  seat_price_monthly: number | null;
+  currency: string;
+  is_active: boolean;
+  last_synced_at: string | null;
+  last_synced_day: string | null;
+  last_error: string | null;
+  per_user_billing_status: string | null;
+  per_user_billing_reason: string | null;
+  metrics_status: string | null;
+  metrics_reason: string | null;
+  // Non-fatal problem from the last successful import.
+  last_warning: string | null;
+}
+
+export interface CopilotConnectionUpsert {
+  organization: string;
+  enterprise?: string | null;
+  token?: string | null;
+  enterprise_token?: string | null;
+  clear_enterprise_token?: boolean;
+  seat_price_monthly: number | null;
+  is_active?: boolean;
+}
+
+export interface CopilotSeat {
+  login: string;
+  last_activity_at: string | null;
+  last_activity_editor: string | null;
+}
+
+export interface CopilotUsageSummary {
+  metered_by_gateway: false;
+  marker: string;
+  period_start: string;
+  period_end: string;
+  connection: CopilotConnection | null;
+  seats: {
+    total_seats: number | null;
+    plan_type: string | null;
+    as_of: string | null;
+    seat_price_monthly: number | null;
+    currency: string;
+    // Null when no seat price was entered: render no dollar line, not $0.
+    monthly_seat_estimate: number | null;
+    assigned: CopilotSeat[];
+  };
+  premium_requests: {
+    total_net_amount: number | null;
+    currency: string;
+    per_user_status: 'available' | 'unavailable' | 'no_data' | string;
+    per_user_unavailable_reason: string | null;
+    org_aggregate_net_amount: number | null;
+    // Spend on per-developer days that no current seat holder explains.
+    unattributed_net_amount: number | null;
+    aggregate_days: number;
+    by_developer: { login: string; net_amount: number; net_quantity: number }[];
+    by_model: { model: string; net_amount: number; net_quantity: number }[];
+  };
+  model_mix: {
+    login: string;
+    basis: 'net_amount' | 'requests';
+    models: { model: string; value: number; share: number }[];
+  }[];
 }
 
 export interface RepriceResponse {
@@ -1688,6 +2044,8 @@ export interface Project {
   url?: string;
   organization_id: string;
   tracker_id?: string;
+  /** Grouping inside the organization, e.g. the Bitbucket project. */
+  group?: string | null;
 }
 
 export interface Organization {
@@ -2294,6 +2652,7 @@ export interface WebhookEndpoint {
   event_types: string[];
   active: boolean;
   source: string;
+  restricted_ci?: boolean;
   secret_hint: string | null;
   created_by_user_id: string | null;
   consecutive_failures: number;

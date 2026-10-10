@@ -1,5 +1,7 @@
 # Native development (no Docker)
 
+Editions: OSS, Cloud, Enterprise. Unless stated otherwise, everything on this page ships in OSS.
+
 Use this when the stack runs **on the machine** (a Linux VM, a spare host, or
 Cursor Cloud) instead of `docker compose up`. Compose remains the default for
 laptops that have Docker.
@@ -36,9 +38,11 @@ From the repo root:
 ./scripts/native-dev-install.sh
 ```
 
-That creates `.venv`, runs `pip install -e ".[dev]"`, installs `frontend`
-npm packages, and writes a gitignored `.env` if one is missing. Re-run after
-dependency changes; it is idempotent.
+That creates `.venv`, installs the hash-pinned dev lock
+(`.github/requirements/app-dev.txt`), installs this checkout with
+`pip install --no-deps -e ".[dev]"`, installs `frontend` from its lockfile
+with `npm ci`, and writes a gitignored `.env` if one is missing. Re-run after
+dependency changes; it is idempotent. `npm ci` replaces `frontend/node_modules`.
 
 ## Start the stack
 
@@ -80,8 +84,12 @@ process. No separate gateway is required for local dev.
 
 ## Gotchas
 
-- Liveness is `GET /api/v1/health`. API docs are `/docs/api`. There is no
-  `/health` or `/docs` on the API port.
+- Liveness is `GET /api/v1/health`. API docs are `/docs/api` and ReDoc is
+  `/docs/redoc`. Both pages load Swagger UI and ReDoc from the local
+  `/static` mount, so a Content-Security-Policy can allow `'self'` instead of
+  a documentation CDN. ReDoc still requests one logo from `cdn.redoc.ly` and
+  hides it if that request fails. There is no `/health` or `/docs` on the
+  API port.
 - `POST /api/v1/auth/register` (and the UI form) require a `username` in
   addition to `email` / `password`.
 - With `DEBUG=true`, uvicorn hot-reloads on code changes. Restart the

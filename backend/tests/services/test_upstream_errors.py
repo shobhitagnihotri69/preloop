@@ -17,6 +17,7 @@ from preloop.services.upstream_errors import (
     ERROR_CLASS_UPSTREAM_QUOTA_EXHAUSTED,
     ERROR_CLASS_UPSTREAM_RATE_LIMITED,
     ERROR_CLASS_CLIENT_CANCELLED,
+    ERROR_CLASS_GATEWAY_TRANSLATION,
     ERROR_CLASS_HOSTED_TARIFF_UNCONFIGURED,
     classify_recorded_error,
     classify_upstream_error,
@@ -275,3 +276,56 @@ def test_hosted_tariff_refusal_is_terminal_not_an_upstream_hiccup() -> None:
     )
     # An ordinary 503 is still a transient overload.
     assert is_terminal_error_class(ERROR_CLASS_UPSTREAM_OVERLOADED) is False
+
+
+def test_gateway_translation_error_is_terminal_in_the_shared_taxonomy() -> None:
+    """A recorded 500 must not look transient once translation failed.
+
+    The class is terminal inside the gateway retry loop. Callers that only
+    have a status and a detail string use this taxonomy instead.
+    """
+    assert is_terminal_error_class(ERROR_CLASS_GATEWAY_TRANSLATION) is True
+    sentence = (
+        "Gateway could not translate this request for the "
+        "configured model: unhashable type: 'dict'"
+    )
+    assert classify_recorded_error(500, sentence) == ERROR_CLASS_GATEWAY_TRANSLATION
+    assert (
+        classify_recorded_error(500, ERROR_CLASS_GATEWAY_TRANSLATION)
+        == ERROR_CLASS_GATEWAY_TRANSLATION
+    )
+    assert (
+        classify_recorded_error(500, "Internal server error")
+        == ERROR_CLASS_UPSTREAM_ERROR
+    )
+
+
+@pytest.mark.parametrize(
+    "detail",
+    [
+        "Model gateway budget exceeded: account monthly limit reached",
+        "Execution budget exceeded: execution token ceiling reached",
+        "Preloop trial limit for hosted model reached. Please configure your own "
+        "OpenAI/Anthropic API key.",
+    ],
+)
+@pytest.mark.parametrize("status_code", [403, 429])
+def test_recorded_budget_denial_is_not_an_upstream_class(status_code, detail):
+    """The gateway's budget 429 (#1447) is never an upstream rate limit."""
+    from preloop.services.upstream_errors import (
+        classify_recorded_error,
+        is_preloop_budget_denial_detail,
+    )
+
+    assert is_preloop_budget_denial_detail(detail)
+    assert classify_recorded_error(status_code, detail) == "budget_exceeded"
+
+
+def test_recorded_plain_429_is_still_an_upstream_rate_limit():
+    from preloop.services.upstream_errors import classify_recorded_error
+
+    assert classify_recorded_error(429, "slow down") == "upstream_rate_limited"
+    assert (
+        classify_recorded_error(429, "You exceeded your current quota")
+        == "upstream_quota_exhausted"
+    )

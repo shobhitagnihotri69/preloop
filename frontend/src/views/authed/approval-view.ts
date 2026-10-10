@@ -1,10 +1,13 @@
+import { ConsoleStatus } from '../../controllers/console-status';
 import { html, css, unsafeCSS } from 'lit';
 import { customElement, state, property } from 'lit/decorators.js';
 import {
   AuthedElement,
+  fetchWithAuth,
   getAgentGovernance,
   getUserProfile,
   hasPermission,
+  permissionErrorFromResponse,
   updateAgentGovernance,
 } from '../../api';
 import type {
@@ -14,15 +17,18 @@ import type {
   SubjectGovernanceConfig,
 } from '../../types';
 import { unifiedWebSocketManager } from '../../services/unified-websocket-manager';
+import '../../components/legal-hold-control';
 import {
   approvalRequesterName,
   formatApprovalSource,
+  getApprovalRepository,
   getApprovalSource,
   withoutApprovalMetadata,
 } from '../../utils/approval-identity';
 import {
   APPROVAL_REQUESTS_PAGE_LIMIT,
   approvalStatusLabel,
+  approvalStatusVariant,
   formatNextWaitingLabel,
   isExpiringSoon,
   isUnexpiredPendingRequest,
@@ -31,7 +37,7 @@ import {
 } from '../../utils/approvals';
 import { isDecidableRequest } from '../../actions/approval-actions';
 import { confirmDialog, showToast } from '../../components/confirm-dialog';
-import { formatRelativeTime } from '../../utils/date';
+import { formatRelativeTime, parseUTCDate } from '../../utils/date';
 import { formatAnswerValue } from '../../utils/question-form';
 import {
   normalizeScopedToolRules,
@@ -42,6 +48,7 @@ import '../../components/answer-form';
 import type { AnswerForm } from '../../components/answer-form';
 import '../../components/approval-rule-context-block';
 import '../../components/attribution-line';
+import '../../components/repository-chip';
 import '../../components/args-diff';
 import { fileEditsFromArgs } from '../../components/args-diff';
 import type { QuestionAnswerDetail } from '../../components/question-answer-panel';
@@ -57,6 +64,7 @@ import '@shoelace-style/shoelace/dist/components/icon/icon.js';
 import '@shoelace-style/shoelace/dist/components/divider/divider.js';
 import '@shoelace-style/shoelace/dist/components/checkbox/checkbox.js';
 import '@shoelace-style/shoelace/dist/components/icon-button/icon-button.js';
+import { debugLog } from '../../utils/debug';
 
 /** One workflow-history entry as returned by the history API. */
 export interface ApprovalTimelineEntry {
@@ -69,6 +77,7 @@ export interface ApprovalTimelineEntry {
 
 @customElement('approval-view')
 export class ApprovalView extends AuthedElement {
+  private readonly accessibilityStatus = new ConsoleStatus(this);
   @property({ type: String })
   requestId: string = '';
 
@@ -81,8 +90,17 @@ export class ApprovalView extends AuthedElement {
   @state()
   private loading = true;
 
+  /**
+   * Why the request could not be shown. "forbidden" (HTTP 403) blames the
+   * viewer's access, "not_found" covers a missing request and one that lives
+   * in another account (the API answers 404 for both), "error" is anything
+   * else, such as an outage.
+   */
   @state()
-  private error: string | null = null;
+  private loadFailure: {
+    kind: 'forbidden' | 'not_found' | 'error';
+    message: string;
+  } | null = null;
 
   /**
    * True when the request is rendered from the public token payload instead
@@ -164,6 +182,16 @@ export class ApprovalView extends AuthedElement {
   static styles = [
     unsafeCSS(consoleStyles),
     css`
+      .load-failure-body {
+        margin: var(--sl-spacing-2x-small) 0 var(--sl-spacing-small);
+      }
+
+      .load-failure-actions {
+        display: flex;
+        flex-wrap: wrap;
+        gap: var(--sl-spacing-small);
+      }
+
       /* No page geometry here: the shell owns the width and the side inset
          (styles/console-styles.css, "The page box"). */
       :host {
@@ -478,7 +506,7 @@ export class ApprovalView extends AuthedElement {
 
       .timeline-icon {
         flex: none;
-        color: var(--sl-color-neutral-500);
+        color: var(--console-meta-color);
         font-size: 1rem;
         margin-top: 0.1rem;
       }
@@ -644,7 +672,7 @@ export class ApprovalView extends AuthedElement {
 
     // Track connection state
     unifiedWebSocketManager.onStateChange((state) => {
-      console.log(`Approval view WebSocket state: ${state}`);
+      debugLog(`Approval view WebSocket state: ${state}`);
     });
   }
 
@@ -654,7 +682,7 @@ export class ApprovalView extends AuthedElement {
       message.approval_request_id === this.requestId &&
       this.approvalRequest
     ) {
-      console.log('Received approval update:', message);
+      debugLog('Received approval update:', message);
 
       // Update the status
       this.approvalRequest = {
@@ -682,13 +710,18 @@ export class ApprovalView extends AuthedElement {
 
   private async loadApprovalRequest() {
     this.loading = true;
-    this.error = null;
     this.publicOnly = false;
+    this.loadFailure = null;
+    this.approvalRequest = null;
 
     try {
-      const data = await this.fetchData(
+      // Read the status directly (not through fetchData, which folds every
+      // failure into null) so the page can tell "you can't see this" from
+      // "this does not exist" from "the server is down".
+      const response = await fetchWithAuth(
         `/api/v1/approval-requests/${this.requestId}`
       );
+      const data = response.ok ? await response.json() : null;
       if (data) {
         // A request the sweeper has not caught up with yet is still `pending`
         // in the database long after its expiry. Read the clock here so the
@@ -697,16 +730,39 @@ export class ApprovalView extends AuthedElement {
         await this.loadHistory();
         return;
       }
-      // Authenticated read failed (not a member of the account or request
-      // gone). Fall back to the public token payload when the link carried
-      // one, so escalation recipients can still see the request (issue #335).
+      // Authenticated read failed, whatever the reason: not a member of the
+      // account, no access, request gone, an expired session or a server
+      // blip. Fall back to the public token payload when the link carried
+      // one, so escalation recipients can still see the request (issue
+      // #335). The status only picks the message when no path worked.
       if (await this.loadPublicRequest()) {
         return;
       }
-      this.error = 'Approval request not found';
+      const forbidden = response.status === 403;
+      const missing = response.ok || response.status === 404;
+      if (forbidden) {
+        this.loadFailure = {
+          kind: 'forbidden',
+          message: (await permissionErrorFromResponse(response)).message,
+        };
+      } else if (missing) {
+        this.loadFailure = { kind: 'not_found', message: '' };
+      } else {
+        this.loadFailure = {
+          kind: 'error',
+          message: `The server answered HTTP ${response.status}.`,
+        };
+      }
     } catch (err: any) {
-      this.error = err.message || 'Failed to load approval request';
       console.error('Error loading approval request:', err);
+      // A network error is a failed read too: try the token link first.
+      if (!this.approvalRequest && (await this.loadPublicRequest())) {
+        return;
+      }
+      this.loadFailure = {
+        kind: 'error',
+        message: err?.message || '',
+      };
     } finally {
       this.loading = false;
     }
@@ -1011,7 +1067,7 @@ export class ApprovalView extends AuthedElement {
   }
 
   private formatDate(dateStr: string): string {
-    const date = new Date(dateStr);
+    const date = parseUTCDate(dateStr);
     return date.toLocaleString('en-US', {
       year: 'numeric',
       month: 'short',
@@ -1025,20 +1081,7 @@ export class ApprovalView extends AuthedElement {
   private getStatusVariant(
     status: string
   ): 'primary' | 'success' | 'warning' | 'danger' | 'neutral' {
-    switch (status) {
-      case 'pending':
-        return 'warning';
-      case 'approved':
-        return 'success';
-      case 'declined':
-        return 'danger';
-      case 'expired':
-        return 'neutral';
-      case 'cancelled':
-        return 'neutral';
-      default:
-        return 'neutral';
-    }
+    return approvalStatusVariant(status);
   }
 
   /** "expires in 4m 12s" while it matters, coarser once it is hours away. */
@@ -1162,6 +1205,59 @@ export class ApprovalView extends AuthedElement {
     }
   }
 
+  /**
+   * The page a deep link lands on when the request cannot be shown. People
+   * reach it from a push, email or Slack notification, so it always says why
+   * in terms of their access and offers a way back and a retry.
+   */
+  private renderLoadFailure(failure: {
+    kind: 'forbidden' | 'not_found' | 'error';
+    message: string;
+  }) {
+    const copy = {
+      forbidden: {
+        variant: 'warning',
+        icon: 'shield-lock',
+        title: "You can't see this request from this account",
+        body: "Your role in the account you're signed into doesn't include viewing approval requests. Ask an account admin for access, or sign in to the account that sent you the link.",
+      },
+      not_found: {
+        variant: 'warning',
+        icon: 'exclamation-triangle',
+        title: 'Approval request not found',
+        body: "It may have been removed, or it belongs to a different account than the one you're signed into.",
+      },
+      error: {
+        variant: 'danger',
+        icon: 'exclamation-octagon',
+        title: "Couldn't load this approval request",
+        body: failure.message || 'Check your connection and try again.',
+      },
+    }[failure.kind];
+    return html`
+      <sl-alert
+        variant=${copy.variant}
+        open
+        class="load-failure"
+        data-kind=${failure.kind}
+      >
+        <sl-icon slot="icon" name=${copy.icon}></sl-icon>
+        <strong>${copy.title}</strong>
+        <p class="load-failure-body">${copy.body}</p>
+        <div class="load-failure-actions">
+          <sl-button size="small" href="/console/approvals">
+            <sl-icon slot="prefix" name="arrow-left"></sl-icon>
+            Back to approvals
+          </sl-button>
+          <sl-button size="small" @click=${() => this.loadApprovalRequest()}>
+            <sl-icon slot="prefix" name="arrow-clockwise"></sl-icon>
+            Retry
+          </sl-button>
+        </div>
+      </sl-alert>
+    `;
+  }
+
   render() {
     if (this.loading) {
       return html`
@@ -1171,22 +1267,10 @@ export class ApprovalView extends AuthedElement {
       `;
     }
 
-    if (this.error) {
-      return html`
-        <sl-alert variant="danger" open>
-          <sl-icon slot="icon" name="exclamation-octagon"></sl-icon>
-          <strong>Error:</strong> ${this.error}
-        </sl-alert>
-      `;
-    }
-
-    if (!this.approvalRequest) {
-      return html`
-        <sl-alert variant="warning" open>
-          <sl-icon slot="icon" name="exclamation-triangle"></sl-icon>
-          <strong>Not found:</strong> Approval request not found
-        </sl-alert>
-      `;
+    if (this.loadFailure || !this.approvalRequest) {
+      return this.renderLoadFailure(
+        this.loadFailure ?? { kind: 'not_found', message: '' }
+      );
     }
 
     // A request whose expiry passed is timed out, whatever the record says:
@@ -1225,6 +1309,10 @@ export class ApprovalView extends AuthedElement {
           >
             ${displayStatus}
           </sl-badge>
+          <legal-hold-control
+            resource-type="approval"
+            resource-id=${request.id}
+          ></legal-hold-control>
           ${
             countdown
               ? html`<sl-badge
@@ -1252,7 +1340,7 @@ export class ApprovalView extends AuthedElement {
           ? html`
               <sl-alert variant="warning" open class="expired-banner">
                 <sl-icon slot="icon" name="clock-history"></sl-icon>
-                <strong>Expired:</strong> no response within the window
+                <strong>Timed out:</strong> no response within the window
               </sl-alert>
             `
           : ''
@@ -1392,15 +1480,20 @@ export class ApprovalView extends AuthedElement {
         }
         ${this.renderRecordedAnswer(request)}
         ${isResolved ? this.renderResolvedHeader(request) : ''}
-
-        <div class="metadata">
-          <sl-icon name="info-circle"></sl-icon>
-          ${
-            isQuestion
-              ? 'An automated agent asked this question and is paused until it gets an answer.'
-              : 'This approval request was generated by an automated agent and requires human review before the tool can be executed.'
-          }
-        </div>
+        ${
+          // Only true while the agent is still waiting: once a request is
+          // approved, denied or timed out, "requires human review" misleads.
+          isPending
+            ? html`<div class="metadata">
+                <sl-icon name="info-circle"></sl-icon>
+                ${
+                  isQuestion
+                    ? 'An automated agent asked this question and is paused until it gets an answer.'
+                    : 'This approval request was generated by an automated agent and requires human review before the tool can be executed.'
+                }
+              </div>`
+            : ''
+        }
       </sl-card>
 
       ${this.decisionTaken ? this.renderPostDecision() : ''}
@@ -1462,6 +1555,16 @@ export class ApprovalView extends AuthedElement {
             ? html`<div class="fact">
                 <span class="fact-label">Adapter</span>
                 <span>${source}</span>
+              </div>`
+            : ''
+        }
+        ${
+          getApprovalRepository(request.tool_args)
+            ? html`<div class="fact">
+                <span class="fact-label">Repository</span>
+                <repository-chip
+                  .toolArgs=${request.tool_args}
+                ></repository-chip>
               </div>`
             : ''
         }
@@ -1679,8 +1782,8 @@ export class ApprovalView extends AuthedElement {
   private decisionElapsed(request: ApprovalRequest): string | null {
     if (!request.resolved_at) return null;
     const elapsed =
-      new Date(request.resolved_at).getTime() -
-      new Date(request.requested_at).getTime();
+      parseUTCDate(request.resolved_at).getTime() -
+      parseUTCDate(request.requested_at).getTime();
     if (!Number.isFinite(elapsed) || elapsed < 0) return null;
     const seconds = Math.round(elapsed / 1000);
     if (seconds < 60) return `${seconds}s`;

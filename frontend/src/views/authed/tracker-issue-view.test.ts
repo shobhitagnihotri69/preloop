@@ -167,7 +167,7 @@ describe('TrackerIssueView', () => {
     expect(getComputedStyle(body as Element).overflowY).to.equal('visible');
   });
 
-  it('hides Run implementer on a Jira tracker', async () => {
+  it('shows Run implementer on a Jira tracker (bound projects run; the server refuses unbound ones)', async () => {
     fetchStub = sinon
       .stub(window, 'fetch')
       .callsFake(async (input: RequestInfo | URL) => {
@@ -213,7 +213,7 @@ describe('TrackerIssueView', () => {
     await el.updateComplete;
     await tick(50);
 
-    expect(el.shadowRoot?.textContent).to.not.contain('Run implementer');
+    expect(el.shadowRoot?.textContent).to.contain('Run implementer');
     expect(el.shadowRoot?.textContent).to.contain('Run triage');
   });
 
@@ -242,6 +242,11 @@ describe('TrackerIssueView', () => {
         if (url.includes(`/api/v1/trackers/${trackerId}`)) {
           return json({ detail: 'missing' }, 404);
         }
+        // The element loads once from connectedCallback, before the test
+        // has route params. That request must still be in flight when the
+        // explicit load runs, or its empty 200 can land last and label the
+        // link GitHub.
+        await new Promise((resolve) => setTimeout(resolve, 80));
         return json({});
       });
 

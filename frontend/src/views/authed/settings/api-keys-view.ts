@@ -1,3 +1,5 @@
+import { ConsoleStatus } from '../../../controllers/console-status';
+import { tableScrollStyles } from '../../../styles/table-scroll';
 import { LitElement, html, css, nothing, unsafeCSS } from 'lit';
 import { customElement, state } from 'lit/decorators.js';
 import { repeat } from 'lit/directives/repeat.js';
@@ -47,6 +49,7 @@ import {
   type ScopedToolRules,
 } from '../../../utils/scoped-governance';
 import { consoleDialogStyles } from '../../../styles/console-dialog';
+import '../../../components/view-header';
 
 interface GovernanceToolDefinition {
   name: string;
@@ -56,6 +59,7 @@ interface GovernanceToolDefinition {
 
 @customElement('api-keys-view')
 export class ApiKeysView extends LitElement {
+  private readonly accessibilityStatus = new ConsoleStatus(this);
   @state()
   private apiKeys: ApiKey[] = [];
 
@@ -82,6 +86,10 @@ export class ApiKeysView extends LitElement {
 
   @state()
   private newlyCreatedKey: ApiKey | null = null;
+
+  /** Feedback for the one-time key dialog's Copy button. */
+  @state()
+  private keyCopyStatus: 'idle' | 'copied' | 'manual' = 'idle';
 
   @state()
   private isSelectOpen = false;
@@ -153,10 +161,7 @@ export class ApiKeysView extends LitElement {
 
   async connectedCallback() {
     super.connectedCallback();
-    await Promise.all([
-      this.fetchApiKeys(),
-      this.fetchGovernanceEditorContext(),
-    ]);
+    await this.fetchApiKeys();
     this.connectRealtime();
   }
 
@@ -332,6 +337,7 @@ export class ApiKeysView extends LitElement {
     try {
       const newKey = await createApiKey(trimmedName, expires_at);
       this.newlyCreatedKey = newKey;
+      this.keyCopyStatus = 'idle';
       this.isCreateModalOpen = false;
       this.isShowKeyModalOpen = true;
       this.newKeyName = ''; // Reset for next time
@@ -411,7 +417,10 @@ export class ApiKeysView extends LitElement {
     this.governanceKeyId = key.id;
     this.governanceKeyName = key.name;
     try {
-      const response = await getApiKeyGovernance(key.id);
+      const [response] = await Promise.all([
+        getApiKeyGovernance(key.id),
+        this.fetchGovernanceEditorContext(),
+      ]);
       this.governanceAllowedModels = response.config.allowed_models.join(', ');
       this.governanceModelBudgets = JSON.stringify(
         response.config.model_budgets || {},
@@ -615,21 +624,53 @@ export class ApiKeysView extends LitElement {
     }
   }
 
-  private _copyKey(e: Event) {
-    const button = e.currentTarget as HTMLElement;
-    const pre = button.previousElementSibling;
-    if (pre && pre.tagName === 'PRE') {
-      const code = pre.querySelector('code');
-      if (code) {
-        navigator.clipboard.writeText(code.innerText).then(() => {
-          const originalHTML = button.innerHTML;
-          button.innerHTML =
-            '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" class="bi bi-check" viewBox="0 0 16 16"><path d="M10.97 4.97a.75.75 0 0 1 1.07 1.05l-3.99 4.99a.75.75 0 0 1-1.08.02L4.324 8.384a.75.75 0 1 1 1.06-1.06l2.094 2.093 3.473-4.425a.267.267 0 0 1 .02-.022z"/></svg>';
-          setTimeout(() => {
-            button.innerHTML = originalHTML;
-          }, 2000);
-        });
+  /**
+   * `navigator.clipboard` only exists in secure contexts, so a self-hosted
+   * console served over plain HTTP has none.
+   */
+  private _clipboardAvailable(): boolean {
+    return typeof navigator.clipboard?.writeText === 'function';
+  }
+
+  private _keyField(): (HTMLElement & { select: () => void }) | null {
+    return this.renderRoot.querySelector('sl-input.key-field');
+  }
+
+  private async _copyKey() {
+    const key = this.newlyCreatedKey?.key;
+    if (!key) return;
+    if (this._clipboardAvailable()) {
+      try {
+        await navigator.clipboard.writeText(key);
+        this.keyCopyStatus = 'copied';
+        return;
+      } catch (error) {
+        console.warn('Clipboard write failed, falling back:', error);
       }
+    }
+    // Select the key so Ctrl/Cmd+C copies it, and try the legacy copy
+    // command, which still works without a secure context.
+    const field = this._keyField();
+    field?.focus();
+    field?.select();
+    let copied = false;
+    try {
+      copied = document.execCommand('copy');
+    } catch {
+      copied = false;
+    }
+    this.keyCopyStatus = copied ? 'copied' : 'manual';
+  }
+
+  private _closeKeyDialog() {
+    this.isShowKeyModalOpen = false;
+    this.keyCopyStatus = 'idle';
+  }
+
+  /** The key is shown once: only the deliberate close controls dismiss it. */
+  private _guardKeyDialogClose(event: CustomEvent<{ source: string }>) {
+    if (event.detail?.source !== 'close-button') {
+      event.preventDefault();
     }
   }
 
@@ -727,138 +768,146 @@ export class ApiKeysView extends LitElement {
         <sl-card class="table-card">
           <div class="table-shell">
             ${this.renderBulkBar()}
-            <table
-              class="styled-table"
-              role="grid"
-              aria-multiselectable="true"
-              aria-label="API keys"
-            >
-              <thead class=${this.selection.count > 0 ? 'selecting' : ''}>
-                <tr>
-                  <th class="select-cell">${this.renderSelectAll()}</th>
-                  <th>Name</th>
-                  <th>Status</th>
-                  <th>Created</th>
-                  <th>Last activity</th>
-                  <th>Recent usage</th>
-                  <th>Expires</th>
-                  <th class="actions-cell">Actions</th>
-                </tr>
-              </thead>
-              <tbody>
-                ${
-                  visibleKeys.length === 0
-                    ? html`<tr>
-                        <td colspan="8" class="empty-row">No active keys.</td>
-                      </tr>`
-                    : ''
-                }
-                ${repeat(
-                  visibleKeys,
-                  (key) => key.id,
-                  (key) => html`
-                    <tr
-                      data-selection-id=${key.id}
-                      aria-selected=${
-                        this.selection.isSelected(key.id) ? 'true' : 'false'
-                      }
-                    >
-                      <td class="select-cell">
-                        ${
-                          this.isRetired(key)
-                            ? nothing
-                            : html`<list-select-checkbox
-                                item-id=${key.id}
-                                label=${`Select ${key.name}`}
-                                ?checked=${this.selection.isSelected(key.id)}
-                                ?disabled=${this.selection.busy}
-                                @selection-toggle=${
-                                  this.selection.handleToggleEvent
-                                }
-                              ></list-select-checkbox>`
+
+            <div class="table-scroll">
+              <table
+                class="styled-table"
+                role="grid"
+                aria-multiselectable="true"
+                aria-label="API keys"
+              >
+                <thead class=${this.selection.count > 0 ? 'selecting' : ''}>
+                  <tr>
+                    <th class="select-cell">${this.renderSelectAll()}</th>
+                    <th>Name</th>
+                    <th>Status</th>
+                    <th>Created</th>
+                    <th>Last activity</th>
+                    <th>Recent usage</th>
+                    <th>Expires</th>
+                    <th class="actions-cell">Actions</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  ${
+                    visibleKeys.length === 0
+                      ? html`<tr>
+                          <td colspan="8" class="empty-row">No active keys.</td>
+                        </tr>`
+                      : ''
+                  }
+                  ${repeat(
+                    visibleKeys,
+                    (key) => key.id,
+                    (key) => html`
+                      <tr
+                        data-selection-id=${key.id}
+                        aria-selected=${
+                          this.selection.isSelected(key.id) ? 'true' : 'false'
                         }
-                      </td>
-                      <td>
-                        <div
-                          style="display: flex; align-items: center; gap: var(--sl-spacing-2x-small); flex-wrap: wrap;"
-                        >
-                          <a
-                            href="/console/settings/api-keys/${key.id}"
-                            style="font-weight: 600; text-decoration: none; color: var(--sl-color-primary-600);"
-                          >
-                            ${key.name}
-                          </a>
+                      >
+                        <td class="select-cell">
                           ${
-                            key.managed_agent_id
-                              ? html`<sl-badge variant="neutral" size="small"
-                                  >Agent</sl-badge
-                                >`
-                              : ''
-                          }
-                        </div>
-                      </td>
-                      <td>
-                        <sl-badge
-                          class="chip"
-                          pill
-                          variant=${this.getActivityVariant(key)}
-                        >
-                          ${this.getActivityLabel(key)}
-                        </sl-badge>
-                      </td>
-                      <td>
-                        ${parseUTCDate(key.created_at).toLocaleDateString()}
-                      </td>
-                      <td>
-                        ${
-                          key.last_activity_at || key.last_used_at
-                            ? parseUTCDate(
-                                key.last_activity_at || key.last_used_at || ''
-                              ).toLocaleDateString()
-                            : 'Never'
-                        }
-                      </td>
-                      <td>
-                        ${
-                          (key.recent_model_calls ?? 0) +
-                          (key.recent_tool_calls ?? 0)
-                        }
-                        (${key.recent_model_calls ?? 0} model /
-                        ${key.recent_tool_calls ?? 0} tool)
-                      </td>
-                      <td>
-                        ${
-                          key.expires_at
-                            ? parseUTCDate(key.expires_at).toLocaleDateString()
-                            : 'Never'
-                        }
-                      </td>
-                      <td class="actions-cell">
-                        <!-- A revoked or expired key cannot be revoked again, so
-                           it carries no actions at all. -->
-                        <resource-actions
-                          menu-only
-                          .actions=${
                             this.isRetired(key)
-                              ? []
-                              : [
-                                  {
-                                    id: 'revoke',
-                                    label: 'Revoke key',
-                                    icon: 'trash',
-                                    variant: 'danger' as const,
-                                    onClick: () =>
-                                      this.handleDeleteApiKey(key.id, key.name),
-                                  },
-                                ]
+                              ? nothing
+                              : html`<list-select-checkbox
+                                  item-id=${key.id}
+                                  label=${`Select ${key.name}`}
+                                  ?checked=${this.selection.isSelected(key.id)}
+                                  ?disabled=${this.selection.busy}
+                                  @selection-toggle=${
+                                    this.selection.handleToggleEvent
+                                  }
+                                ></list-select-checkbox>`
                           }
-                        ></resource-actions>
-                      </td>
-                    </tr>
-                  `
-                )}
-              </tbody>
-            </table>
+                        </td>
+                        <td>
+                          <div
+                            style="display: flex; align-items: center; gap: var(--sl-spacing-2x-small); flex-wrap: wrap;"
+                          >
+                            <a
+                              href="/console/settings/api-keys/${key.id}"
+                              style="font-weight: 600; text-decoration: none; color: var(--sl-color-primary-600);"
+                            >
+                              ${key.name}
+                            </a>
+                            ${
+                              key.managed_agent_id
+                                ? html`<sl-badge variant="neutral" size="small"
+                                    >Agent</sl-badge
+                                  >`
+                                : ''
+                            }
+                          </div>
+                        </td>
+                        <td>
+                          <sl-badge
+                            class="chip"
+                            pill
+                            variant=${this.getActivityVariant(key)}
+                          >
+                            ${this.getActivityLabel(key)}
+                          </sl-badge>
+                        </td>
+                        <td>
+                          ${parseUTCDate(key.created_at).toLocaleDateString()}
+                        </td>
+                        <td>
+                          ${
+                            key.last_activity_at || key.last_used_at
+                              ? parseUTCDate(
+                                  key.last_activity_at || key.last_used_at || ''
+                                ).toLocaleDateString()
+                              : 'Never'
+                          }
+                        </td>
+                        <td>
+                          ${
+                            (key.recent_model_calls ?? 0) +
+                            (key.recent_tool_calls ?? 0)
+                          }
+                          (${key.recent_model_calls ?? 0} model /
+                          ${key.recent_tool_calls ?? 0} tool)
+                        </td>
+                        <td>
+                          ${
+                            key.expires_at
+                              ? parseUTCDate(
+                                  key.expires_at
+                                ).toLocaleDateString()
+                              : 'Never'
+                          }
+                        </td>
+                        <td class="actions-cell">
+                          <!-- A revoked or expired key cannot be revoked again, so
+                           it carries no actions at all. -->
+                          <resource-actions
+                            menu-only
+                            .actions=${
+                              this.isRetired(key)
+                                ? []
+                                : [
+                                    {
+                                      id: 'revoke',
+                                      label: 'Revoke key',
+                                      icon: 'trash',
+                                      variant: 'danger' as const,
+                                      onClick: () =>
+                                        this.handleDeleteApiKey(
+                                          key.id,
+                                          key.name
+                                        ),
+                                    },
+                                  ]
+                            }
+                          ></resource-actions>
+                        </td>
+                      </tr>
+                    `
+                  )}
+                </tbody>
+              </table>
+            </div>
           </div>
           ${
             hiddenCount > 0 && !this.showAllKeys
@@ -972,29 +1021,48 @@ export class ApiKeysView extends LitElement {
       <sl-dialog
         label="API key created"
         .open=${this.isShowKeyModalOpen && this.newlyCreatedKey}
-        @sl-hide=${() => (this.isShowKeyModalOpen = false)}
+        @sl-request-close=${this._guardKeyDialogClose}
+        @sl-hide=${(e: Event) => {
+          if (e.target === e.currentTarget) this._closeKeyDialog();
+        }}
       >
-        <p>Here is your new API key:</p>
-        <div class="code-container">
-          <pre><code>${this.newlyCreatedKey?.key}</code></pre>
-          <button class="copy-btn" @click=${this._copyKey}>
-            <svg
-              xmlns="http://www.w3.org/2000/svg"
-              width="16"
-              height="16"
-              fill="currentColor"
-              class="bi bi-clipboard"
-              viewBox="0 0 16 16"
-            >
-              <path
-                d="M4 1.5H3a2 2 0 0 0-2 2V14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V3.5a2 2 0 0 0-2-2h-1v1h1a1 1 0 0 1 1 1V14a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1V3.5a1 1 0 0 1 1-1h1v-1z"
-              />
-              <path
-                d="M9.5 1a.5.5 0 0 1 .5.5v1a.5.5 0 0 1-.5.5h-3a.5.5 0 0 1-.5-.5v-1a.5.5 0 0 1 .5-.5h3zm-3-1A1.5 1.5 0 0 0 5 1.5v1A1.5 1.5 0 0 0 6.5 4h3A1.5 1.5 0 0 0 11 2.5v-1A1.5 1.5 0 0 0 9.5 0h-3z"
-              />
-            </svg>
-          </button>
+        <div class="key-row">
+          <sl-input
+            class="key-field"
+            label="API key"
+            readonly
+            .value=${this.newlyCreatedKey?.key ?? ''}
+            @sl-focus=${(e: Event) =>
+              (e.target as HTMLElement & { select: () => void }).select()}
+          ></sl-input>
+          <sl-button class="copy-key" size="medium" @click=${this._copyKey}>
+            <sl-icon
+              slot="prefix"
+              name=${this.keyCopyStatus === 'copied' ? 'check' : 'clipboard'}
+            ></sl-icon>
+            ${this.keyCopyStatus === 'copied' ? 'Copied' : 'Copy key'}
+          </sl-button>
         </div>
+        <div class="copy-status" role="status" aria-live="polite">
+          ${
+            this.keyCopyStatus === 'copied'
+              ? 'API key copied to clipboard.'
+              : this.keyCopyStatus === 'manual'
+                ? "Couldn't copy automatically. The key is selected: press Ctrl+C (Cmd+C on Mac)."
+                : nothing
+          }
+        </div>
+        ${
+          this.keyCopyStatus === 'idle' && !this._clipboardAvailable()
+            ? html`<p class="copy-hint">
+                Copying isn't available on this connection. Click the key and
+                press Ctrl+C (Cmd+C on Mac).
+              </p>`
+            : nothing
+        }
+        <p class="usage-hint">
+          Send it in the <code>Authorization: Bearer &lt;key&gt;</code> header.
+        </p>
         <div class="warning-text">
           <sl-icon name="exclamation-triangle"></sl-icon>
           <span>Please copy it now. You will not be able to see it again.</span>
@@ -1003,7 +1071,7 @@ export class ApiKeysView extends LitElement {
           slot="footer"
           variant="primary"
           autofocus
-          @click=${() => (this.isShowKeyModalOpen = false)}
+          @click=${this._closeKeyDialog}
           >I have copied my key</sl-button
         >
       </sl-dialog>
@@ -1011,154 +1079,160 @@ export class ApiKeysView extends LitElement {
   }
 
   static styles = [
-    consoleDialogStyles,
-    unsafeCSS(consoleStyles),
-    css`
-      .loading-indicator {
-        display: flex;
-        justify-content: center;
-        align-items: center;
-        height: 200px;
-      }
-      .form-label {
-        font-size: var(--sl-input-label-font-size-medium);
-        display: inline-block;
-        color: var(--sl-input-label-color);
-        margin-bottom: var(--sl-spacing-3x-small);
-      }
-      .expiry-dropdown {
-        display: block;
-        margin-bottom: 1rem;
-      }
-      .expiry-dropdown::part(trigger) {
-        width: 100%;
-      }
-      .expiry-dropdown sl-button {
-        width: 100%;
-        text-align: left;
-      }
-      table {
-        width: 100%;
-        border-collapse: collapse;
-      }
-      /* The bulk bar's containing block. It wraps the table rather than
+    tableScrollStyles,
+    [
+      consoleDialogStyles,
+      unsafeCSS(consoleStyles),
+      css`
+        .loading-indicator {
+          display: flex;
+          justify-content: center;
+          align-items: center;
+          height: 200px;
+        }
+        .form-label {
+          font-size: var(--sl-input-label-font-size-medium);
+          display: inline-block;
+          color: var(--sl-input-label-color);
+          margin-bottom: var(--sl-spacing-3x-small);
+        }
+        .expiry-dropdown {
+          display: block;
+          margin-bottom: 1rem;
+        }
+        .expiry-dropdown::part(trigger) {
+          width: 100%;
+        }
+        .expiry-dropdown sl-button {
+          width: 100%;
+          text-align: left;
+        }
+        table {
+          width: 100%;
+          border-collapse: collapse;
+        }
+        /* The bulk bar's containing block. It wraps the table rather than
          being the table head: WebKit does not make a positioned table section
          a containing block, so a bar anchored to the head escaped to the
          viewport in Safari. The wrapper is a plain block, which every engine
          positions against, and the bar still covers only the header row
          because it is anchored to the top and sized by its own content. */
-      .table-shell {
-        position: relative;
-      }
-      .head-bulk-bar {
-        position: absolute;
-        top: 0;
-        left: 0;
-        right: 0;
-        display: flex;
-        align-items: center;
-        /* The same padding the header cells carry, so the bar's content
-           starts on the line the column labels start on. */
-        padding: var(--sl-spacing-medium);
-        background: var(--sl-panel-background-color);
-        /* Visible inside a header the selection has hidden. */
-        visibility: visible;
-        transition: opacity 120ms ease-out;
-      }
-      .head-bulk-bar[data-hidden] {
-        visibility: hidden;
-        opacity: 0;
-        pointer-events: none;
-      }
-      @media (prefers-reduced-motion: reduce) {
-        .head-bulk-bar {
-          transition: none;
+        .table-shell {
+          position: relative;
         }
-      }
-      thead.selecting th {
-        visibility: hidden;
-      }
-      th,
-      td {
-        padding: var(--sl-spacing-medium);
-        text-align: left;
-        border-bottom: 1px solid var(--sl-color-neutral-200);
-      }
-      th {
-        background-color: var(--sl-color-neutral-50);
-        font-weight: var(--sl-font-weight-semibold);
-      }
-      tr:last-child td {
-        border-bottom: none;
-      }
-      td.actions-cell {
-        text-align: right;
-        width: 1%;
-        white-space: nowrap;
-      }
-      /* The Actions header sits over a right-aligned column, so it is
+        /* Eight columns do not fit a phone: the table scrolls sideways inside
+         its card instead of pushing the page (and the Revoke action) off
+         screen. */
+        .table-scroll {
+          overflow-x: auto;
+        }
+        .head-bulk-bar {
+          position: absolute;
+          top: 0;
+          left: 0;
+          right: 0;
+          display: flex;
+          align-items: center;
+          /* The same padding the header cells carry, so the bar's content
+           starts on the line the column labels start on. */
+          padding: var(--sl-spacing-medium);
+          background: var(--sl-panel-background-color);
+          /* Visible inside a header the selection has hidden. */
+          visibility: visible;
+          transition: opacity 120ms ease-out;
+        }
+        .head-bulk-bar[data-hidden] {
+          visibility: hidden;
+          opacity: 0;
+          pointer-events: none;
+        }
+        @media (prefers-reduced-motion: reduce) {
+          .head-bulk-bar {
+            transition: none;
+          }
+        }
+        thead.selecting th {
+          visibility: hidden;
+        }
+        th,
+        td {
+          padding: var(--sl-spacing-medium);
+          text-align: left;
+          border-bottom: 1px solid var(--sl-color-neutral-200);
+        }
+        th {
+          background-color: var(--sl-color-neutral-50);
+          font-weight: var(--sl-font-weight-semibold);
+        }
+        tr:last-child td {
+          border-bottom: none;
+        }
+        td.actions-cell {
+          text-align: right;
+          width: 1%;
+          white-space: nowrap;
+        }
+        /* The Actions header sits over a right-aligned column, so it is
          right-aligned too. */
-      th.actions-cell {
-        text-align: right;
-      }
-      .empty-row {
-        color: var(--console-meta-color, var(--sl-color-neutral-600));
-        font-size: var(--sl-font-size-small);
-      }
-      /* A hairline footer, not a card: the count of what is not on screen and
+        th.actions-cell {
+          text-align: right;
+        }
+        .empty-row {
+          color: var(--console-meta-color, var(--sl-color-neutral-600));
+          font-size: var(--sl-font-size-small);
+        }
+        /* A hairline footer, not a card: the count of what is not on screen and
          the one control that reveals it. */
-      .table-footnote {
-        border-top: 1px solid
-          var(--console-hairline, var(--sl-color-neutral-200));
-        padding: var(--sl-spacing-small) var(--sl-spacing-medium);
-        color: var(--console-meta-color, var(--sl-color-neutral-600));
-        font-size: var(--sl-font-size-small);
-      }
-      .link-button {
-        background: none;
-        border: none;
-        padding: 0;
-        font: inherit;
-        color: var(--sl-color-primary-600);
-        cursor: pointer;
-      }
-      .link-button:hover {
-        text-decoration: underline;
-      }
-      .code-container {
-        position: relative;
-        background-color: var(--sl-color-neutral-100);
-        border-radius: var(--sl-border-radius-medium);
-        margin: 1rem 0;
-      }
-      .code-container pre {
-        margin: 0;
-        padding: var(--sl-spacing-medium);
-        white-space: pre-wrap;
-        word-break: break-all;
-      }
-      .copy-btn {
-        position: absolute;
-        top: var(--sl-spacing-x-small);
-        right: var(--sl-spacing-x-small);
-        background: none;
-        border: none;
-        color: var(--sl-color-neutral-600);
-        cursor: pointer;
-        padding: var(--sl-spacing-2x-small);
-        border-radius: var(--sl-border-radius-circle);
-      }
-      .copy-btn:hover {
-        background-color: var(--sl-color-neutral-200);
-      }
-      .warning-text {
-        display: flex;
-        align-items: center;
-        gap: var(--sl-spacing-x-small);
-        color: var(--sl-color-neutral-600);
-        margin-top: var(--sl-spacing-medium);
-        font-size: var(--sl-font-size-small);
-      }
-    `,
+        .table-footnote {
+          border-top: 1px solid
+            var(--console-hairline, var(--sl-color-neutral-200));
+          padding: var(--sl-spacing-small) var(--sl-spacing-medium);
+          color: var(--console-meta-color, var(--sl-color-neutral-600));
+          font-size: var(--sl-font-size-small);
+        }
+        .link-button {
+          background: none;
+          border: none;
+          padding: 0;
+          font: inherit;
+          color: var(--sl-color-primary-600);
+          cursor: pointer;
+        }
+        .link-button:hover {
+          text-decoration: underline;
+        }
+        .key-row {
+          display: flex;
+          align-items: flex-end;
+          gap: var(--sl-spacing-x-small);
+        }
+        .key-field {
+          flex: 1;
+          min-width: 0;
+        }
+        .key-field::part(input) {
+          font-family: var(--sl-font-mono);
+        }
+        .copy-status {
+          margin-top: var(--sl-spacing-x-small);
+          font-size: var(--sl-font-size-small);
+          color: var(--sl-color-neutral-700);
+        }
+        .copy-hint,
+        .usage-hint {
+          margin: var(--sl-spacing-x-small) 0 0;
+          font-size: var(--sl-font-size-small);
+          color: var(--console-meta-color, var(--sl-color-neutral-600));
+        }
+        .warning-text {
+          display: flex;
+          align-items: center;
+          gap: var(--sl-spacing-x-small);
+          color: var(--sl-color-neutral-600);
+          margin-top: var(--sl-spacing-medium);
+          font-size: var(--sl-font-size-small);
+        }
+      `,
+    ],
   ];
 }

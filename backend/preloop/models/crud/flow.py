@@ -1,8 +1,8 @@
 from typing import Any, List, Optional, Union
 from uuid import UUID
 
-from sqlalchemy import cast, String
-from sqlalchemy.orm import Query, Session, joinedload
+from sqlalchemy import String, cast, or_
+from sqlalchemy.orm import Query, Session, joinedload, load_only
 
 from .. import models, schemas
 from .base import CRUDBase
@@ -60,12 +60,61 @@ class CRUDFlow(CRUDBase[models.Flow]):
         skip: int = 0,
         limit: int = 100,
         account_id: Optional[str] = None,
+        include_shared: bool = False,
+        lightweight: bool = False,
         **filters: Any,
     ) -> List[models.Flow]:
-        """List flows with ``ai_model`` joined so ``ai_model_name`` is not N+1."""
+        """List flows with ``ai_model`` joined so ``ai_model_name`` is not N+1.
+
+        ``include_shared`` adds flows another account shares with
+        ``account_id`` (account hook H3); only the flows list asks for them.
+        """
         query = self._query_with_ai_model(db)
+        if lightweight:
+            query = query.options(
+                load_only(
+                    self.model.id,
+                    self.model.account_id,
+                    self.model.name,
+                    self.model.description,
+                    self.model.icon,
+                    self.model.created_at,
+                    self.model.updated_at,
+                    self.model.trigger_event_source,
+                    self.model.trigger_event_types,
+                    self.model.ai_model_id,
+                    self.model.agent_type,
+                    self.model.is_enabled,
+                    self.model.is_preset,
+                    self.model.source_preset_id,
+                    self.model.prompt_customized,
+                    self.model.tools_customized,
+                    self.model.preset_update_available,
+                    self.model.schedule_config,
+                    raiseload=True,
+                ),
+                joinedload(self.model.ai_model).load_only(
+                    models.AIModel.id, models.AIModel.name, raiseload=True
+                ),
+            )
         if account_id and hasattr(self.model, "account_id"):
-            query = query.filter(self.model.account_id == account_id)
+            shared_ids: list[Any] = []
+            if include_shared:
+                from preloop.plugins.account_hooks import (
+                    VISIBLE_FLOW,
+                    extra_visible_ids,
+                )
+
+                shared_ids = extra_visible_ids(db, account_id, VISIBLE_FLOW)
+            if shared_ids:
+                query = query.filter(
+                    or_(
+                        self.model.account_id == account_id,
+                        self.model.id.in_(shared_ids),
+                    )
+                )
+            else:
+                query = query.filter(self.model.account_id == account_id)
 
         for key, value in filters.items():
             if hasattr(self.model, key):

@@ -27,12 +27,15 @@ export interface FlowPresetRecord {
   icon?: string;
   account_id?: string | null;
   slug?: string;
+  trigger_event_source?: string | null;
   trigger_event_types?: string[] | null;
   allowed_mcp_tools?: unknown[] | null;
   git_clone_config?: {
     enabled?: boolean;
     create_pull_request?: boolean;
   } | null;
+  /** Catalog marker. False or absent means the preset expects an ephemeral checkout. */
+  supports_persistent?: boolean;
 }
 
 export interface PresetChip {
@@ -55,6 +58,45 @@ export function presetSlug(preset: FlowPresetRecord): string {
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, '-')
     .replace(/^-+|-+$/g, '');
+}
+
+/** A schedule-triggered preset runs on its own clock, not on tracker events. */
+export function isScheduledPreset(preset: FlowPresetRecord): boolean {
+  return preset.trigger_event_source === 'schedule';
+}
+
+function toolNames(preset: FlowPresetRecord): string[] {
+  return (preset.allowed_mcp_tools || [])
+    .map((tool) =>
+      typeof tool === 'string'
+        ? tool
+        : tool && typeof tool === 'object'
+          ? String(
+              (tool as { name?: unknown; tool_name?: unknown }).name ??
+                (tool as { tool_name?: unknown }).tool_name ??
+                ''
+            )
+          : ''
+    )
+    .filter(Boolean);
+}
+
+/**
+ * Scope line for a preset that reads artifacts with search_artifacts.
+ *
+ * The tool reads the flow's own runs by default and needs an operator grant
+ * for other agents' artifacts, so a preset card says which of the two it
+ * relies on before anyone enables it (#1106).
+ */
+export function presetArtifactScopeNote(preset: FlowPresetRecord): string {
+  if (!toolNames(preset).includes('search_artifacts')) {
+    return '';
+  }
+  return (
+    "Same-agent: reads artifacts from this flow's own runs, in every edition. " +
+    "Cross-agent: other agents' artifacts need the " +
+    'artifact_search.account_scope grant (Enterprise).'
+  );
 }
 
 function isSecuritySlug(slug: string): boolean {
@@ -121,7 +163,11 @@ export function presetGroups(presets: FlowPresetRecord[]): PresetGroup[] {
       security.push(preset);
       continue;
     }
-    if (preset.trigger_event_types && preset.trigger_event_types.length > 0) {
+    if (
+      !isScheduledPreset(preset) &&
+      preset.trigger_event_types &&
+      preset.trigger_event_types.length > 0
+    ) {
       tracker.push(preset);
       continue;
     }
@@ -162,7 +208,12 @@ export function presetGroups(presets: FlowPresetRecord[]): PresetGroup[] {
 
 export function presetChips(preset: FlowPresetRecord): PresetChip[] {
   const chips: PresetChip[] = [];
-  if (preset.trigger_event_types && preset.trigger_event_types.length > 0) {
+  if (isScheduledPreset(preset)) {
+    chips.push({ key: 'schedule', label: 'Scheduled' });
+  } else if (
+    preset.trigger_event_types &&
+    preset.trigger_event_types.length > 0
+  ) {
     chips.push({ key: 'tracker', label: 'Tracker' });
   }
   chips.push({ key: 'model', label: 'Model' });
@@ -251,8 +302,13 @@ export class PreloopFlowPresetPicker extends LitElement {
         border-bottom: none;
       }
 
-      .row:hover:not(.selected) {
-        background: var(--console-hover-tint);
+      .row.disabled {
+        cursor: not-allowed;
+        opacity: 0.55;
+      }
+
+      .row.disabled:hover {
+        background: transparent;
       }
 
       .row.selected {
@@ -310,6 +366,14 @@ export class PreloopFlowPresetPicker extends LitElement {
         color: var(--console-meta-color);
       }
 
+      .row-note {
+        grid-column: 2 / span 2;
+        grid-row: 3;
+        font-size: var(--console-text-meta);
+        color: var(--console-meta-color);
+        font-style: italic;
+      }
+
       .chips {
         grid-column: 3;
         grid-row: 1;
@@ -355,6 +419,10 @@ export class PreloopFlowPresetPicker extends LitElement {
 
   @property({ type: Boolean })
   collapsed = false;
+
+  /** When true, presets that do not support persistent execution are disabled. */
+  @property({ type: Boolean })
+  persistent = false;
 
   @state()
   private search = '';
@@ -417,7 +485,23 @@ export class PreloopFlowPresetPicker extends LitElement {
     return this.presets.find((preset) => preset.id === this.selectedId);
   }
 
+  private presetDisabledReason(preset?: FlowPresetRecord): string {
+    if (!this.persistent || !preset) {
+      return '';
+    }
+    if (preset.supports_persistent === true) {
+      return '';
+    }
+    return 'This preset does not support persistent execution. It expects an ephemeral checkout.';
+  }
+
   private emitSelect(presetId: string): void {
+    if (presetId !== BLANK_PRESET_ID) {
+      const preset = this.presets.find((item) => item.id === presetId);
+      if (this.presetDisabledReason(preset)) {
+        return;
+      }
+    }
     this.dispatchEvent(
       new CustomEvent('preset-select', {
         detail: { presetId },
@@ -491,14 +575,20 @@ export class PreloopFlowPresetPicker extends LitElement {
   }) {
     const selected = this.selectedId === options.optionId;
     const active = this.activeId === options.optionId;
+    const disabledReason = this.presetDisabledReason(options.preset);
+    const disabled = Boolean(disabledReason);
     return html`
       <div
         id=${`preset-option-${options.optionId}`}
-        class=${classMap({ row: true, selected, active })}
+        class=${classMap({ row: true, selected, active, disabled })}
         role="option"
         data-preset-id=${options.optionId}
         aria-selected=${selected ? 'true' : 'false'}
-        @click=${() => this.emitSelect(options.optionId)}
+        aria-disabled=${disabled ? 'true' : 'false'}
+        title=${disabledReason || nothing}
+        @click=${() => {
+          if (!disabled) this.emitSelect(options.optionId);
+        }}
       >
         <sl-icon class="row-icon" name=${options.icon}></sl-icon>
         <div class="row-name">
@@ -517,9 +607,24 @@ export class PreloopFlowPresetPicker extends LitElement {
             ? html`<sl-icon class="row-check" name="check-lg"></sl-icon>`
             : html`<div></div>`
         }
-        <div class="row-desc">${options.description}</div>
+        <div class="row-desc">${disabledReason || options.description}</div>
+        ${
+          options.preset && !disabledReason
+            ? this.renderScopeNote(options.preset)
+            : nothing
+        }
       </div>
     `;
+  }
+
+  private renderScopeNote(preset: FlowPresetRecord) {
+    const note = presetArtifactScopeNote(preset);
+    if (!note) {
+      return nothing;
+    }
+    return html`<div class="row-note" data-testid="preset-scope-note">
+      ${note}
+    </div>`;
   }
 
   private renderCollapsed() {
@@ -563,6 +668,7 @@ export class PreloopFlowPresetPicker extends LitElement {
       <div class="header">
         <div class="label">Start from</div>
         <sl-input
+          aria-label="Search presets"
           class="search"
           size="small"
           clearable

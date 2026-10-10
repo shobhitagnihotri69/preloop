@@ -27,6 +27,9 @@ ERROR_CLASS_UPSTREAM_QUOTA_EXHAUSTED = "upstream_quota_exhausted"
 ERROR_CLASS_UPSTREAM_AUTH = "upstream_auth"
 ERROR_CLASS_UPSTREAM_PROTOCOL = "upstream_protocol"
 ERROR_CLASS_UPSTREAM_ERROR = "upstream_error"
+#: The gateway's own budget hard limit (#1447). Not an upstream class: it is
+#: recorded so the 429 it now answers with is never counted as a rate limit.
+ERROR_CLASS_BUDGET_EXCEEDED = "budget_exceeded"
 ERROR_CLASS_UPSTREAM_DISCONNECT = "upstream_disconnect"
 ERROR_CLASS_CLIENT_CANCELLED = "client_cancelled"
 # A deployment-provided hosted model the operator has not given a verified
@@ -43,6 +46,66 @@ ERROR_CLASS_HOSTED_TARIFF_UNCONFIGURED = "hosted_tariff_unconfigured"
 # proxy read timeout, an ingress hang-up — killed the request, whereas a
 # cancellation is normal client behaviour (user hit Ctrl-C, agent moved on).
 ERROR_CLASS_STREAM_ABANDONED = "stream_abandoned"
+# The gateway's own request translation failed before any upstream call:
+# LiteLLM raised a plain ``TypeError`` (e.g. ``unhashable type: 'dict'`` from
+# ``get_optional_params`` when a provider mapping hashes a dict-valued param)
+# or a ``ValueError`` while mapping parameters. The provider never received a
+# request, so recording this as ``upstream_error`` (502) blamed the customer's
+# endpoint in alerts (prod 2026-10-05, 38 identical failures). Deterministic:
+# retrying the same body fails the same way.
+ERROR_CLASS_GATEWAY_TRANSLATION = "gateway_translation_error"
+
+# Frames that only run while LiteLLM maps request parameters, i.e. before any
+# network I/O. A ``ValueError`` raised under one of these is ours.
+_PARAM_MAPPING_FRAMES = frozenset(
+    {
+        "get_optional_params",
+        "map_openai_params",
+        "pre_process_non_default_params",
+        "pre_process_optional_params",
+        "_build_completion_kwargs",
+    }
+)
+
+
+def is_gateway_translation_error(exc: BaseException) -> bool:
+    """Whether ``exc`` is a local request-translation bug, not an upstream fault.
+
+    Assumption: LiteLLM wraps provider and transport failures in its own
+    exception classes (``openai.APIError`` subclasses, or any type defined in
+    ``litellm``, ``openai``, ``httpx``, or ``json``). A bare ``TypeError``
+    whose class sits outside those modules is treated as local translation.
+    That includes a ``TypeError`` raised while LiteLLM transforms a provider
+    response, not only during parameter mapping. The rule stays that broad
+    on purpose: no current response-transform ``TypeError`` has been shown
+    to be a genuine upstream fault, and narrowing it would risk missing the
+    unhashable-dict param-mapping crash this class exists to catch.
+    ``ValueError`` is broader (``json.JSONDecodeError`` on an upstream body
+    is one), so it counts only when a param-mapping frame
+    (``get_optional_params`` and the other names in
+    ``_PARAM_MAPPING_FRAMES``) is on the traceback.
+
+    Args:
+        exc: The exception raised by the upstream call.
+
+    Returns:
+        True when the failure happened in request translation.
+    """
+    if not isinstance(exc, (TypeError, ValueError)):
+        return False
+    if any(
+        cls.__module__.split(".", 1)[0] in {"litellm", "openai", "httpx", "json"}
+        for cls in type(exc).__mro__
+    ):
+        return False
+    if isinstance(exc, TypeError):
+        return True
+    tb = exc.__traceback__
+    while tb is not None:
+        if tb.tb_frame.f_code.co_name in _PARAM_MAPPING_FRAMES:
+            return True
+        tb = tb.tb_next
+    return False
 
 
 @dataclass(frozen=True)
@@ -80,6 +143,35 @@ _QUOTA_MARKERS = (
     "quota",
 )
 
+# The gateway's own budget denial (#1447). It is a 429 whose OpenAI body says
+# ``insufficient_quota``, so without this guard the recorded-row classifier
+# would file it as an upstream rate limit or upstream quota exhaustion. It is
+# neither: Preloop refused the request before any upstream call.
+PRELOOP_BUDGET_DENIAL_MARKERS = (
+    "model gateway budget exceeded",
+    "model gateway budget enforcement requires pricing",
+    "execution budget exceeded",
+    "preloop budget exceeded",
+    "budget_limit_exceeded",
+    "execution_budget_exceeded",
+    "limit for hosted model reached",
+    "limit for hosted models reached",
+)
+
+
+def is_preloop_budget_denial_detail(detail: Optional[str]) -> bool:
+    """Whether an error text is the gateway's own budget denial.
+
+    Args:
+        detail: Recorded error detail or exception text.
+
+    Returns:
+        True for a Preloop budget denial in any status shape (the ``429``
+        since #1447 or the legacy ``403``).
+    """
+    return _contains((detail or "").lower(), PRELOOP_BUDGET_DENIAL_MARKERS)
+
+
 # Markers indicating transient provider overload (Anthropic 529
 # "overloaded_error", OpenAI "engine is currently overloaded", generic 502
 # "servers are currently overloaded" bodies).
@@ -98,6 +190,14 @@ _OVERLOAD_MARKERS = (
 HOSTED_TARIFF_UNCONFIGURED_MARKERS = (
     ERROR_CLASS_HOSTED_TARIFF_UNCONFIGURED,
     "no operator tariff",
+)
+
+# The gateway failed to translate the request before any upstream call.
+# Classifiers that only see status plus detail would otherwise read the
+# deterministic 500 as a transient ``upstream_error``.
+_GATEWAY_TRANSLATION_MARKERS = (
+    ERROR_CLASS_GATEWAY_TRANSLATION,
+    "could not translate this request",
 )
 
 # Explicit capability errors are deterministic even when a provider reports
@@ -373,6 +473,9 @@ _NON_RETRYABLE_ERROR_CLASSES = frozenset(
         ERROR_CLASS_CLIENT_CANCELLED,
         ERROR_CLASS_STREAM_ABANDONED,
         ERROR_CLASS_HOSTED_TARIFF_UNCONFIGURED,
+        ERROR_CLASS_GATEWAY_TRANSLATION,
+        # A budget refill is an operator action; retrying cannot clear it.
+        ERROR_CLASS_BUDGET_EXCEEDED,
     }
 )
 
@@ -457,7 +560,9 @@ def classify_recorded_error(
 
     Used by ``_record_gateway_request`` when no richer classification was
     attached to the exception (#118). Returns ``None`` for successes and for
-    failures that are not upstream-related (validation, budget denials…).
+    failures that are not upstream-related (validation and similar), and
+    ``budget_exceeded`` for the gateway's own budget denial (#1447) so its
+    429 is never read as an upstream rate limit.
 
     Note: without the original exception, this helper cannot always tell
     ``upstream_disconnect`` from a generic ``upstream_error``. Streaming
@@ -470,8 +575,13 @@ def classify_recorded_error(
     text = (error_detail or "").lower()
     if _contains(text, HOSTED_TARIFF_UNCONFIGURED_MARKERS):
         return ERROR_CLASS_HOSTED_TARIFF_UNCONFIGURED
+    if _contains(text, _GATEWAY_TRANSLATION_MARKERS):
+        return ERROR_CLASS_GATEWAY_TRANSLATION
     if status_code == 499:
         return ERROR_CLASS_CLIENT_CANCELLED
+    if _contains(text, PRELOOP_BUDGET_DENIAL_MARKERS):
+        # Preloop's budget, not the upstream's (#1447).
+        return ERROR_CLASS_BUDGET_EXCEEDED
     if status_code == 429:
         if _contains(text, _QUOTA_MARKERS):
             return ERROR_CLASS_UPSTREAM_QUOTA_EXHAUSTED

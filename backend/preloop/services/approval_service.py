@@ -653,6 +653,7 @@ class ApprovalService:
         managed_agent_name: Optional[str] = None,
         api_key_id: Optional[uuid.UUID] = None,
         rule_context: Optional[Dict[str, Any]] = None,
+        server_name: Optional[str] = None,
     ) -> ApprovalRequest:
         """Create a new approval request.
 
@@ -724,6 +725,18 @@ class ApprovalService:
             provided_name=managed_agent_name,
         )
 
+        # Stored arguments follow the account's redact rules (#1123). The
+        # in-process approval wait keeps the original in memory; the async
+        # replay path re-executes from this stored copy, so a redact rule on
+        # a tool also redacts what an asynchronously approved replay sends.
+        stored_tool_args = await self._storage_redacted_tool_args(
+            account_id,
+            tool_name=tool_name,
+            tool_args=tool_args,
+            managed_agent_id=managed_agent_id,
+            server_name=server_name,
+        )
+
         # Create approval request
         approval_request = ApprovalRequest(
             id=uuid.uuid4(),
@@ -732,7 +745,7 @@ class ApprovalService:
             approval_workflow_id=approval_workflow_id,
             execution_id=execution_id,
             tool_name=tool_name,
-            tool_args=tool_args,
+            tool_args=stored_tool_args,
             agent_reasoning=agent_reasoning,
             managed_agent_id=managed_agent_id,
             runtime_session_id=runtime_session_id,
@@ -788,7 +801,9 @@ class ApprovalService:
             correlation_id=corr_id,
             extra_details={
                 "approval_workflow_id": str(approval_workflow_id),
-                "tool_args": redact_dict(tool_args),
+                # Credential scrub over the already policy-redacted copy, so
+                # the lifecycle audit row holds neither secrets nor PII.
+                "tool_args": redact_dict(stored_tool_args or {}),
                 "timeout_seconds": timeout,
                 **({"rule_context": rule_context} if rule_context else {}),
             },
@@ -850,6 +865,21 @@ class ApprovalService:
         # Update fields
         for field, value in update.model_dump(exclude_unset=True).items():
             setattr(approval_request, field, value)
+
+        if str(getattr(approval_request, "status", "")) in self._TERMINAL_STATUSES:
+            # A sealed original (reference-only, original_until_decided) is
+            # deleted in the same transaction as the decision; the reference
+            # record is what remains on the row.
+            from sqlalchemy.orm.attributes import flag_modified
+
+            from preloop.services.sensitive_data.reference import (
+                strip_sealed_original,
+            )
+
+            cleaned, removed = strip_sealed_original(approval_request.tool_args)
+            if removed:
+                approval_request.tool_args = cleaned
+                flag_modified(approval_request, "tool_args")
 
         await self.db.commit()
         await self.db.refresh(approval_request)
@@ -1818,12 +1848,16 @@ class ApprovalService:
         Returns:
             True if successful, False otherwise
         """
-        # Get webhook URL from workflow
-        webhook_url = None
-        if approval_workflow.approval_config:
-            webhook_url = approval_workflow.approval_config.get("webhook_url")
+        from preloop.services.approval_summary import fallback_approval_summary
+        from preloop.services.event_webhooks.approval_shim import (
+            resolve_webhook_target,
+        )
 
-        if not webhook_url:
+        # channel_configs.<webhook|slack|mattermost> or the legacy
+        # approval_config.webhook_url; the channel picks the payload format.
+        target = resolve_webhook_target(approval_workflow)
+
+        if target is None:
             error_msg = "No webhook URL configured in approval workflow"
             await self.update_approval_request(
                 approval_request.id,
@@ -1846,15 +1880,18 @@ class ApprovalService:
         )
 
         # Format tool arguments for display (redact sensitive fields)
-        from preloop.utils.redaction import redact_dict
+        from preloop.utils.redaction import omit_preloop_markers, redact_dict
 
         tool_args_redacted = redact_dict(approval_request.tool_args or {})
-        tool_args_formatted = json.dumps(tool_args_redacted, indent=2)
+        tool_args_formatted = json.dumps(
+            omit_preloop_markers(tool_args_redacted), indent=2
+        )
         ask_text = (approval_request.summary or "").strip() or None
         headline = ask_text or f"Approval Required: {approval_request.tool_name}"
 
         # Create message based on approval type
-        if approval_workflow.approval_type in ["slack", "mattermost"]:
+        channel = target[0]
+        if channel in ["slack", "mattermost"]:
             # Build message text with all details: summary first when present
             if ask_text:
                 message_text = f"⚠️ **{ask_text}**\n\n"
@@ -1923,7 +1960,11 @@ class ApprovalService:
                 "type": "approval_request",
                 "request_id": str(approval_request.id),
                 "tool_name": approval_request.tool_name,
-                "summary": ask_text,
+                # Never null: receivers show this to a person.
+                "summary": ask_text
+                or fallback_approval_summary(
+                    approval_request.tool_name, approval_request.tool_args
+                ),
                 "tool_args": tool_args_redacted,
                 "agent_reasoning": approval_request.agent_reasoning,
                 "status": approval_request.status,
@@ -1934,7 +1975,8 @@ class ApprovalService:
                     else None
                 ),
                 # "review" is the honest name: the link opens the approval
-                # page, it does not decide anything. Decisions are taken with
+                # page, it does not decide anything. A receiving system decides
+                # with the token URLs under "decision" below, or with
                 # POST /api/v1/approval-requests/{id}/approve or /decline.
                 # "approve", "decline" and "view" are the same URL and always
                 # were; they stay for receivers that read those keys today and
@@ -1944,6 +1986,22 @@ class ApprovalService:
                     "approve": review_url,  # deprecated, same page as review
                     "decline": review_url,  # deprecated, same page as review
                     "view": review_url,  # deprecated, same page as review
+                },
+                # Machine-callable decision URLs. "actions" above are pages
+                # for a person; these are what a receiving system calls to
+                # answer. POST, no Authorization header: the token in the
+                # query string is the credential. Body is optional:
+                # {"comment": "..."} (approve also takes "answer").
+                "decision": {
+                    "method": "POST",
+                    "approve_url": urljoin(
+                        self.base_url,
+                        f"/approval/{approval_request.id}/approve?token={token}",
+                    ),
+                    "decline_url": urljoin(
+                        self.base_url,
+                        f"/approval/{approval_request.id}/decline?token={token}",
+                    ),
                 },
             }
 
@@ -1988,6 +2046,64 @@ class ApprovalService:
             )
             return False
 
+    async def _storage_redacted_tool_args(
+        self,
+        account_id: Any,
+        *,
+        tool_name: str,
+        tool_args: Dict[str, Any],
+        managed_agent_id: Optional[uuid.UUID],
+        server_name: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Apply the account's redact rules to the stored argument copy."""
+        from preloop.api.loop_safety import run_db_off_loop
+        from preloop.services.sensitive_data.storage import (
+            StorageScope,
+            apply_storage_redaction,
+        )
+
+        from preloop.services.sensitive_data import reference as reference_module
+        from preloop.services.sensitive_data.storage import resolve_config
+
+        scope = StorageScope(
+            target="tool.args",
+            tool_name=tool_name,
+            server_name=server_name,
+            managed_agent_id=str(managed_agent_id) if managed_agent_id else None,
+        )
+
+        def _stored() -> Dict[str, Any]:
+            config = resolve_config(account_id)
+            stored = apply_storage_redaction(
+                account_id, tool_args, scope=scope, config=config
+            )
+            rule = reference_module.reference_rule_for(
+                config,
+                tool_name=tool_name,
+                server_name=server_name,
+                managed_agent_id=scope.managed_agent_id,
+            )
+            if reference_module.wants_original_until_decided(rule) and isinstance(
+                stored, dict
+            ):
+                # original_until_decided: the raw arguments ride encrypted on
+                # the pending row, console only, and are removed at decision
+                # (see update_approval_request). Email, webhook and push
+                # payloads mask this key (redact_dict treats it as secret).
+                stored = {
+                    **stored,
+                    reference_module.SEALED_ARGS_KEY: reference_module.seal_original(
+                        tool_args
+                    ),
+                }
+            return stored
+
+        try:
+            return await run_db_off_loop(_stored)
+        except Exception:  # noqa: BLE001 - never block an approval on this
+            logger.warning("Approval storage redaction failed", exc_info=True)
+            return tool_args
+
     async def create_and_notify(
         self,
         account_id: str,
@@ -2005,6 +2121,7 @@ class ApprovalService:
         standing_bypass_reason: Optional[str] = None,
         rule_context: Optional[Dict[str, Any]] = None,
         timeout_seconds: Optional[int] = None,
+        server_name: Optional[str] = None,
     ) -> ApprovalRequest:
         """Create approval request and send notifications through configured channels.
 
@@ -2054,21 +2171,36 @@ class ApprovalService:
             managed_agent_name=managed_agent_name,
             api_key_id=api_key_id,
             rule_context=rule_context,
+            server_name=server_name,
         )
 
         # Generate user-facing summary before any notifications fire.
+        # Every stored request must carry a summary. The model summary is
+        # unavailable on several paths (no default model, timeout, empty
+        # output, or a fragment/truncation rejection), and the summary
+        # machinery can raise (session setup, generation, or teardown). The
+        # deterministic fallback needs no database, so put it in place before
+        # the model path runs: that way an exception below still leaves the
+        # request with the same non-null fallback the webhook uses.
+        from preloop.services.approval_summary import (
+            fallback_approval_summary,
+            generate_approval_summary,
+        )
+
+        summary = fallback_approval_summary(tool_name, approval_request.tool_args or {})
         try:
             from preloop.api.loop_safety import run_db_off_loop
             from preloop.models.db.session import get_session_factory
-            from preloop.services.approval_summary import generate_approval_summary
 
             sync_db = await run_db_off_loop(lambda: get_session_factory()())
             try:
-                summary = await generate_approval_summary(
+                # The summary is stored on the request and shown on every
+                # surface: generate it from the stored (redacted) arguments.
+                generated = await generate_approval_summary(
                     sync_db,
                     account_id=account_id,
                     tool_name=tool_name,
-                    tool_args=tool_args,
+                    tool_args=approval_request.tool_args or {},
                     agent_reasoning=agent_reasoning,
                     managed_agent_name=managed_agent_name,
                 )
@@ -2076,16 +2208,38 @@ class ApprovalService:
                 # Rollback during close is database I/O too. The summary's
                 # worker has drained before returning, including cancellation.
                 await run_db_off_loop(sync_db.close)
-            if summary:
-                approval_request = await self.update_approval_request(
+            if generated:
+                # Prefer the model's user-facing ask; otherwise the fallback
+                # computed above is already in place.
+                summary = generated
+            else:
+                logger.warning(
+                    "Approval summary model produced no usable summary for "
+                    "request %s (tool %s); storing deterministic fallback",
                     approval_request.id,
-                    ApprovalRequestUpdate(summary=summary),
+                    tool_name,
                 )
         except Exception as summary_error:
             logger.warning(
-                "Failed to attach approval summary for %s: %s",
+                "Failed to generate approval summary for %s: %s; storing "
+                "deterministic fallback",
                 approval_request.id,
                 summary_error,
+                exc_info=True,
+            )
+
+        # Persist the summary outside the generation try/except so a failure
+        # above cannot skip it and leave the stored request null.
+        try:
+            approval_request = await self.update_approval_request(
+                approval_request.id,
+                ApprovalRequestUpdate(summary=summary),
+            )
+        except Exception as persist_error:
+            logger.warning(
+                "Failed to persist approval summary for %s: %s",
+                approval_request.id,
+                persist_error,
                 exc_info=True,
             )
 
@@ -2351,6 +2505,26 @@ class ApprovalService:
         except Exception as exc:  # pragma: no cover - defensive
             logger.debug(f"Failed to resolve approver list for audit: {exc}")
 
+        try:
+            from preloop.services.chat_worker import enqueue_approval_notifications
+
+            results["chat"] = {
+                "queued": await asyncio.to_thread(
+                    enqueue_approval_notifications,
+                    approval_request.account_id,
+                    approval_request.id,
+                    approver_user_ids,
+                )
+            }
+        except Exception:
+            logger.warning(
+                "Failed to enqueue private chat approval notifications", exc_info=True
+            )
+            results["chat"] = {
+                "success": False,
+                "error": "Chat notification queue unavailable",
+            }
+
         partition = await self._partition_approvers_for_stagger(approver_user_ids)
 
         # Push first so watch/mobile get the head start.
@@ -2442,11 +2616,16 @@ class ApprovalService:
                 correlation_id=correlation_id,
             )
 
-        # Handle webhook-based notifications (these are workflow-level, not per-user)
-        # Derive notification channels from approval_type (the model field)
-        workflow_channels = (
-            [approval_workflow.approval_type] if approval_workflow.approval_type else []
+        # Handle webhook-based notifications (these are workflow-level, not per-user).
+        # The channel comes from the configured destination, not approval_type:
+        # policy YAML and the documented channel_configs.webhook form leave
+        # approval_type at its default and must still dispatch.
+        from preloop.services.event_webhooks.approval_shim import (
+            resolve_webhook_target,
         )
+
+        target = resolve_webhook_target(approval_workflow)
+        workflow_channels = [target[0]] if target else []
         for channel in workflow_channels:
             if channel in ["slack", "mattermost", "webhook"]:
                 try:
@@ -2833,6 +3012,11 @@ class ApprovalService:
                     # Who asked, in the subject: an approver triaging an inbox
                     # decides on the caller as much as on the tool.
                     agent_name=approval_request.managed_agent_name,
+                    runtime_session_id=(
+                        str(approval_request.runtime_session_id)
+                        if approval_request.runtime_session_id
+                        else None
+                    ),
                 )
 
                 sent_count += 1
@@ -3005,6 +3189,11 @@ class ApprovalService:
             summary=approval_request.summary,
             rule_context=approval_request.rule_context,
             agent_name=approval_request.managed_agent_name,
+            runtime_session_id=(
+                str(approval_request.runtime_session_id)
+                if approval_request.runtime_session_id
+                else None
+            ),
         )
 
         apns_priority = 10 if priority_str in ["urgent", "high"] else 5
@@ -3665,6 +3854,11 @@ class ApprovalService:
             summary=approval_request.summary,
             rule_context=approval_request.rule_context,
             agent_name=approval_request.managed_agent_name,
+            runtime_session_id=(
+                str(approval_request.runtime_session_id)
+                if approval_request.runtime_session_id
+                else None
+            ),
         )
 
         sent_count = 0

@@ -1,3 +1,5 @@
+import { ConsoleStatus } from '../../controllers/console-status';
+import { tableScrollStyles } from '../../styles/table-scroll';
 import { LitElement, html, css, unsafeCSS, nothing } from 'lit';
 import { customElement, state } from 'lit/decorators.js';
 import { Router } from '../../router';
@@ -20,14 +22,19 @@ import '../../components/resource-actions.ts';
 import '../../components/list-toolbar.ts';
 import type { ResourceAction } from '../../components/resource-actions.ts';
 import {
+  BITBUCKET_CLOUD_OAUTH_FEATURE,
   fetchWithAuth,
   getFeatures,
   deleteTracker,
+  disconnectBitbucket,
+  getBitbucketConnectionStatus,
   listIssues,
   listOrganizations,
   listProjectPullRequests,
   listProjects,
+  startBitbucketReconnect,
   syncTracker,
+  type BitbucketConnectionStatus,
   type FeaturesResponse,
 } from '../../api';
 import { openRunPresetDialog } from '../../components/run-preset-dialog';
@@ -39,6 +46,7 @@ import type {
 } from '../../types';
 import {
   describeTrackerScope,
+  groupProjectsByGroup,
   groupProjectsByOrganization,
 } from '../../utils/tracker-scope';
 import { formatLocalDateTime, formatRelativeTime } from '../../utils/date';
@@ -46,6 +54,7 @@ import { confirmDialog } from '../../components/confirm-dialog';
 import { trackerKindLabel } from '../../components/tracker-list';
 import { getStatusVariant } from '../../utils/verdict';
 import consoleStyles from '../../styles/console-styles.css?inline';
+import '../../components/add-tracker-modal';
 
 /** Where the last project read on a tracker is remembered, per session. */
 const PROJECT_MEMORY_KEY = 'preloop.tracker.project.';
@@ -62,6 +71,12 @@ interface TrackerDetail {
   is_valid: boolean;
   validation_message?: string;
   url?: string;
+  auth_type?: string;
+  connection_details?: Record<string, any> | null;
+  /** When the stored token expires, if recorded (Bitbucket). */
+  token_expires_at?: string | null;
+  /** 'expired', 'expiring' (within 14 days), 'ok', or null when unknown. */
+  token_expiry_status?: 'expired' | 'expiring' | 'ok' | null;
   scope_rules?: Array<{
     scope_type: string;
     rule_type: string;
@@ -71,6 +86,7 @@ interface TrackerDetail {
 
 @customElement('tracker-detail-view')
 export class TrackerDetailView extends LitElement {
+  private readonly accessibilityStatus = new ConsoleStatus(this);
   @state()
   private _tracker: TrackerDetail | null = null;
 
@@ -97,6 +113,18 @@ export class TrackerDetailView extends LitElement {
 
   @state()
   private _featuresLoaded = false;
+
+  /** Managed Bitbucket connection status (sanitized, never tokens). */
+  @state()
+  private _managedStatus: BitbucketConnectionStatus | null = null;
+
+  /** Full-page navigation to the provider consent URL (overridable in tests). */
+  private _navigate(url: string): void {
+    window.location.href = url;
+  }
+
+  @state()
+  private _managedBusy = false;
 
   @state()
   private _syncing = false;
@@ -160,293 +188,323 @@ export class TrackerDetailView extends LitElement {
   private readonly _prsPageSize = 20;
 
   static styles = [
-    unsafeCSS(consoleStyles),
-    css`
-      .tracker-header {
-        display: flex;
-        align-items: center;
-        gap: var(--sl-spacing-medium);
-        margin-bottom: var(--sl-spacing-small);
-      }
+    tableScrollStyles,
+    [
+      unsafeCSS(consoleStyles),
+      css`
+        .tracker-header {
+          display: flex;
+          align-items: center;
+          gap: var(--sl-spacing-medium);
+          margin-bottom: var(--sl-spacing-small);
+        }
 
-      .tracker-icon {
-        font-size: 2.5rem;
-        color: var(--sl-color-primary-600);
-      }
+        .tracker-icon {
+          font-size: 2.5rem;
+          color: var(--sl-color-primary-600);
+        }
 
-      .tracker-meta {
-        display: flex;
-        flex-wrap: wrap;
-        gap: var(--sl-spacing-medium);
-        margin-bottom: var(--sl-spacing-medium);
-        color: var(--sl-color-neutral-600);
-        font-size: var(--sl-font-size-small);
-      }
+        .tracker-meta {
+          display: flex;
+          flex-wrap: wrap;
+          gap: var(--sl-spacing-medium);
+          margin-bottom: var(--sl-spacing-medium);
+          color: var(--sl-color-neutral-600);
+          font-size: var(--sl-font-size-small);
+        }
 
-      .tracker-meta span {
-        display: flex;
-        align-items: center;
-        gap: var(--sl-spacing-x-small);
-      }
+        .tracker-meta span {
+          display: flex;
+          align-items: center;
+          gap: var(--sl-spacing-x-small);
+        }
 
-      .scope-summary {
-        margin: 0 0 var(--sl-spacing-large) 0;
-        padding: var(--sl-spacing-medium);
-        background: var(--sl-color-neutral-50);
-        border-radius: var(--sl-border-radius-medium);
-        font-size: var(--sl-font-size-small);
-        color: var(--sl-color-neutral-700);
-        line-height: 1.5;
-      }
+        .managed-connection-panel {
+          margin: 0 0 var(--sl-spacing-large) 0;
+        }
 
-      .scope-summary strong {
-        color: var(--sl-color-neutral-900);
-      }
+        .managed-connection-facts {
+          display: grid;
+          grid-template-columns: max-content 1fr;
+          gap: var(--sl-spacing-2x-small) var(--sl-spacing-medium);
+          margin: 0;
+          font-size: var(--sl-font-size-small);
+        }
 
-      .section-header {
-        display: flex;
-        align-items: center;
-        justify-content: space-between;
-        gap: var(--sl-spacing-medium);
-        flex-wrap: wrap;
-        margin: var(--sl-spacing-large) 0 var(--sl-spacing-medium) 0;
-      }
+        .managed-connection-facts dt {
+          color: var(--sl-color-neutral-600);
+        }
 
-      .section-title {
-        font-size: var(--sl-font-size-large);
-        font-weight: var(--sl-font-weight-semibold);
-        margin: 0;
-        display: flex;
-        align-items: center;
-        gap: var(--sl-spacing-x-small);
-      }
+        .managed-connection-facts dd {
+          margin: 0;
+        }
 
-      .analytics-grid {
-        display: grid;
-        grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
-        gap: var(--sl-spacing-medium);
-      }
+        .scope-summary {
+          margin: 0 0 var(--sl-spacing-large) 0;
+          padding: var(--sl-spacing-medium);
+          background: var(--sl-color-neutral-50);
+          border-radius: var(--sl-border-radius-medium);
+          font-size: var(--sl-font-size-small);
+          color: var(--sl-color-neutral-700);
+          line-height: 1.5;
+        }
 
-      .analytics-card {
-        cursor: pointer;
-        transition: box-shadow 0.2s ease;
-      }
+        .scope-summary strong {
+          color: var(--sl-color-neutral-900);
+        }
 
-      .analytics-card:hover {
-        box-shadow: var(--sl-shadow-medium);
-      }
+        .section-header {
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          gap: var(--sl-spacing-medium);
+          flex-wrap: wrap;
+          margin: var(--sl-spacing-large) 0 var(--sl-spacing-medium) 0;
+        }
 
-      .analytics-card .card-header {
-        display: flex;
-        align-items: center;
-        gap: var(--sl-spacing-small);
-        margin-bottom: var(--sl-spacing-small);
-      }
+        .section-title {
+          font-size: var(--sl-font-size-large);
+          font-weight: var(--sl-font-weight-semibold);
+          margin: 0;
+          display: flex;
+          align-items: center;
+          gap: var(--sl-spacing-x-small);
+        }
 
-      .analytics-card .card-header sl-icon {
-        font-size: 1.25rem;
-        color: var(--sl-color-primary-600);
-      }
+        .analytics-grid {
+          display: grid;
+          grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+          gap: var(--sl-spacing-medium);
+        }
 
-      .analytics-card .card-header h3 {
-        margin: 0;
-        font-size: var(--sl-font-size-medium);
-      }
+        .analytics-card {
+          cursor: pointer;
+          transition: box-shadow 0.2s ease;
+        }
 
-      .analytics-card p {
-        margin: 0;
-        color: var(--sl-color-neutral-600);
-        font-size: var(--sl-font-size-small);
-      }
+        .analytics-card:hover {
+          box-shadow: var(--sl-shadow-medium);
+        }
 
-      .org-group {
-        margin-bottom: var(--sl-spacing-large);
-      }
+        .analytics-card .card-header {
+          display: flex;
+          align-items: center;
+          gap: var(--sl-spacing-small);
+          margin-bottom: var(--sl-spacing-small);
+        }
 
-      .org-group:last-child {
-        margin-bottom: 0;
-      }
+        .analytics-card .card-header sl-icon {
+          font-size: 1.25rem;
+          color: var(--sl-color-primary-600);
+        }
 
-      .org-header {
-        display: flex;
-        align-items: center;
-        gap: var(--sl-spacing-x-small);
-        margin-bottom: var(--sl-spacing-small);
-        font-size: var(--sl-font-size-small);
-        font-weight: var(--sl-font-weight-semibold);
-        color: var(--sl-color-neutral-700);
-      }
+        .analytics-card .card-header h3 {
+          margin: 0;
+          font-size: var(--sl-font-size-medium);
+        }
 
-      .projects-list {
-        display: flex;
-        flex-direction: column;
-        gap: var(--sl-spacing-x-small);
-      }
+        .analytics-card p {
+          margin: 0;
+          color: var(--sl-color-neutral-600);
+          font-size: var(--sl-font-size-small);
+        }
 
-      .project-row {
-        display: flex;
-        align-items: center;
-        justify-content: space-between;
-        gap: var(--sl-spacing-medium);
-        padding: var(--sl-spacing-small) 0;
-        border-bottom: 1px solid var(--console-hairline);
-        font-size: var(--console-text-body);
-      }
+        .org-group {
+          margin-bottom: var(--sl-spacing-large);
+        }
 
-      .project-actions {
-        display: flex;
-        flex-wrap: wrap;
-        gap: var(--sl-spacing-x-small);
-        flex-shrink: 0;
-      }
+        .org-group:last-child {
+          margin-bottom: 0;
+        }
 
-      .project-row:last-child {
-        border-bottom: none;
-      }
+        .org-header {
+          display: flex;
+          align-items: center;
+          gap: var(--sl-spacing-x-small);
+          margin-bottom: var(--sl-spacing-small);
+          font-size: var(--sl-font-size-small);
+          font-weight: var(--sl-font-weight-semibold);
+          color: var(--sl-color-neutral-700);
+        }
 
-      sl-tab-group::part(tabs) {
-        border-bottom: 1px solid var(--console-hairline);
-      }
+        .projects-list {
+          display: flex;
+          flex-direction: column;
+          gap: var(--sl-spacing-x-small);
+        }
 
-      sl-tab::part(base) {
-        font-size: var(--console-text-body);
-      }
+        .project-row {
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          gap: var(--sl-spacing-medium);
+          padding: var(--sl-spacing-small) 0;
+          border-bottom: 1px solid var(--console-hairline);
+          font-size: var(--console-text-body);
+        }
 
-      /* Issues and pull requests are collections, so their tabs are panes
+        .project-actions {
+          display: flex;
+          flex-wrap: wrap;
+          gap: var(--sl-spacing-x-small);
+          flex-shrink: 0;
+        }
+
+        .project-row:last-child {
+          border-bottom: none;
+        }
+
+        sl-tab-group::part(tabs) {
+          border-bottom: 1px solid var(--console-hairline);
+        }
+
+        sl-tab::part(base) {
+          font-size: var(--console-text-body);
+        }
+
+        /* Issues and pull requests are collections, so their tabs are panes
          that span the page: a filter bar, then the table, with no card
          around them and no title (the tab is the title). Flows is the
          reference collection page and this is the same bar. */
-      .collection-pane {
-        display: block;
-        width: 100%;
-        padding-top: var(--sl-spacing-medium);
-      }
+        .collection-pane {
+          display: block;
+          width: 100%;
+          padding-top: var(--sl-spacing-medium);
+        }
 
-      .collection-pane list-toolbar {
-        margin-bottom: var(--sl-spacing-small);
-      }
+        .collection-pane list-toolbar {
+          margin-bottom: var(--sl-spacing-small);
+        }
 
-      .collection-pane sl-select {
-        min-width: 180px;
-      }
+        .collection-pane sl-select {
+          min-width: 180px;
+        }
 
-      /* The bar has no room for a stacked label above every control, so each
+        /* The bar has no room for a stacked label above every control, so each
          select names itself inside its own combobox ("Project Alpha",
          "Status Open") and the label is left for assistive tech. A dropdown
          reading only "Alpha" names nothing. */
-      .collection-pane sl-select .select-name {
-        color: var(--console-meta-color, var(--sl-color-neutral-500));
-      }
+        .collection-pane sl-select .select-name {
+          color: var(--console-meta-color, var(--sl-color-neutral-500));
+        }
 
-      .collection-pane sl-select::part(form-control-label) {
-        position: absolute;
-        width: 1px;
-        height: 1px;
-        padding: 0;
-        margin: -1px;
-        overflow: hidden;
-        clip: rect(0 0 0 0);
-        white-space: nowrap;
-        border: 0;
-      }
+        .collection-pane sl-select::part(form-control-label) {
+          position: absolute;
+          width: 1px;
+          height: 1px;
+          padding: 0;
+          margin: -1px;
+          overflow: hidden;
+          clip: rect(0 0 0 0);
+          white-space: nowrap;
+          border: 0;
+        }
 
-      .collection-pane .styled-table {
-        width: 100%;
-      }
+        .collection-pane .styled-table {
+          width: 100%;
+        }
 
-      .actions-cell {
-        width: 56px;
-        text-align: right;
-        overflow: visible;
-      }
+        .actions-cell {
+          width: 56px;
+          text-align: right;
+          overflow: visible;
+        }
 
-      .select-col {
-        width: 2.5rem;
-      }
+        .select-col {
+          width: 2.5rem;
+        }
 
-      /* One line, the height of a table row, so an empty pane is the same
+        /* One line, the height of a table row, so an empty pane is the same
          page as a full one rather than a collapsed card. */
-      .issues-empty,
-      .issues-error,
-      .prs-empty,
-      .prs-error {
-        display: flex;
-        align-items: center;
-        flex-wrap: wrap;
-        gap: var(--sl-spacing-x-small);
-        min-height: 72px;
-        border-top: 1px solid var(--console-hairline);
-        color: var(--console-meta-color);
-        font-size: var(--console-text-body);
-      }
+        .issues-empty,
+        .issues-error,
+        .prs-empty,
+        .prs-error {
+          display: flex;
+          align-items: center;
+          flex-wrap: wrap;
+          gap: var(--sl-spacing-x-small);
+          min-height: 72px;
+          border-top: 1px solid var(--console-hairline);
+          color: var(--console-meta-color);
+          font-size: var(--console-text-body);
+        }
 
-      .live-note,
-      .pr-branches {
-        font-size: 13px;
-        color: var(--console-meta-color);
-      }
+        .live-note,
+        .pr-branches {
+          font-size: 13px;
+          color: var(--console-meta-color);
+        }
 
-      .live-note {
-        margin: 0 0 var(--sl-spacing-small) 0;
-      }
+        .live-note {
+          margin: 0 0 var(--sl-spacing-small) 0;
+        }
 
-      .load-more {
-        display: block;
-        margin-top: var(--sl-spacing-small);
-        font-size: var(--console-text-meta);
-      }
+        .load-more {
+          display: block;
+          margin-top: var(--sl-spacing-small);
+          font-size: var(--console-text-meta);
+        }
 
-      .visually-hidden {
-        position: absolute;
-        width: 1px;
-        height: 1px;
-        overflow: hidden;
-        clip: rect(0 0 0 0);
-        white-space: nowrap;
-      }
+        .visually-hidden {
+          position: absolute;
+          width: 1px;
+          height: 1px;
+          overflow: hidden;
+          clip: rect(0 0 0 0);
+          white-space: nowrap;
+        }
 
-      .project-info {
-        display: flex;
-        align-items: flex-start;
-        gap: var(--sl-spacing-small);
-        min-width: 0;
-      }
+        .project-info {
+          display: flex;
+          align-items: flex-start;
+          gap: var(--sl-spacing-small);
+          min-width: 0;
+        }
 
-      .project-text {
-        min-width: 0;
-      }
+        .project-text {
+          min-width: 0;
+        }
 
-      .project-name {
-        font-weight: var(--sl-font-weight-semibold);
-        color: var(--sl-color-neutral-900);
-      }
+        .project-name {
+          font-weight: var(--sl-font-weight-semibold);
+          color: var(--sl-color-neutral-900);
+        }
 
-      .project-description {
-        color: var(--sl-color-neutral-500);
-        font-size: var(--sl-font-size-x-small);
-        margin-top: 2px;
-        overflow: hidden;
-        text-overflow: ellipsis;
-        white-space: nowrap;
-      }
+        .project-description {
+          color: var(--console-meta-color);
+          font-size: var(--sl-font-size-x-small);
+          margin-top: 2px;
+          overflow: hidden;
+          text-overflow: ellipsis;
+          white-space: nowrap;
+        }
 
-      .header-actions {
-        display: flex;
-        justify-content: flex-end;
-        align-items: center;
-        gap: var(--sl-spacing-small);
-        flex: 1;
-        min-width: min(100%, 360px);
-      }
+        .header-actions {
+          display: flex;
+          justify-content: flex-end;
+          align-items: center;
+          gap: var(--sl-spacing-small);
+          flex: 1;
+          min-width: min(100%, 360px);
+        }
 
-      .no-analytics,
-      .no-projects {
-        padding: var(--sl-spacing-medium) 0;
-        color: var(--console-meta-color);
-        font-size: var(--console-text-body);
-        line-height: 1.5;
-      }
-    `,
+        .project-subgroup {
+          font-size: var(--console-text-meta, var(--sl-font-size-small));
+          font-weight: var(--sl-font-weight-semibold);
+          color: var(--console-meta-color);
+          padding: var(--sl-spacing-x-small) 0;
+        }
+
+        .no-analytics,
+        .no-projects {
+          padding: var(--sl-spacing-medium) 0;
+          color: var(--console-meta-color);
+          font-size: var(--console-text-body);
+          line-height: 1.5;
+        }
+      `,
+    ],
   ];
 
   connectedCallback() {
@@ -899,7 +957,328 @@ export class TrackerDetailView extends LitElement {
   }
 
   private _prHost(): string {
+    if (this._isBitbucket()) return 'Bitbucket';
     return this._isGitlab() ? 'GitLab' : 'GitHub';
+  }
+
+  private _isBitbucket(): boolean {
+    return (this._tracker?.tracker_type || '')
+      .toLowerCase()
+      .includes('bitbucket');
+  }
+
+  /** A managed Bitbucket grant (browser consent, no pasted token). */
+  private _isManagedBitbucket(): boolean {
+    return this._isBitbucket() && this._tracker?.auth_type === 'managed_oauth';
+  }
+
+  private _managedFeatureEnabled(): boolean {
+    return this._features?.[BITBUCKET_CLOUD_OAUTH_FEATURE] === true;
+  }
+
+  private async _loadManagedStatus() {
+    this._managedStatus = null;
+    if (!this._isManagedBitbucket() || !this._managedFeatureEnabled()) {
+      return;
+    }
+    try {
+      this._managedStatus = await getBitbucketConnectionStatus(this._trackerId);
+    } catch (error) {
+      console.error('Failed to read the Bitbucket connection status:', error);
+    }
+  }
+
+  private async _reconnectBitbucket() {
+    if (this._managedBusy) return;
+    this._managedBusy = true;
+    this._error = null;
+    try {
+      const start = await startBitbucketReconnect(
+        this._trackerId,
+        '/console/trackers'
+      );
+      this._navigate(start.authorization_url);
+    } catch (error) {
+      this._error =
+        error instanceof Error
+          ? error.message
+          : 'Failed to start the Bitbucket reconnect';
+    } finally {
+      this._managedBusy = false;
+    }
+  }
+
+  private async _disconnectBitbucket() {
+    if (!this._tracker || this._managedBusy) return;
+    const confirmed = await confirmDialog({
+      title: 'Disconnect Bitbucket',
+      message: `Disconnect the Bitbucket connection of "${this._tracker.name}"?`,
+      detail:
+        'The grant is erased and the tracker is disabled until it is reconnected. The Bitbucket OAuth consumer is kept.',
+      confirmLabel: 'Disconnect',
+      variant: 'danger',
+    });
+    if (!confirmed) return;
+    this._managedBusy = true;
+    this._error = null;
+    try {
+      await disconnectBitbucket(this._trackerId);
+      await this._loadData();
+    } catch (error) {
+      this._error =
+        error instanceof Error
+          ? error.message
+          : 'Failed to disconnect the Bitbucket connection';
+    } finally {
+      this._managedBusy = false;
+    }
+  }
+
+  private _managedStateChip(state: BitbucketConnectionStatus['state']) {
+    switch (state) {
+      case 'connected':
+        return { text: 'Managed: connected', variant: 'success' };
+      case 'workspace_required':
+        return { text: 'Managed: workspace required', variant: 'warning' };
+      case 'reconnect_required':
+        return { text: 'Managed: reconnect required', variant: 'danger' };
+      case 'disconnected':
+        return { text: 'Managed: disconnected', variant: 'neutral' };
+      case 'unavailable':
+        return { text: 'Managed: provider unavailable', variant: 'warning' };
+      default:
+        return { text: 'Managed', variant: 'neutral' };
+    }
+  }
+
+  private _capabilityLabel(value: boolean | null | undefined): string {
+    if (value === true) return 'granted';
+    if (value === false) return 'missing';
+    return 'unknown';
+  }
+
+  /** Status chip for a managed grant; the manual expiry chip never applies. */
+  private _renderManagedChip() {
+    if (!this._isManagedBitbucket()) {
+      return nothing;
+    }
+    if (!this._managedFeatureEnabled()) {
+      return html`<sl-badge
+        class="chip managed-connection"
+        variant="warning"
+        pill
+        data-state="unavailable"
+        title="This deployment has no managed Bitbucket provider configured"
+        >Managed: provider unavailable</sl-badge
+      >`;
+    }
+    const status = this._managedStatus;
+    if (!status) {
+      return nothing;
+    }
+    const chip = this._managedStateChip(status.state);
+    return html`<sl-badge
+      class="chip managed-connection"
+      variant=${chip.variant as any}
+      pill
+      data-state=${status.state}
+      title=${
+        status.expires_at
+          ? `Access token expires ${formatLocalDateTime(status.expires_at)}`
+          : ''
+      }
+      >${chip.text}</sl-badge
+    >`;
+  }
+
+  /** Managed connection panel: actor, selection, actual expiry, capabilities. */
+  private _renderManagedConnection() {
+    if (!this._isManagedBitbucket()) {
+      return nothing;
+    }
+    if (!this._managedFeatureEnabled()) {
+      return html`
+        <sl-alert variant="warning" open class="managed-connection-panel">
+          <sl-icon slot="icon" name="exclamation-triangle"></sl-icon>
+          <strong>Managed Bitbucket connections are unavailable here.</strong>
+          This tracker authenticates through a managed provider that is not
+          configured on this deployment, so it cannot refresh its credential
+          until an administrator enables the <code>bitbucket_cloud_oauth</code>
+          capability. Pasted-token trackers are unaffected.
+        </sl-alert>
+      `;
+    }
+    const status = this._managedStatus;
+    if (!status) {
+      return nothing;
+    }
+    const actor =
+      status.actor?.display_name || status.actor?.nickname || 'unknown actor';
+    const busy = this._managedBusy;
+    return html`
+      <sl-card class="managed-connection-panel" data-state=${status.state}>
+        <div
+          slot="header"
+          style="display:flex; justify-content:space-between; align-items:center; gap:0.5rem;"
+        >
+          <strong>Managed Bitbucket connection</strong>
+          <div style="display:flex; gap:0.5rem;">
+            <sl-button
+              size="small"
+              class="managed-reconnect"
+              .loading=${busy}
+              ?disabled=${busy}
+              @click=${() => this._reconnectBitbucket()}
+            >
+              <sl-icon slot="prefix" name="arrow-repeat"></sl-icon>
+              Reconnect
+            </sl-button>
+            <sl-button
+              size="small"
+              variant="danger"
+              outline
+              class="managed-disconnect"
+              .loading=${busy}
+              ?disabled=${busy || status.state === 'disconnected'}
+              @click=${() => this._disconnectBitbucket()}
+            >
+              <sl-icon slot="prefix" name="plug"></sl-icon>
+              Disconnect
+            </sl-button>
+          </div>
+        </div>
+        <dl class="managed-connection-facts">
+          <dt>Authorized by</dt>
+          <dd class="managed-actor">${actor}</dd>
+          <dt>Workspace</dt>
+          <dd>${status.workspace ?? 'not selected'}</dd>
+          <dt>Repository</dt>
+          <dd>${status.repository ?? 'any in the workspace'}</dd>
+          <dt>Access token expiry</dt>
+          <dd class="managed-expiry">
+            ${
+              status.expires_at
+                ? formatLocalDateTime(status.expires_at)
+                : 'none (reconnect required)'
+            }
+            <span style="color: var(--console-meta-color);">
+              (renewed by the provider service)</span
+            >
+          </dd>
+          ${
+            status.reconnect_reason
+              ? html`<dt>Reason</dt>
+                  <dd class="managed-reason">${status.reconnect_reason}</dd>`
+              : ''
+          }
+        </dl>
+        <p style="margin: 0.5rem 0 0.25rem 0;"><strong>Capabilities</strong></p>
+        <ul
+          class="managed-capabilities"
+          style="margin:0; padding-left:1.25rem;"
+        >
+          ${Object.entries(status.capabilities ?? {}).map(
+            ([name, value]) => html`
+              <li
+                data-capability=${name}
+                data-value=${this._capabilityLabel(value)}
+              >
+                ${name.replace(/_/g, ' ')}: ${this._capabilityLabel(value)}
+              </li>
+            `
+          )}
+        </ul>
+        <p
+          style="color: var(--console-meta-color); font-size: var(--sl-font-size-small); margin: 0.5rem 0 0 0;"
+        >
+          Discovery succeeded. Push, approval and webhook capability are derived
+          from consented scopes and are not tested until first use.
+        </p>
+      </sl-card>
+    `;
+  }
+
+  /** Warning chip when the recorded token expiry is near or past. */
+  private _renderTokenExpiry(tracker: TrackerDetail) {
+    if (this._isManagedBitbucket()) {
+      // Managed grants report their real expiry through the provider status.
+      return nothing;
+    }
+    const status = tracker.token_expiry_status;
+    if (status !== 'expired' && status !== 'expiring') {
+      return nothing;
+    }
+    const when = tracker.token_expires_at ?? '';
+    return html`<sl-badge
+      class="chip token-expiry"
+      variant=${status === 'expired' ? 'danger' : 'warning'}
+      pill
+      title=${when ? `Token expiry: ${when}` : ''}
+      >${status === 'expired' ? 'Token expired' : `Token expires ${when}`}</sl-badge
+    >`;
+  }
+
+  private _renderProjectRow(project: Project) {
+    return html`
+      <div class="project-row">
+        <div class="project-info">
+          <sl-icon
+            name="folder"
+            style="color: var(--sl-color-primary-500); flex-shrink: 0;"
+          ></sl-icon>
+          <div class="project-text">
+            <div class="project-name">${project.name}</div>
+            ${
+              project.description
+                ? html`<div class="project-description">
+                    ${project.description}
+                  </div>`
+                : ''
+            }
+          </div>
+        </div>
+        <div class="project-actions">
+          ${
+            this._isBitbucket()
+              ? ''
+              : html`<sl-button
+                  size="small"
+                  variant="text"
+                  @click=${() => this._showIssuesForProject(project.id)}
+                >
+                  Issues
+                </sl-button>`
+          }
+          ${
+            this._supportsPullRequests()
+              ? html`<sl-button
+                  size="small"
+                  variant="text"
+                  @click=${() => this._showPullRequestsForProject(project.id)}
+                >
+                  ${this._prTabLabel()}
+                </sl-button>`
+              : ''
+          }
+        </div>
+      </div>
+    `;
+  }
+
+  /** Projects of one organization, sub-grouped by `group` when present. */
+  private _renderProjectList(projects: Project[]) {
+    const groups = groupProjectsByGroup(projects);
+    if (groups.length <= 1 && !groups[0]?.name) {
+      return projects.map((project) => this._renderProjectRow(project));
+    }
+    return groups.map(
+      (group) => html`
+        <div class="project-subgroup" data-group=${group.name || 'other'}>
+          ${group.name || 'No project'}
+        </div>
+        ${group.projects.map((project) => this._renderProjectRow(project))}
+      `
+    );
   }
 
   private async _loadPullRequests(reset = true) {
@@ -1010,6 +1389,7 @@ export class TrackerDetailView extends LitElement {
       this._tracker = await trackerRes.json();
       this._features = featuresRes.features;
       this._featuresLoaded = true;
+      await this._loadManagedStatus();
       await this._loadProjectsForTracker();
       if (
         this._activeTab === 'pull-requests' &&
@@ -1056,6 +1436,7 @@ export class TrackerDetailView extends LitElement {
     if (type.includes('jira')) return 'git';
     if (type.includes('github')) return 'github';
     if (type.includes('gitlab')) return 'gitlab';
+    if (type.includes('bitbucket')) return 'bucket';
     return 'box-seam';
   }
 
@@ -1218,118 +1599,122 @@ export class TrackerDetailView extends LitElement {
                     }
                   </div>`
                 : html`
-                    <table class="styled-table">
-                      <thead>
-                        <tr>
-                          <th class="select-col">
-                            <sl-checkbox
-                              ?checked=${
-                                this._visibleIssues().length > 0 &&
-                                this._selectedVisibleIssues().length ===
-                                  Math.min(
-                                    this._visibleIssues().length,
-                                    this._triageBatchMax
-                                  )
-                              }
-                              ?indeterminate=${
-                                this._selectedVisibleIssues().length > 0 &&
-                                this._selectedVisibleIssues().length <
-                                  Math.min(
-                                    this._visibleIssues().length,
-                                    this._triageBatchMax
-                                  )
-                              }
-                              @sl-change=${(event: Event) => {
-                                const checkbox = event.target as {
-                                  checked?: boolean;
-                                };
-                                this._toggleSelectVisible(
-                                  Boolean(checkbox.checked)
-                                );
-                              }}
-                            >
-                              <span class="visually-hidden">Select issues</span>
-                            </sl-checkbox>
-                          </th>
-                          <th>Key</th>
-                          <th>Title</th>
-                          <th>Status</th>
-                          <th>Updated</th>
-                          <th>
-                            <span class="visually-hidden">Actions</span>
-                          </th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        ${visible.map(
-                          (issue) => html`
-                            <tr>
-                              <td class="select-col">
-                                <sl-checkbox
-                                  ?checked=${this._selectedIssueIds.includes(
-                                    issue.id
-                                  )}
-                                  ?disabled=${
-                                    !this._selectedIssueIds.includes(
-                                      issue.id
-                                    ) &&
-                                    this._selectedIssueIds.length >=
+                    <div class="table-scroll">
+                      <table class="styled-table">
+                        <thead>
+                          <tr>
+                            <th class="select-col">
+                              <sl-checkbox
+                                ?checked=${
+                                  this._visibleIssues().length > 0 &&
+                                  this._selectedVisibleIssues().length ===
+                                    Math.min(
+                                      this._visibleIssues().length,
                                       this._triageBatchMax
-                                  }
-                                  @sl-change=${(event: Event) => {
-                                    const checkbox = event.target as {
-                                      checked?: boolean;
-                                    };
-                                    this._toggleIssueSelection(
-                                      issue.id,
-                                      Boolean(checkbox.checked)
-                                    );
-                                  }}
-                                >
-                                  <span class="visually-hidden"
-                                    >Select ${issue.key}</span
-                                  >
-                                </sl-checkbox>
-                              </td>
-                              <td>
-                                <a
-                                  href="/console/trackers/${this._trackerId}/issues/${issue.id}"
-                                >
-                                  ${issue.key}
-                                </a>
-                              </td>
-                              <td>${issue.title}</td>
-                              <td>
-                                <sl-badge
-                                  pill
-                                  variant=${getStatusVariant(
-                                    issue.status || ''
-                                  )}
-                                  >${issue.status}</sl-badge
-                                >
-                              </td>
-                              <td title=${issue.updated_at}>
-                                ${formatRelativeTime(issue.updated_at)}
-                              </td>
-                              <td class="actions-cell">
-                                ${
-                                  this._isGitTracker()
-                                    ? html`
-                                        <resource-actions
-                                          menu-only
-                                          .actions=${this._issueRowActions(
-                                            issue
-                                          )}
-                                        ></resource-actions>
-                                      `
-                                    : nothing
+                                    )
                                 }
-                              </td>
-                            </tr>
-                          `
-                        )}
-                      </tbody>
-                    </table>
+                                ?indeterminate=${
+                                  this._selectedVisibleIssues().length > 0 &&
+                                  this._selectedVisibleIssues().length <
+                                    Math.min(
+                                      this._visibleIssues().length,
+                                      this._triageBatchMax
+                                    )
+                                }
+                                @sl-change=${(event: Event) => {
+                                  const checkbox = event.target as {
+                                    checked?: boolean;
+                                  };
+                                  this._toggleSelectVisible(
+                                    Boolean(checkbox.checked)
+                                  );
+                                }}
+                              >
+                                <span class="visually-hidden"
+                                  >Select issues</span
+                                >
+                              </sl-checkbox>
+                            </th>
+                            <th>Key</th>
+                            <th>Title</th>
+                            <th>Status</th>
+                            <th>Updated</th>
+                            <th>
+                              <span class="visually-hidden">Actions</span>
+                            </th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          ${visible.map(
+                            (issue) => html`
+                              <tr>
+                                <td class="select-col">
+                                  <sl-checkbox
+                                    ?checked=${this._selectedIssueIds.includes(
+                                      issue.id
+                                    )}
+                                    ?disabled=${
+                                      !this._selectedIssueIds.includes(
+                                        issue.id
+                                      ) &&
+                                      this._selectedIssueIds.length >=
+                                        this._triageBatchMax
+                                    }
+                                    @sl-change=${(event: Event) => {
+                                      const checkbox = event.target as {
+                                        checked?: boolean;
+                                      };
+                                      this._toggleIssueSelection(
+                                        issue.id,
+                                        Boolean(checkbox.checked)
+                                      );
+                                    }}
+                                  >
+                                    <span class="visually-hidden"
+                                      >Select ${issue.key}</span
+                                    >
+                                  </sl-checkbox>
+                                </td>
+                                <td>
+                                  <a
+                                    href="/console/trackers/${this._trackerId}/issues/${issue.id}"
+                                  >
+                                    ${issue.key}
+                                  </a>
+                                </td>
+                                <td>${issue.title}</td>
+                                <td>
+                                  <sl-badge
+                                    pill
+                                    variant=${getStatusVariant(
+                                      issue.status || ''
+                                    )}
+                                    >${issue.status}</sl-badge
+                                  >
+                                </td>
+                                <td title=${issue.updated_at}>
+                                  ${formatRelativeTime(issue.updated_at)}
+                                </td>
+                                <td class="actions-cell">
+                                  ${
+                                    this._isGitTracker()
+                                      ? html`
+                                          <resource-actions
+                                            menu-only
+                                            .actions=${this._issueRowActions(
+                                              issue
+                                            )}
+                                          ></resource-actions>
+                                        `
+                                      : nothing
+                                  }
+                                </td>
+                              </tr>
+                            `
+                          )}
+                        </tbody>
+                      </table>
+                    </div>
                     ${
                       canLoadMore
                         ? html`<sl-button
@@ -1387,52 +1772,54 @@ export class TrackerDetailView extends LitElement {
                 ? this._renderPrsError()
                 : html`<div class="prs-empty">${empty}</div>`
               : html`
-                  <table class="styled-table">
-                    <thead>
-                      <tr>
-                        <th>Number</th>
-                        <th>Title</th>
-                        <th>Author</th>
-                        <th>Branches</th>
-                        <th>Updated</th>
-                        <th>
-                          <span class="visually-hidden">Actions</span>
-                        </th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      ${this._pullRequests.map(
-                        (pr) => html`
-                          <tr>
-                            <td>
-                              <a
-                                href=${pr.url}
-                                target="_blank"
-                                rel="noopener noreferrer"
-                                >#${pr.number}</a
-                              >
-                            </td>
-                            <td>${pr.title}</td>
-                            <td>${pr.author || ''}</td>
-                            ${this._renderPrBranches(pr)}
-                            <td title=${pr.updated_at || ''}>
-                              ${
-                                pr.updated_at
-                                  ? formatRelativeTime(pr.updated_at)
-                                  : ''
-                              }
-                            </td>
-                            <td class="actions-cell">
-                              <resource-actions
-                                menu-only
-                                .actions=${this._pullRequestRowActions(pr)}
-                              ></resource-actions>
-                            </td>
-                          </tr>
-                        `
-                      )}
-                    </tbody>
-                  </table>
+                  <div class="table-scroll">
+                    <table class="styled-table">
+                      <thead>
+                        <tr>
+                          <th>Number</th>
+                          <th>Title</th>
+                          <th>Author</th>
+                          <th>Branches</th>
+                          <th>Updated</th>
+                          <th>
+                            <span class="visually-hidden">Actions</span>
+                          </th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        ${this._pullRequests.map(
+                          (pr) => html`
+                            <tr>
+                              <td>
+                                <a
+                                  href=${pr.url}
+                                  target="_blank"
+                                  rel="noopener noreferrer"
+                                  >#${pr.number}</a
+                                >
+                              </td>
+                              <td>${pr.title}</td>
+                              <td>${pr.author || ''}</td>
+                              ${this._renderPrBranches(pr)}
+                              <td title=${pr.updated_at || ''}>
+                                ${
+                                  pr.updated_at
+                                    ? formatRelativeTime(pr.updated_at)
+                                    : ''
+                                }
+                              </td>
+                              <td class="actions-cell">
+                                <resource-actions
+                                  menu-only
+                                  .actions=${this._pullRequestRowActions(pr)}
+                                ></resource-actions>
+                              </td>
+                            </tr>
+                          `
+                        )}
+                      </tbody>
+                    </table>
+                  </div>
                   ${
                     this._prsHasMore
                       ? html`<sl-button
@@ -1473,49 +1860,7 @@ export class TrackerDetailView extends LitElement {
               >
             </div>
             <div class="projects-list">
-              ${group.projects.map(
-                (project) => html`
-                  <div class="project-row">
-                    <div class="project-info">
-                      <sl-icon
-                        name="folder"
-                        style="color: var(--sl-color-primary-500); flex-shrink: 0;"
-                      ></sl-icon>
-                      <div class="project-text">
-                        <div class="project-name">${project.name}</div>
-                        ${
-                          project.description
-                            ? html`<div class="project-description">
-                                ${project.description}
-                              </div>`
-                            : ''
-                        }
-                      </div>
-                    </div>
-                    <div class="project-actions">
-                      <sl-button
-                        size="small"
-                        variant="text"
-                        @click=${() => this._showIssuesForProject(project.id)}
-                      >
-                        Issues
-                      </sl-button>
-                      ${
-                        this._supportsPullRequests()
-                          ? html`<sl-button
-                              size="small"
-                              variant="text"
-                              @click=${() =>
-                                this._showPullRequestsForProject(project.id)}
-                            >
-                              ${this._prTabLabel()}
-                            </sl-button>`
-                          : ''
-                      }
-                    </div>
-                  </div>
-                `
-              )}
+              ${this._renderProjectList(group.projects)}
             </div>
           </div>
         `
@@ -1634,6 +1979,7 @@ export class TrackerDetailView extends LitElement {
               pill
               >${tracker.is_valid ? 'Connected' : 'Not validated'}</sl-badge
             >
+            ${this._renderTokenExpiry(tracker)} ${this._renderManagedChip()}
           </div>
 
           <div class="tracker-meta">
@@ -1658,6 +2004,8 @@ export class TrackerDetailView extends LitElement {
                 : ''
             }
           </div>
+
+          ${this._renderManagedConnection()}
 
           <p class="scope-summary">
             <strong>Scope:</strong> ${this._describeScope()}

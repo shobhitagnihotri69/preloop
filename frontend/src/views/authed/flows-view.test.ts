@@ -63,6 +63,87 @@ describe('FlowsView', () => {
     invalidateApiCaches();
   });
 
+  it('renders flow rows before execution requests finish', async () => {
+    let release!: () => void;
+    const pending = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    fetchStub = sinon
+      .stub(window, 'fetch')
+      .callsFake(async (input: RequestInfo | URL) => {
+        const url = input.toString();
+        if (url.includes('/flows/executions')) await pending;
+        const data =
+          url.includes('/flows') &&
+          !url.includes('/executions') &&
+          !url.includes('/presets')
+            ? [{ id: 'flow-1', name: 'Nightly sweep', is_enabled: true }]
+            : [];
+        return new Response(JSON.stringify(data), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      });
+    const el = await fixture<FlowsView>(html`<flows-view></flows-view>`);
+    try {
+      await waitUntil(() => !(el as any).isLoading);
+      await el.updateComplete;
+      expect(el.shadowRoot!.textContent).to.include('Nightly sweep');
+    } finally {
+      release();
+    }
+  });
+
+  it('keeps pending executions through a range change and ignores older range answers', async () => {
+    const render = sinon
+      .stub(customElements.get('flows-view')!.prototype, 'render')
+      .returns(html``);
+    let releaseExecutions!: () => void;
+    let releaseOlder!: () => void;
+    const executions = new Promise<void>((resolve) => {
+      releaseExecutions = resolve;
+    });
+    const older = new Promise<void>((resolve) => {
+      releaseOlder = resolve;
+    });
+    let summaries = 0;
+    fetchStub = sinon
+      .stub(window, 'fetch')
+      .callsFake(async (input: RequestInfo | URL) => {
+        const url = input.toString();
+        let data: unknown = [];
+        if (url.includes('/flows/executions')) {
+          await executions;
+          data = [{ id: 'pending-run', status: 'RUNNING' }];
+        } else if (url.includes('/flows/summary')) {
+          const request = ++summaries;
+          if (request === 2) await older;
+          data = [{ id: 'flow-1', name: `Range ${request}`, is_enabled: true }];
+        }
+        return new Response(JSON.stringify(data), {
+          headers: { 'Content-Type': 'application/json' },
+        });
+      });
+    const el = await fixture<FlowsView>(html`<flows-view></flows-view>`);
+    await waitUntil(() => !(el as any).isLoading);
+    try {
+      (el as any).range = 'week';
+      const oldRead = (el as any).loadRangeStats();
+      (el as any).range = 'day';
+      await (el as any).loadRangeStats();
+      releaseExecutions();
+      await waitUntil(() => (el as any).activeExecutions.length === 1);
+      releaseOlder();
+      await oldRead;
+      expect((el as any).flows[0].name).to.equal('Range 3');
+      expect((el as any).executions[0].id).to.equal('pending-run');
+    } finally {
+      releaseExecutions();
+      releaseOlder();
+      render.restore();
+    }
+  });
+
   it('renders the flow list view', async () => {
     fetchStub = createFetchStub([], []);
     const element = (await fixture(
@@ -375,6 +456,9 @@ describe('FlowsView', () => {
     const emptyState = element.shadowRoot?.querySelector('.empty-state');
     expect(emptyState).to.exist;
     expect(emptyState?.textContent).to.include('No flows yet');
+    // The title says it once; the body explains what a flow is instead.
+    expect(emptyState?.textContent?.match(/No flows yet/g)).to.have.length(1);
+    expect(emptyState?.textContent).to.include('Flows start an agent');
   });
 
   it('shows flow cards when flows exist', async () => {
@@ -1485,6 +1569,10 @@ describe('FlowsView', () => {
       const text = (element.shadowRoot?.textContent || '').replace(/\s+/g, ' ');
       expect(text).to.contain('Could not load your flows');
       expect(text).to.not.contain('No flows yet');
+      // The reason, said once, with no odd aside about the list.
+      expect(text.match(/Could not load your flows/g)).to.have.length(1);
+      expect(text).to.not.contain('not empty');
+      expect(text).to.contain('Try again in a moment.');
       // The failure no longer escapes loadData, so the rest of the page ran.
       expect((element as any).isLoading).to.be.false;
     });
@@ -1593,6 +1681,103 @@ describe('FlowsView', () => {
       const footer = element.shadowRoot!.querySelector('.card-last-run')!;
       expect((footer.textContent || '').trim()).to.equal('No run yet');
     });
+  });
+
+  it('names the type and status filters for a screen reader', async () => {
+    fetchStub = createFetchStub(
+      [{ id: 'flow-1', name: 'Nightly sweep', is_enabled: true }],
+      []
+    );
+    const element = (await fixture(
+      html`<flows-view></flows-view>`
+    )) as FlowsView;
+    await waitUntil(() => !(element as any).isLoading);
+    await element.updateComplete;
+
+    const type = element.shadowRoot!.querySelector('sl-select.preset-filter');
+    const status = element.shadowRoot!.querySelector('sl-select.status-filter');
+    expect(type?.getAttribute('label')).to.equal('Flow type');
+    expect(status?.getAttribute('label')).to.equal('Flow status');
+  });
+
+  it('asks before removing a saved preset and reports a failure', async () => {
+    resetConfirmDialogForTests();
+    const deletes: string[] = [];
+    fetchStub = sinon
+      .stub(window, 'fetch')
+      .callsFake(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === 'string' ? input : input.toString();
+        const method = (init?.method || 'GET').toUpperCase();
+        const json = (data: unknown, status = 200) =>
+          new Response(JSON.stringify(data), {
+            status,
+            headers: { 'Content-Type': 'application/json' },
+          });
+        if (method === 'DELETE') {
+          deletes.push(url);
+          return json({ detail: 'Preset is in use' }, 500);
+        }
+        if (url.includes('/api/v1/flows/presets')) {
+          return json([
+            { id: 'preset-1', name: 'Team triage', account_id: 'acct-1' },
+          ]);
+        }
+        return json([]);
+      });
+    const element = (await fixture(
+      html`<flows-view></flows-view>`
+    )) as FlowsView;
+    await waitUntil(() => (element as any).presets?.length === 1);
+    await element.updateComplete;
+
+    const remove = () =>
+      [...element.shadowRoot!.querySelectorAll('.flow-card sl-button')]
+        .map((button) => button as HTMLElement)
+        .find((button) => button.textContent?.trim() === 'Remove')!;
+    const answer = async (label: string) => {
+      let target: HTMLElement | undefined;
+      let dialog: Element | null = null;
+      await waitUntil(() => {
+        dialog = document.body.querySelector('confirm-dialog');
+        target = [
+          ...((dialog as Element | null)?.shadowRoot?.querySelectorAll(
+            'sl-button'
+          ) || []),
+        ]
+          .map((button) => button as HTMLElement)
+          .find((button) => button.textContent?.trim() === label);
+        return Boolean(target);
+      });
+      const text = (dialog as Element | null)?.shadowRoot?.textContent || '';
+      target!.click();
+      return text;
+    };
+
+    try {
+      remove().click();
+      const asked = await answer('Cancel');
+      expect(asked).to.contain('Remove "Team triage"?');
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(deletes, 'nothing is deleted on Cancel').to.have.length(0);
+
+      remove().click();
+      await answer('Remove preset');
+      await waitUntil(() =>
+        [...document.body.querySelectorAll('sl-alert')].some((alert) =>
+          alert.textContent?.includes('Could not remove the preset')
+        )
+      );
+      expect(deletes).to.have.length(1);
+    } finally {
+      resetConfirmDialogForTests();
+      // Hide rather than remove: a toast removes itself from the toast stack
+      // once hidden, and pulling it out first makes that removal throw.
+      await Promise.all(
+        [...document.body.querySelectorAll('sl-alert')].map((alert) =>
+          (alert as HTMLElement & { hide: () => Promise<void> }).hide()
+        )
+      );
+    }
   });
 
   it('labels the preset card action Use preset', async () => {
@@ -1794,6 +1979,48 @@ describe('FlowsView', () => {
         'a stopped run is not in flight'
       ).to.equal(0);
       expect(items(element).length).to.equal(0);
+    });
+
+    it('opens a run in flight through a real link and a labelled arrow', async () => {
+      active = [run('exec-running', 'RUNNING')];
+      fetchStub = stubWith(() => active);
+      const element = await view();
+
+      const item = items(element)[0];
+      const link = item.querySelector('a.row-link');
+      expect(link?.getAttribute('href')).to.equal(
+        '/console/flows/executions/exec-running'
+      );
+      expect(link?.textContent?.trim()).to.equal('Automated runs');
+      const arrow = item.querySelector('sl-icon-button[name="arrow-right"]');
+      expect(arrow?.getAttribute('href')).to.equal(
+        '/console/flows/executions/exec-running'
+      );
+      expect(arrow?.getAttribute('label')).to.equal(
+        'Open run of Automated runs'
+      );
+      expect(item.querySelector('sl-button')).to.equal(null);
+    });
+
+    it('colours run status the way the executions pages do', async () => {
+      active = [run('exec-running', 'RUNNING'), run('exec-pending', 'PENDING')];
+      fetchStub = stubWith(() => active);
+      const element = await view();
+
+      const chips = items(element).map((item) =>
+        item.querySelector('sl-badge.status-chip')
+      );
+      // Blue in flight, as on the executions pages; grey only while queued.
+      expect(chips[0]?.getAttribute('variant')).to.equal('primary');
+      expect(chips[0]?.textContent?.trim()).to.equal('Running');
+      expect(chips[1]?.getAttribute('variant')).to.equal('neutral');
+      expect(chips[1]?.textContent?.trim()).to.equal('Pending');
+      const chip = (
+        element as unknown as {
+          renderRunStatusChip: (status: string) => unknown;
+        }
+      ).renderRunStatusChip('TIMEOUT') as { values: unknown[] };
+      expect(chip.values).to.include('danger');
     });
 
     it('recounts the runs in flight when the tab becomes visible again', async () => {

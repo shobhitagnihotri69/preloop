@@ -1,3 +1,4 @@
+import { ConsoleStatus } from '../../controllers/console-status';
 import { LitElement, html, css, unsafeCSS, nothing } from 'lit';
 import { customElement, state } from 'lit/decorators.js';
 import { unsafeHTML } from 'lit/directives/unsafe-html.js';
@@ -23,6 +24,7 @@ interface TrackerSummary {
 
 @customElement('tracker-issue-view')
 export class TrackerIssueView extends LitElement {
+  private readonly accessibilityStatus = new ConsoleStatus(this);
   @state()
   private _loading = true;
 
@@ -37,6 +39,7 @@ export class TrackerIssueView extends LitElement {
 
   private _trackerId = '';
   private _issueId = '';
+  private _loadGeneration = 0;
 
   static styles = [
     unsafeCSS(consoleStyles),
@@ -128,6 +131,18 @@ export class TrackerIssueView extends LitElement {
     return type.includes('github') || type.includes('gitlab');
   }
 
+  /**
+   * Git trackers implement in their own repository. A Jira issue runs in the
+   * repository its project is bound to; an unbound project gets a 400 from
+   * the server that says how to bind one.
+   */
+  private _canRunImplementer(): boolean {
+    const type = this._tracker?.tracker_type?.toLowerCase() || '';
+    return (
+      this._isGitTracker() || type.includes('bitbucket') || type === 'jira'
+    );
+  }
+
   private _runImplementer() {
     if (!this._issue) return;
     void openRunPresetDialog({
@@ -155,6 +170,7 @@ export class TrackerIssueView extends LitElement {
   }
 
   private async _load() {
+    const generation = ++this._loadGeneration;
     this._loading = true;
     this._error = null;
     try {
@@ -162,15 +178,19 @@ export class TrackerIssueView extends LitElement {
         getIssue(this._issueId),
         fetchWithAuth(`/api/v1/trackers/${this._trackerId}`),
       ]);
+      if (generation !== this._loadGeneration) return;
       this._issue = issue;
       this._tracker = trackerRes.ok
         ? ((await trackerRes.json()) as TrackerSummary)
         : null;
     } catch (error) {
+      if (generation !== this._loadGeneration) return;
       this._error =
         error instanceof Error ? error.message : 'Failed to load issue';
     } finally {
-      this._loading = false;
+      if (generation === this._loadGeneration) {
+        this._loading = false;
+      }
     }
   }
 
@@ -224,7 +244,7 @@ export class TrackerIssueView extends LitElement {
             Run triage
           </sl-button>
           ${
-            this._isGitTracker()
+            this._canRunImplementer()
               ? html`
                   <sl-button
                     size="small"

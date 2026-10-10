@@ -1,5 +1,7 @@
 # Outbound event webhooks
 
+Editions: OSS, Cloud, Enterprise. Unless stated otherwise, everything on this page ships in OSS.
+
 Preloop can POST signed governance events to a URL you own: an approval was
 raised or decided, a policy denied a call, a runtime session closed, spend
 crossed a budget, a flow execution finished, a CRA audit found a reportable
@@ -78,6 +80,13 @@ Every request body is one JSON object with exactly these keys:
 | `agent.note_sent` | An operator note is accepted for a running agent | `note_id`, `managed_agent_id`, `runtime_session_id`, `text`, `author` (`user_id`, `display`, `auth_method`), `created_at`, `expires_at` |
 | `agent.note_delivered` | That note reaches the agent at a turn boundary | same fields plus `delivered_at`, `delivery_channel` (`gateway`, `hook`, `claude_channel`, `claude_message`), `turn_index` |
 | `cra.reportable_vulnerability` | A CRA audit found an actively exploited vulnerability that its own evidence says affects the product | `cve`, `actively_exploited`, `exploited_evidence`, `affected`, `vex_status`, `discovered_at`, `deadlines`, `status`, `assessment`, `kev_snapshot_date`, `kev_source_url` |
+| `agent.discovered` | Opt-in workstation discovery reports an agent tool that was not reported before | `candidate_id`, `agent_kind`, `agent_version`, `workstation_fingerprint` (salted hash), `config_path_hash` (salted hash), `mcp_server_count`, `enrolled`, `os_family`, `status`, `first_seen_at` |
+| `agent.onboarded` | A managed-agent enrollment is validated for the first time | `agent_id`, `agent_name`, `agent_kind`, `source_type` (`discovered`, `custom`), `outcome` (`created`, `relinked`, `merged`), `enrollment_id`, `owner_user_id`, `actor_user_id`, `gateway_routed`, `mcp_rewritten`, `mcp_server_count` |
+
+`agent.discovered` fires once per new candidate row; a workstation that reports
+the same tool again only moves `last_seen_at`. It carries no user name,
+hostname, clear path or MCP detail. See
+[agent discovery reporting](agent-discovery-reporting.md).
 
 Operator note payloads do carry the note `text`, unlike approval payloads.
 The text is the fact, and a receiver mirroring notes into a ticket or a
@@ -95,6 +104,41 @@ ENISA single reporting platform and does not file anything. Routing this event
 into a ticket queue automates a notification, never a filing. The block behind
 it is documented in
 [security audit presets](flows/security-audit-presets.md#cra-article-14-reporting).
+
+`agent.onboarded` fires when an enrollment first reaches `validated`, not
+when the enrollment row is created: a config that was written but never
+checked is not governed yet. (A row created through the API already in
+`validated` status counts as validated at creation and emits then.) The event id is deterministic on the enrollment,
+so validating the same enrollment again does not produce a second event.
+`outcome` says how the agent relates to agents Preloop already governed:
+`created` for its first onboarding, `relinked` when an earlier enrollment of
+the same agent was onboarded before (for example after a restore, or on a new
+workstation), and `merged` when a duplicate was merged into the agent since its
+last onboarding. The payload carries no hostname, OS user name, config path,
+MCP server URL or credential; `mcp_server_count` is a count only.
+
+```json
+{
+  "id": "1d7c0b9e-4f0a-5d43-9a7e-3b2f6c1e8a21",
+  "type": "agent.onboarded",
+  "version": "1",
+  "occurred_at": "2026-10-03T09:15:02.118000+00:00",
+  "account_id": "00000000-0000-4000-8000-000000000001",
+  "data": {
+    "agent_id": "00000000-0000-4000-8000-0000000000a1",
+    "agent_name": "Codex workspace",
+    "agent_kind": "codex",
+    "source_type": "discovered",
+    "outcome": "created",
+    "enrollment_id": "00000000-0000-4000-8000-0000000000e1",
+    "owner_user_id": "00000000-0000-4000-8000-0000000000c1",
+    "actor_user_id": "00000000-0000-4000-8000-0000000000c1",
+    "gateway_routed": true,
+    "mcp_rewritten": true,
+    "mcp_server_count": 2
+  }
+}
+```
 
 Approval payloads deliberately omit tool arguments. Those routinely carry the
 payload the approval exists to guard, and a webhook target is not the audit
@@ -250,20 +294,29 @@ sees the same `X-Preloop-Event-Id` with a new `X-Preloop-Delivery-Id`.
 
 ## Approval workflow webhooks
 
-An approval workflow with `webhook_url` in its `approval_config` keeps
-working, unchanged in shape: the same JSON body goes to the same URL. It is
-now delivered through the outbox, which means it is **signed and retried**
-where it previously was a single unsigned POST with no retry.
+An approval workflow sends its approval requests to a webhook configured in
+`channel_configs` (`webhook`, `slack` or `mattermost`, each with a `url`), or
+in the older `approval_config.webhook_url`. Either way the request goes
+through the outbox, so it is **signed and retried**, with the headers and
+signature described [above](#verifying-the-signature).
 
-The signing secret is `approval_config.webhook_secret`. Set it yourself to
-choose it; leave it out and Preloop generates one and writes it back beside
-the URL, where you can read it. These endpoints appear in the console list
-read-only, so you can see one failing, and are edited by changing the approval
-workflow.
+The signing secret is generated when you create the workflow through the API
+and returned once, in `webhook_secret` on that response. Reads show only
+`webhook_secret_hint`. To get a new one (for a workflow created by policy
+apply, or a secret you did not keep), rotate it:
 
-Two behaviour changes worth knowing: `webhook_posted_at` on the approval
-request is now stamped when a receiver actually accepted the delivery rather
-than when the POST was issued, and a receiver that is down no longer loses the
+```bash
+curl -X POST "https://preloop.example.com/api/v1/approval-workflows/$WORKFLOW_ID/webhook-secret/rotate" \
+  -H "Authorization: Bearer $PRELOOP_API_KEY"
+```
+
+The response carries the new `webhook_secret`; the next delivery is signed
+with it. You can also set `approval_config.webhook_secret` yourself to choose
+the secret. These endpoints appear in the console list read-only, so you can
+see one failing, and are edited by changing the approval workflow.
+
+`webhook_posted_at` on the approval request is stamped when a receiver
+actually accepted the delivery, and a receiver that is down does not lose the
 notification.
 
 ## Settings

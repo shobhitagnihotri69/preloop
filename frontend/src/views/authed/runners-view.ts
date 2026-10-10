@@ -1,3 +1,5 @@
+import { ConsoleStatus } from '../../controllers/console-status';
+import { tableScrollStyles } from '../../styles/table-scroll';
 import { LitElement, html, css, unsafeCSS, nothing } from 'lit';
 import { customElement, state } from 'lit/decorators.js';
 import '@shoelace-style/shoelace/dist/components/badge/badge.js';
@@ -5,23 +7,31 @@ import '@shoelace-style/shoelace/dist/components/spinner/spinner.js';
 import '@shoelace-style/shoelace/dist/components/copy-button/copy-button.js';
 import '@shoelace-style/shoelace/dist/components/button/button.js';
 import '@shoelace-style/shoelace/dist/components/input/input.js';
+import '@shoelace-style/shoelace/dist/components/alert/alert.js';
+import '@shoelace-style/shoelace/dist/components/icon/icon.js';
 import type SlInput from '@shoelace-style/shoelace/dist/components/input/input.js';
 import '../../components/view-header.ts';
 import {
+  deleteRunner,
   getAccountOrganization,
   getRunners,
+  rotateRunnerToken,
+  RunnerHasLeasesError,
   updateAccountOrganization,
   updateRunnerConcurrency,
   type RunnerRecord,
 } from '../../api';
 import { unifiedWebSocketManager } from '../../services/unified-websocket-manager';
+import { confirmDialog } from '../../components/confirm-dialog';
 import { formatLocalDateTime, formatRelativeTime } from '../../utils/date';
 import { AUTO_RUNNER_POOL } from '../../utils/runner-pool';
 import '../../components/preloop-runner-pool-select';
+import '../../components/capability-extension';
 import consoleStyles from '../../styles/console-styles.css?inline';
 
 @customElement('runners-view')
 export class RunnersView extends LitElement {
+  private readonly accessibilityStatus = new ConsoleStatus(this);
   @state()
   private runners: RunnerRecord[] = [];
 
@@ -53,107 +63,171 @@ export class RunnersView extends LitElement {
   @state()
   private concurrencyError: string | null = null;
 
+  /**
+   * Runners with a delete or rotate under way: from the click that opens
+   * the confirmation until the request settles. Marked before the question
+   * is awaited, so a second click cannot open another ask (which would
+   * cancel the first) or send the request twice.
+   */
+  @state()
+  private busyRunners: ReadonlySet<string> = new Set();
+
+  private isBusy(runnerId: string): boolean {
+    return this.busyRunners.has(runnerId);
+  }
+
+  /** Mark the row busy. False when it already was: the click is a repeat. */
+  private claimRow(runnerId: string): boolean {
+    if (this.isBusy(runnerId)) return false;
+    this.busyRunners = new Set([...this.busyRunners, runnerId]);
+    return true;
+  }
+
+  private releaseRow(runnerId: string): void {
+    const next = new Set(this.busyRunners);
+    next.delete(runnerId);
+    this.busyRunners = next;
+  }
+
+  /**
+   * Outcome of the last delete or rotate, shown under that runner's row.
+   * ``conflict`` marks a delete the server refused because the runner still
+   * holds executions, which is when "Force delete" is offered.
+   */
+  @state()
+  private actionNotice: {
+    runnerId: string;
+    text: string;
+    conflict?: boolean;
+  } | null = null;
+
   private unsubscribe?: () => void;
 
   /** Matches MAX_RUNNER_CONCURRENCY on the control plane. */
   private static readonly maxConcurrency = 32;
 
   static styles = [
-    unsafeCSS(consoleStyles),
-    css`
-      :host {
-        display: block;
-        font-size: 14px;
-      }
-      .muted {
-        color: var(--sl-color-neutral-500);
-        font-size: 13px;
-      }
-      table {
-        width: 100%;
-        border-collapse: collapse;
-      }
-      th,
-      td {
-        text-align: left;
-        padding: 8px 10px;
-        border-bottom: 1px solid var(--sl-color-neutral-200);
-        font-size: 14px;
-        vertical-align: top;
-      }
-      th {
-        font-size: 13px;
-        font-weight: 600;
-        color: var(--sl-color-neutral-600);
-      }
-      .labels {
-        display: flex;
-        flex-wrap: wrap;
-        gap: 4px;
-      }
-      a {
-        color: var(--sl-color-primary-600);
-      }
-      /*
+    tableScrollStyles,
+    [
+      unsafeCSS(consoleStyles),
+      css`
+        :host {
+          display: block;
+          font-size: 14px;
+        }
+        .muted {
+          color: var(--console-meta-color);
+          font-size: 13px;
+        }
+        table {
+          width: 100%;
+          border-collapse: collapse;
+        }
+        th,
+        td {
+          text-align: left;
+          padding: 8px 10px;
+          border-bottom: 1px solid var(--sl-color-neutral-200);
+          font-size: 14px;
+          vertical-align: top;
+        }
+        th {
+          font-size: 13px;
+          font-weight: 600;
+          color: var(--sl-color-neutral-600);
+        }
+        .labels {
+          display: flex;
+          flex-wrap: wrap;
+          gap: 4px;
+        }
+        a {
+          color: var(--sl-color-primary-600);
+        }
+        /*
        * An empty page states one fact and hands over one command. The old
        * treatment (a 580px card, a 72px badge icon and a full width primary
        * button) spent a screen saying "nothing here yet".
        */
-      .empty-state {
-        /* The shared recipe stacks its empty states in a column; this one is
+        .empty-state {
+          /* The shared recipe stacks its empty states in a column; this one is
            a sentence, a command and a link that read as one line. Declared in
            full, including the 72px box, so it does not depend on which half
            of console-styles.css the cascade leaves standing. */
-        box-sizing: border-box;
-        display: flex;
-        flex-flow: row wrap;
-        align-items: center;
-        justify-content: center;
-        gap: var(--sl-spacing-x-small) var(--sl-spacing-small);
-        margin: 0;
-        min-height: 72px;
-        padding: var(--sl-spacing-medium);
-        color: var(--sl-color-neutral-600);
-        font-size: 13px;
-      }
-      .empty-command {
-        display: inline-flex;
-        align-items: center;
-        gap: var(--sl-spacing-2x-small);
-        font-family: var(--sl-font-mono);
-      }
-      .empty-command code {
-        background: var(--sl-color-neutral-100);
-        border-radius: var(--sl-border-radius-small);
-        color: var(--sl-color-neutral-800);
-        padding: 1px 6px;
-      }
-      .default-pool {
-        margin: 0 0 var(--sl-spacing-large);
-        max-width: 420px;
-      }
-      .default-pool sl-select {
-        margin-bottom: var(--sl-spacing-2x-small);
-      }
-      .slots {
-        display: flex;
-        align-items: center;
-        gap: var(--sl-spacing-2x-small);
-      }
-      .slot-edit {
-        display: flex;
-        align-items: center;
-        gap: var(--sl-spacing-2x-small);
-      }
-      .slot-edit sl-input {
-        width: 5.5rem;
-      }
-      .executions {
-        display: flex;
-        flex-direction: column;
-        gap: 2px;
-      }
-    `,
+          box-sizing: border-box;
+          display: flex;
+          flex-flow: row wrap;
+          align-items: center;
+          justify-content: center;
+          gap: var(--sl-spacing-x-small) var(--sl-spacing-small);
+          margin: 0;
+          min-height: 72px;
+          padding: var(--sl-spacing-medium);
+          color: var(--sl-color-neutral-600);
+          font-size: 13px;
+        }
+        .empty-command {
+          display: inline-flex;
+          align-items: center;
+          gap: var(--sl-spacing-2x-small);
+          font-family: var(--sl-font-mono);
+        }
+        .empty-command code {
+          background: var(--sl-color-neutral-100);
+          border-radius: var(--sl-border-radius-small);
+          color: var(--sl-color-neutral-800);
+          padding: 1px 6px;
+        }
+        .default-pool {
+          margin: 0 0 var(--sl-spacing-large);
+          max-width: 420px;
+        }
+        .default-pool sl-select {
+          margin-bottom: var(--sl-spacing-2x-small);
+        }
+        .slots {
+          display: flex;
+          align-items: center;
+          gap: var(--sl-spacing-2x-small);
+        }
+        .slot-edit {
+          display: flex;
+          align-items: center;
+          gap: var(--sl-spacing-2x-small);
+        }
+        .slot-edit sl-input {
+          width: 5.5rem;
+        }
+        .executions {
+          display: flex;
+          flex-direction: column;
+          gap: 2px;
+        }
+        .actions {
+          display: flex;
+          flex-wrap: wrap;
+          gap: var(--sl-spacing-2x-small);
+        }
+        .action-notice td {
+          border-bottom: 1px solid var(--sl-color-neutral-200);
+          color: var(--sl-color-neutral-700);
+          font-size: 13px;
+        }
+        .action-notice sl-button {
+          margin-left: var(--sl-spacing-x-small);
+        }
+        .table-scroll {
+          overflow-x: auto;
+          -webkit-overflow-scrolling: touch;
+        }
+        .table-scroll table {
+          min-width: 720px;
+        }
+        .load-error-actions {
+          margin-top: var(--sl-spacing-small);
+        }
+      `,
+    ],
   ];
 
   connectedCallback() {
@@ -175,6 +249,10 @@ export class RunnersView extends LitElement {
     type?: string;
     payload?: Partial<RunnerRecord>;
   }) {
+    if (message.type === 'runner_deleted' && message.payload?.id) {
+      this.removeRunner(message.payload.id);
+      return;
+    }
     if (message.type !== 'runner_updated' || !message.payload?.id) {
       return;
     }
@@ -195,6 +273,137 @@ export class RunnersView extends LitElement {
       },
       ...this.runners.slice(index + 1),
     ];
+  }
+
+  private removeRunner(runnerId: string) {
+    this.runners = this.runners.filter((row) => row.id !== runnerId);
+    if (this.editingConcurrencyFor === runnerId) {
+      this.editingConcurrencyFor = null;
+    }
+  }
+
+  private async handleDelete(row: RunnerRecord, force = false) {
+    if (!this.claimRow(row.id)) return;
+    const confirmed = await confirmDialog(
+      force
+        ? {
+            title: 'Halt executions and delete runner',
+            message: `Halt the executions ${row.name} is running and delete it?`,
+            detail:
+              'The running executions stop where they are. The runner token stops working. This cannot be undone.',
+            confirmLabel: 'Halt and delete',
+            variant: 'danger',
+          }
+        : {
+            title: 'Delete runner',
+            message: `Delete runner ${row.name}?`,
+            detail:
+              'Its token stops working and it disconnects. This cannot be undone.',
+            confirmLabel: 'Delete runner',
+            variant: 'danger',
+          }
+    );
+    if (!confirmed) {
+      this.releaseRow(row.id);
+      return;
+    }
+    this.actionNotice = null;
+    try {
+      await deleteRunner(row.id, force);
+      this.removeRunner(row.id);
+    } catch (err) {
+      this.actionNotice = {
+        runnerId: row.id,
+        text: err instanceof Error ? err.message : 'Failed to delete runner',
+        conflict: err instanceof RunnerHasLeasesError,
+      };
+    } finally {
+      this.releaseRow(row.id);
+    }
+  }
+
+  private async handleRotate(row: RunnerRecord) {
+    if (!this.claimRow(row.id)) return;
+    const confirmed = await confirmDialog({
+      title: 'Rotate runner token',
+      message: `Rotate the token for ${row.name}?`,
+      detail:
+        'The current token stops working and the runner disconnects. Run "preloop runner restart" on that machine to reconnect.',
+      confirmLabel: 'Rotate token',
+      variant: 'primary',
+    });
+    if (!confirmed) {
+      this.releaseRow(row.id);
+      return;
+    }
+    this.actionNotice = null;
+    try {
+      await rotateRunnerToken(row.id);
+      // The new token is deliberately not shown: a runner service picks up a
+      // fresh one on restart, and a secret on screen is one more to leak.
+      this.actionNotice = {
+        runnerId: row.id,
+        text: 'Token rotated and the runner was disconnected. Run "preloop runner restart" on that machine to reconnect with a new token.',
+      };
+    } catch (err) {
+      this.actionNotice = {
+        runnerId: row.id,
+        text:
+          err instanceof Error ? err.message : 'Failed to rotate runner token',
+      };
+    } finally {
+      this.releaseRow(row.id);
+    }
+  }
+
+  private renderActions(row: RunnerRecord) {
+    const busy = this.isBusy(row.id);
+    return html`
+      <div class="actions">
+        <sl-button
+          class="rotate-token"
+          size="small"
+          ?disabled=${busy}
+          @click=${() => void this.handleRotate(row)}
+          >Rotate token</sl-button
+        >
+        <sl-button
+          class="delete-runner"
+          size="small"
+          variant="danger"
+          outline
+          ?disabled=${busy}
+          @click=${() => void this.handleDelete(row)}
+          >Delete</sl-button
+        >
+      </div>
+    `;
+  }
+
+  private renderActionNotice(row: RunnerRecord) {
+    const notice = this.actionNotice;
+    if (!notice || notice.runnerId !== row.id) {
+      return nothing;
+    }
+    return html`
+      <tr class="action-notice">
+        <td colspan="9">
+          <span class="action-notice-text">${notice.text}</span>
+          ${
+            notice.conflict
+              ? html`<sl-button
+                  class="force-delete"
+                  size="small"
+                  variant="danger"
+                  ?disabled=${this.isBusy(row.id)}
+                  @click=${() => void this.handleDelete(row, true)}
+                  >Force delete</sl-button
+                >`
+              : nothing
+          }
+        </td>
+      </tr>
+    `;
   }
 
   private async load() {
@@ -338,6 +547,7 @@ export class RunnersView extends LitElement {
       return html`
         <div class="slot-edit">
           <sl-input
+            aria-label="Runner concurrency"
             type="number"
             size="small"
             min="1"
@@ -415,7 +625,21 @@ export class RunnersView extends LitElement {
         this.loading
           ? html`<sl-spinner></sl-spinner>`
           : this.error
-            ? html`<p class="muted">${this.error}</p>`
+            ? html`<sl-alert
+                variant="danger"
+                open
+                role="alert"
+                class="load-error"
+              >
+                <sl-icon slot="icon" name="exclamation-octagon"></sl-icon>
+                <strong>Could not load runners</strong><br />
+                ${this.error}
+                <div class="load-error-actions">
+                  <sl-button size="small" @click=${() => void this.load()}
+                    >Try again</sl-button
+                  >
+                </div>
+              </sl-alert>`
             : this.runners.length === 0
               ? html`
                   <p class="empty-state">
@@ -436,106 +660,127 @@ export class RunnersView extends LitElement {
                   </p>
                 `
               : html`
-                  <table>
-                    <thead>
-                      <tr>
-                        <th>Name</th>
-                        <th>Labels</th>
-                        <th>Registered by</th>
-                        <th>Host</th>
-                        <th>Status</th>
-                        <th>Last heartbeat</th>
-                        <th>Running / slots</th>
-                        <th>Executions</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      ${this.runners.map(
-                        (row) => html`
-                          <tr>
-                            <td>${row.name}</td>
-                            <td>
-                              <div class="labels">
-                                ${(row.labels || []).map(
-                                  (label) =>
-                                    html`<sl-badge class="chip" pill
-                                      >${label}</sl-badge
-                                    >`
-                                )}
-                              </div>
-                            </td>
-                            <td class="muted">
-                              ${row.registered_by_email || '-'}
-                            </td>
-                            <td>
-                              ${row.hostname || '-'}
-                              <div class="muted">
-                                ${[row.os, row.arch].filter(Boolean).join('/')}
-                              </div>
-                            </td>
-                            <td>
-                              <sl-badge
-                                class="chip"
-                                pill
-                                variant=${this.statusVariant(row.status)}
-                              >
-                                ${this.statusLabel(row.status)}
-                              </sl-badge>
-                              ${
-                                /*
-                                 * An ephemeral runner is only worth pointing
-                                 * out while it is here: the row vanishes with
-                                 * the CI job, so a reader seeing this badge
-                                 * knows not to expect it back.
-                                 */
-                                row.ephemeral && this.isPresent(row.status)
-                                  ? html`<sl-badge
-                                      class="chip"
-                                      pill
-                                      variant="neutral"
-                                      title="One-shot CI runner. It unregisters when its job ends."
-                                      >ephemeral</sl-badge
-                                    >`
-                                  : nothing
-                              }
-                            </td>
-                            <td class="muted">
-                              ${
-                                row.last_heartbeat
-                                  ? html`<span
-                                      title=${formatLocalDateTime(
-                                        row.last_heartbeat
-                                      )}
-                                      >${formatRelativeTime(
-                                        row.last_heartbeat
-                                      )}</span
-                                    >`
-                                  : '-'
-                              }
-                            </td>
-                            <td>${this.renderSlots(row)}</td>
-                            <td>
-                              ${
-                                this.runningIdsOf(row).length === 0
-                                  ? html`<span class="muted">Idle</span>`
-                                  : html`<div class="executions">
-                                      ${this.runningIdsOf(row).map(
-                                        (executionId) =>
-                                          html`<a
-                                            href="/console/flows/executions/${executionId}"
-                                            >${executionId.slice(0, 8)}…</a
-                                          >`
-                                      )}
-                                    </div>`
-                              }
-                            </td>
-                          </tr>
-                        `
-                      )}
-                    </tbody>
-                  </table>
+                  <!-- Nine columns do not fit a phone: the table scrolls
+                       sideways inside this box instead of the whole page. -->
+
+                  <div class="table-scroll">
+                    <table>
+                      <thead>
+                        <tr>
+                          <th>Name</th>
+                          <th>Labels</th>
+                          <th>Registered by</th>
+                          <th>Host</th>
+                          <th>Status</th>
+                          <th>Last heartbeat</th>
+                          <th>Running / slots</th>
+                          <th>Executions</th>
+                          <th>Actions</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        ${this.runners.map(
+                          (row) => html`
+                            <tr>
+                              <td>${row.name}</td>
+                              <td>
+                                <div class="labels">
+                                  ${(row.labels || []).map(
+                                    (label) =>
+                                      html`<sl-badge class="chip" pill
+                                        >${label}</sl-badge
+                                      >`
+                                  )}
+                                </div>
+                              </td>
+                              <td class="muted">
+                                ${row.registered_by_email || '-'}
+                              </td>
+                              <td>
+                                ${row.hostname || '-'}
+                                <div class="muted">
+                                  ${[row.os, row.arch].filter(Boolean).join('/')}
+                                </div>
+                              </td>
+                              <td>
+                                <sl-badge
+                                  class="chip"
+                                  pill
+                                  variant=${this.statusVariant(row.status)}
+                                >
+                                  ${this.statusLabel(row.status)}
+                                </sl-badge>
+                                ${
+                                  /*
+                                   * An ephemeral runner is only worth pointing
+                                   * out while it is here: the row vanishes with
+                                   * the CI job, so a reader seeing this badge
+                                   * knows not to expect it back.
+                                   */
+                                  row.ephemeral && this.isPresent(row.status)
+                                    ? html`<sl-badge
+                                        class="chip"
+                                        pill
+                                        variant="neutral"
+                                        title="One-shot CI runner. It unregisters when its job ends."
+                                        >ephemeral</sl-badge
+                                      >`
+                                    : nothing
+                                }
+                              </td>
+                              <td class="muted">
+                                ${
+                                  row.last_heartbeat
+                                    ? html`<span
+                                        title=${formatLocalDateTime(
+                                          row.last_heartbeat
+                                        )}
+                                        >${formatRelativeTime(
+                                          row.last_heartbeat
+                                        )}</span
+                                      >`
+                                    : '-'
+                                }
+                              </td>
+                              <td>${this.renderSlots(row)}</td>
+                              <td>
+                                ${
+                                  this.runningIdsOf(row).length === 0
+                                    ? html`<span class="muted">Idle</span>`
+                                    : html`<div class="executions">
+                                        ${this.runningIdsOf(row).map(
+                                          (executionId) =>
+                                            html`<a
+                                              href="/console/flows/executions/${executionId}"
+                                              >${executionId.slice(0, 8)}…</a
+                                            >`
+                                        )}
+                                      </div>`
+                                }
+                              </td>
+                              <td>${this.renderActions(row)}</td>
+                            </tr>
+                            ${this.renderActionNotice(row)}
+                          `
+                        )}
+                      </tbody>
+                    </table>
+                  </div>
                 `
       }
+      <capability-extension
+        name="runner-pools"
+        .context=${{ pools: this.poolNames().join(',') }}
+      ></capability-extension>
     `;
+  }
+
+  /** Pool names are runner labels; the same label on two runners is one pool. */
+  private poolNames(): string[] {
+    const names = new Set<string>();
+    for (const row of this.runners) {
+      for (const label of row.labels || []) names.add(label);
+    }
+    return [...names].sort();
   }
 }

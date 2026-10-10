@@ -8,7 +8,7 @@ import json
 import re
 from contextlib import closing
 from dataclasses import dataclass, field
-from typing import Any, NamedTuple
+from typing import Any, Mapping, NamedTuple
 from types import SimpleNamespace
 from copy import deepcopy
 from urllib.parse import quote
@@ -16,6 +16,7 @@ from urllib.parse import quote
 from preloop.models import models
 from preloop.models.crud import crud_tracker, crud_flow_feedback
 from preloop.models.crud.oauth_app_installation import crud_oauth_app_installation
+from preloop.services.managed_credentials import tracker_credential_source
 from preloop.sync.trackers import create_tracker_client
 from preloop.sync.exceptions import TrackerPermissionError, TrackerResponseError
 from sqlalchemy.orm import Session
@@ -36,6 +37,50 @@ PROVIDER_PAGE_SIZE = 100
 # A diagnostic read of a resource that is absent or not visible to this
 # installation is no evidence; every other status stays an error.
 MISSING_OR_DENIED = frozenset({403, 404})
+_BOT_LOGIN_SUFFIX = "[bot]"
+
+
+def _login_matches(token: str, login: str) -> bool:
+    """Match an app slug to its ``[bot]`` login without prefix matching.
+
+    ``preloop`` matches ``preloop`` and ``preloop[bot]``. It does not match
+    ``preloop-staging[bot]`` or a user named ``preloop-fan``.
+    """
+    if not token or not login:
+        return False
+    if token == login:
+        return True
+    if login.endswith(_BOT_LOGIN_SUFFIX) and token == login[: -len(_BOT_LOGIN_SUFFIX)]:
+        return True
+    if token.endswith(_BOT_LOGIN_SUFFIX) and login == token[: -len(_BOT_LOGIN_SUFFIX)]:
+        return True
+    return False
+
+
+def reviewer_is_trusted(policy: Mapping[str, Any], actor: Mapping[str, Any]) -> bool:
+    """Return whether a bot actor is an explicitly trusted reviewer.
+
+    Entries may be numeric provider actor ids, user/app names, or Bitbucket
+    account ids and user UUIDs (with or without braces). Humans are not
+    decided here; callers still accept a non-bot author with an empty list.
+    """
+    actor_id = str(actor.get("id") or "").strip().strip("{}").lower()
+    account_id = str(actor.get("account_id") or "").strip().lower()
+    login = str(actor.get("login") or actor.get("username") or "").strip().lower()
+    for raw in policy.get("trusted_reviewer_ids") or []:
+        token = str(raw).strip()
+        if not token:
+            continue
+        if token.isdigit():
+            if token == actor_id:
+                return True
+            continue
+        if _login_matches(token.lower(), login):
+            return True
+        normalized = token.lower().strip("{}")
+        if normalized and normalized in {actor_id, account_id}:
+            return True
+    return False
 
 
 @dataclass
@@ -401,6 +446,10 @@ def feedback_tracker_options(db: Session, tracker: Any) -> dict[str, Any]:
     """Materialize authoritative tracker authentication before network I/O."""
     options = deepcopy({"url": tracker.url, **(tracker.connection_details or {})})
     auth_type = getattr(tracker, "auth_type", None) or "api_token"
+    if tracker.tracker_type == "bitbucket":
+        # The row's auth_type is authoritative: provider metadata may record
+        # oauth_token for git-username purposes while the grant is managed.
+        options["auth_type"] = auth_type
     if tracker.tracker_type == "github":
         options["auth_type"] = auth_type
         options.pop("github_installation_id", None)
@@ -439,6 +488,9 @@ class FeedbackProvider:
             tracker.resolved_api_key,
             feedback_tracker_options(db, tracker),
         )
+        # Feedback reads happen long after launch; a managed grant resolves a
+        # fresh credential per request instead of reusing a launch token.
+        credential_source = tracker_credential_source(tracker)
         snapshot = SimpleNamespace(
             provider=thread.provider,
             repository_id=thread.repository_id,
@@ -446,7 +498,9 @@ class FeedbackProvider:
             policy=deepcopy(thread.policy),
         )
         crud_flow_feedback.release_read(db)
-        client = await create_tracker_client(*tracker_args)
+        client = await create_tracker_client(
+            *tracker_args, credential_source=credential_source
+        )
         if client is None:
             raise ValueError("feedback provider unavailable")
         return cls(client, snapshot)
@@ -456,12 +510,13 @@ class FeedbackProvider:
             return await self._github()
         if self.thread.provider == "gitlab":
             return await self._gitlab()
+        if self.thread.provider == "bitbucket":
+            return await self._bitbucket()
         raise ValueError("unsupported feedback provider")
 
     def _comments(
         self, items: list[dict[str, Any]], kind: str, sha: str
     ) -> list[dict[str, Any]]:
-        trusted = set(map(str, self.thread.policy.get("trusted_reviewer_ids", [])))
         self_ids = set(map(str, self.thread.policy.get("implementer_actor_ids", [])))
         results = []
         for item in items:
@@ -475,7 +530,7 @@ class FeedbackProvider:
                 continue
             if (
                 actor.get("type") == "Bot" or actor.get("bot")
-            ) and actor_id not in trusted:
+            ) and not reviewer_is_trusted(self.thread.policy, actor):
                 continue
             # No marker can authorize a bot. Trusted sender identity is required.
             results.append(receipt(kind, item, head_sha=sha))
@@ -571,7 +626,7 @@ class FeedbackProvider:
         )
         statuses = await request("GET", f"{repo}/commits/{sha}/status?per_page=100")
         reviews = await request("GET", f"{base}/reviews?per_page=100")
-        query = """query($id:ID!){node(id:$id){... on PullRequest{reviewThreads(first:100){pageInfo{hasNextPage} nodes{isResolved isOutdated comments(first:100){pageInfo{hasNextPage} nodes{databaseId body url createdAt updatedAt author{__typename ... on User{databaseId} ... on Bot{databaseId}}}}}}}}}"""
+        query = """query($id:ID!){node(id:$id){... on PullRequest{reviewThreads(first:100){pageInfo{hasNextPage} nodes{isResolved isOutdated comments(first:100){pageInfo{hasNextPage} nodes{databaseId body url createdAt updatedAt author{__typename ... on User{databaseId login} ... on Bot{databaseId login}}}}}}}}}"""
         graph = await request(
             "POST", "/graphql", {"query": query, "variables": {"id": pr["node_id"]}}
         )
@@ -597,6 +652,7 @@ class FeedbackProvider:
                         "updated_at": comment["updatedAt"],
                         "user": {
                             "id": actor.get("databaseId"),
+                            "login": actor.get("login"),
                             "type": actor.get("__typename"),
                         },
                     }
@@ -782,6 +838,157 @@ class FeedbackProvider:
         if current["sha"] != sha:
             return FeedbackState(
                 current["sha"],
+                closed=state.closed,
+                checks_pending=True,
+                blocked_reason="head_changed_during_reconciliation",
+            )
+        return state
+
+    @staticmethod
+    def _bitbucket_actor(user: dict[str, Any] | None) -> dict[str, Any]:
+        """Map a Bitbucket user onto the actor shape ``_comments`` filters."""
+        from preloop.utils.bitbucket import normalize_uuid
+
+        user = user or {}
+        return {
+            "id": normalize_uuid(user.get("uuid")),
+            "login": user.get("nickname") or user.get("display_name"),
+            "account_id": user.get("account_id"),
+        }
+
+    async def _bitbucket(self) -> FeedbackState:
+        """Reconcile a Bitbucket Cloud pull request.
+
+        Reviews are participant flips (approve, request changes), checks are
+        commit build statuses posted by external CI, and required checks come
+        from the thread policy only: Bitbucket branch restrictions have no
+        readable required-checks API shape shared with the other providers.
+        Approvals carry no commit binding on Bitbucket; a stale approval is
+        whatever the repository's reset-on-push setting left in place.
+        """
+        from preloop.utils.bitbucket import (
+            BUILD_STATUS_OUTCOMES,
+            looks_like_uuid,
+            normalize_uuid,
+            repository_api_path,
+        )
+
+        async def get(path: str, params: dict[str, Any] | None = None) -> Any:
+            response = await self.client._request("GET", path, params=params)
+            return response.json()
+
+        closed_states = {"MERGED", "DECLINED", "SUPERSEDED"}
+        repo = repository_api_path(self.thread.repository_id)
+        base = f"{repo}/pullrequests/{int(self.thread.pr_number)}"
+        pr = await get(base)
+        destination = (pr.get("destination") or {}).get("repository") or {}
+        expected = self.thread.repository_id.split("/", 1)[-1]
+        if looks_like_uuid(expected):
+            matches = normalize_uuid(destination.get("uuid")) == normalize_uuid(
+                expected
+            )
+        else:
+            matches = str(destination.get("full_name") or "") == str(
+                self.thread.repository_id
+            )
+        if not matches:
+            raise ValueError("provider repository identity mismatch")
+        sha = ((pr.get("source") or {}).get("commit") or {}).get("hash")
+        if not sha:
+            raise ValueError("provider head commit unavailable")
+        pr_url = ((pr.get("links") or {}).get("html") or {}).get("href")
+        state = FeedbackState(
+            sha, closed=str(pr.get("state") or "").upper() in closed_states
+        )
+        if state.closed:
+            return state
+        page = {"pagelen": PROVIDER_PAGE_SIZE}
+        statuses_data = await get(f"{repo}/commit/{sha}/statuses", params=page)
+        statuses = statuses_data.get("values") or []
+        checks = [
+            {
+                "id": item.get("uuid") or item.get("key"),
+                "name": str(item.get("key") or item.get("name") or ""),
+                "state": BUILD_STATUS_OUTCOMES.get(
+                    str(item.get("state") or "").upper()
+                ),
+                "updated_at": item.get("updated_on"),
+                "target_url": item.get("url"),
+            }
+            for item in statuses
+        ]
+        (
+            state.checks_pending,
+            state.checks_passed,
+            state.blocked_reason,
+            failed,
+            state.infra_failures,
+        ) = classify_checks(checks, self.thread.policy.get("required_checks", []))
+        comments_data = await get(f"{base}/comments", params=page)
+        raw_comments = comments_data.get("values") or []
+        inline: list[dict[str, Any]] = []
+        general: list[dict[str, Any]] = []
+        for comment in raw_comments:
+            if comment.get("deleted"):
+                continue
+            mapped = {
+                "id": comment.get("id"),
+                "body": (comment.get("content") or {}).get("raw") or "",
+                "html_url": ((comment.get("links") or {}).get("html") or {}).get(
+                    "href"
+                ),
+                "created_at": comment.get("created_on"),
+                "updated_at": comment.get("updated_on"),
+                "resolvable": bool(comment.get("inline")),
+                "resolved": bool(comment.get("resolution")),
+                "user": self._bitbucket_actor(comment.get("user")),
+            }
+            (inline if comment.get("inline") else general).append(mapped)
+        participants = pr.get("participants") or []
+        approved_by = {
+            normalize_uuid((item.get("user") or {}).get("uuid"))
+            for item in participants
+            if item.get("approved")
+        }
+        changes_requested = [
+            item
+            for item in participants
+            if str(item.get("state") or "").lower() == "changes_requested"
+        ]
+        state.reviews_passed = (
+            len(approved_by) >= int(self.thread.policy.get("required_approvals", 1))
+            and not changes_requested
+        )
+        reviews = [
+            {
+                "id": normalize_uuid((item.get("user") or {}).get("uuid")),
+                "state": "changes_requested",
+                "updated_at": item.get("participated_on"),
+                "body": "",
+                "html_url": pr_url,
+                "user": self._bitbucket_actor(item.get("user")),
+            }
+            for item in changes_requested
+        ]
+        if (
+            len(statuses) >= PROVIDER_PAGE_SIZE
+            or statuses_data.get("next")
+            or len(raw_comments) >= PROVIDER_PAGE_SIZE
+            or comments_data.get("next")
+        ):
+            state.blocked_reason = "provider_page_limit"
+        state.feedback = (
+            self._comments(inline, "inline_comment", sha)
+            + self._comments(general, "comment", sha)
+            + self._comments(reviews, "review", sha)
+        )
+        state.feedback += [receipt("ci", item, head_sha=sha) for item in failed]
+        current = await get(base)
+        state.closed = str(current.get("state") or "").upper() in closed_states
+        current_sha = ((current.get("source") or {}).get("commit") or {}).get("hash")
+        if current_sha != sha:
+            return FeedbackState(
+                str(current_sha or ""),
                 closed=state.closed,
                 checks_pending=True,
                 blocked_reason="head_changed_during_reconciliation",

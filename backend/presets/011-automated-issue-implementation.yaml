@@ -1,4 +1,5 @@
 slug: automated-issue-implementation
+supports_persistent: false
 name: Automated Issue Implementation
 description: >-
   Turn a tracker issue into a working change: read the issue, implement it,
@@ -11,7 +12,12 @@ trigger_event_source: null
 # comment_created is correlated in the trigger service to a pull request this
 # flow opened, so unrelated comments never start a cold run. Pair this with
 # trigger_config to decide which issues qualify, for example
-# {"labels": ["agent-ready"]}.
+# {"labels": ["agent-ready"]}. The Issue Triage Assistant can apply that label
+# itself when its agent_config.dispatch policy is met (see issue-triage.md).
+# To route by tag, add labels_all (the issue must carry every listed label):
+# {"labels": ["agent-ready"], "labels_all": ["complexity:low"]} on a flow with
+# a fast model, and a second copy with ["complexity:medium"] and a stronger
+# model. One agent-ready event then starts only the matching flow.
 trigger_event_types:
   - issue_labeled
   - comment_created
@@ -110,6 +116,12 @@ prompt_template: |
   CONTRIBUTING, any agent instructions file (AGENTS.md, CLAUDE.md), the
   test layout, and the code you are about to change.
 
+  Read by range, not by whole file. Your context is finite and reading a
+  large file end to end spends it on lines you will never touch. Locate
+  what you need with `grep -n` first, then read the region around the hit
+  with `sed -n '120,180p' path/to/file`. Read a whole file only when it is
+  genuinely small or you are about to rewrite it.
+
   Write a short plan for yourself, at most ten lines: the files you expect
   to touch, the tests you will add, and the acceptance criteria you are
   working to. Keep it proportional. A one-line fix does not need a design.
@@ -129,16 +141,26 @@ prompt_template: |
      tests by the directory or the file that covers your change. Never run
      a repository-wide suite: this container has a bounded memory limit and
      a whole-suite run is the usual way to exceed it, and CI runs the full
-     suite on the pull request anyway. When a broader run is genuinely
-     needed, run one top-level test directory at a time with `-x` and `-q`,
-     and stop at the first failure instead of starting the next directory.
+     suite on the pull request anyway. Before broadening coverage, read
+     the container's cgroup memory limit (memory.max on cgroup v2 or
+     memory.limit_in_bytes on v1). A broad category such as all backend
+     endpoint tests can also exceed that limit during collection. Run only
+     directly affected test files in small batches, each in a fresh process
+     with `-x` and `-q`. Do not use parallel test workers. Stop at the first
+     failure and address it before starting another batch. Leave full-suite
+     and broad category coverage to CI, and record that scope in the summary.
+     Run browser tests with `--concurrency 1`; do not launch checks in the
+     background or start a second check before the first process has exited.
      Never run the same suite again just to confirm a pass.
   4. If a check cannot run in this environment (a missing database, a
      missing network service, a missing secret), do not fake it. Record
      the exact command and the reason under "skipped" in your summary.
-  5. Commit locally with a message that says why, not only what. One
-     logical commit is usually enough; split it when the change has
-     genuinely separate parts.
+  5. Commit locally at each milestone, with a message that says why, not
+     only what. Do not save every commit for the end: a run that is cut
+     short keeps whatever is committed and loses the rest. Make the first
+     commit within 20 minutes of starting to edit, even if it is a work in
+     progress; WIP commits are fine and you can refine them later. Several
+     small commits are as acceptable as one logical commit.
 
   ═══════════════════════════════════════════════════════════
   PHASE 2R: RESUME (when Resume from is set)
@@ -159,6 +181,9 @@ prompt_template: |
      modules under the same memory limit as the first run. Repeat checks when
      code or inputs change, failures persist or evidence is inconclusive; do
      not rerun unrelated suites merely because another message arrived.
+     The first-run test scope and sequential-process rules apply here too:
+     directly affected files only, browser `--concurrency 1`, no background
+     checks, and no repository-wide or broad category suites. CI owns those.
      Required invariant checks and the trusted publication gate still apply.
   4. Commit locally. Do not create a new branch and do not open a second
      pull request.
@@ -277,6 +302,9 @@ agent_config:
     max_turns: 5
     max_age_hours: 168
     ci_deadline_seconds: 3600
+    # App slug. Matches the preloop[bot] GitHub App, not preloop-staging.
+    trusted_reviewer_ids:
+      - preloop
 allowed_mcp_servers: []
 # Read the issue and the pull request, report back, and ask the human only
 # when a critical decision is missing. Nothing here can push, merge, or

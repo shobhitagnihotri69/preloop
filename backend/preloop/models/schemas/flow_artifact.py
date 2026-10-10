@@ -16,6 +16,10 @@ class ArtifactReference(BaseModel):
     execution_id: UUID
     storage_kind: Literal["hosted", "runner_local"] = "hosted"
     manifest_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    # True when this PUT reused an artifact already stored for the same
+    # execution and thread: an unchanged workspace snapshot (#1339) or a
+    # byte-identical evidence pack (#1408).
+    deduplicated: bool = False
 
 
 class ArtifactManifest(BaseModel):

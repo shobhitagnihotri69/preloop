@@ -1212,6 +1212,31 @@ class TestPostWebhookNotification:
         assert set(actions) == {"review", "approve", "decline", "view"}
         assert len(set(actions.values())) == 1
 
+    async def test_post_webhook_carries_callable_decision_urls(
+        self,
+        monkeypatch,
+        approval_service,
+        sample_approval_request,
+        sample_approval_workflow,
+    ):
+        """A receiving system gets POST URLs it can call to decide (issue 1128)."""
+        from urllib.parse import urlsplit
+
+        sample_approval_workflow.approval_type = "webhook"
+        captured = self._queue(monkeypatch)
+
+        await approval_service.post_webhook_notification(
+            sample_approval_request, sample_approval_workflow
+        )
+
+        decision = captured["payload"]["decision"]
+        assert decision["method"] == "POST"
+        for key, route in (("approve_url", "approve"), ("decline_url", "decline")):
+            parts = urlsplit(decision[key])
+            # The token routes in public_approval.py, token in the query.
+            assert parts.path == f"/approval/{sample_approval_request.id}/{route}"
+            assert parts.query == f"token={sample_approval_request.approval_token}"
+
     async def test_post_webhook_with_agent_reasoning(
         self,
         monkeypatch,
@@ -1674,6 +1699,12 @@ class TestCreateAndNotify:
             ) as mock_create,
             patch.object(
                 approval_service,
+                "update_approval_request",
+                new_callable=AsyncMock,
+                return_value=mock_approval_request,
+            ),
+            patch.object(
+                approval_service,
                 "send_notifications",
                 new_callable=AsyncMock,
                 return_value={"email": {}, "slack": {"success": True}},
@@ -1763,6 +1794,175 @@ class TestCreateAndNotify:
             sync_db.close.assert_called_once()
 
     @patch("preloop.services.approval_service.get_task_publisher")
+    async def test_create_and_notify_stores_fallback_summary_when_model_fails(
+        self,
+        mock_get_publisher,
+        approval_service,
+        sample_approval_workflow,
+        mock_task_publisher,
+        caplog,
+    ):
+        """A failed model summary still stores the deterministic fallback.
+
+        Regression for #1282: identifier-only args plus a model that returns a
+        fragment used to leave ``summary`` null on the stored request while the
+        webhook showed the fallback text.
+        """
+        mock_get_publisher.return_value = mock_task_publisher
+
+        mock_approval_request = MagicMock(spec=ApprovalRequest)
+        mock_approval_request.id = uuid.uuid4()
+        mock_approval_request.summary = None
+        mock_approval_request.requested_at = datetime.utcnow()
+        mock_approval_request.tool_args = {"owner": "did:web:example:u:abc"}
+
+        updated_request = MagicMock(spec=ApprovalRequest)
+        updated_request.id = mock_approval_request.id
+        updated_request.summary = (
+            "Allow get_weekly_summary with owner=did:web:example:u:abc?"
+        )
+
+        sync_db = MagicMock()
+
+        with (
+            patch.object(
+                approval_service,
+                "create_approval_request",
+                new_callable=AsyncMock,
+                return_value=mock_approval_request,
+            ),
+            patch.object(
+                approval_service,
+                "update_approval_request",
+                new_callable=AsyncMock,
+                return_value=updated_request,
+            ) as mock_update,
+            patch.object(
+                approval_service,
+                "send_notifications",
+                new_callable=AsyncMock,
+                return_value={},
+            ),
+            patch(
+                "preloop.models.db.session.get_session_factory",
+                return_value=MagicMock(return_value=sync_db),
+            ),
+            patch(
+                "preloop.services.approval_summary.generate_approval_summary",
+                new_callable=AsyncMock,
+                return_value=None,
+            ) as mock_generate,
+        ):
+            result = await approval_service.create_and_notify(
+                account_id="test_account",
+                tool_configuration_id=uuid.uuid4(),
+                approval_workflow=sample_approval_workflow,
+                tool_name="get_weekly_summary",
+                tool_args={"owner": "did:web:example:u:abc"},
+                managed_agent_name="coder",
+            )
+
+            assert result is updated_request
+            mock_generate.assert_awaited_once()
+            mock_update.assert_awaited_once()
+            update_arg = mock_update.await_args.args[1]
+            assert isinstance(update_arg, ApprovalRequestUpdate)
+            assert update_arg.summary == (
+                "Allow get_weekly_summary with owner=did:web:example:u:abc?"
+            )
+            sync_db.close.assert_called_once()
+            assert any(
+                record.levelname == "WARNING"
+                and "storing deterministic fallback" in record.getMessage()
+                for record in caplog.records
+            )
+
+    @patch("preloop.services.approval_service.get_task_publisher")
+    async def test_create_and_notify_persists_fallback_when_summary_raises(
+        self,
+        mock_get_publisher,
+        approval_service,
+        sample_approval_workflow,
+        mock_task_publisher,
+        caplog,
+    ):
+        """A raising summary pipeline still persists the deterministic fallback.
+
+        Regression for #1282: an exception from ``generate_approval_summary``
+        (or from opening/closing the sync session) used to skip the update and
+        leave the created request's ``summary`` null. The fallback is now put
+        in place before the model path and persisted regardless.
+        """
+        mock_get_publisher.return_value = mock_task_publisher
+
+        mock_approval_request = MagicMock(spec=ApprovalRequest)
+        mock_approval_request.id = uuid.uuid4()
+        mock_approval_request.summary = None
+        mock_approval_request.requested_at = datetime.utcnow()
+        mock_approval_request.tool_args = {"owner": "did:web:example:u:abc"}
+
+        updated_request = MagicMock(spec=ApprovalRequest)
+        updated_request.id = mock_approval_request.id
+        updated_request.summary = (
+            "Allow get_weekly_summary with owner=did:web:example:u:abc?"
+        )
+
+        sync_db = MagicMock()
+
+        with (
+            patch.object(
+                approval_service,
+                "create_approval_request",
+                new_callable=AsyncMock,
+                return_value=mock_approval_request,
+            ),
+            patch.object(
+                approval_service,
+                "update_approval_request",
+                new_callable=AsyncMock,
+                return_value=updated_request,
+            ) as mock_update,
+            patch.object(
+                approval_service,
+                "send_notifications",
+                new_callable=AsyncMock,
+                return_value={},
+            ),
+            patch(
+                "preloop.models.db.session.get_session_factory",
+                return_value=MagicMock(return_value=sync_db),
+            ),
+            patch(
+                "preloop.services.approval_summary.generate_approval_summary",
+                new_callable=AsyncMock,
+                side_effect=RuntimeError("model backend unavailable"),
+            ) as mock_generate,
+        ):
+            result = await approval_service.create_and_notify(
+                account_id="test_account",
+                tool_configuration_id=uuid.uuid4(),
+                approval_workflow=sample_approval_workflow,
+                tool_name="get_weekly_summary",
+                tool_args={"owner": "did:web:example:u:abc"},
+                managed_agent_name="coder",
+            )
+
+            assert result is updated_request
+            mock_generate.assert_awaited_once()
+            mock_update.assert_awaited_once()
+            update_arg = mock_update.await_args.args[1]
+            assert isinstance(update_arg, ApprovalRequestUpdate)
+            assert update_arg.summary == (
+                "Allow get_weekly_summary with owner=did:web:example:u:abc?"
+            )
+            sync_db.close.assert_called_once()
+            assert any(
+                record.levelname == "WARNING"
+                and "storing deterministic fallback" in record.getMessage()
+                for record in caplog.records
+            )
+
+    @patch("preloop.services.approval_service.get_task_publisher")
     async def test_create_and_notify_with_execution_id(
         self,
         mock_get_publisher,
@@ -1780,6 +1980,12 @@ class TestCreateAndNotify:
             patch.object(
                 approval_service,
                 "create_approval_request",
+                new_callable=AsyncMock,
+                return_value=mock_approval_request,
+            ),
+            patch.object(
+                approval_service,
+                "update_approval_request",
                 new_callable=AsyncMock,
                 return_value=mock_approval_request,
             ),
@@ -1860,6 +2066,12 @@ class TestCreateAndNotify:
             patch.object(
                 approval_service,
                 "create_approval_request",
+                new_callable=AsyncMock,
+                return_value=mock_request,
+            ),
+            patch.object(
+                approval_service,
+                "update_approval_request",
                 new_callable=AsyncMock,
                 return_value=mock_request,
             ),
@@ -3003,6 +3215,12 @@ class TestAIDrivenApprovalFlow:
             patch.object(
                 approval_service,
                 "create_approval_request",
+                new_callable=AsyncMock,
+                return_value=mock_request,
+            ),
+            patch.object(
+                approval_service,
+                "update_approval_request",
                 new_callable=AsyncMock,
                 return_value=mock_request,
             ),

@@ -17,6 +17,7 @@ from preloop.models.crud.user import crud_user
 from preloop.models.models.flow import Flow
 from preloop.models.models.flow_runner import FlowRunner
 from preloop.services.host_exec import (
+    HOST_EXEC_AGENT_TYPE,
     host_exec_profile_name,
     runner_has_host_exec_profile,
 )
@@ -325,12 +326,19 @@ def workspace_owner_runner_id(
     from preloop.models.crud import crud_flow_execution
 
     resume_from = payload.get("resume_from")
+    host_resume = payload.get("host_exec_resume")
+    if isinstance(host_resume, dict):
+        # A Copilot continuation resumes a session that exists only on the
+        # originating runner (#1069): always pinned.
+        resume_from = host_resume.get("execution_id")
     if not isinstance(resume_from, str) or not resume_from.strip():
         return None
     config = unwrap_agent_config(payload.get("agent_config"))
     runner_config = config.get("runner") if isinstance(config, dict) else None
-    if not isinstance(runner_config, dict) or not _truthy(
-        runner_config.get("persist_workspace")
+    host_bound = isinstance(host_resume, dict) or bool(host_exec_profile_name(config))
+    if not host_bound and (
+        not isinstance(runner_config, dict)
+        or not _truthy(runner_config.get("persist_workspace"))
     ):
         return None
     try:
@@ -377,6 +385,49 @@ def runner_blocked_notice(runner: Optional[FlowRunner], execution_id: Any) -> st
     )
 
 
+def _runner_may_accept(
+    db: Session,
+    *,
+    account_id: UUID,
+    runner: FlowRunner,
+    pool: str,
+    execution_id: UUID,
+    flow_id: Optional[str] = None,
+) -> bool:
+    """Whether the account authorizer (hook H4) lets ``runner`` take the job.
+
+    Asked with the ``runner:accept`` action before a slot is claimed, so a
+    denied runner is skipped without a claim to roll back. True when no
+    authorizer is registered.
+    """
+    from preloop.plugins.account_hooks import (
+        ACTION_RUNNER_ACCEPT,
+        AuthorizationContext,
+        authorize,
+        get_authorizer,
+    )
+
+    if get_authorizer() is None:
+        return True
+    if flow_id is None:
+        from preloop.models.crud import crud_flow_execution
+
+        execution = crud_flow_execution.get(
+            db, id=str(execution_id), account_id=account_id
+        )
+        flow_id = str(execution.flow_id) if execution else None
+    ctx = AuthorizationContext(
+        account_id=account_id,
+        db=db,
+        attributes={
+            "pool": pool,
+            "execution_id": str(execution_id),
+            "flow_id": flow_id,
+        },
+    )
+    return authorize(ctx, ACTION_RUNNER_ACCEPT, runner).allowed
+
+
 def lease_job(
     db: Session,
     *,
@@ -419,9 +470,25 @@ def lease_job(
     ]
     required_profile = host_exec_profile_name(payload)
     stored = persistable_job_payload(payload)
+    execution = crud_flow_execution.get(db, id=str(execution_id), account_id=account_id)
+    flow_id = str(execution.flow_id) if execution else None
     for candidate in available:
+        if not _runner_may_accept(
+            db,
+            account_id=account_id,
+            runner=candidate,
+            pool=pool,
+            execution_id=execution_id,
+            flow_id=flow_id,
+        ):
+            continue
         if required_profile and not runner_has_host_exec_profile(
-            candidate, required_profile, payload.get("model_identifier")
+            candidate,
+            required_profile,
+            payload.get("model_identifier"),
+            payload.get("agent_type") or HOST_EXEC_AGENT_TYPE,
+            require_publication=bool(payload.get("host_exec_publication")),
+            require_continuation=bool(payload.get("host_exec_resume")),
         ):
             continue
         runner = crud_flow_runner.claim_free_slot(db, runner_id=candidate.id)
@@ -530,5 +597,20 @@ def emit_runner_updated(runner: FlowRunner, db: Optional[Session] = None) -> Non
             event_type="runner_updated",
             runner_id=str(runner.id),
             payload=runner_console_payload(runner, registered_by_email=email),
+        )
+    )
+
+
+def emit_runner_deleted(account_id: Any, runner_id: Any) -> None:
+    """Tell console websockets subscribed to ``runners`` that a row is gone."""
+    if not account_id or not runner_id:
+        return
+    emit_account_event(
+        build_account_event(
+            account_id=str(account_id),
+            topic=ACCOUNT_TOPIC_RUNNERS,
+            event_type="runner_deleted",
+            runner_id=str(runner_id),
+            payload={"id": str(runner_id)},
         )
     )

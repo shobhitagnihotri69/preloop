@@ -172,6 +172,38 @@ def test_expire_stale_pending_marks_expired(crud_approval_request, mock_db_sessi
     mock_db_session.commit.assert_called_once()
 
 
+def test_expire_stale_pending_strips_sealed_originals(
+    crud_approval_request, mock_db_session
+):
+    """Bulk expiry removes the sealed original, same as a single decision."""
+    from preloop.services.sensitive_data.reference import SEALED_ARGS_KEY
+
+    now = datetime.utcnow()
+    account_id = str(uuid4())
+    row = MagicMock()
+    row.tool_args = {"note": "kept", SEALED_ARGS_KEY: "ciphertext"}
+    account_query = MagicMock()
+    account_query.filter.return_value = account_query
+    account_query.all.return_value = [(account_id,)]
+    row_query = MagicMock()
+    row_query.filter.return_value = row_query
+    row_query.all.return_value = [row]
+    row_query.update.return_value = 1
+
+    def query_side_effect(target):
+        if target is ApprovalRequest.account_id:
+            return account_query
+        return row_query
+
+    mock_db_session.query.side_effect = query_side_effect
+    result = crud_approval_request.expire_stale_pending(
+        mock_db_session, account_id=account_id, now=now
+    )
+    assert result == 1
+    assert SEALED_ARGS_KEY not in row.tool_args
+    assert row.tool_args["note"] == "kept"
+
+
 def test_get_multi_by_account_pending_does_not_expire_stale_rows(
     crud_approval_request, mock_db_session
 ):
@@ -229,3 +261,68 @@ def test_get_multi_by_account_approved_does_not_expire_stale_rows(
 
     assert result == []
     expire_stale.assert_not_called()
+
+
+def test_session_scoping_combines_account_execution_status_and_paging(
+    db_session: Session,
+) -> None:
+    """Sessions on a shared agent still require exact account/session matching."""
+    from preloop.models import models
+    from preloop.models.crud import crud_approval_request
+
+    account = models.Account(organization_name="Example account")
+    other = models.Account(organization_name="Other example account")
+    db_session.add_all([account, other])
+    db_session.flush()
+    session_a, session_b = uuid4(), uuid4()
+    expected = None
+    for owner, session_id, status in [
+        (account, session_a, "pending"),
+        (account, session_b, "pending"),
+        (other, session_a, "pending"),
+        (account, session_a, "approved"),
+    ]:
+        workflow = models.ApprovalWorkflow(
+            account_id=owner.id, name=f"Example {uuid4()}", workflow_type="simple"
+        )
+        tool = models.ToolConfiguration(
+            account_id=owner.id, tool_name="terminal", tool_source="builtin"
+        )
+        db_session.add_all([workflow, tool])
+        db_session.flush()
+        row = models.ApprovalRequest(
+            account_id=owner.id,
+            runtime_session_id=session_id,
+            execution_id="execution-example",
+            tool_configuration_id=tool.id,
+            approval_workflow_id=workflow.id,
+            tool_name="terminal",
+            tool_args={},
+            status=status,
+        )
+        db_session.add(row)
+        db_session.flush()
+        if owner is account and session_id == session_a and status == "pending":
+            expected = row.id
+    rows = crud_approval_request.get_multi_by_account(
+        db_session,
+        account_id=str(account.id),
+        runtime_session_id=str(session_a),
+        execution_id="execution-example",
+        status="pending",
+        limit=1,
+        skip=0,
+    )
+    assert [row.id for row in rows] == [expected]
+    assert (
+        crud_approval_request.get_multi_by_account(
+            db_session,
+            account_id=str(account.id),
+            runtime_session_id=str(session_a),
+            execution_id="execution-example",
+            status="pending",
+            limit=1,
+            skip=1,
+        )
+        == []
+    )

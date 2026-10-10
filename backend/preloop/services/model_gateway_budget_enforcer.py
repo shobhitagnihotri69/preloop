@@ -25,7 +25,7 @@ deliberately not part of this change.
 
 import logging
 import uuid
-from typing import Any, Dict, Optional, List, Tuple
+from typing import Any, Dict, Optional, List, Set, Tuple
 from datetime import datetime, timezone
 
 from sqlalchemy.orm import Session
@@ -33,13 +33,22 @@ from sqlalchemy.orm import Session
 from preloop.models import models
 from preloop.services.model_runtime_resolver import resolve_ai_model_runtime
 from preloop.services.model_gateway_auth import ModelGatewayAuthContext
-from preloop.services.model_gateway_errors import ModelGatewayAPIError
+from preloop.services.model_gateway_denials import (
+    BUDGET_LIMIT_EXCEEDED_CODE,
+    budget_denial_error,
+)
 from preloop.services.model_gateway_budget import ModelGatewayBudgetService
+from preloop.services.gateway_upstream_identity import (
+    BUDGET_SUBJECT_GATEWAY_SUBJECT,
+    per_subject_budget,
+)
 from preloop.models.crud import crud_managed_agent
+from preloop.plugins.account_hooks import get_budget_extension
 from preloop.models.crud.budget import (
     ACCOUNT_LEVEL_SUBJECT_TYPES,
     crud_budget_policy,
     crud_budget_spend,
+    get_period_end,
     get_period_start,
     spend_bucket_for_policy,
 )
@@ -146,6 +155,99 @@ def _resolve_owner_user_id(
         return None
 
 
+def _api_key_owner_user_id(
+    auth_context: ModelGatewayAuthContext,
+    managed_agent_id: Optional[uuid.UUID],
+) -> Optional[uuid.UUID]:
+    """Owner of the calling API key, for per-user budgets.
+
+    Agent traffic counts against the agent's owner instead, so a key that
+    resolves to a managed agent contributes no key owner. This mirrors the
+    ``user`` spend scope recorded by ``crud_api_usage.log_gateway_request``.
+    """
+    api_key = auth_context.api_key
+    if api_key is None or managed_agent_id is not None:
+        return None
+    gateway_subject = getattr(auth_context, "gateway_subject", None)
+    if gateway_subject is not None:
+        # Traffic a trusted upstream gateway names belongs to that developer,
+        # never to the admin who owns the gateway's key: only the member the
+        # subject's email linked to (if any) has user budgets that apply.
+        return gateway_subject.linked_user_id
+    owner_id = getattr(api_key, "user_id", None)
+    if owner_id is None:
+        return None
+    try:
+        return owner_id if isinstance(owner_id, uuid.UUID) else uuid.UUID(str(owner_id))
+    except (TypeError, ValueError):
+        return None
+
+
+def _per_subject_default_policy(
+    auth_context: ModelGatewayAuthContext,
+    gateway_subject_id: uuid.UUID,
+    candidates: List[models.BudgetPolicy],
+) -> Optional[models.BudgetPolicy]:
+    """Transient policy for the upstream key's per-subject default budget.
+
+    ``ApiKey.context_data["per_subject_budget"]`` gives every developer behind
+    a trusted upstream key the same limit unless an explicit
+    ``gateway_subject`` policy names that developer. The policy is never
+    persisted; it reads and records the subject's own spend bucket.
+    """
+    config = per_subject_budget(auth_context.api_key)
+    if config is None:
+        return None
+    if any(
+        policy.subject_type == BUDGET_SUBJECT_GATEWAY_SUBJECT
+        and policy.subject_id == gateway_subject_id
+        for policy in candidates
+    ):
+        return None
+    try:
+        period = models.BudgetPeriod(config["period"])
+    except ValueError:
+        logger.warning(
+            "Ignoring per_subject_budget with unknown period on api key %s",
+            getattr(auth_context.api_key, "id", None),
+        )
+        return None
+    return models.BudgetPolicy(
+        id=uuid.uuid5(gateway_subject_id, f"per_subject_budget:{period.value}"),
+        account_id=auth_context.account_id,
+        subject_type=BUDGET_SUBJECT_GATEWAY_SUBJECT,
+        subject_id=gateway_subject_id,
+        model_alias=config["model_alias"],
+        period=period,
+        hard_limit_usd=config["hard_limit_usd"],
+        soft_limit_usd=config["soft_limit_usd"],
+        notify_on_soft=False,
+        notify_on_hard=False,
+    )
+
+
+def budget_user_ids(
+    db: Session,
+    auth_context: ModelGatewayAuthContext,
+) -> Set[uuid.UUID]:
+    """Users whose ``user`` budgets a gateway request counts against.
+
+    The owner of the managed agent making the call, otherwise the owner of
+    the calling API key. Plugins that budget groups of users (for example
+    teams) resolve the same users.
+    """
+    managed_agent_id = _resolve_managed_agent_id(db, auth_context)
+    users = {
+        user_id
+        for user_id in (
+            _resolve_owner_user_id(db, auth_context.account_id, managed_agent_id),
+            _api_key_owner_user_id(auth_context, managed_agent_id),
+        )
+        if user_id is not None
+    }
+    return users
+
+
 def _policy_lookup_subjects(
     auth_context: ModelGatewayAuthContext,
     managed_agent_id: Optional[uuid.UUID],
@@ -176,7 +278,7 @@ class ModelGatewayBudgetEnforcer:
         ai_model: models.AIModel,
         payload: Dict[str, Any],
     ) -> Optional[str]:
-        """Check budgets and raise 403 if a priced hard limit is exceeded.
+        """Check budgets and raise 429 if a priced hard limit is exceeded.
 
         Args:
             db: Database session.
@@ -190,7 +292,7 @@ class ModelGatewayBudgetEnforcer:
             price), or ``None`` when every applicable budget was evaluated.
 
         Raises:
-            ModelGatewayAPIError: 403 when a priced request would cross a
+            BudgetDenialError: 429 when a priced request would cross a
                 configured hard limit.
         """
         # 1. Estimate cost
@@ -209,7 +311,7 @@ class ModelGatewayBudgetEnforcer:
             )
 
         now = datetime.now(timezone.utc)
-        account_id = auth_context.user.account_id
+        account_id = auth_context.account_id
 
         model_alias = resolve_ai_model_runtime(
             ai_model
@@ -219,13 +321,40 @@ class ModelGatewayBudgetEnforcer:
 
         # Read candidate policies before resolving optional attribution. Accounts
         # without policies pay one indexed policy query and no agent/owner reads.
+        gateway_subject = getattr(auth_context, "gateway_subject", None)
         candidates = crud_budget_policy.get_gateway_policies(
             db,
             account_id=account_id,
             ai_model_id=ai_model.id,
             model_alias=model_alias,
             api_key_id=auth_context.api_key.id if auth_context.api_key else None,
+            gateway_subject_id=(
+                gateway_subject.id if gateway_subject is not None else None
+            ),
         )
+        if gateway_subject is not None:
+            default_policy = _per_subject_default_policy(
+                auth_context, gateway_subject.id, candidates
+            )
+            if default_policy is not None:
+                candidates = list(candidates) + [default_policy]
+        # Policies of other accounts that also cover this request, such as an
+        # ancestor's (account hook H5). Their spend lives under their own
+        # account, so each is read from ``policy.account_id`` below.
+        extension = get_budget_extension()
+        if extension is not None:
+            extra = list(
+                extension.extra_policies(
+                    db,
+                    account_id=account_id,
+                    auth_context=auth_context,
+                    ai_model=ai_model,
+                    model_alias=model_alias,
+                )
+                or []
+            )
+            if extra:
+                candidates = list(candidates) + extra
         if not candidates:
             return None
         subject_types = {policy.subject_type for policy in candidates}
@@ -239,6 +368,20 @@ class ModelGatewayBudgetEnforcer:
             if "user" in subject_types
             else None
         )
+        # A per-user budget covers the agents the user owns and the API keys
+        # the user owns (the same users the spend is recorded against).
+        budget_users = (
+            {
+                user_id
+                for user_id in (
+                    owner_user_id,
+                    _api_key_owner_user_id(auth_context, managed_agent_id),
+                )
+                if user_id is not None
+            }
+            if "user" in subject_types
+            else set()
+        )
         policies_by_id = {
             policy.id: policy
             for policy in candidates
@@ -249,9 +392,13 @@ class ModelGatewayBudgetEnforcer:
                     and policy.subject_id == managed_agent_id
                 )
             )
+            and (policy.subject_type != "user" or policy.subject_id in budget_users)
             and (
-                policy.subject_type != "user"
-                or (owner_user_id is not None and policy.subject_id == owner_user_id)
+                policy.subject_type != BUDGET_SUBJECT_GATEWAY_SUBJECT
+                or (
+                    gateway_subject is not None
+                    and policy.subject_id == gateway_subject.id
+                )
             )
         }
 
@@ -280,6 +427,9 @@ class ModelGatewayBudgetEnforcer:
                 Optional[datetime],
             ]
         ] = set()
+        # Buckets of other accounts' policies (hook H5), keyed by that account.
+        foreign_buckets: Dict[str, List[Any]] = {}
+        own_account = str(account_id)
 
         unenforceable_hard_limit = False
         for policy in policies_by_id.values():
@@ -311,6 +461,12 @@ class ModelGatewayBudgetEnforcer:
                 policy.period,
                 p_start,
             )
+            policy_account = str(policy.account_id or account_id)
+            if policy_account != own_account:
+                evaluations.append((policy, p_start, (policy_account, bucket_key)))
+                if bucket_key not in foreign_buckets.setdefault(policy_account, []):
+                    foreign_buckets[policy_account].append(bucket_key)
+                continue
             evaluations.append((policy, p_start, bucket_key))
             if bucket_key not in seen_buckets:
                 seen_buckets.add(bucket_key)
@@ -332,20 +488,17 @@ class ModelGatewayBudgetEnforcer:
             )
             return unpriced_budget_warning(model_alias)
 
-        spend_map: Dict[
-            Tuple[
-                str,
-                Optional[uuid.UUID],
-                Optional[str],
-                models.BudgetPeriod,
-                Optional[datetime],
-            ],
-            float,
-        ] = {}
+        spend_map: Dict[Any, float] = {}
         if buckets_to_fetch:
             spend_map = crud_budget_spend.get_spend_multi(
                 db=db, account_id=account_id, buckets=buckets_to_fetch
             )
+        for foreign_account, foreign in foreign_buckets.items():
+            foreign_spend = crud_budget_spend.get_spend_multi(
+                db=db, account_id=foreign_account, buckets=foreign
+            )
+            for foreign_key, amount in foreign_spend.items():
+                spend_map[(foreign_account, foreign_key)] = amount
 
         for policy, _p_start, bucket_key in evaluations:
             current_spend = spend_map.get(bucket_key, 0.0)
@@ -388,17 +541,22 @@ class ModelGatewayBudgetEnforcer:
                         current_spend_usd=projected_spend,
                     )
 
-                raise ModelGatewayAPIError(
-                    provider=provider,
-                    status_code=403,
-                    message=(
+                period_end = get_period_end(now, policy.period)
+                raise budget_denial_error(
+                    provider,
+                    BUDGET_LIMIT_EXCEEDED_CODE,
+                    (
                         "Model gateway budget exceeded: "
                         f"{display_subject_type} {policy.period.name} hard limit "
                         f"of ${policy.hard_limit_usd:.2f} reached "
                         f"(current spend ${current_spend:.2f}, "
                         f"projected ${projected_spend:.2f})"
                     ),
-                    code="budget_limit_exceeded",
+                    (
+                        max(1, int((period_end - now).total_seconds()))
+                        if period_end is not None
+                        else None
+                    ),
                 )
 
         return None

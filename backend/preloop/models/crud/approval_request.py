@@ -63,6 +63,23 @@ class CRUDApprovalRequest(CRUDBase[ApprovalRequest]):
                 pending = pending.filter(
                     self.model.expires_at < halted.activated_at.replace(tzinfo=None)
                 )
+            # The sealed original is deleted on every terminal status,
+            # including this bulk expiry. update_approval_request does the
+            # same for a single row; a query.update() would leave the
+            # ciphertext on the expired row.
+            from sqlalchemy.orm.attributes import flag_modified
+
+            from preloop.services.sensitive_data.reference import (
+                strip_sealed_original,
+            )
+
+            for row in pending.all():
+                cleaned, removed = strip_sealed_original(
+                    getattr(row, "tool_args", None)
+                )
+                if removed:
+                    row.tool_args = cleaned
+                    flag_modified(row, "tool_args")
             expired += pending.update(
                 {"status": "expired", "resolved_at": now},
                 synchronize_session="fetch",
@@ -173,10 +190,18 @@ class CRUDApprovalRequest(CRUDBase[ApprovalRequest]):
         account_id: str,
         execution_id: Optional[str] = None,
         status: Optional[str] = None,
+        runtime_session_id: Optional[Union[UUID, str]] = None,
         skip: int = 0,
         limit: int = 100,
     ) -> list[ApprovalRequest]:
         """Get approval requests for an account with optional filters.
+
+        ``runtime_session_id`` narrows to one agent conversation, which is what
+        a live session view needs: without it the only way to answer "what is
+        THIS session waiting on" is to page the whole account and filter in
+        the browser. It is ANDed with ``account_id`` (never replacing it), so
+        naming another account's session returns nothing rather than that
+        account's approvals.
 
         Expiry is handled by explicit sweep callers via ``expire_stale_pending``;
         keeping this method read-only avoids hidden UPDATE+COMMIT work on list
@@ -187,15 +212,64 @@ class CRUDApprovalRequest(CRUDBase[ApprovalRequest]):
         if execution_id:
             query = query.filter(self.model.execution_id == execution_id)
 
+        if runtime_session_id:
+            query = query.filter(
+                self.model.runtime_session_id == str(runtime_session_id)
+            )
+
         if status:
             query = query.filter(self.model.status == status)
 
         return (
-            query.order_by(self.model.requested_at.desc())
+            query.order_by(self.model.requested_at.desc(), self.model.id.desc())
             .offset(skip)
             .limit(limit)
             .all()
         )
+
+    #: Written on requests cancelled because the execution that asked can
+    #: no longer receive an answer.
+    EXECUTION_ENDED_CANCEL_REASON = (
+        "Cancelled because the execution ended before the approval was answered."
+    )
+
+    def cancel_pending_for_execution(
+        self,
+        db: Session,
+        *,
+        execution_id: str,
+        reason: str = EXECUTION_ENDED_CANCEL_REASON,
+        commit: bool = True,
+    ) -> int:
+        """Cancel pending requests whose execution can no longer be resumed.
+
+        A terminal run (failed, cancelled, timed out) must not leave a
+        question on the console that a human can answer into nothing. Only
+        ``pending`` rows for this execution change. Already decided requests
+        stay as they are.
+
+        Returns:
+            How many requests were cancelled.
+        """
+        now = datetime.utcnow()
+        cancelled = (
+            db.query(self.model)
+            .filter(
+                self.model.execution_id == str(execution_id),
+                self.model.status == "pending",
+            )
+            .update(
+                {
+                    "status": "cancelled",
+                    "resolved_at": now,
+                    "approver_comment": reason,
+                },
+                synchronize_session="fetch",
+            )
+        )
+        if commit:
+            db.commit()
+        return int(cancelled)
 
 
 # Create instance

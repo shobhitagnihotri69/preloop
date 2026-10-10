@@ -60,6 +60,38 @@ class TestSendEmail:
     @patch("preloop.utils.email.smtplib.SMTP")
     @patch("preloop.utils.email.SMTP_USERNAME", "test@example.com")
     @patch("preloop.utils.email.SMTP_PASSWORD", "password")
+    def test_success_log_omits_the_subject(self, mock_smtp):
+        """The sent-path log names the recipient but not the subject.
+
+        Regression for py/clear-text-logging-sensitive-data: the failure-alert
+        flow passes a subject built from the flow name, and static analysis
+        treats any subject that reaches the shared transport as a secret.
+        """
+        mock_server = MagicMock()
+        mock_smtp.return_value.__enter__.return_value = mock_server
+        handler = _CapturingHandler()
+        email_logger = logging.getLogger("preloop.utils.email")
+        previous_level = email_logger.level
+        email_logger.addHandler(handler)
+        email_logger.setLevel(logging.DEBUG)
+        try:
+            send_email(
+                to_email="recipient@example.com",
+                subject="SUBJECT-SENTINEL-should-not-be-logged",
+                body_text="Test body",
+            )
+        finally:
+            email_logger.removeHandler(handler)
+            email_logger.setLevel(previous_level)
+
+        assert handler.messages, "no log records captured; assertion would be vacuous"
+        combined = "\n".join(handler.messages)
+        assert "recipient@example.com" in combined
+        assert "SUBJECT-SENTINEL-should-not-be-logged" not in combined
+
+    @patch("preloop.utils.email.smtplib.SMTP")
+    @patch("preloop.utils.email.SMTP_USERNAME", "test@example.com")
+    @patch("preloop.utils.email.SMTP_PASSWORD", "password")
     def test_send_email_with_html(self, mock_smtp):
         """Test sending email with both text and HTML bodies."""
         mock_server = MagicMock()
@@ -608,8 +640,13 @@ class TestUnconfiguredSmtpDoesNotLogSecrets:
 
     @patch("preloop.utils.email.SMTP_USERNAME", "")
     @patch("preloop.utils.email.SMTP_PASSWORD", "")
-    def test_body_text_is_not_logged_but_send_is_reported(self):
-        """The body is suppressed while the operator-facing signal survives."""
+    def test_body_and_subject_are_not_logged_but_send_is_reported(self):
+        """Neither body nor subject is logged; the recipient still is.
+
+        The subject carries caller-supplied text (a flow or tool name), so the
+        shared transport must not echo it: covering both keeps
+        py/clear-text-logging-sensitive-data closed for the failure-alert flow.
+        """
         handler = _CapturingHandler()
         email_logger = logging.getLogger("preloop.utils.email")
         previous_level = email_logger.level
@@ -618,7 +655,7 @@ class TestUnconfiguredSmtpDoesNotLogSecrets:
         try:
             send_email(
                 to_email="recipient@example.com",
-                subject="Test Subject",
+                subject="SUBJECT-SENTINEL-should-not-be-logged",
                 body_text="BODY-SENTINEL-should-not-be-logged",
             )
         finally:
@@ -628,9 +665,9 @@ class TestUnconfiguredSmtpDoesNotLogSecrets:
         assert handler.messages, "no log records captured; assertion would be vacuous"
         combined = "\n".join(handler.messages)
         assert "BODY-SENTINEL-should-not-be-logged" not in combined
+        assert "SUBJECT-SENTINEL-should-not-be-logged" not in combined
         # The operator still learns that an email would have been sent.
         assert "recipient@example.com" in combined
-        assert "Test Subject" in combined
 
 
 class TestSendApprovalRequestEmail:
@@ -662,6 +699,28 @@ class TestSendApprovalRequestEmail:
         assert "Claude Code (laptop)" in body_html
         # The generic line is replaced, not added to.
         assert "An AI agent is requesting" not in body_text
+
+    @pytest.mark.asyncio
+    @patch("preloop.utils.email.send_email")
+    async def test_hides_preloop_markers_from_the_arguments_block(
+        self, mock_send_email
+    ):
+        """Trusted markers stay on the stored approval and leave the email."""
+        await send_approval_request_email(
+            user_email="approver@example.com",
+            tool_name="Bash",
+            tool_args={
+                "command": "git status",
+                "_preloop_source": "cursor",
+                "_preloop_repository": {"remote": "github.com/example/repo"},
+            },
+            approval_url="https://app.test.com/console/approval/1",
+        )
+
+        _to, _subject, body_text, body_html = mock_send_email.call_args[0]
+        assert "git status" in body_text
+        assert "_preloop_" not in body_text
+        assert "_preloop_" not in body_html
 
     @pytest.mark.asyncio
     @patch("preloop.utils.email.send_email")
@@ -719,3 +778,27 @@ class TestSendApprovalRequestEmail:
         _to, subject, body_text, _body_html = mock_send_email.call_args[0]
         assert subject == "Deploy to production"
         assert "Agent: Release Bot" in body_text
+
+
+@pytest.mark.asyncio
+@patch("preloop.utils.email.send_email")
+async def test_approval_email_displays_origin_before_omitting_markers(
+    mock_send_email: MagicMock,
+) -> None:
+    """Origin identity is readable without exposing internal tool metadata."""
+    await send_approval_request_email(
+        "approver@example.com",
+        "Bash",
+        {
+            "_preloop_source": "codex_cli",
+            "_preloop_origin": {"session_id": "11111111-session", "model": "gpt-alpha"},
+            "command": "ls",
+        },
+        "https://example.com/console/approval/request-one",
+        runtime_session_id="shared-session",
+    )
+    _, _, text, html = mock_send_email.call_args[0]
+    assert "Session: 11111111-session · Model: gpt-alpha" in text
+    assert "Session: 11111111-session · Model: gpt-alpha" in html
+    assert "_preloop_origin" not in text
+    assert "shared-session" not in text

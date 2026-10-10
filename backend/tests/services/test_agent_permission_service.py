@@ -1080,6 +1080,70 @@ async def test_request_agent_permission_no_rule_match_keeps_legacy_approval_path
 
 
 @pytest.mark.asyncio
+async def test_request_agent_permission_keeps_repository_marker_in_tool_args() -> None:
+    """The hook's repository marker survives into the approval tool_args.
+
+    The endpoint stamps ``_preloop_repository`` into ``tool_input``; this pins
+    that the service persists it on the approval row unchanged, next to the
+    adapter marker, for approver surfaces and the session timeline to read.
+    """
+    account_id = str(uuid.uuid4())
+    default_workflow = models.ApprovalWorkflow(
+        id=uuid.uuid4(),
+        account_id=account_id,
+        name="Default Approval Workflow",
+        approval_type=DEFAULT_APPROVAL_TYPE,
+        is_default=True,
+        timeout_seconds=300,
+    )
+    db = _enforced_db(default_workflow)
+    tool_config = MagicMock()
+    tool_config.id = uuid.uuid4()
+    tool_config.is_enabled = True
+    approval = MagicMock()
+    approval.id = uuid.uuid4()
+    approval.status = "approved"
+    approval.approver_comment = "Looks safe"
+    repository = {
+        "remote": "github.com/example/repo",
+        "toplevel": "/home/dev/repo",
+        "relative_path": "pkg/sub",
+        "source": "hook_cwd",
+    }
+
+    with (
+        patch(
+            "preloop.services.agent_permission_service.get_async_db_session"
+        ) as mock_get_session,
+        patch("preloop.services.approval_service.ApprovalService") as mock_service_cls,
+        patch(
+            "preloop.models.crud.tool_configuration."
+            "get_tool_config_by_name_and_source_async",
+            new=AsyncMock(return_value=tool_config),
+        ),
+        patch(
+            "preloop.services.agent_permission_service.apply_native_access_rules",
+            new=AsyncMock(return_value=None),
+        ),
+    ):
+        mock_get_session.return_value.__aenter__.return_value = db
+        mock_service = AsyncMock()
+        mock_service.create_and_notify = AsyncMock(return_value=approval)
+        mock_service_cls.return_value = mock_service
+
+        await request_agent_permission(
+            **_permission_kwargs(
+                account_id=account_id,
+                tool_input={"command": "ls", "_preloop_repository": repository},
+            )
+        )
+
+    kwargs = mock_service.create_and_notify.await_args.kwargs
+    assert kwargs["tool_args"]["_preloop_repository"] == repository
+    assert kwargs["tool_args"]["command"] == "ls"
+
+
+@pytest.mark.asyncio
 async def test_request_agent_permission_rule_overrides_client_allow() -> None:
     """A matching deny rule wins over the agent's own client_decision=allow."""
     tool_config = MagicMock()
@@ -1492,3 +1556,20 @@ async def test_pre_tool_use_require_approval_keeps_human_gate(status: str) -> No
     assert result[2] == str(approval.id)
     assert result[3] is (status == "expired")
     service.create_and_notify.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_origin_snapshot_does_not_enter_native_policy_arguments() -> None:
+    """Only tool arguments enter policy; origin remains on the approval copy."""
+    config = MagicMock(id=uuid.uuid4(), is_enabled=True)
+    call_kwargs = _native_rule_kwargs()
+    tool_input = {
+        "command": "ls",
+        "_preloop_origin": {"session_id": "session-one", "model": "gpt-alpha"},
+    }
+    call_kwargs["tool_input"] = tool_input
+    evaluate = AsyncMock(return_value=PolicyDecision("deny", None, "Denied", None))
+    with patch("preloop.services.policy_evaluator.evaluate_policy_async", evaluate):
+        await apply_native_access_rules(AsyncMock(), config=config, **call_kwargs)
+    assert evaluate.await_args.args[2] == {"command": "ls"}
+    assert tool_input["_preloop_origin"]["model"] == "gpt-alpha"

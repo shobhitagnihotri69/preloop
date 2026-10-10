@@ -3,6 +3,7 @@ import { customElement, property, state } from 'lit/decorators.js';
 import { repeat } from 'lit/directives/repeat.js';
 import type { Tool, ApprovalWorkflow } from './tool-card';
 import type { AccessRuleSummary } from './governance-rule-set-editor';
+import './tool-list-item';
 
 interface ToolGroup {
   id: string;
@@ -53,7 +54,7 @@ export class ScopedToolsEditor extends LitElement {
     }
     .section-icon {
       transition: transform 0.2s ease;
-      color: var(--sl-color-neutral-500);
+      color: var(--console-meta-color);
     }
     .section-icon.open {
       transform: rotate(90deg);
@@ -64,7 +65,7 @@ export class ScopedToolsEditor extends LitElement {
     }
     .section-meta {
       font-size: var(--sl-font-size-small);
-      color: var(--sl-color-neutral-500);
+      color: var(--console-meta-color);
       margin-left: auto;
     }
     .tool-list {
@@ -171,7 +172,7 @@ export class ScopedToolsEditor extends LitElement {
                           group.tools.length === 0
                             ? html`
                                 <div
-                                  style="padding: var(--sl-spacing-small); color: var(--sl-color-neutral-400); font-size: var(--sl-font-size-small);"
+                                  style="padding: var(--sl-spacing-small); color: var(--console-meta-color); font-size: var(--sl-font-size-small);"
                                 >
                                   No tools discovered.
                                 </div>

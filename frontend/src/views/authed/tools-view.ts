@@ -1,7 +1,10 @@
-import { LitElement, html, css, unsafeCSS } from 'lit';
+import { ConsoleStatus } from '../../controllers/console-status';
+import { replaceListFilters } from '../../utils/list-filter-url';
+import { LitElement, html, css, unsafeCSS, nothing } from 'lit';
 import { customElement, state } from 'lit/decorators.js';
 import {
   getTools,
+  getToolsSummary,
   getMCPServers,
   deleteMCPServer,
   scanMCPServer,
@@ -68,6 +71,10 @@ import {
 } from '../../components/tools-editor-component';
 import type { GatewayUsageByTool } from '../../types';
 import { consoleDialogStyles } from '../../styles/console-dialog';
+import { confirmDialog, showToast } from '../../components/confirm-dialog';
+import { ruleActionLabel } from '../../utils/rule-actions';
+import { Router } from '../../router';
+import '../../components/view-header';
 
 type ToolsTab = 'mcp' | 'native';
 
@@ -128,10 +135,15 @@ interface StarterPolicyDiff {
 
 @customElement('tools-view')
 export class ToolsView extends LitElement {
+  private readonly accessibilityStatus = new ConsoleStatus(this);
   @state() private tools: ToolWithRules[] = [];
   @state() private mcpServers: MCPServer[] = [];
   @state() private approvalPolicies: ApprovalWorkflow[] = [];
   @state() private loading = true;
+  @state() private refreshing = false;
+  private hasLoadedTools = false;
+  private filterSearchTimer: number | null = null;
+  private nativeSearchTimer: number | null = null;
   @state() private error: string | null = null;
   // Account-wide native tool-approval defaults (inherited by agents).
   @state() private governanceDefaults: AccountGovernanceDefaults | null = null;
@@ -305,7 +317,7 @@ export class ToolsView extends LitElement {
       .empty-state {
         text-align: center;
         padding: var(--sl-spacing-x-large);
-        color: var(--sl-color-neutral-500);
+        color: var(--console-meta-color);
       }
 
       .starter-policy-description {
@@ -316,7 +328,7 @@ export class ToolsView extends LitElement {
       }
 
       .starter-policy-meta {
-        color: var(--sl-color-neutral-500);
+        color: var(--console-meta-color);
         font-size: var(--sl-font-size-x-small);
         margin-bottom: var(--sl-spacing-small);
       }
@@ -476,6 +488,8 @@ export class ToolsView extends LitElement {
   connectedCallback() {
     super.connectedCallback();
     this.activeTab = this._resolveInitialTab();
+    this._readFilterLocation();
+    window.addEventListener('popstate', this._onFilterPopState);
 
     // Check for OAuth callback hash (#setup_mcp=success or #setup_mcp=error)
     if (window.location.hash) {
@@ -493,14 +507,30 @@ export class ToolsView extends LitElement {
       if (tool) {
         this.filters = { ...this.filters, query: tool };
       }
-      // Clean up the hash without dropping ?tab=.
-      const url = new URL(window.location.href);
-      url.hash = '';
-      window.history.replaceState({}, '', `${url.pathname}${url.search}`);
+      // Consume known setup/rule deep links; preserve unrelated anchors.
+      if (hashParams.has('setup_mcp') || hashParams.has('tool')) {
+        const url = new URL(window.location.href);
+        url.hash = '';
+        window.history.replaceState(
+          window.history.state,
+          '',
+          `${url.pathname}${url.search}`
+        );
+      }
     }
 
     this._rememberTab(this.activeTab);
+    this._syncFilterLocation();
     this.loadData();
+  }
+
+  disconnectedCallback(): void {
+    super.disconnectedCallback();
+    window.removeEventListener('popstate', this._onFilterPopState);
+    this._cancelFilterSearch();
+    ++this.toolsLoadGeneration;
+    this.toolsSchemaRequest = null;
+    this.toolsSchemasLoading = false;
   }
 
   private _resolveInitialTab(): ToolsTab {
@@ -528,7 +558,11 @@ export class ToolsView extends LitElement {
     const url = new URL(window.location.href);
     if (url.searchParams.get('tab') !== tab) {
       url.searchParams.set('tab', tab);
-      window.history.replaceState({}, '', `${url.pathname}${url.search}`);
+      window.history.replaceState(
+        window.history.state,
+        '',
+        `${url.pathname}${url.search}${url.hash}`
+      );
     }
   }
 
@@ -541,8 +575,57 @@ export class ToolsView extends LitElement {
     this._rememberTab(name);
   }
 
+  private toolsLoadGeneration = 0;
+  private toolsSchemasReady = false;
+  @state() private toolsSchemasLoading = false;
+  private toolsSchemaRequest: Promise<void> | null = null;
+  @state() private toolsContextLoading = true;
+
+  private async loadToolSchemas(): Promise<void> {
+    if (this.toolsSchemasReady) return;
+    if (this.toolsSchemaRequest) return this.toolsSchemaRequest;
+    const generation = this.toolsLoadGeneration;
+    this.toolsSchemasLoading = true;
+    const request: Promise<void> = getTools()
+      .then((tools) => {
+        if (generation !== this.toolsLoadGeneration) return;
+        // Only hydrate schemas: a late catalogue must not overwrite a rule
+        // the user changed while this request was in flight.
+        this.tools = this.tools.map((tool) => {
+          const full = tools.find(
+            (item) =>
+              item.name === tool.name &&
+              item.source_id === tool.source_id &&
+              item.source === tool.source
+          );
+          return full
+            ? { ...tool, schema: full.schema, parameters: full.parameters }
+            : tool;
+        });
+        this.toolsSchemasReady = true;
+      })
+      .catch((error) => {
+        if (generation !== this.toolsLoadGeneration) return;
+        console.error('Failed to load tool schemas:', error);
+        this.error = 'Could not load tool schemas. Expand a tool to retry.';
+      })
+      .finally(() => {
+        if (this.toolsSchemaRequest === request) this.toolsSchemaRequest = null;
+        if (generation === this.toolsLoadGeneration)
+          this.toolsSchemasLoading = false;
+      });
+    this.toolsSchemaRequest = request;
+    return request;
+  }
+
   private async loadData() {
-    this.loading = true;
+    const generation = ++this.toolsLoadGeneration;
+    this.toolsSchemaRequest = null;
+    this.toolsSchemasLoading = false;
+    this.toolsSchemasReady = false;
+    this.toolsContextLoading = !this.hasLoadedTools;
+    this.loading = !this.hasLoadedTools;
+    this.refreshing = this.hasLoadedTools;
     this.error = null;
     let starterPolicyRequest: {
       serverId: string | null;
@@ -558,20 +641,67 @@ export class ToolsView extends LitElement {
         currentUser,
         aiModels,
       ] = await Promise.all([
-        getTools(),
-        getMCPServers(),
-        getApprovalWorkflows(),
-        getFeatures(),
-        getUserProfile(),
-        getAIModels(),
+        getToolsSummary().then((tools) => {
+          if (generation === this.toolsLoadGeneration) {
+            this.tools = tools.map((tool) => ({
+              ...tool,
+              schema: {},
+            })) as ToolWithRules[];
+            const servers = new Map(
+              this.mcpServers.map((server) => [server.id, server])
+            );
+            for (const tool of tools) {
+              if (
+                tool.source === 'mcp' &&
+                tool.source_id &&
+                !servers.has(tool.source_id)
+              ) {
+                servers.set(tool.source_id, {
+                  id: tool.source_id,
+                  name: tool.source_name,
+                  url: '',
+                  transport: '',
+                  auth_type: '',
+                  status: '',
+                  created_at: '',
+                  updated_at: '',
+                });
+              }
+            }
+            this.mcpServers = [...servers.values()];
+            this.hasLoadedTools = true;
+            this.loading = false;
+          }
+          return tools;
+        }),
+        getMCPServers().catch(() => this.mcpServers),
+        getApprovalWorkflows().catch(() => this.approvalPolicies),
+        getFeatures().catch(() => ({ features: this.features })),
+        getUserProfile().catch(() => this.currentUser),
+        getAIModels().catch(() => []),
       ]);
 
+      if (generation !== this.toolsLoadGeneration) return;
       this.currentUser = currentUser;
+      this.toolsContextLoading = false;
       this.features = featuresResponse.features || {};
-      this.tools = tools as ToolWithRules[];
+      this.tools = tools.map((tool) => ({
+        ...tool,
+        schema: {},
+      })) as ToolWithRules[];
       this.mcpServers = servers;
       this.approvalPolicies = policies;
       this.hasDefaultAIModel = aiModels.some((model) => model.is_default);
+      try {
+        if (
+          JSON.parse(sessionStorage.getItem('preloopExpandedTools') || '[]')
+            .length
+        ) {
+          void this.loadToolSchemas();
+        }
+      } catch {
+        /* Invalid remembered expansion is ignored. */
+      }
       // Tool usage stats are intentionally async and must not block the tools
       // list — kick off after list data is assigned so first paint stays fast.
       void this._loadToolUsageStats();
@@ -596,10 +726,15 @@ export class ToolsView extends LitElement {
         this._handledOauthStarterPolicy = true;
       }
     } catch (err: any) {
+      if (generation !== this.toolsLoadGeneration) return;
       this.error = err.message || 'Failed to load data';
       console.error('Error loading tools data:', err);
     } finally {
-      this.loading = false;
+      if (generation === this.toolsLoadGeneration) {
+        this.loading = false;
+        this.refreshing = false;
+        this.toolsContextLoading = false;
+      }
       if (starterPolicyRequest) {
         void this._openStarterPolicySuggestion(starterPolicyRequest.serverId, {
           fallbackToLatest: starterPolicyRequest.fallbackToLatest,
@@ -1189,6 +1324,21 @@ ${this._formatStarterPolicyDiffValue(change.new_value)}</pre>
   }
 
   private async _handleSaveRule(e: CustomEvent) {
+    const { resolve, reject } = e.detail;
+    if (!this.toolsSchemasReady) {
+      try {
+        await this.loadToolSchemas();
+      } catch (err: any) {
+        reject?.(
+          err.message || 'Could not load tool schemas. Please try again.'
+        );
+        return;
+      }
+      if (!this.toolsSchemasReady) {
+        reject?.('Could not load tool schemas. Please try again.');
+        return;
+      }
+    }
     const { tool, existingRule, formData } = e.detail as {
       tool: ToolWithRules;
       existingRule: AccessRuleSummary | null;
@@ -1241,14 +1391,37 @@ ${this._formatStarterPolicyDiffValue(change.new_value)}</pre>
       }
 
       await this.loadData();
+      resolve?.();
+      this.dispatchEvent(
+        new CustomEvent('show-toast', {
+          detail: { message: 'Rule saved.' },
+          bubbles: true,
+          composed: true,
+        })
+      );
     } catch (err: any) {
       this.error = err.message || 'Failed to save rule';
+      reject?.(this.error);
     }
   }
 
   private async _handleDeleteRule(e: CustomEvent) {
-    const { rule } = e.detail;
-    if (!confirm('Delete this access rule? This cannot be undone.')) {
+    const { rule, tool } = e.detail as {
+      rule: AccessRuleSummary;
+      tool?: { name?: string };
+    };
+    const toolName = tool?.name;
+    const confirmed = await confirmDialog({
+      title: 'Delete this access rule?',
+      message: `The ${ruleActionLabel(rule.action).toLowerCase()} rule${
+        toolName ? ` on ${toolName}` : ''
+      } stops applying as soon as it is deleted. This cannot be undone.`,
+      detail:
+        'Calls it matched fall through to the next rule, or to the default when no other rule matches.',
+      confirmLabel: 'Delete rule',
+      variant: 'danger',
+    });
+    if (!confirmed) {
       return;
     }
 
@@ -1381,7 +1554,28 @@ ${this._formatStarterPolicyDiffValue(change.new_value)}</pre>
     input.click();
   }
 
+  /**
+   * Apply a policy YAML file, after saying what it replaces.
+   *
+   * Tools has no diff of its own, so the confirm points at the Policies page,
+   * whose Import shows one before anything changes.
+   */
   private async _importFile(file: File) {
+    const confirmed = await confirmDialog({
+      title: 'Apply this configuration?',
+      message: `Importing ${file.name} replaces the matching MCP servers, approval workflows and access rules with the ones in the file. This page applies it without a preview.`,
+      detail:
+        'To see a diff before anything changes, cancel and use Import YAML on the Policies page.',
+      confirmLabel: 'Apply file',
+      variant: 'danger',
+    });
+    if (!confirmed) {
+      showToast('Nothing was imported.', 'neutral', {
+        label: 'Preview on Policies',
+        onClick: () => Router.go('/console/policies'),
+      });
+      return;
+    }
     try {
       const formData = new FormData();
       formData.append('file', file);
@@ -1398,6 +1592,7 @@ ${this._formatStarterPolicyDiffValue(change.new_value)}</pre>
         );
       }
 
+      showToast(`Imported ${file.name}.`, 'success');
       await this.loadData();
     } catch (err: any) {
       this.error = err.message || 'Failed to import configuration';
@@ -1422,11 +1617,20 @@ ${this._formatStarterPolicyDiffValue(change.new_value)}</pre>
   }
 
   private async _handleDeletePolicy(policy: ApprovalWorkflow) {
-    if (
-      !confirm(
-        `Delete approval workflow "${policy.name}"? This cannot be undone.`
-      )
-    ) {
+    const usedBy = this.tools.filter((tool) =>
+      this._toolUsesWorkflow(tool, policy.id)
+    ).length;
+    const confirmed = await confirmDialog({
+      title: 'Delete this approval workflow?',
+      message: `"${policy.name}" will be deleted. This cannot be undone.`,
+      detail:
+        usedBy > 0
+          ? `${usedBy} ${usedBy === 1 ? 'tool uses' : 'tools use'} it for approvals. Their rules are unlinked from it, so check that each still routes approvals where you expect.`
+          : 'No tool on this page uses it.',
+      confirmLabel: 'Delete workflow',
+      variant: 'danger',
+    });
+    if (!confirmed) {
       return;
     }
     try {
@@ -1436,6 +1640,7 @@ ${this._formatStarterPolicyDiffValue(change.new_value)}</pre>
           ...this.filters,
           workflows: this.filters.workflows.filter((id) => id !== policy.id),
         };
+        this._syncFilterLocation();
       }
       await this.loadData();
     } catch (err: any) {
@@ -1445,12 +1650,59 @@ ${this._formatStarterPolicyDiffValue(change.new_value)}</pre>
 
   // ─── Render helpers ──────────────────────────────────
 
+  private _cancelFilterSearch(): void {
+    if (this.filterSearchTimer !== null)
+      window.clearTimeout(this.filterSearchTimer);
+    if (this.nativeSearchTimer !== null)
+      window.clearTimeout(this.nativeSearchTimer);
+    this.filterSearchTimer = this.nativeSearchTimer = null;
+  }
+
+  private _readFilterLocation(): void {
+    const params = new URLSearchParams(window.location.search);
+    this.filters = {
+      query: params.get('mcp_q') ?? '',
+      statuses: params.getAll('mcp_status'),
+      servers: params.getAll('mcp_server'),
+      rules: params.getAll('mcp_rule'),
+      workflows: params.getAll('mcp_workflow'),
+    };
+    this.nativeFilters = {
+      query: params.get('native_q') ?? '',
+      agents: params.getAll('native_agent'),
+      rules: params.getAll('native_rule'),
+    };
+  }
+
+  private _syncFilterLocation(): void {
+    replaceListFilters({
+      mcp_q: this.filters.query,
+      mcp_status: this.filters.statuses,
+      mcp_server: this.filters.servers,
+      mcp_rule: this.filters.rules,
+      mcp_workflow: this.filters.workflows,
+      native_q: this.nativeFilters.query,
+      native_agent: this.nativeFilters.agents,
+      native_rule: this.nativeFilters.rules,
+    });
+  }
+
+  private _onFilterPopState = (): void => {
+    this._cancelFilterSearch();
+    const tab = new URLSearchParams(window.location.search).get('tab');
+    this.activeTab = isToolsTab(tab) ? tab : 'mcp';
+    this._readFilterLocation();
+  };
+
   private _clearFilters() {
+    this._cancelFilterSearch();
     this.filters = { ...EMPTY_FILTERS };
+    this._syncFilterLocation();
   }
 
   private _setFilterValues(patch: Partial<ToolsFilters>) {
     this.filters = { ...this.filters, ...patch };
+    this._syncFilterLocation();
   }
 
   private _toggleSingleFilter(
@@ -1463,7 +1715,13 @@ ${this._formatStarterPolicyDiffValue(change.new_value)}</pre>
   }
 
   private _handleSearchChange(event: CustomEvent<{ value: string }>) {
-    this._setFilterValues({ query: event.detail.value });
+    if (this.filterSearchTimer !== null)
+      window.clearTimeout(this.filterSearchTimer);
+    const query = event.detail.value;
+    this.filterSearchTimer = window.setTimeout(() => {
+      this.filterSearchTimer = null;
+      this._setFilterValues({ query });
+    }, 250);
   }
 
   private _handleViewChange(event: CustomEvent<{ value: ListViewMode }>) {
@@ -1493,10 +1751,13 @@ ${this._formatStarterPolicyDiffValue(change.new_value)}</pre>
 
   private _setNativeFilterValues(patch: Partial<NativeFilters>) {
     this.nativeFilters = { ...this.nativeFilters, ...patch };
+    this._syncFilterLocation();
   }
 
   private _clearNativeFilters() {
+    this._cancelFilterSearch();
     this.nativeFilters = { ...EMPTY_NATIVE_FILTERS };
+    this._syncFilterLocation();
   }
 
   private _toggleSingleNativeFilter(value: string) {
@@ -1506,7 +1767,13 @@ ${this._formatStarterPolicyDiffValue(change.new_value)}</pre>
   }
 
   private _handleNativeSearchChange(event: CustomEvent<{ value: string }>) {
-    this._setNativeFilterValues({ query: event.detail.value });
+    if (this.nativeSearchTimer !== null)
+      window.clearTimeout(this.nativeSearchTimer);
+    const query = event.detail.value;
+    this.nativeSearchTimer = window.setTimeout(() => {
+      this.nativeSearchTimer = null;
+      this._setNativeFilterValues({ query });
+    }, 250);
   }
 
   private _handleNativeAgentFilterChange(event: Event) {
@@ -1927,7 +2194,7 @@ ${this._formatStarterPolicyDiffValue(change.new_value)}</pre>
           >
             <sl-option value="with_rules">With rules</sl-option>
             <sl-option value="no_rules">No rules</sl-option>
-            <sl-option value="require_approval">Requires approval</sl-option>
+            <sl-option value="require_approval">Require approval</sl-option>
           </sl-select>
           <sl-select
             class="workflow-filter"
@@ -1954,6 +2221,8 @@ ${this._formatStarterPolicyDiffValue(change.new_value)}</pre>
   private _renderMcpEditor() {
     return html`
       <tools-editor-component
+        ?inert=${this.toolsContextLoading || this.toolsSchemasLoading}
+        @toggle-expand=${() => this.loadToolSchemas()}
         family="mcp"
         .tools=${this._getFilteredTools()}
         .toolStats=${Object.fromEntries(this._getToolStatsMap())}
@@ -2091,7 +2360,7 @@ ${this._formatStarterPolicyDiffValue(change.new_value)}</pre>
           >
             <sl-option value="with_rules">With rules</sl-option>
             <sl-option value="no_rules">No rules</sl-option>
-            <sl-option value="require_approval">Requires approval</sl-option>
+            <sl-option value="require_approval">Require approval</sl-option>
             <sl-option value="allowed">Allowed</sl-option>
             <sl-option value="blocked">Blocked</sl-option>
           </sl-select>
@@ -2106,6 +2375,8 @@ ${this._formatStarterPolicyDiffValue(change.new_value)}</pre>
   private _renderNativeEditor() {
     return html`
       <tools-editor-component
+        ?inert=${this.toolsContextLoading || this.toolsSchemasLoading}
+        @toggle-expand=${() => this.loadToolSchemas()}
         family="native"
         .tools=${this._getFilteredNativeTools()}
         .accountAsksByDefault=${this._nativeAsksByDefault()}
@@ -2190,7 +2461,9 @@ ${this._formatStarterPolicyDiffValue(change.new_value)}</pre>
             Connect an agent
           </sl-button>
 
-          <sl-tooltip content="Import configuration from YAML">
+          <sl-tooltip
+            content="Apply a configuration YAML file (no preview; Policies shows a diff first)"
+          >
             <sl-button size="small" @click=${this._triggerImport}>
               <sl-icon slot="prefix" name="upload"></sl-icon>
               Import
@@ -2270,6 +2543,14 @@ ${this._formatStarterPolicyDiffValue(change.new_value)}</pre>
                 </sl-alert>`
               : ''
           }
+          <div
+            role="status"
+            aria-live="polite"
+            aria-atomic="true"
+            style="height: 1.5rem; min-height: 1.5rem; flex: 0 0 1.5rem; display: flex; align-items: center; gap: 0.5rem;"
+          >
+            ${this.refreshing ? html`<sl-spinner></sl-spinner> Refreshing tools…` : nothing}
+          </div>
           ${
             this.loading
               ? html`<div class="loading-indicator">

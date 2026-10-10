@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Mapping, Optional, Tuple
 from uuid import UUID
 
 from sqlalchemy.orm import Session
@@ -23,19 +23,48 @@ from preloop.services.runner_service import (
 
 from preloop.services.host_exec import (
     HOST_EXEC_AGENT_TYPE,
+    ISOLATED_PUBLICATION_UNAVAILABLE,
     host_exec_profile_name,
+    host_exec_model_identifier,
     host_exec_unavailable_reason,
+    is_host_exec_agent_type,
+)
+from preloop.services.host_exec_publication import (
+    HOST_PUBLICATION_LEASE_KEY,
+    host_publication_requested,
 )
 
 from .base import AgentExecutionResult, AgentExecutor, AgentStatus
+from .images import agent_config_has_image, default_agent_image
 from .runner_launch import (
     LAUNCH_VERSION,
     flow_launch_fingerprint,
     prepare_runner_delivery,
 )
-from .images import agent_config_has_image, default_agent_image
 
 logger = logging.getLogger(__name__)
+
+
+def _config_without_publication_mode(git_clone_config: Any) -> Any:
+    """Return checkout config with publication mode removed.
+
+    The host lease rejects isolated mode after the snapshot lookup so a
+    missing snapshot keeps its existing error. Other host-exec checks still
+    see ``create_pull_request`` and remote setup fields.
+    """
+    if isinstance(git_clone_config, Mapping):
+        return {
+            key: value
+            for key, value in git_clone_config.items()
+            if key != "publication_mode"
+        }
+    if hasattr(git_clone_config, "model_dump"):
+        dumped = git_clone_config.model_dump()
+        if isinstance(dumped, Mapping):
+            return {
+                key: value for key, value in dumped.items() if key != "publication_mode"
+            }
+    return git_clone_config
 
 
 class RemoteRunnerExecutor(AgentExecutor):
@@ -334,9 +363,9 @@ class RemoteRunnerExecutor(AgentExecutor):
         )
         profile = host_exec_profile_name(agent_config, context)
         kind = str(agent_type or "").strip().lower() if agent_type else ""
-        if kind == HOST_EXEC_AGENT_TYPE and not profile:
+        if is_host_exec_agent_type(kind) and not profile:
             raise ValueError(
-                "agent type cursor requires agent_config.host_exec_profile "
+                f"agent type {kind} requires agent_config.host_exec_profile "
                 "on a private runner"
             )
         if not profile and not agent_config_has_image(agent_config):
@@ -352,12 +381,37 @@ class RemoteRunnerExecutor(AgentExecutor):
 
         git_clone_config = context_or_flow("git_clone_config")
         resume_from = _resume_from_execution_id(context, self.execution)
+        host_resume = context.get("host_exec_resume") if profile else None
+        if (
+            profile
+            and resume_from
+            and not isinstance(host_resume, dict)
+            and flow is not None
+            and host_publication_requested(git_clone_config)
+        ):
+            # Delayed lease: no orchestrator context, so validate the
+            # continuation again from the rows (#1069).
+            host_resume = _host_continuation_from_rows(
+                self.db, flow, self.execution, profile, kind
+            )
+        if isinstance(host_resume, dict) and (
+            host_resume.get("execution_id") == resume_from or resume_from is None
+        ):
+            # The orchestrator validated this continuation and owns the
+            # resume argument; it is not a generic native resume.
+            resume_from = None
+        else:
+            host_resume = None
         if profile:
+            # Isolated mode is decided after the snapshot lookup below so a
+            # missing snapshot keeps its existing error. Passing the mode
+            # here would replace that error.
             blocked = host_exec_unavailable_reason(
-                git_clone_config=git_clone_config,
+                git_clone_config=_config_without_publication_mode(git_clone_config),
                 resume_from=resume_from,
                 session_id=context.get("session_id"),
                 custom_commands=context_or_flow("custom_commands"),
+                agent_type=kind,
             )
             if blocked:
                 raise ValueError(blocked)
@@ -399,8 +453,12 @@ class RemoteRunnerExecutor(AgentExecutor):
                 raise ValueError(
                     "Private publication requires a trusted policy snapshot"
                 )
+            if profile:
+                raise ValueError(ISOLATED_PUBLICATION_UNAVAILABLE)
             payload["_publication"] = state
         if profile:
+            if "_publication" in payload:
+                raise ValueError(ISOLATED_PUBLICATION_UNAVAILABLE)
             payload["host_exec_profile"] = profile
             timeout_seconds = context.get("timeout_seconds")
             if timeout_seconds is None and flow is not None:
@@ -419,8 +477,25 @@ class RemoteRunnerExecutor(AgentExecutor):
                 "timeout_seconds",
             }
             payload = {key: value for key, value in payload.items() if key in allowed}
+            if not context.get("model_identifier"):
+                # A lease built without orchestrator context (delayed
+                # lease) uses the same precedence as the host context:
+                # the copilot_model / cursor_model alias, then the catalog
+                # model. Continuation admission compares this value.
+                alias = host_exec_model_identifier(kind, agent_config)
+                if alias:
+                    payload["model_identifier"] = alias
             payload["agent_config"] = {"host_exec_profile": profile}
             payload["completion_protocol"] = "host_exec"
+            if host_publication_requested(git_clone_config):
+                # Data only: assignment requires a host_publication runner
+                # and delivery replaces it with the transient runner plan.
+                payload[HOST_PUBLICATION_LEASE_KEY] = {"mode": "legacy"}
+                if host_resume is not None:
+                    payload["host_exec_resume"] = {
+                        "session_id": str(host_resume["session_id"]),
+                        "execution_id": str(host_resume["execution_id"]),
+                    }
         else:
             # Docker launch already carries the prompt as chunked launch env.
             # Leaving it on the lease makes the runner CLI copy it into
@@ -507,6 +582,40 @@ async def _push_job(runner_id: UUID, payload: Dict[str, Any]) -> None:
         await push_job_to_runner(runner_id, payload)
     except Exception as exc:
         logger.debug("live job push skipped: %s", exc)
+
+
+def _host_continuation_from_rows(
+    db: Any, flow: Any, execution: Any, profile: str, kind: str
+) -> Dict[str, str]:
+    """Re-validate a Copilot continuation for a lease built without context.
+
+    Raises:
+        HostContinuationError: ``resume_unavailable`` when it cannot run.
+    """
+    from preloop.services.host_exec import host_exec_model_identifier
+    from preloop.services.host_exec_continuation import resolve_host_continuation
+
+    trigger = getattr(execution, "trigger_event_details", None) or {}
+    try:
+        ai_model = getattr(flow, "ai_model", None)
+    except Exception:
+        ai_model = None
+    # Same precedence as the orchestrator's host context: alias, then the
+    # catalog model.
+    model = host_exec_model_identifier(
+        kind, getattr(flow, "agent_config", None)
+    ) or getattr(ai_model, "model_identifier", None)
+    resolved = resolve_host_continuation(
+        db,
+        flow=flow,
+        resume=trigger.get("_resume") if isinstance(trigger, dict) else None,
+        profile=profile,
+        model_identifier=model,
+    )
+    return {
+        "session_id": resolved["session_id"],
+        "execution_id": resolved["execution_id"],
+    }
 
 
 def _resume_from_execution_id(

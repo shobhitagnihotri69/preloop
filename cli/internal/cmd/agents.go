@@ -56,6 +56,9 @@ type AgentConfig struct {
 	ConfigDrift          bool     `json:"config_drift,omitempty"`
 	ReonboardRecommended bool     `json:"reonboard_recommended,omitempty"`
 	DriftReasons         []string `json:"drift_reasons,omitempty"`
+	// ModelRoute is the Claude Desktop model route read from the OS managed
+	// configuration (direct, apps-gateway, mcp-only); empty for other agents.
+	ModelRoute string `json:"model_route,omitempty"`
 }
 
 // MCPDef is a minimal MCP server definition read from an agent config.
@@ -124,6 +127,10 @@ var agentSpecs = []agentSpec{
 		Parser:      parseGenericMCP,
 	},
 	{
+		// VS Code / Copilot Chat. Onboarding writes ~/.vscode/mcp.json only.
+		// Model traffic is manual BYOK (Chat: Manage Language Models ->
+		// Add Models -> Custom Endpoint, then chatLanguageModels.json).
+		// There is no config-file hook for agents onboard to rewrite.
 		Name:        "VSCode / Copilot",
 		ConfigPaths: []string{".vscode/mcp.json"},
 		Parser:      parseGenericMCP,
@@ -204,6 +211,20 @@ var agentSpecs = []agentSpec{
 		BootstrapConfigPath: ".config/devin/config.json",
 		Parser:              parseGenericMCP,
 	},
+	{
+		// GitHub Copilot CLI (`copilot`). User MCP config lives at
+		// ~/.copilot/mcp-config.json (COPILOT_HOME can relocate the directory;
+		// we probe the home-relative path like other single-home agents).
+		// Schema is either `{ "mcpServers": {…} }` or a bare top-level map of
+		// servers; VS Code's `{ "servers": … }` shape is ignored. Inference
+		// stays on GitHub's backend — MCP-firewall only.
+		Name:                copilotCLIAgentName,
+		ConfigPaths:         []string{".copilot/mcp-config.json"},
+		DetectionPaths:      []string{".copilot"},
+		DetectionCommands:   []string{"copilot"},
+		BootstrapConfigPath: ".copilot/mcp-config.json",
+		Parser:              parseCopilotCLIMCP,
+	},
 }
 
 // Display names for the additional MCP-only agent adapters. Kept as
@@ -212,6 +233,7 @@ var agentSpecs = []agentSpec{
 const (
 	antigravityAgentName = "Antigravity"
 	devinAgentName       = "Devin"
+	copilotCLIAgentName  = "Copilot CLI"
 )
 
 // isAntigravityAgent reports whether the agent is the Antigravity surface
@@ -225,53 +247,52 @@ func isDevinAgent(agent AgentConfig) bool {
 	return strings.EqualFold(strings.TrimSpace(agent.Name), devinAgentName)
 }
 
+// isCopilotCLIAgent reports whether the agent is the GitHub Copilot CLI
+// (distinct from "VSCode / Copilot", which is the editor MCP surface).
+func isCopilotCLIAgent(agent AgentConfig) bool {
+	return strings.EqualFold(strings.TrimSpace(agent.Name), copilotCLIAgentName)
+}
+
 // isClaudeDesktopAgent reports whether the agent is the Claude Desktop app.
 func isClaudeDesktopAgent(agent AgentConfig) bool {
 	return strings.EqualFold(strings.TrimSpace(agent.Name), "claude desktop")
 }
 
-// mcpOnlyAgentModelNote returns a clear, agent-specific note explaining why
-// an agent is onboarded for tool-call governance only and its model traffic
-// is not routed through the Preloop gateway. These agents either expose no
-// programmatic custom-base-URL hook (Cursor) or run inference exclusively on
-// a vendor backend that cannot be redirected (Antigravity, Devin). Returns
-// "" for agents that do support gateway routing.
+// mcpOnlyAgentModelNote describes limitations of the current Preloop adapter,
+// without inferring vendor limitations or verification from the app type.
 func mcpOnlyAgentModelNote(agent AgentConfig) string {
-	// Every mcp-only note leads with the shared support-level phrase so the
-	// onboarding output matches the discovery listing and summary table:
-	// this is a support level of the agent type, not an incomplete
-	// onboarding.
-	switch {
-	case strings.EqualFold(strings.TrimSpace(agent.Name), "cursor"):
-		return mcpOnlySupportLabel + ": Cursor tool calls are governed through " +
-			"Preloop's MCP firewall. Cursor only accepts a custom model base URL via " +
-			"its in-app Settings → Models (global, no config-file hook), so Preloop " +
-			"does not rewrite model traffic automatically. Setting the OpenAI base " +
-			"URL override there to your Preloop gateway URL routes the AI panel's " +
-			"third-party model calls (Ask/Plan and Agent modes) through Preloop; " +
-			"Tab, inline edit, and Cursor-billed bundled models stay on Cursor's " +
-			"backend."
-	case strings.EqualFold(strings.TrimSpace(agent.Name), "claude desktop"):
-		return mcpOnlySupportLabel + ": Claude Desktop tool calls are governed " +
-			"through Preloop's MCP firewall. Claude Desktop's model traffic is fixed " +
-			"to Anthropic's backend by design and cannot be repointed, so MCP-level " +
-			"governance is the complete onboarding for this agent type."
-	case isAntigravityAgent(agent):
-		return mcpOnlySupportLabel + ": Antigravity tool calls are governed through " +
-			"Preloop's MCP firewall. Antigravity is locked to Google-hosted models " +
-			"with no BYO key or custom base URL, so model traffic cannot be routed " +
-			"through the Preloop gateway."
-	case isDevinAgent(agent):
-		return mcpOnlySupportLabel + ": Devin tool calls are governed through " +
-			"Preloop's MCP firewall. Devin runs all inference in Cognition's cloud " +
-			"and does not support third-party LLM endpoints, so model traffic cannot " +
-			"be routed through the Preloop gateway."
-	case supportLevelForAgent(agent) == agentSupportLevelMCPOnly:
-		return mcpOnlySupportLabel + ": tool calls are governed through Preloop's " +
-			"MCP firewall; this agent type exposes no hook for rewriting model " +
-			"traffic."
-	default:
+	if capabilitiesForAgent(agent).ModelRoute == controlSupported {
 		return ""
+	}
+	scope := ": only calls routed through the managed MCP entry reach Preloop. "
+	switch {
+	case isClaudeDesktopAgent(agent):
+		return mcpOnlySupportLabel + scope +
+			"Onboarding adds a managed MCP bridge and does not configure Desktop model routing by itself. " +
+			"To route Desktop model traffic through Preloop, run " +
+			"`preloop agents onboard \"Claude Desktop\" --model-route direct` (or `--model-route apps-gateway`) " +
+			"and deploy the printed managed configuration with your MDM."
+	case strings.EqualFold(strings.TrimSpace(agent.Name), "cursor"):
+		return mcpOnlySupportLabel + scope +
+			"Cursor native action gates are supported separately via --approvals. " +
+			"Preloop does not automatically rewrite Cursor model traffic; its in-app Settings → Models " +
+			"base URL override requires separate configuration and verification."
+	case strings.EqualFold(strings.TrimSpace(agent.Name), "vscode / copilot"):
+		return mcpOnlySupportLabel + scope +
+			"Manual BYOK uses Chat: Manage Language Models -> Add Models -> Custom Endpoint " +
+			"and chatLanguageModels.json. Set the model url to the full gateway path " +
+			"(/openai/v1/chat/completions, /openai/v1/responses, or /anthropic/v1/messages) " +
+			"and toolCalling true. Onboarding writes the MCP firewall entry only."
+	case isCopilotCLIAgent(agent):
+		return mcpOnlySupportLabel + scope +
+			"Copilot CLI native action gates are supported separately via --approvals. " +
+			"The current Preloop adapter does not configure Copilot CLI model routing."
+	default:
+		if capabilitiesForAgent(agent).ManagedMCP != controlSupported {
+			return "Adapter support unknown; application behavior unverified."
+		}
+		return mcpOnlySupportLabel + scope +
+			"This describes the current Preloop adapter, not all vendor integration options."
 	}
 }
 
@@ -289,17 +310,28 @@ var agentsDiscoverCmd = &cobra.Command{
 	Long: `Scan standard configuration paths for known AI agents and display their
 MCP server configurations without mutating local files or your Preloop account.
 
-Supported agents: Claude Code, Cursor, Windsurf, VSCode/Copilot,
-                  Gemini CLI, OpenCode, Codex CLI, OpenClaw, Hermes,
-                  Antigravity, Devin.
+Supported agents: Pi, DeepSeek Harness, Claude Code, Claude Desktop, Cursor,
+                  Windsurf, VSCode / Copilot, Gemini CLI, OpenCode, Codex CLI,
+                  OpenClaw, Hermes, Antigravity, Devin, Copilot CLI.
 
 Each listed agent shows a pre-onboarding readiness probe:
   Auth     Ready / Not logged in / Unknown, detected from the agent's local
-           auth artifacts. A not-logged-in agent can still be onboarded; live
-           validation will fail until the agent logs in.
-  Support  Full (MCP firewall + model routing), or MCP-governed when the
-           agent type offers no way to route model traffic (a support level,
-           not a failure).
+           auth artifacts. A not-logged-in agent can still be onboarded; model
+           routing may require provider credentials.
+  Support  Independent model-routing, native-action-gate and managed-MCP
+           adapter support. Support does not mean installed or verified.
+           Only calls routed through the managed MCP entry reach Preloop.
+
+Live validation sends a direct gateway route/accounting probe using managed
+configuration. It does not launch the application or verify that the application
+consumed its configuration.
+
+VSCode / Copilot model routing is Manual BYOK. Discover and onboard leave
+chatLanguageModels.json alone. The click path is Chat: Manage Language Models
+-> Add Models -> Custom Endpoint, with toolCalling true and the model url set
+to the full gateway path (/openai/v1/chat/completions, /openai/v1/responses, or
+/anthropic/v1/messages). Business and Enterprise seats need the admin BYOK
+policy. See docs/guide/clients/vscode-copilot.md.
 
 When the post-scan onboarding prompts run, an error onboarding one agent does
 not stop the remaining agents; a per-agent summary (onboarded / partial /
@@ -312,7 +344,8 @@ partially), non-zero only when every attempted agent failed.
 
 Examples:
   preloop agents discover
-  preloop agents discover --json`,
+  preloop agents discover --json
+  preloop agents discover --inventory`,
 	RunE: runAgentsDiscover,
 }
 
@@ -326,6 +359,17 @@ entry to the selected agent configuration.
 
 This is the mutating companion to 'preloop agents discover'. Use --dry-run to
 preview the planned config and account changes without writing anything.
+
+Claude Code is onboarded without pinning the stock opus/sonnet/haiku model
+families, so /model follows Claude Code's own defaults. With subscription OAuth
+and gateway family autoregistration enabled, new Anthropic releases arrive with
+the next Claude Code update and unseen ids register on first use. API-key
+accounts must use --pin-model-families or run preloop models sync to populate
+new ids before selecting them.
+The Fable pair and the custom model option are still written. Pass
+--pin-model-families for API-key accounts or a gateway whose family
+autoregistration is disabled; the choice is saved in the local enrollment state so a later refresh
+honours it without the flag.
 
 A missing agent binary does not fail onboarding: the MCP and model routing
 configuration still applies and the managed launcher step is skipped with a
@@ -733,6 +777,37 @@ type localEnrollmentState struct {
 	RestoredAt          *time.Time             `json:"restored_at,omitempty"`
 	DiscoveredConfig    map[string]interface{} `json:"discovered_config,omitempty"`
 	ManagedConfig       map[string]interface{} `json:"managed_config,omitempty"`
+	// OffboardArchived checkpoints completed recovery/config restore/archive so
+	// cleanup can be retried even after its model credential has been deleted.
+	OffboardArchived bool `json:"offboard_archived,omitempty"`
+	// CodexOAuthSyncedLastRefresh is the auth.json or Keychain last_refresh
+	// value last pushed for this enrollment. The Codex permission hook
+	// compares the local ChatGPT login against it.
+	CodexOAuthSyncedLastRefresh string `json:"codex_oauth_synced_last_refresh,omitempty"`
+	// CodexOAuthSyncedAuthMtimeNS is the auth.json mtime in Unix nanoseconds
+	// at that push. The no-change path stats the file and reads this state
+	// once, then skips the network.
+	CodexOAuthSyncedAuthMtimeNS int64 `json:"codex_oauth_synced_auth_mtime_ns,omitempty"`
+	// CodexOAuthSyncLastAttempt is when a push was last tried and failed.
+	// The permission hook waits before trying again so a stalled API cannot
+	// hold every tool decision.
+	CodexOAuthSyncLastAttempt string `json:"codex_oauth_sync_last_attempt,omitempty"`
+	// CodexOAuthSyncedServerExpiresMS is Preloop's stored access-token
+	// expiry (epoch milliseconds) at the last sync in either direction. A
+	// larger value on Preloop's rotation marker means Preloop rotated the
+	// bundle since then and the hook pulls it into the local login.
+	CodexOAuthSyncedServerExpiresMS int64 `json:"codex_oauth_synced_server_expires_ms,omitempty"`
+	// CodexOAuthServerCheckedAt is when the hook last read Preloop's
+	// rotation marker. The hook reads it at most once per
+	// codexOAuthServerCheckInterval while the local login is unchanged.
+	CodexOAuthServerCheckedAt string `json:"codex_oauth_server_checked_at,omitempty"`
+	// CodexOAuthSyncModelIDs caches one model row id per distinct Codex
+	// OAuth secret for this enrollment, so a marker check is one request.
+	CodexOAuthSyncModelIDs []string `json:"codex_oauth_sync_model_ids,omitempty"`
+	// PinModelFamilies records the operator's choice from
+	// `--pin-model-families` so `preloop agents refresh` honours it without the
+	// flag on a later run. It only affects Claude Code's stock family pins.
+	PinModelFamilies bool `json:"pin_model_families,omitempty"`
 }
 
 type managedMCPAdapter interface {
@@ -777,26 +852,30 @@ func init() {
 	agentsCmd.AddCommand(agentsStarterPolicyCmd)
 
 	agentsDiscoverCmd.Flags().Bool("add", false, "deprecated: use 'preloop agents onboard <agent>' instead")
-	agentsDiscoverCmd.Flags().Bool("json", false, "output discovered agents as JSON (read-only, no prompts)")
+	agentsDiscoverCmd.Flags().Bool("json", false, "output safe discovery summaries as JSON (read-only, no prompts)")
+	agentsDiscoverCmd.Flags().Bool("inventory", false, "output offline known-app inventory JSON (no auth, network, prompts, or writes)")
 	agentsDiscoverCmd.Flags().Bool("no-onboard-prompt", false, "do not prompt to onboard discovered agents")
 	agentsDiscoverCmd.Flags().BoolP("yes", "y", false, "auto-approve interactive onboarding prompts")
 	agentsDiscoverCmd.Flags().BoolP("force", "f", false, "alias for --yes")
-	agentsDiscoverCmd.Flags().Bool("skip-live-validate", false, "do not run a live validation prompt after onboarding")
+	agentsDiscoverCmd.Flags().Bool("skip-live-validate", false, "do not run a direct gateway route/accounting probe after onboarding")
+	agentsDiscoverCmd.Flags().Bool("report", false, "opt in: send salted hashes of what was found to Preloop (also PRELOOP_DISCOVERY_REPORT=1); see docs/guide/agent-discovery-reporting.md")
 	_ = agentsDiscoverCmd.Flags().MarkDeprecated("add", "use 'preloop agents onboard [agent]'")
 	agentsEnrollCmd.Flags().Bool("dry-run", false, "preview account and config changes without writing")
 	agentsEnrollCmd.Flags().BoolP("yes", "y", false, "skip the onboarding confirmation prompt")
 	agentsEnrollCmd.Flags().BoolP("force", "f", false, "alias for --yes")
 	agentsEnrollCmd.Flags().Bool("all", false, "onboard all discovered agents")
-	agentsEnrollCmd.Flags().Bool("live-validate", true, "after onboarding, run a supported live validation prompt through the agent (default: true; pass --skip-live-validate or --live-validate=false to opt out)")
-	agentsEnrollCmd.Flags().Bool("skip-live-validate", false, "do not run a live validation prompt after onboarding (overrides --live-validate)")
+	agentsEnrollCmd.Flags().Bool("live-validate", true, "after onboarding, run a supported direct gateway route/accounting probe (application behavior unverified) (default: true; pass --skip-live-validate or --live-validate=false to opt out)")
+	agentsEnrollCmd.Flags().Bool("skip-live-validate", false, "do not run a direct gateway route/accounting probe after onboarding (overrides --live-validate)")
 	agentsEnrollCmd.Flags().StringSlice("tags", []string{}, "add key-value tags to the enrolled agent (e.g., --tags ext=true,env=prod)")
-	agentsEnrollCmd.Flags().Bool("approvals", false, "install native hooks for central policy and mobile/watch approvals (Claude Code, Cursor, Codex CLI)")
+	agentsEnrollCmd.Flags().Bool("approvals", false, "install native action gates for central policy and mobile/watch approvals (Claude Code, Cursor, Codex CLI, Copilot CLI, OpenCode, Pi, DeepSeek Harness)")
 	agentsEnrollCmd.Flags().Bool("no-usage-hooks", false, "Cursor only: do not install the usage hooks that store conversations as runtime sessions with a token estimate (installed by default)")
 	agentsEnrollCmd.Flags().Bool("store-transcript", false, "Cursor only: have the usage hooks also ship transcript text as session activities (default: counts, title and a short summary only)")
 	agentsEnrollCmd.Flags().String("model", "", "managed model alias to use for gateway routing (skips the interactive model picker)")
+	registerClaudeDesktopRouteFlags(agentsEnrollCmd)
+	agentsEnrollCmd.Flags().Bool("pin-model-families", false, "Claude Code only: keep writing the stock opus/sonnet/haiku family pins (use for API-key accounts or when family autoregistration is disabled; the choice persists for refresh)")
 	agentsListCmd.Flags().Bool("json", false, "output managed agents as JSON")
-	agentsStatusCmd.Flags().Bool("json", false, "output managed status as JSON")
-	agentsValidateCmd.Flags().Bool("live", false, "run a supported live validation prompt in addition to config validation")
+	agentsStatusCmd.Flags().Bool("json", false, "output allowlisted managed status as JSON")
+	agentsValidateCmd.Flags().Bool("live", false, "run a supported direct gateway route/accounting probe in addition to config validation (application behavior unverified)")
 	agentsInstallPluginCmd.Flags().Bool("dry-run", false, "print the runtime plugin installation command without running it")
 	agentsRestoreCmd.Flags().BoolP("yes", "y", false, "skip the restore confirmation prompt")
 	agentsRestoreCmd.Flags().BoolP("force", "f", false, "alias for --yes")
@@ -818,11 +897,15 @@ func init() {
 
 // runAgentsDiscover scans for AI agents on the machine.
 func runAgentsDiscover(cmd *cobra.Command, args []string) error {
+	if isOfflineInventoryCommand(cmd) {
+		return runAgentsInventory(cmd)
+	}
 	asJSON, _ := cmd.Flags().GetBool("json")
 	addServers, _ := cmd.Flags().GetBool("add")
 	noOnboardPrompt, _ := cmd.Flags().GetBool("no-onboard-prompt")
 	autoApprove, _ := cmd.Flags().GetBool("yes")
 	skipLiveValidate, _ := cmd.Flags().GetBool("skip-live-validate")
+	report, _ := cmd.Flags().GetBool("report")
 
 	if addServers {
 		return fmt.Errorf("discover is now read-only; use 'preloop agents onboard <agent>'")
@@ -830,23 +913,43 @@ func runAgentsDiscover(cmd *cobra.Command, args []string) error {
 
 	discovered, err := discoverAgents(os.Stdout, !asJSON)
 	if err != nil {
+		if asJSON {
+			return fmt.Errorf("discovery failed")
+		}
 		return err
 	}
 	client := authenticatedDiscoveryClient()
 	discovered, err = enrichDiscoveredAgents(discovered, client)
 	if err != nil {
+		if asJSON {
+			return fmt.Errorf("discovery enrichment failed")
+		}
 		return err
 	}
 
+	// Opt-in only: without --report or PRELOOP_DISCOVERY_REPORT=1 nothing
+	// about this scan is sent anywhere.
+	if discoveryReportingRequested(report) {
+		reportOut := io.Writer(os.Stdout)
+		if asJSON {
+			reportOut = os.Stderr
+		}
+		if err := sendDiscoveryReport(client, discovered, reportOut); err != nil {
+			return err
+		}
+	}
+
+	annotateClaudeDesktopModelRoutes(discovered, discoveryPreloopURL())
+
 	if asJSON {
-		enc := json.NewEncoder(os.Stdout)
+		enc := json.NewEncoder(cmd.OutOrStdout())
 		enc.SetIndent("", "  ")
-		return enc.Encode(discovered)
+		return enc.Encode(safeDiscoveryJSON(discovered))
 	}
 
 	if len(discovered) == 0 {
 		fmt.Println("No AI agents found on this machine.")
-		fmt.Println("Looked for: Claude Code, Cursor, Windsurf, VSCode, Gemini CLI, OpenCode, Codex CLI, OpenClaw, Hermes, Antigravity, Devin")
+		fmt.Println(agentDiscoverySearchLabel())
 		return nil
 	}
 
@@ -865,6 +968,9 @@ func runAgentsDiscover(cmd *cobra.Command, args []string) error {
 			fmt.Printf("     Runtime: %s\n", runtimeLabel)
 		}
 		fmt.Printf("     Support: %s\n", agentSupportListingLabel(agent))
+		if label := claudeDesktopModelRouteLabel(agent.ModelRoute); label != "" {
+			fmt.Printf("     Model route: %s\n", label)
+		}
 		if agent.IsOnboarded {
 			fmt.Printf(
 				"     Managed: yes (%s)\n",
@@ -1254,6 +1360,12 @@ func isAutoApprove(cmd *cobra.Command) bool {
 }
 
 func runAgentsEnroll(cmd *cobra.Command, args []string) error {
+	if err := rejectRouteOnlyFlagsWithoutModelRoute(cmd); err != nil {
+		return err
+	}
+	if modelRouteRequested(cmd) {
+		return runClaudeDesktopModelRouteCmd(cmd, args)
+	}
 	dryRun, _ := cmd.Flags().GetBool("dry-run")
 	autoApprove := isAutoApprove(cmd)
 	liveValidate, _ := cmd.Flags().GetBool("live-validate")
@@ -1264,6 +1376,8 @@ func runAgentsEnroll(cmd *cobra.Command, args []string) error {
 	noUsageHooks, _ := cmd.Flags().GetBool("no-usage-hooks")
 	storeTranscript, _ := cmd.Flags().GetBool("store-transcript")
 	preferredModel, _ := cmd.Flags().GetString("model")
+	pinModelFamilies, _ := cmd.Flags().GetBool("pin-model-families")
+	pinModelFamiliesSet := cmd.Flags().Changed("pin-model-families")
 
 	tags := make(map[string]string)
 	for _, kv := range tagsInput {
@@ -1281,18 +1395,20 @@ func runAgentsEnroll(cmd *cobra.Command, args []string) error {
 	}
 
 	opts := managedEnrollmentOptions{
-		DryRun:           dryRun,
-		AutoApprove:      autoApprove,
-		LiveValidate:     liveValidate,
-		SkipLiveValidate: skipLiveValidate,
-		Approvals:        approvals,
-		NoUsageHooks:     noUsageHooks,
-		StoreTranscript:  storeTranscript,
-		PreferredModel:   strings.TrimSpace(preferredModel),
-		Tags:             tags,
-		SkipConfirmation: false,
-		Input:            os.Stdin,
-		Output:           os.Stdout,
+		DryRun:              dryRun,
+		AutoApprove:         autoApprove,
+		LiveValidate:        liveValidate,
+		SkipLiveValidate:    skipLiveValidate,
+		Approvals:           approvals,
+		NoUsageHooks:        noUsageHooks,
+		StoreTranscript:     storeTranscript,
+		PreferredModel:      strings.TrimSpace(preferredModel),
+		PinModelFamilies:    pinModelFamilies,
+		PinModelFamiliesSet: pinModelFamiliesSet,
+		Tags:                tags,
+		SkipConfirmation:    false,
+		Input:               os.Stdin,
+		Output:              os.Stdout,
 	}
 
 	if len(args) == 0 {
@@ -1633,12 +1749,11 @@ func runAgentsStatus(cmd *cobra.Command, args []string) error {
 	}
 
 	if asJSON {
-		payload := map[string]interface{}{
-			"agent":        agent,
-			"local_state":  localState,
-			"remote_state": detail,
-			"models":       agentModels,
+		desktop, err := loadDesktopStatus()
+		if err != nil {
+			return err
 		}
+		payload := safeStatusJSON(agent, localState, detail, agentModels, desktop)
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
 		return enc.Encode(payload)
@@ -1648,6 +1763,7 @@ func runAgentsStatus(cmd *cobra.Command, args []string) error {
 	fmt.Printf("Agent name: %s\n", resolveAgentDisplayName(agent))
 	fmt.Printf("Config: %s\n", agent.ConfigPath)
 	fmt.Printf("Runtime principal: %s\n", runtimePrincipalIDForAgent(agent))
+	printAgentStatusDisclosure(os.Stdout, agent)
 	if localState != nil {
 		fmt.Printf("Local backup: %s\n", localState.BackupPath)
 		fmt.Printf("Managed MCP URL: %s\n", localState.ManagedServerURL)
@@ -1685,6 +1801,8 @@ func runAgentsStatus(cmd *cobra.Command, args []string) error {
 			if summary == "" {
 				summary = m.ModelIdentifier
 			}
+		} else {
+			summary = annotateCodexOAuth401Summary(agent, m.CredentialType, summary)
 		}
 		fmt.Printf("Model: %s\n", m.Name)
 		fmt.Printf("Model status: %s\n", mStatus)
@@ -1734,7 +1852,7 @@ func runAgentsList(cmd *cobra.Command, args []string) error {
 		if localAgent, ok := localAgentsByPrincipal[agent.SessionSourceID]; ok {
 			localConfig = localAgent.ConfigPath
 		}
-		if managedAgentLooksStale(agent, localConfig) {
+		if managedAgentLooksStale(agent) {
 			staleEntries = true
 		}
 		source := agent.SessionSourceType
@@ -1777,10 +1895,10 @@ func runAgentsList(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-func managedAgentLooksStale(agent managedAgentSummary, localConfig string) bool {
-	// Only archived rows are treated as stale. Missing local config (or idle
-	// activity) is normal when the agent lives on another machine.
-	_ = localConfig
+// managedAgentLooksStale reports whether a managed agent row is stale. Only
+// archived rows are: a missing local config (or idle activity) is normal when
+// the agent lives on another machine, so neither is an input.
+func managedAgentLooksStale(agent managedAgentSummary) bool {
 	return strings.EqualFold(strings.TrimSpace(agent.LifecycleState), "decommissioned")
 }
 
@@ -1867,6 +1985,7 @@ func runAgentsValidate(cmd *cobra.Command, args []string) error {
 				}
 				result["model_status"] = mStatus
 				result["model_summary"] = summary
+				result["model_credential_type"] = m.CredentialType
 				if strings.EqualFold(mStatus, "error") {
 					status = "validation_failed"
 					if result["error"] == nil {
@@ -1926,14 +2045,18 @@ func runAgentsValidate(cmd *cobra.Command, args []string) error {
 		"error",
 	} {
 		if value, ok := result[key]; ok {
-			fmt.Printf("  %s: %s\n", key, formatManagedValidationValue(key, value))
+			shown := displayedValidationValue(agent, result, key, value)
+			fmt.Printf("  %s: %s\n", key, formatManagedValidationValue(key, shown))
 		}
 	}
 	if ms, ok := result["model_status"].(string); ok && ms != "" {
 		fmt.Printf("Model status: %s\n", ms)
 	}
 	if sum, ok := result["model_summary"].(string); ok && sum != "" {
-		fmt.Printf("Model summary: %s\n", sum)
+		fmt.Printf(
+			"Model summary: %s\n",
+			displayedValidationValue(agent, result, "model_summary", sum),
+		)
 	}
 	fmt.Printf("  onboarding_mode: %s\n", onboardingStateLabel(onboardingStateFromValidation(result)))
 	fmt.Printf("  routing: %s\n", onboardingStateNote(onboardingStateFromValidation(result)))
@@ -1997,13 +2120,15 @@ func runAgentsInstallPlugin(cmd *cobra.Command, args []string) error {
 			err,
 		)
 	}
-	if runtimeSessionSourceTypeForAgent(agentName) == "claude_code" {
+	agentForInstall := AgentConfig{Name: agentName}
+	if agentControlPluginInstallerCommand(agentForInstall) == "npm" {
 		// npm install -g <source folder> links the folder as-is, so prepare an
-		// unbuilt Claude plugin checkout before installing it. This keeps the
+		// unbuilt sidecar checkout before installing it. This keeps the
 		// standalone command aligned with the onboarding installer.
-		if buildErr := buildClaudePluginSourceIfNeeded(
+		if buildErr := buildNpmSidecarSourceIfNeeded(
 			executable,
-			agentControlPluginInstallTarget(AgentConfig{Name: agentName}),
+			agentControlPluginInstallTarget(agentForInstall),
+			npmSidecarBuildLabel(agentForInstall),
 			cmd.ErrOrStderr(),
 		); buildErr != nil {
 			return fmt.Errorf("failed to prepare Preloop runtime plugin source: %w", buildErr)
@@ -2022,7 +2147,7 @@ func runAgentsInstallPlugin(cmd *cobra.Command, args []string) error {
 		}
 	}
 	var command *exec.Cmd
-	if runtimeSessionSourceTypeForAgent(agentName) == "claude_code" {
+	if agentControlPluginInstallerCommand(AgentConfig{Name: agentName}) == "npm" {
 		ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 		defer cancel()
 		command = exec.CommandContext(ctx, executable, installArgs...)
@@ -2404,55 +2529,51 @@ func executeOffboard(agent AgentConfig, autoApprove bool, modelRemovalPolicy, se
 		}
 	}
 
-	// Strip the gateway key's pre-approval from ~/.claude.json while the
-	// managed settings (and therefore the key) are still readable.
-	if err := removeClaudeAPIKeyApproval(agent); err != nil {
-		fmt.Printf("  Warning: could not remove the gateway key approval from Claude Code's user config: %v\n", err)
+	if state != nil && state.OffboardArchived && detail == nil {
+		return fmt.Errorf("offboard partially completed; cannot resolve managed record for remaining cleanup; enrollment retry state retained")
 	}
-	if state != nil {
-		if _, err := restoreAgentFromBackup(agent, state); err != nil {
-			return err
-		}
-	} else {
-		fmt.Printf("Skipped restoring config: no local backup found.\n")
-		if err := removeClaudeCodeManagedMCPServer(agent); err != nil {
-			return err
-		}
-		if err := removeApprovalHooks(agent, nil); err != nil {
-			return err
-		}
+	recovery := subscriptionRestoreNotApplicable
+	partial := func(err error) error {
+		return fmt.Errorf("offboard partially completed; enrollment retry state retained: %w", err)
 	}
+	if state == nil || !state.OffboardArchived {
+		var recoveryErr error
+		recovery, recoveryErr = restoreSubscriptionLoginOnOffboard(client, agent, detail, os.Stdout)
+		if recoveryErr != nil {
+			return recoveryErr
+		}
+		// Strip the gateway key's pre-approval from ~/.claude.json while the
+		// managed settings (and therefore the key) are still readable. A
+		// malformed or read-only user config must not strand offboarding
+		// after credentials were recovered.
+		if err := removeClaudeAPIKeyApproval(agent); err != nil {
+			fmt.Printf("  Warning: could not remove the gateway key approval from Claude Code's user config: %v\n", err)
+		}
+		if state != nil {
+			if _, err := restoreAgentFromBackup(agent, state); err != nil {
+				return partial(err)
+			}
+		} else {
+			fmt.Printf("Skipped restoring config: no local backup found.\n")
+			if err := removeClaudeCodeManagedMCPServer(agent); err != nil {
+				return partial(err)
+			}
+			if err := removeApprovalHooks(agent, nil); err != nil {
+				return partial(err)
+			}
+		}
 
-	if detail != nil {
-		if err := archiveManagedAgentRecord(client, detail.Agent.ID); err != nil {
-			return err
-		}
-	}
-
-	if state != nil {
-		if err := removeLocalEnrollmentState(agent); err != nil {
-			return err
-		}
-	}
-
-	fmt.Printf("✓ Offboarded %s\n", resolveAgentDisplayName(agent))
-	fmt.Printf("  Restored config: %s\n", agent.ConfigPath)
-	restartHermesGatewayAfterReconfig(agent, os.Stdout)
-	printMutatingCommandUndo(
-		os.Stdout,
-		fmt.Sprintf(
-			"preloop agents onboard %s",
-			shellQuoteAgentName(resolveAgentDisplayName(agent)),
-		),
-	)
-	if isClaudeCodeAgent(agent) || isCodexCLIAgent(agent) {
-		// Subscription refresh tokens rotate server-side while onboarded, so
-		// write the live Preloop-held bundle back to the local credential
-		// store before cleanup can delete it. The note is the fallback when
-		// no bundle could be restored.
-		if !restoreSubscriptionLoginOnOffboard(client, agent, detail, os.Stdout) &&
-			isClaudeCodeAgent(agent) {
-			printClaudeCodeOAuthOffboardNote(os.Stdout)
+		if detail != nil {
+			if err := archiveManagedAgentRecord(client, detail.Agent.ID); err != nil {
+				return partial(err)
+			}
+			if state == nil {
+				state = &localEnrollmentState{AgentName: agent.Name, ConfigPath: agent.ConfigPath, RuntimePrincipalID: runtimePrincipalIDForAgent(agent)}
+			}
+			state.OffboardArchived = true
+			if err := saveLocalEnrollmentState(state); err != nil {
+				return partial(err)
+			}
 		}
 	}
 	if detail != nil {
@@ -2463,7 +2584,7 @@ func executeOffboard(agent AgentConfig, autoApprove bool, modelRemovalPolicy, se
 		)
 		candidates, err := collectOffboardCleanupCandidates(client, detail.Agent)
 		if err != nil {
-			return err
+			return partial(err)
 		}
 		if err := promptOffboardCleanup(
 			os.Stdin,
@@ -2474,8 +2595,21 @@ func executeOffboard(agent AgentConfig, autoApprove bool, modelRemovalPolicy, se
 			client,
 			candidates,
 		); err != nil {
-			return err
+			return partial(err)
 		}
+	}
+
+	if state != nil {
+		if err := removeLocalEnrollmentState(agent); err != nil {
+			return partial(err)
+		}
+	}
+	fmt.Printf("✓ Offboarded %s\n", resolveAgentDisplayName(agent))
+	fmt.Printf("  Restored config: %s\n", agent.ConfigPath)
+	restartHermesGatewayAfterReconfig(agent, os.Stdout)
+	printMutatingCommandUndo(os.Stdout, fmt.Sprintf("preloop agents onboard %s", shellQuoteAgentName(resolveAgentDisplayName(agent))))
+	if recovery == subscriptionRestoreNotApplicable && isClaudeCodeAgent(agent) {
+		printClaudeCodeOAuthOffboardNote(os.Stdout)
 	}
 
 	return nil
@@ -3136,6 +3270,8 @@ func managedAgentKindForAgent(agentName string) string {
 		return "antigravity"
 	case strings.ToLower(devinAgentName):
 		return "devin"
+	case strings.ToLower(copilotCLIAgentName):
+		return "copilot_cli"
 	default:
 		return runtimeSessionSourceTypeForAgent(agentName)
 	}
@@ -3676,11 +3812,11 @@ func onboardingStateFromValidation(validation map[string]interface{}) string {
 func onboardingStateLabel(state string) string {
 	switch strings.TrimSpace(state) {
 	case "fully_onboarded":
-		return "Fully onboarded"
+		return "MCP bridge and model gateway configured"
 	case "mcp_proxy_only":
-		return "MCP proxy only"
+		return "Managed MCP bridge configured"
 	case "gateway_only":
-		return "Model gateway only"
+		return "Model gateway configured"
 	default:
 		return "Incomplete"
 	}
@@ -3689,13 +3825,13 @@ func onboardingStateLabel(state string) string {
 func onboardingStateNote(state string) string {
 	switch strings.TrimSpace(state) {
 	case "fully_onboarded":
-		return "Tool calls and model traffic are both routed through Preloop."
+		return "Managed MCP entry and model gateway are configured; only calls routed through the managed MCP entry reach Preloop; application behavior unverified."
 	case "mcp_proxy_only":
-		return "Tool calls are routed through Preloop, but model traffic is still direct."
+		return "Managed MCP entry is configured; only calls routed through that entry reach Preloop. No model gateway configuration detected; application behavior unverified."
 	case "gateway_only":
-		return "Model traffic is routed through Preloop, but MCP tool traffic is still direct."
+		return "Model gateway is configured; no managed MCP entry detected; application behavior unverified."
 	default:
-		return "This agent is not fully managed by Preloop yet."
+		return "Managed MCP and model gateway configuration is incomplete; application behavior unverified."
 	}
 }
 
@@ -4094,6 +4230,7 @@ func applyManagedGatewayForAgent(
 	token string,
 	modelAlias string,
 	familyAliases []string,
+	pinModelFamilies bool,
 ) (managedMCPEnrollmentPlan, error) {
 	switch strings.ToLower(strings.TrimSpace(agent.Name)) {
 	case "openclaw":
@@ -4103,7 +4240,7 @@ func applyManagedGatewayForAgent(
 	case "opencode":
 		return applyOpenCodeManagedGateway(plan, baseURL, token, modelAlias, familyAliases)
 	case "claude code":
-		return applyClaudeManagedGateway(plan, baseURL, token, modelAlias, familyAliases)
+		return applyClaudeManagedGateway(plan, baseURL, token, modelAlias, familyAliases, pinModelFamilies)
 	case "gemini cli":
 		return applyGeminiManagedGateway(plan, baseURL, token, modelAlias)
 	case "pi", "deepseek harness", "deepseek", "dsh":
@@ -4322,6 +4459,7 @@ func applyClaudeManagedGateway(
 	plan managedMCPEnrollmentPlan,
 	baseURL, token, modelAlias string,
 	familyAliases []string,
+	pinModelFamilies bool,
 ) (managedMCPEnrollmentPlan, error) {
 	env, ok := asObjectMap(plan.ManagedDocument["env"])
 	if !ok {
@@ -4355,49 +4493,53 @@ func applyClaudeManagedGateway(
 		delete(env, key)
 	}
 	clearClaudePinnedModelEnv(env)
-	if selection, envKey := claudePinnedModelSelection(modelAlias); envKey != "" {
-		plan.ManagedDocument["model"] = selection
-		env["ANTHROPIC_MODEL"] = selection
-		// The pinned model's alias goes first so it wins within its own
-		// family; sibling family aliases follow so `/model` switching,
-		// background/fast-path (haiku) requests, and subagents pinned to a
-		// different family all resolve at the gateway instead of 404ing.
-		// clearClaudePinnedModelEnv above wiped every family key, and
-		// claudeFamilyModelEnv only re-adds families that actually resolve,
-		// so no key is ever left pointing at a model the account lacks.
-		// CLAUDE_CODE_SUBAGENT_MODEL stays unset on purpose: with the
-		// family keys covered, subagents resolve through the same selector
-		// chain as stock Claude Code, preserving default model-selection UX.
-		coverage := append([]string{modelAlias}, familyAliases...)
-		for key, value := range claudeFamilyModelEnv(coverage) {
-			env[key] = value
+	if pinModelFamilies {
+		if selection, envKey := claudePinnedModelSelection(modelAlias); envKey != "" {
+			plan.ManagedDocument["model"] = selection
+			env["ANTHROPIC_MODEL"] = selection
+			// The pinned model's alias goes first so it wins within its own
+			// family; sibling family aliases follow so `/model` switching,
+			// background/fast-path (haiku) requests, and subagents pinned to a
+			// different family all resolve at the gateway instead of 404ing.
+			// clearClaudePinnedModelEnv above wiped every family key, and
+			// claudeFamilyModelEnv only re-adds families that actually resolve,
+			// so no key is ever left pointing at a model the account lacks.
+			// CLAUDE_CODE_SUBAGENT_MODEL stays unset on purpose: with the
+			// family keys covered, subagents resolve through the same selector
+			// chain as stock Claude Code, preserving default model-selection UX.
+			coverage := append([]string{modelAlias}, familyAliases...)
+			for key, value := range claudeFamilyModelEnv(coverage) {
+				env[key] = value
+			}
+			plan.Notes = append(plan.Notes, describeClaudeFamilyCoverage(coverage))
+		} else {
+			// Also replace settings.model: a stale explicit selection (e.g.
+			// "claude-fable-5[1m]") outranks the env pin, and when it is not
+			// honorable in API-key mode Claude Code silently switches to its API
+			// default model instead of the managed alias (tester #4, 2026-07-20).
+			plan.ManagedDocument["model"] = modelAlias
+			env["ANTHROPIC_MODEL"] = modelAlias
+			// Non-family managed model (e.g. a Kimi K3 alias): Claude Code's
+			// background/fast-path requests resolve through the built-in
+			// claude-haiku-* family identifiers and subagents through
+			// CLAUDE_CODE_SUBAGENT_MODEL, none of which exist at the gateway
+			// for a non-Anthropic account model. Map every selector at the
+			// managed alias so those calls resolve instead of 404ing.
+			// clearClaudePinnedModelEnv above wipes these same keys first, so
+			// re-onboarding and model changes always refresh them.
+			for key, value := range claudeNonFamilyModelEnv(modelAlias) {
+				env[key] = value
+			}
+			plan.Notes = append(
+				plan.Notes,
+				fmt.Sprintf(
+					"All Claude Code model selectors (opus/sonnet/haiku, background, and subagent models) will resolve to %s through Preloop.",
+					modelAlias,
+				),
+			)
 		}
-		plan.Notes = append(plan.Notes, describeClaudeFamilyCoverage(coverage))
 	} else {
-		// Also replace settings.model: a stale explicit selection (e.g.
-		// "claude-fable-5[1m]") outranks the env pin, and when it is not
-		// honorable in API-key mode Claude Code silently switches to its API
-		// default model instead of the managed alias (tester #4, 2026-07-20).
-		plan.ManagedDocument["model"] = modelAlias
-		env["ANTHROPIC_MODEL"] = modelAlias
-		// Non-family managed model (e.g. a Kimi K3 alias): Claude Code's
-		// background/fast-path requests resolve through the built-in
-		// claude-haiku-* family identifiers and subagents through
-		// CLAUDE_CODE_SUBAGENT_MODEL, none of which exist at the gateway
-		// for a non-Anthropic account model. Map every selector at the
-		// managed alias so those calls resolve instead of 404ing.
-		// clearClaudePinnedModelEnv above wipes these same keys first, so
-		// re-onboarding and model changes always refresh them.
-		for key, value := range claudeNonFamilyModelEnv(modelAlias) {
-			env[key] = value
-		}
-		plan.Notes = append(
-			plan.Notes,
-			fmt.Sprintf(
-				"All Claude Code model selectors (opus/sonnet/haiku, background, and subagent models) will resolve to %s through Preloop.",
-				modelAlias,
-			),
-		)
+		applyClaudeUnpinnedManagedModelEnv(&plan, env, modelAlias, familyAliases)
 	}
 	plan.ManagedModelAlias = modelAlias
 	plan.ManagedProviderName = "preloop"
@@ -4409,6 +4551,77 @@ func applyClaudeManagedGateway(
 		fmt.Sprintf("Model traffic will route through Preloop using %s.", modelAlias),
 	)
 	return refreshManagedPlanSnapshots(plan)
+}
+
+// applyClaudeUnpinnedManagedModelEnv writes the default (unpinned) Claude Code
+// managed model env. Stock Claude Code families (opus/sonnet/haiku) get no env
+// pin, so Claude Code keeps using its own built-in default and the gateway
+// auto-registers unseen claude-* ids for subscription OAuth when enabled; a new release
+// then arrives with the next Claude Code binary update and no `preloop agents
+// refresh`. Fable has no built-in Claude Code default, so its pair stays
+// pinned, and a custom/non-family model is still pinned explicitly or Claude
+// Code's background and subagent requests would 404 at the gateway.
+//
+// It mutates plan.ManagedDocument and env in place because the caller already
+// holds the maps, and appends the note to plan.Notes (hence the pointer: the
+// caller's Note slice header must be updated too).
+func applyClaudeUnpinnedManagedModelEnv(
+	plan *managedMCPEnrollmentPlan,
+	env map[string]interface{},
+	modelAlias string,
+	familyAliases []string,
+) {
+	coverage := append([]string{modelAlias}, familyAliases...)
+	selection, _ := claudePinnedModelSelection(modelAlias)
+	switch {
+	case selection == "":
+		// Custom/non-Anthropic model: pin the main model and map every Claude
+		// Code selector at it so background (haiku fast-path) and subagent
+		// requests resolve at the gateway.
+		plan.ManagedDocument["model"] = modelAlias
+		env["ANTHROPIC_MODEL"] = modelAlias
+		for key, value := range claudeNonFamilyModelEnv(modelAlias) {
+			env[key] = value
+		}
+		plan.Notes = append(
+			plan.Notes,
+			fmt.Sprintf(
+				"All Claude Code model selectors (opus/sonnet/haiku, background, and subagent models) will resolve to %s through Preloop.",
+				modelAlias,
+			),
+		)
+	case claudeFamilySelectorIsStock(selection):
+		// Stock family: drop the family pins and any managed ANTHROPIC_MODEL
+		// pin. settings.model keeps the family selector (e.g. "sonnet"), which
+		// Claude Code resolves to its own built-in default and which clears any
+		// stale non-family model left by a previous enrollment.
+		plan.ManagedDocument["model"] = selection
+		delete(env, "ANTHROPIC_MODEL")
+		for key, value := range claudeUnpinnedFamilyEnv(coverage) {
+			env[key] = value
+		}
+		plan.Notes = append(
+			plan.Notes,
+			"Preloop will let Claude Code pick its own stock family defaults (opus/sonnet/haiku). Automatic registration of new Anthropic ids requires subscription OAuth and enabled family autoregistration. API-key accounts should use --pin-model-families or run preloop models sync before selecting new ids.",
+		)
+	default:
+		// Non-stock family (fable): no built-in Claude Code default exists, so
+		// keep the selector and its env pair, but never invent stock pins.
+		plan.ManagedDocument["model"] = selection
+		env["ANTHROPIC_MODEL"] = selection
+		for key, value := range claudeUnpinnedFamilyEnv(coverage) {
+			env[key] = value
+		}
+		if alias := claudeUnpinnedFamilyEnv(coverage)["ANTHROPIC_DEFAULT_FABLE_MODEL"]; alias != "" {
+			plan.Notes = append(
+				plan.Notes,
+				fmt.Sprintf(
+					"Fable has no built-in Claude Code default; /model fable resolves to %s through Preloop.",
+					alias,
+				),
+			)
+		}
+	}
 }
 
 func restoreClaudeGatewayEnvFromOriginal(
@@ -5676,6 +5889,13 @@ func validateManagedEnrollmentRecord(
 		"status":            status,
 		"validation_result": validationResult,
 	}
+	if status == "validated" {
+		// Salted hashes only; lets the server mark a candidate reported by
+		// `agents discover --report` on this workstation as onboarded.
+		for key, value := range discoveryLinkFields(client, agent) {
+			request[key] = value
+		}
+	}
 	var response managedAgentEnrollmentSummary
 	if err := client.Post(
 		"/api/v1/agents/"+managedAgent.ID+"/enrollments/"+enrollmentID+"/validate",
@@ -5786,9 +6006,52 @@ func saveLocalEnrollmentState(state *localEnrollmentState) error {
 	if err != nil {
 		return fmt.Errorf("failed to encode local enrollment state: %w", err)
 	}
-	if err := os.WriteFile(statePath, data, 0600); err != nil {
+	// Write a temp file in the same directory and rename it over the target.
+	// os.WriteFile truncates in place, so two hook processes (or a hook and
+	// sync-credentials) can tear the JSON. Rename replaces the inode on Unix.
+	if err := writeFileAtomically(statePath, data, 0600, ".enrollment-*.json"); err != nil {
 		return fmt.Errorf("failed to persist local enrollment state: %w", err)
 	}
+	return nil
+}
+
+// writeFileAtomically writes data to a temp file next to path and renames it
+// over path, so a concurrent reader sees either the old or the new content
+// and never a torn file. The temp file gets perm before any byte is written.
+func writeFileAtomically(path string, data []byte, perm os.FileMode, pattern string) error {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, pattern)
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	cleanup := true
+	defer func() {
+		if cleanup {
+			_ = os.Remove(tmpName)
+		}
+	}()
+	if err := tmp.Chmod(perm); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		// Windows rename does not replace an existing file.
+		if rmErr := os.Remove(path); rmErr != nil && !os.IsNotExist(rmErr) {
+			return err
+		}
+		if err := os.Rename(tmpName, path); err != nil {
+			return err
+		}
+	}
+	cleanup = false
 	return nil
 }
 
@@ -5862,13 +6125,16 @@ func writeJSONDocument(path string, doc map[string]interface{}) error {
 	}
 	data = append(data, '\n')
 	// 0600: the managed config embeds the durable runtime bearer token, so it
-	// must not be world-readable. Chmod after write enforces the mode even when
-	// the file already existed (os.WriteFile only sets mode on creation).
-	if err := os.WriteFile(path, data, 0600); err != nil {
-		return fmt.Errorf("failed to write managed config: %w", err)
+	// must not be world-readable. The document is written to a sibling temp
+	// file and renamed into place, so a concurrent reader (a CLI starting up,
+	// or a second writer) never observes a truncated or half-written file.
+	// A symlinked config is replaced at its target so dotfile links survive.
+	target := path
+	if resolved, err := filepath.EvalSymlinks(path); err == nil {
+		target = resolved
 	}
-	if err := os.Chmod(path, 0600); err != nil {
-		return fmt.Errorf("failed to secure managed config permissions: %w", err)
+	if err := writeFileAtomic(target, data, 0600); err != nil {
+		return fmt.Errorf("failed to write managed config: %w", err)
 	}
 	return nil
 }
@@ -5936,6 +6202,20 @@ func (a genericManagedMCPAdapter) EnsureServerContainer(doc map[string]interface
 		}
 		created := make(map[string]interface{})
 		doc["mcp_servers"] = created
+		return created, nil
+	}
+	if isCopilotCLIAgent(a.agent) {
+		// Copilot CLI accepts either `{ "mcpServers": {…} }` or a bare
+		// top-level server map. Do not treat VS Code's `servers` key as the
+		// container — that shape belongs to the editor, not the CLI.
+		if servers, ok := asObjectMap(doc["mcpServers"]); ok {
+			return servers, nil
+		}
+		if looksLikeMCPServerContainer(doc) {
+			return doc, nil
+		}
+		created := make(map[string]interface{})
+		doc["mcpServers"] = created
 		return created, nil
 	}
 	if servers, ok := asObjectMap(doc["mcpServers"]); ok {
@@ -6024,6 +6304,17 @@ func (a genericManagedMCPAdapter) BuildManagedServer(baseURL, token string) map[
 				"Authorization": "Bearer " + token,
 			},
 		}
+	case strings.ToLower(copilotCLIAgentName):
+		// Copilot CLI's MCP schema uses `type` (http) + `url` + headers —
+		// the same remote shape Gemini CLI accepts. Do not write a
+		// `transport` field; Copilot ignores it.
+		return map[string]interface{}{
+			"type": "http",
+			"url":  url,
+			"headers": map[string]interface{}{
+				"Authorization": "Bearer " + token,
+			},
+		}
 	case "claude desktop":
 		// claude_desktop_config.json only supports stdio servers
 		// (command/args/env); remote HTTP servers are added through the
@@ -6079,7 +6370,7 @@ func (a genericManagedMCPAdapter) ValidateManagedConfig(doc map[string]interface
 		"authorization_header_ok": false,
 	}
 	if !ok {
-		return result
+		return mergeNpmSidecarControlValidation(a.agent, doc, baseURL, result)
 	}
 
 	result["preloop_url_ok"] = preloop["url"] == expectedURL
@@ -6094,6 +6385,12 @@ func (a genericManagedMCPAdapter) ValidateManagedConfig(doc map[string]interface
 	if isDevinAgent(a.agent) {
 		// Devin defaults to Streamable HTTP and takes no transport field.
 		result["transport_ok"] = true
+	}
+	if isCopilotCLIAgent(a.agent) {
+		result["transport_ok"] = strings.EqualFold(
+			strings.TrimSpace(fmt.Sprint(preloop["type"])),
+			"http",
+		)
 	}
 	if strings.EqualFold(strings.TrimSpace(a.agent.Name), "gemini cli") {
 		if transport, _ := preloop["transport"].(string); strings.EqualFold(strings.TrimSpace(transport), "http-streaming") {
@@ -6342,6 +6639,21 @@ func (a genericManagedMCPAdapter) ValidateManagedConfig(doc map[string]interface
 			}
 		}
 	}
+	return mergeNpmSidecarControlValidation(a.agent, doc, baseURL, result)
+}
+
+func mergeNpmSidecarControlValidation(
+	agent AgentConfig,
+	doc map[string]interface{},
+	baseURL string,
+	result map[string]interface{},
+) map[string]interface{} {
+	if !isCodexCLIAgent(agent) && !isClaudeCodeAgent(agent) {
+		return result
+	}
+	for key, value := range validateAgentControlConfig(agent, doc, baseURL) {
+		result[key] = value
+	}
 	return result
 }
 
@@ -6520,6 +6832,17 @@ func lookupMCPServerContainer(doc map[string]interface{}) map[string]interface{}
 		}
 		if fallback == nil {
 			fallback = servers
+		}
+	}
+	// Bare top-level server maps (Copilot CLI's alternate schema). Only
+	// accept when every value looks like an MCP server entry so ordinary
+	// settings files are never mistaken for a server container.
+	if looksLikeMCPServerContainer(doc) {
+		if _, hasPreloop := doc["preloop"]; hasPreloop {
+			return doc
+		}
+		if fallback == nil {
+			fallback = doc
 		}
 	}
 	if fallback != nil {
@@ -6791,6 +7114,52 @@ func parseGenericMCP(path string) (map[string]MCPDef, error) {
 		return nil, err
 	}
 	return parseServerMapFromJSON(data)
+}
+
+// parseCopilotCLIMCP reads GitHub Copilot CLI's ~/.copilot/mcp-config.json.
+// Accepted shapes:
+//   - `{ "mcpServers": { name: { type, url, headers, … } } }`
+//   - a bare top-level map of server names to entries
+//
+// The VS Code `{ "servers": … }` shape is deliberately ignored so a stray
+// editor config cannot be mistaken for Copilot CLI's user file.
+func parseCopilotCLIMCP(path string) (map[string]MCPDef, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var doc map[string]interface{}
+	if err := json.Unmarshal(data, &doc); err != nil {
+		return nil, err
+	}
+	return parseCopilotCLIServerMap(doc), nil
+}
+
+func parseCopilotCLIServerMap(doc map[string]interface{}) map[string]MCPDef {
+	if doc == nil {
+		return map[string]MCPDef{}
+	}
+	if servers, ok := asObjectMap(doc["mcpServers"]); ok {
+		return mcpDefsFromServerContainer(servers)
+	}
+	// Reject documents whose only server-related key is VS Code's `servers`.
+	if _, hasServers := doc["servers"]; hasServers && len(doc) == 1 {
+		return map[string]MCPDef{}
+	}
+	if looksLikeMCPServerContainer(doc) {
+		return mcpDefsFromServerContainer(doc)
+	}
+	return map[string]MCPDef{}
+}
+
+func mcpDefsFromServerContainer(container map[string]interface{}) map[string]MCPDef {
+	result := make(map[string]MCPDef, len(container))
+	for name, raw := range container {
+		if def, ok := mcpDefFromRawServer(raw); ok {
+			result[name] = def
+		}
+	}
+	return result
 }
 
 func parseCodexConfig(path string) (map[string]MCPDef, error) {

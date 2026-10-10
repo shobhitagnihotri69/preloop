@@ -8,6 +8,7 @@ import './tool-rule-editor';
 import type { ApprovalWorkflow } from './tool-card';
 import type { AccessRule } from '../api';
 import type { RuleFormData } from './tool-rule-editor';
+import { ruleActionMeta } from '../utils/rule-actions';
 
 export interface AccessRuleSummary {
   id: string;
@@ -87,7 +88,7 @@ export class GovernanceRuleSetEditor extends LitElement {
     }
 
     .drag-handle {
-      color: var(--sl-color-neutral-400);
+      color: var(--console-meta-color);
       cursor: grab;
       flex-shrink: 0;
       font-size: 0.85rem;
@@ -101,7 +102,7 @@ export class GovernanceRuleSetEditor extends LitElement {
     .rule-priority {
       font-size: var(--sl-font-size-x-small);
       font-weight: var(--sl-font-weight-semibold);
-      color: var(--sl-color-neutral-500);
+      color: var(--console-meta-color);
       min-width: 20px;
       text-align: center;
       padding-top: 2px;
@@ -113,16 +114,25 @@ export class GovernanceRuleSetEditor extends LitElement {
       padding-top: 1px;
     }
 
-    .rule-action-icon.deny {
+    /* Colour by the shared rule-action variant (utils/rule-actions.ts). */
+    .rule-action-icon.danger {
       color: var(--sl-color-danger-600);
     }
 
-    .rule-action-icon.approval {
+    .rule-action-icon.warning {
+      color: var(--sl-color-warning-600);
+    }
+
+    .rule-action-icon.success {
+      color: var(--sl-color-success-600);
+    }
+
+    .rule-action-icon.primary {
       color: var(--sl-color-primary-600);
     }
 
-    .rule-action-icon.allow {
-      color: var(--sl-color-success-600);
+    .rule-action-icon.neutral {
+      color: var(--sl-color-neutral-600);
     }
 
     .rule-details {
@@ -135,16 +145,24 @@ export class GovernanceRuleSetEditor extends LitElement {
       font-size: var(--sl-font-size-small);
     }
 
-    .rule-action-label.deny {
+    .rule-action-label.danger {
       color: var(--sl-color-danger-700);
     }
 
-    .rule-action-label.approval {
+    .rule-action-label.warning {
+      color: var(--sl-color-warning-700);
+    }
+
+    .rule-action-label.success {
+      color: var(--sl-color-success-700);
+    }
+
+    .rule-action-label.primary {
       color: var(--sl-color-primary-700);
     }
 
-    .rule-action-label.allow {
-      color: var(--sl-color-success-700);
+    .rule-action-label.neutral {
+      color: var(--sl-color-neutral-700);
     }
 
     .rule-condition {
@@ -157,7 +175,7 @@ export class GovernanceRuleSetEditor extends LitElement {
 
     .rule-description {
       font-size: var(--sl-font-size-x-small);
-      color: var(--sl-color-neutral-500);
+      color: var(--console-meta-color);
       font-style: italic;
       margin-top: 2px;
     }
@@ -178,52 +196,13 @@ export class GovernanceRuleSetEditor extends LitElement {
     .empty-rules {
       text-align: center;
       padding: var(--sl-spacing-medium);
-      color: var(--sl-color-neutral-500);
+      color: var(--console-meta-color);
       font-size: var(--sl-font-size-small);
       border: 1px dashed var(--sl-color-neutral-300);
       border-radius: var(--sl-border-radius-medium);
       background: var(--sl-color-neutral-50);
     }
   `;
-
-  private _getActionIconName(action: string): string {
-    switch (action) {
-      case 'deny':
-        return 'x-octagon-fill';
-      case 'require_approval':
-        return 'shield-lock-fill';
-      case 'allow':
-        return 'check-circle-fill';
-      default:
-        return 'question-circle';
-    }
-  }
-
-  private _getActionColorClass(action: string): string {
-    switch (action) {
-      case 'deny':
-        return 'deny';
-      case 'require_approval':
-        return 'approval';
-      case 'allow':
-        return 'allow';
-      default:
-        return '';
-    }
-  }
-
-  private _getActionLabel(action: string): string {
-    switch (action) {
-      case 'deny':
-        return 'DENY';
-      case 'require_approval':
-        return 'REQUIRE APPROVAL';
-      case 'allow':
-        return 'ALLOW';
-      default:
-        return action.toUpperCase();
-    }
-  }
 
   private _openRuleEditor(rule: AccessRuleSummary | null = null) {
     this._editingRule = rule as AccessRule | null;
@@ -237,7 +216,9 @@ export class GovernanceRuleSetEditor extends LitElement {
 
   private _handleSaveRule(e: CustomEvent) {
     e.stopPropagation();
-    const { rule, formData } = e.detail as {
+    const { rule, formData, resolve, reject } = e.detail as {
+      resolve: () => void;
+      reject: (message: string) => void;
       rule: AccessRuleSummary | null;
       formData: RuleFormData;
     };
@@ -247,12 +228,13 @@ export class GovernanceRuleSetEditor extends LitElement {
           toolName: this.toolName,
           existingRule: rule,
           formData,
+          resolve,
+          reject,
         },
         bubbles: true,
         composed: true,
       })
     );
-    this._closeRuleEditor();
   }
 
   private _handleWorkflowCreated() {
@@ -340,6 +322,33 @@ export class GovernanceRuleSetEditor extends LitElement {
     this._dragOverIndex = null;
   }
 
+  private _moveRule(index: number, delta: number) {
+    const rules = [...this.rules].sort((a, b) => a.priority - b.priority);
+    const target = index + delta;
+    if (target < 0 || target >= rules.length) return;
+    const [moved] = rules.splice(index, 1);
+    rules.splice(target, 0, moved);
+    this.dispatchEvent(
+      new CustomEvent('reorder-rules', {
+        detail: {
+          toolName: this.toolName,
+          reorderedRules: rules.map((rule, priority) => ({
+            id: rule.id,
+            priority,
+          })),
+        },
+        bubbles: true,
+        composed: true,
+      })
+    );
+  }
+
+  private _handleRuleKeydown(index: number, e: KeyboardEvent) {
+    if (!e.altKey || !['ArrowUp', 'ArrowDown'].includes(e.key)) return;
+    e.preventDefault();
+    this._moveRule(index, e.key === 'ArrowUp' ? -1 : 1);
+  }
+
   private _handleDragEnd() {
     this._dragIndex = null;
     this._dragOverIndex = null;
@@ -349,7 +358,8 @@ export class GovernanceRuleSetEditor extends LitElement {
     const workflow = rule.approval_workflow_id
       ? this.workflows.find((p) => p.id === rule.approval_workflow_id)
       : null;
-    const colorClass = this._getActionColorClass(rule.action);
+    const actionMeta = ruleActionMeta(rule.action);
+    const colorClass = actionMeta.variant;
     const isDragging = this._dragIndex === index;
     const isDragOver = this._dragOverIndex === index;
     const dragPosition =
@@ -364,6 +374,8 @@ export class GovernanceRuleSetEditor extends LitElement {
         class="rule-item ${!rule.is_enabled ? 'disabled-rule' : ''} ${
           isDragging ? 'dragging' : ''
         } ${dragPosition}"
+        tabindex="0"
+        @keydown=${(e: KeyboardEvent) => this._handleRuleKeydown(index, e)}
         draggable="true"
         @dragstart=${(e: DragEvent) => this._handleDragStart(index, e)}
         @dragover=${(e: DragEvent) => this._handleDragOver(index, e)}
@@ -375,11 +387,11 @@ export class GovernanceRuleSetEditor extends LitElement {
         <span class="rule-priority">${index + 1}.</span>
         <sl-icon
           class="rule-action-icon ${colorClass}"
-          name=${this._getActionIconName(rule.action)}
+          name=${actionMeta.icon}
         ></sl-icon>
         <div class="rule-details">
           <span class="rule-action-label ${colorClass}">
-            ${this._getActionLabel(rule.action)}${
+            ${actionMeta.label}${
               rule.action === 'require_approval' && workflow
                 ? html` <span
                     style="font-weight: normal; font-size: var(--sl-font-size-x-small);"
@@ -404,15 +416,29 @@ export class GovernanceRuleSetEditor extends LitElement {
           }
         </div>
         <div class="rule-actions">
+          <sl-icon-button
+            name="arrow-up"
+            label=${`Move rule ${index + 1} up`}
+            ?disabled=${index === 0}
+            @click=${() => this._moveRule(index, -1)}
+          ></sl-icon-button>
+          <sl-icon-button
+            name="arrow-down"
+            label=${`Move rule ${index + 1} down`}
+            ?disabled=${index === this.rules.length - 1}
+            @click=${() => this._moveRule(index, 1)}
+          ></sl-icon-button>
           <sl-tooltip content="Edit rule">
             <sl-icon-button
               name="pencil"
+              label=${`Edit rule ${index + 1}`}
               @click=${() => this._openRuleEditor(rule)}
             ></sl-icon-button>
           </sl-tooltip>
           <sl-tooltip content="Delete rule">
             <sl-icon-button
               name="trash"
+              label=${`Delete rule ${index + 1}`}
               @click=${() => this._handleDeleteRule(rule)}
             ></sl-icon-button>
           </sl-tooltip>
@@ -425,6 +451,10 @@ export class GovernanceRuleSetEditor extends LitElement {
     const sortedRules = [...this.rules].sort((a, b) => a.priority - b.priority);
 
     return html`
+      <p class="rules-hint">
+        Rules are checked top to bottom; the first match decides. No match means
+        allowed.
+      </p>
       <div class="rules-list">
         ${
           sortedRules.length === 0

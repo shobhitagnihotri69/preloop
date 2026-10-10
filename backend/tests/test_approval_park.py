@@ -236,6 +236,32 @@ class TestAnswerProjection:
         )
         assert "Do not perform the action" in block
 
+    def test_approved_action_tool_block_points_at_get_approval_status(self):
+        """A gated action never ran; re-calling it parks the run again.
+
+        Live rehearsal 2026-10-09: a reviewer flow with update_pull_request
+        behind a manual approval re-called the tool after every resume and
+        opened six approvals without ever posting the review.
+        """
+        block = approval_park.answers_prompt_block(
+            {
+                "request_id": "r-gated",
+                "status": "approved",
+                "tool_name": "update_pull_request",
+            }
+        )
+        assert "has NOT run yet" in block
+        assert "Do not call that tool again" in block
+        assert "get_approval_status" in block
+        assert "r-gated" in block
+
+    def test_approved_question_block_has_no_replay_instruction(self):
+        """ask_user's approval is the answer itself: nothing to replay."""
+        block = approval_park.answers_prompt_block(
+            {"request_id": "r1", "status": "approved", "tool_name": "ask_user"}
+        )
+        assert "get_approval_status" not in block
+
     def test_answer_is_framed_as_data_not_instructions(self):
         block = approval_park.answers_prompt_block(
             {
@@ -402,6 +428,14 @@ class _FakeQuery:
         self._owner.filters.append(" AND ".join(_render(c) for c in criteria))
         return self
 
+    def with_for_update(self):
+        return self
+
+    def first(self):
+        if getattr(self._owner, "approval_pending", True):
+            return object()
+        return None
+
     def update(self, values, synchronize_session=False):
         self._owner.updates.append(values)
         clause = self._owner.filters[-1] if self._owner.filters else ""
@@ -432,6 +466,7 @@ class _FakeDB:
         self.filters = []
         self.updates = []
         self.commits = 0
+        self.approval_pending = True
 
     def query(self, *entities):
         return _FakeQuery(self)
@@ -462,10 +497,29 @@ class TestStatusTransitions:
             )
             is True
         )
-        clause = db.filters[0]
-        assert "status IN" in clause
-        assert "park_request_id IS NULL" in clause
+        park_clause = next(
+            clause for clause in db.filters if "park_request_id" in clause
+        )
+        assert "status IN" in park_clause
+        assert "park_request_id IS NULL" in park_clause
+        assert any("pending" in clause for clause in db.filters)
         assert db.commits == 1
+
+    def test_a_decided_request_is_not_parked(self):
+        """A decision that won the race must not be overwritten by a park."""
+        db = _FakeDB(rowcounts=[1])
+        db.approval_pending = False
+        assert (
+            self.crud.request_park(
+                db,
+                execution_id=uuid.uuid4(),
+                approval_request_id=uuid.uuid4(),
+                expires_at=datetime.now(UTC),
+            )
+            is False
+        )
+        assert db.updates == []
+        assert db.commits == 0
 
     def test_park_request_on_a_finished_run_is_a_no_op(self):
         db = _FakeDB(rowcounts=[0])

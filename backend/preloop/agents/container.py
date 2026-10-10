@@ -14,11 +14,13 @@ import re
 import shlex
 import tarfile
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import aiodocker
 from aiodocker.exceptions import DockerError
 
+from preloop.agents.resources import docker_memory_bytes
 from preloop.config import settings
 from preloop.utils import pr_metadata
 from preloop.services.flow_failure_category import (
@@ -33,8 +35,14 @@ from .failure_analysis import (
     analyze_agent_failure,
     runtime_log_text,
 )
+from .kubernetes_placement import (
+    client_tolerations as agent_client_tolerations,
+    node_selector as agent_node_selector,
+    runtime_class_name as agent_runtime_class_name,
+)
 from preloop.services.mcp_config_service import MCPConfigService
 from preloop.agents.verification import build_verification_gate_shell
+from preloop.services.managed_credentials import MANAGED_AUTH_TYPE
 from preloop.services.tracker_git_token import APP_AUTH_TYPES
 from preloop.utils.git_credentials import (
     GitCredential,
@@ -51,6 +59,7 @@ from preloop.utils.execve_limits import (
     MAX_LAUNCH_STRING_BYTES,
     MAX_LAUNCH_TOTAL_BYTES,
     LaunchPayloadTooLargeError,
+    build_chunk_materialization_shell,
     check_launch_payload,
     chunk_bytes_env,
     chunk_count_env,
@@ -58,6 +67,11 @@ from preloop.utils.execve_limits import (
     prompt_transport_env,
 )
 from preloop.utils.repo_urls import repo_url_log_location, tracker_host_kind
+from preloop.utils.bitbucket import (
+    payload_commit_hash as bitbucket_payload_commit_hash,
+    pr_source_branch as bitbucket_pr_source_branch,
+    pr_target_branch as bitbucket_pr_target_branch,
+)
 from preloop.utils.secret_scrubbing import scrub_secret_lines, scrub_secrets
 from preloop.utils.workspace_baseline import (
     BaselineDelivery,
@@ -127,6 +141,26 @@ def _validated_git_ref(name: Optional[str]) -> Optional[str]:
         if not part or part.startswith(".") or part.endswith(".lock"):
             return None
     return name
+
+
+def _git_identity_commands(git_user_name: str, git_user_email: str) -> list[str]:
+    """Identity plus a workspace trust exception, safe to run inside the repo.
+
+    Kubernetes ``fsGroup`` leaves an emptyDir owned by root and writable by
+    the runtime group. A non-root harness (DeepSeek and Pi run as uid 10000)
+    can clone into that directory, and Git then refuses every later command
+    with ``dubious ownership`` because the worktree uid is not the process
+    uid. ``safe.directory`` has to be recorded before the first command that
+    enters the new repository. ``-c`` lets these config writes succeed when
+    the current directory is already such a checkout.
+    """
+
+    trust = "git -c safe.directory='*' config --global"
+    return [
+        f"{trust} user.name {shlex.quote(git_user_name)}",
+        f"{trust} user.email {shlex.quote(git_user_email)}",
+        f"{trust} --add safe.directory '*'",
+    ]
 
 
 # Path inside the agent container where eval/observe flows write their
@@ -260,14 +294,15 @@ COMMIT_PR_LIST_FILE = "/tmp/preloop-commit-pr-list.txt"
 # ``object_attributes.*`` paths, so those names alias onto the GitHub shape.
 _GIT_CONFIG_PLACEHOLDER_RE = re.compile(r"\{\{(\w+(?:\.\w+)*)\}\}")
 _GIT_CONFIG_PATH_ALIASES = {
-    "object_attributes.title": ("issue.title",),
+    # issue.fields.summary: Jira issue webhooks (repository binding, #957).
+    "object_attributes.title": ("issue.title", "issue.fields.summary"),
     "object_attributes.description": ("issue.body", "issue.description"),
     "object_attributes.number": ("issue.number",),
     "object_attributes.iid": ("issue.number",),
 }
 
-# Builds the GitHub/GitLab create payload in the container so title and body
-# can contain quotes and newlines. Reads, in order: result.json (agent),
+# Builds the GitHub/GitLab/Bitbucket create payload in the container so title
+# and body can contain quotes and newlines. Reads, in order: result.json (agent),
 # flow-configured title/body, then the commit subject/body (with a flow
 # execution link, and a **Commits:** list when the push is more than one
 # commit).
@@ -342,6 +377,13 @@ if reason and not applied:
         body += extra if len(encoded) <= budget else encoded[:budget].decode("utf-8", "ignore")
 if kind == "gitlab":
     payload = {"title": title, "description": body, "source_branch": head, "target_branch": base}
+elif kind == "bitbucket":
+    payload = {
+        "title": title,
+        "description": body,
+        "source": {"branch": {"name": head}},
+        "destination": {"branch": {"name": base}},
+    }
 else:
     payload = {"title": title, "body": body, "head": head, "base": base}
 Path(out_path).write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
@@ -350,77 +392,173 @@ Path(out_path).write_text(json.dumps(payload, ensure_ascii=False), encoding="utf
 
 
 def _existing_pr_failure_update_shell(
-    *, kind: str, api_url: str, authorization: str, branch: str
+    *,
+    kind: str,
+    api_url: str,
+    authorization: str,
+    branch: str,
+    execution_link: str = "",
 ) -> str:
-    """Refresh only the failure disclosure when branch lookup finds an open PR."""
+    """Refresh failure disclosure and upsert provenance on an open PR.
+
+    A lookup that does not identify exactly one PR/MR, an invalid number, or an
+    unmergeable notice aborts without writing. A provenance parse or size
+    failure skips only the owned region; an already-merged failure disclosure
+    is still posted (exit 2). A non-2xx provider response sets
+    ``PRELOOP_PROVENANCE_FAILED`` so the caller does not claim success.
+    """
     script = (
         inspect.getsource(pr_metadata)
         + r"""
 import sys
-lookup_path, payload_path, update_path, kind, branch = sys.argv[1:]
+lookup_path, payload_path, update_path, kind, branch = sys.argv[1:6]
+execution_link = sys.argv[6] if len(sys.argv) > 6 else ""
+head_sha = sys.argv[7] if len(sys.argv) > 7 else ""
+update_required = False
 try:
     with open(lookup_path, "rb") as stream:
         raw = stream.read(MAX_ARTIFACT_BYTES + 1)
     if len(raw) > MAX_ARTIFACT_BYTES:
         raise ValueError("lookup response too large")
     candidates = json.loads(raw)
+    if kind == "bitbucket" and isinstance(candidates, dict):
+        # Bitbucket wraps list responses in {"values": [...]}.
+        candidates = candidates.get("values")
     if not isinstance(candidates, list):
         raise ValueError("lookup response is not a list")
-    with open(payload_path, "rb") as stream:
-        payload_raw = stream.read(MAX_ARTIFACT_BYTES + 1)
-    if len(payload_raw) > MAX_ARTIFACT_BYTES:
-        raise ValueError("payload too large")
-    payload = json.loads(payload_raw)
-    field = "description" if kind == "gitlab" else "body"
-    notices = re.findall(
-        r"<!-- preloop:failure:([0-9a-f-]{36}):start -->.*?<!-- preloop:failure:\1:end -->",
-        payload[field], re.DOTALL,
-    )
-    if not notices:
-        sys.exit(0)
-    candidates = [item for item in candidates if isinstance(item, dict) and (
-        item.get("source_branch") if kind == "gitlab" else (item.get("head") or {}).get("ref")
-    ) == branch]
+    field = "body" if kind == "github" else "description"
+    payload = {}
+    try:
+        with open(payload_path, "rb") as stream:
+            payload_raw = stream.read(MAX_ARTIFACT_BYTES + 1)
+        if len(payload_raw) > MAX_ARTIFACT_BYTES:
+            raise ValueError("payload too large")
+        payload = json.loads(payload_raw)
+    except (OSError, ValueError, UnicodeDecodeError, RecursionError):
+        payload = {}
+    notices = []
+    if isinstance(payload, dict) and isinstance(payload.get(field), str):
+        notices = re.findall(
+            r"<!-- preloop:failure:([0-9a-f-]{36}):start -->.*?<!-- preloop:failure:\1:end -->",
+            payload[field], re.DOTALL,
+        )
+    def _source_branch(item):
+        if kind == "gitlab":
+            return item.get("source_branch")
+        if kind == "bitbucket":
+            return ((item.get("source") or {}).get("branch") or {}).get("name")
+        return (item.get("head") or {}).get("ref")
+
+    candidates = [
+        item
+        for item in candidates
+        if isinstance(item, dict) and _source_branch(item) == branch
+    ]
+    if execution_link and candidates:
+        update_required = True
     if len(candidates) != 1:
         raise ValueError("lookup did not identify one source branch")
     existing = candidates[0]
-    number = existing.get("iid" if kind == "gitlab" else "number")
+    number_key = {"gitlab": "iid", "bitbucket": "id"}.get(kind, "number")
+    number = existing.get(number_key)
     if type(number) is not int or number <= 0:
         raise ValueError("invalid PR number")
-    body = existing.get(field) or ""
-    if not isinstance(body, str):
+    original = existing.get(field) or ""
+    if not isinstance(original, str):
         raise ValueError("invalid existing description")
+    body = original
+    provenance_failed = False
     for execution_id in notices:
         start = f"<!-- preloop:failure:{execution_id}:start -->"
         end = f"<!-- preloop:failure:{execution_id}:end -->"
         notice = payload[field].split(start, 1)[1].split(end, 1)[0]
         body = merge_failure_notice(body, start + notice + end)
-    Path(update_path).write_text(json.dumps({field: body}), encoding="utf-8")
-    print(number)
+    if execution_link and head_sha:
+        public_url, separator, current_id = execution_link.rpartition(
+            "/console/flows/executions/"
+        )
+        if not separator or not public_url:
+            raise ValueError("Execution link is not a console execution URL")
+        try:
+            body = append_provenance(
+                body, PublicationRecord(current_id, head_sha), public_url
+            )
+        except ValueError as exc:
+            print("PRELOOP_PR_METADATA_WARNING: " + str(exc), file=sys.stderr)
+            provenance_failed = True
+    if body != original:
+        Path(update_path).write_text(json.dumps({field: body}), encoding="utf-8")
+        print(number)
+    if provenance_failed:
+        sys.exit(2)
+    if body == original:
+        sys.exit(0)
+except SystemExit:
+    raise
 except (OSError, ValueError, KeyError, TypeError, RecursionError):
-    print("PRELOOP_PR_METADATA_WARNING: could not refresh existing failure disclosure", file=sys.stderr)
+    print("PRELOOP_PR_METADATA_WARNING: could not refresh existing pull request body", file=sys.stderr)
+    if update_required:
+        sys.exit(3)
 """
     )
     update_path = f"{EVIDENCE_DIR_PATH}/pr-failure-update.json"
-    method = "PUT" if kind == "gitlab" else "PATCH"
+    method = "PATCH" if kind == "github" else "PUT"
+    provenance_args = ""
+    if execution_link:
+        provenance_args = f' {shlex.quote(execution_link)} "$(git rev-parse HEAD)"'
     return f"""
-      python3 - {PR_LOOKUP_FILE} {PR_PAYLOAD_FILE} {update_path} {kind} {shlex.quote(branch)} > {update_path}.number <<'PRELOOP_FAILURE_UPDATE'
+      PRELOOP_PROVENANCE_FAILED=
+      py_status=0
+      # ``|| py_status=$?``: exit 2 is an expected outcome, and the harness
+      # runs this block under ``set -e``, which would abort on a bare call.
+      python3 - {PR_LOOKUP_FILE} {PR_PAYLOAD_FILE} {update_path} {kind} {shlex.quote(branch)}{provenance_args} > {update_path}.number <<'PRELOOP_FAILURE_UPDATE' || py_status=$?
 {script}
 PRELOOP_FAILURE_UPDATE
-      PRELOOP_UPDATE_NUMBER=$(cat {update_path}.number)
-      if [ -n "$PRELOOP_UPDATE_NUMBER" ] && [ -s {update_path} ]; then
-        curl -fsS -o /dev/null -X {method} \
-          -H "{authorization}" \
-          -H 'Content-Type: application/json' \
-          --data-binary @{update_path} \
-          "{api_url}/$PRELOOP_UPDATE_NUMBER" \
-          || echo "PRELOOP_PR_METADATA_WARNING: failed to update existing failure disclosure"
+      if [ "$py_status" -ne 0 ]; then
+        PRELOOP_PROVENANCE_FAILED=1
+      fi
+      PRELOOP_UPDATE_NUMBER=$(cat {update_path}.number 2>/dev/null || true)
+      # Exit 2 means provenance was skipped after the failure disclosure was
+      # merged. Still post that body. Any other failure leaves it unchanged.
+      if {{ [ "$py_status" -eq 0 ] || [ "$py_status" -eq 2 ]; }} && [ -n "$PRELOOP_UPDATE_NUMBER" ] && [ -s {update_path} ]; then
+        UPDATE_HTTP=$(curl -sS -o /dev/null -w "%{{http_code}}" -X {method} \\
+          -H "{authorization}" \\
+          -H 'Content-Type: application/json' \\
+          --data-binary @{update_path} \\
+          "{api_url}/$PRELOOP_UPDATE_NUMBER" || echo "000")
+        case "$UPDATE_HTTP" in
+          2??) PRELOOP_BODY_UPDATED=1 ;;
+          *)
+            echo "PRELOOP_PR_METADATA_WARNING: failed to update existing pull request body" >&2
+            PRELOOP_PROVENANCE_FAILED=1
+            ;;
+        esac
       fi
 """
 
 
+def provenance_failure_exit_shell() -> str:
+    """Non-zero exit for the plain push path when a body update failed.
+
+    Capture shells only set ``PRELOOP_PROVENANCE_FAILED``. A bare ``exit``
+    inside them also kills the report-publication wrapper, which must stay
+    at status zero and print one marker. Call this after the capture shell
+    on the plain push path only.
+    """
+    return """
+if [ -n "${PRELOOP_PROVENANCE_FAILED:-}" ]; then
+  exit 1
+fi
+"""
+
+
 def build_github_pr_capture_shell(
-    *, token_ref: str, owner: str, repo: str, branch: str
+    *,
+    token_ref: str,
+    owner: str,
+    repo: str,
+    branch: str,
+    execution_link: str = "",
 ) -> str:
     """Shell that turns the create-PR response into one recognizable line.
 
@@ -431,7 +569,13 @@ def build_github_pr_capture_shell(
     grep_pr = 'grep -o \'"html_url"[[:space:]]*:[[:space:]]*"[^"]*/pull/[0-9]*"\''
     sed_url = 'sed \'s/.*"\\(https[^"]*\\)"$/\\1/\''
     return f"""
-    PR_URL=$({grep_pr} {PR_RESPONSE_FILE} 2>/dev/null | head -1 | {sed_url})
+    # Initialised here, not only in the lookup fallback: the happy path
+    # (URL in the create response) reads these under ``set -u``. The harness
+    # runs this under ``set -euo pipefail``, so a grep with no match must not
+    # end the block before the fallback (``|| true`` on each capture).
+    PRELOOP_PROVENANCE_FAILED=
+    PRELOOP_BODY_UPDATED=
+    PR_URL=$({grep_pr} {PR_RESPONSE_FILE} 2>/dev/null | head -1 | {sed_url}) || true
     if [ -z "$PR_URL" ]; then
       echo "No PR URL in the create response; looking it up by head branch"
       curl -sS \\
@@ -440,10 +584,12 @@ def build_github_pr_capture_shell(
         -o {PR_LOOKUP_FILE} \\
         "https://api.github.com/repos/{owner}/{repo}/pulls?state=open&head={owner}:{branch}" \\
         || echo "PR lookup by head branch failed"
-      PR_URL=$({grep_pr} {PR_LOOKUP_FILE} 2>/dev/null | head -1 | {sed_url})
-      {_existing_pr_failure_update_shell(kind="github", api_url=f"https://api.github.com/repos/{owner}/{repo}/pulls", authorization=f"Authorization: token {token_ref}", branch=branch)}
+      PR_URL=$({grep_pr} {PR_LOOKUP_FILE} 2>/dev/null | head -1 | {sed_url}) || true
+      {_existing_pr_failure_update_shell(kind="github", api_url=f"https://api.github.com/repos/{owner}/{repo}/pulls", authorization=f"Authorization: token {token_ref}", branch=branch, execution_link=execution_link)}
     fi
-    if [ -n "$PR_URL" ]; then
+    if [ -n "${{PRELOOP_PROVENANCE_FAILED:-}}" ] && [ -z "${{PRELOOP_BODY_UPDATED:-}}" ]; then
+      echo "PRELOOP_PR_METADATA_WARNING: existing pull request body was left unchanged" >&2
+    elif [ -n "${{PR_URL:-}}" ]; then
       echo "{PR_OPENED_LOG_MARKER} {{\\"url\\": \\"$PR_URL\\", \\"branch\\": \\"{branch}\\", \\"provider\\": \\"github\\"}}"
     else
       echo "No pull request URL could be resolved for branch {branch}"
@@ -452,7 +598,12 @@ def build_github_pr_capture_shell(
 
 
 def build_gitlab_mr_capture_shell(
-    *, token_ref: str, gitlab_host: str, encoded_path: str, branch: str
+    *,
+    token_ref: str,
+    gitlab_host: str,
+    encoded_path: str,
+    branch: str,
+    execution_link: str = "",
 ) -> str:
     """GitLab counterpart of :func:`build_github_pr_capture_shell`."""
 
@@ -461,7 +612,13 @@ def build_gitlab_mr_capture_shell(
     )
     sed_url = 'sed \'s/.*"\\(https[^"]*\\)"$/\\1/\''
     return f"""
-    MR_URL=$({grep_mr} {PR_RESPONSE_FILE} 2>/dev/null | head -1 | {sed_url})
+    # Initialised here, not only in the lookup fallback: the happy path
+    # (URL in the create response) reads these under ``set -u``. The harness
+    # runs this under ``set -euo pipefail``, so a grep with no match must not
+    # end the block before the fallback (``|| true`` on each capture).
+    PRELOOP_PROVENANCE_FAILED=
+    PRELOOP_BODY_UPDATED=
+    MR_URL=$({grep_mr} {PR_RESPONSE_FILE} 2>/dev/null | head -1 | {sed_url}) || true
     if [ -z "$MR_URL" ]; then
       echo "No MR URL in the create response; looking it up by source branch"
       curl -sS \\
@@ -469,13 +626,64 @@ def build_gitlab_mr_capture_shell(
         -o {PR_LOOKUP_FILE} \\
         "https://{gitlab_host}/api/v4/projects/{encoded_path}/merge_requests?state=opened&source_branch={branch}" \\
         || echo "MR lookup by source branch failed"
-      MR_URL=$({grep_mr} {PR_LOOKUP_FILE} 2>/dev/null | head -1 | {sed_url})
-      {_existing_pr_failure_update_shell(kind="gitlab", api_url=f"https://{gitlab_host}/api/v4/projects/{encoded_path}/merge_requests", authorization=f"PRIVATE-TOKEN: {token_ref}", branch=branch)}
+      MR_URL=$({grep_mr} {PR_LOOKUP_FILE} 2>/dev/null | head -1 | {sed_url}) || true
+      {_existing_pr_failure_update_shell(kind="gitlab", api_url=f"https://{gitlab_host}/api/v4/projects/{encoded_path}/merge_requests", authorization=f"PRIVATE-TOKEN: {token_ref}", branch=branch, execution_link=execution_link)}
     fi
-    if [ -n "$MR_URL" ]; then
+    if [ -n "${{PRELOOP_PROVENANCE_FAILED:-}}" ] && [ -z "${{PRELOOP_BODY_UPDATED:-}}" ]; then
+      echo "PRELOOP_PR_METADATA_WARNING: existing pull request body was left unchanged" >&2
+    elif [ -n "${{MR_URL:-}}" ]; then
       echo "{PR_OPENED_LOG_MARKER} {{\\"url\\": \\"$MR_URL\\", \\"branch\\": \\"{branch}\\", \\"provider\\": \\"gitlab\\"}}"
     else
       echo "No merge request URL could be resolved for branch {branch}"
+    fi
+"""
+
+
+def build_bitbucket_pr_capture_shell(
+    *,
+    repo_path: str,
+    branch: str,
+    execution_link: str = "",
+) -> str:
+    """Bitbucket counterpart of :func:`build_github_pr_capture_shell`.
+
+    Reads the ``PRELOOP_BB_AUTH`` header variable the create shell set, so the
+    lookup and the body update reuse whichever auth scheme the create call
+    settled on (Bearer, or Basic after a 401).
+    """
+
+    grep_pr = (
+        'grep -o \'"href"[[:space:]]*:[[:space:]]*'
+        '"https://bitbucket.org/[^"]*/pull-requests/[0-9]*"\''
+    )
+    sed_url = 'sed \'s/.*"\\(https[^"]*\\)"$/\\1/\''
+    api_url = f"https://api.bitbucket.org/2.0/repositories/{repo_path}/pullrequests"
+    return f"""
+    # Initialised here, not only in the lookup fallback: the happy path
+    # (URL in the create response) reads these under ``set -u``. The harness
+    # runs this under ``set -euo pipefail``, so a grep with no match must not
+    # end the block before the fallback (``|| true`` on each capture).
+    PRELOOP_PROVENANCE_FAILED=
+    PRELOOP_BODY_UPDATED=
+    PR_URL=$({grep_pr} {PR_RESPONSE_FILE} 2>/dev/null | head -1 | {sed_url}) || true
+    if [ -z "$PR_URL" ]; then
+      echo "No PR URL in the create response; looking it up by source branch"
+      curl -sS --get \\
+        -H "$PRELOOP_BB_AUTH" \\
+        --data-urlencode 'state=OPEN' \\
+        --data-urlencode 'q=source.branch.name = "{branch}"' \\
+        -o {PR_LOOKUP_FILE} \\
+        "{api_url}" \\
+        || echo "PR lookup by source branch failed"
+      PR_URL=$({grep_pr} {PR_LOOKUP_FILE} 2>/dev/null | head -1 | {sed_url}) || true
+      {_existing_pr_failure_update_shell(kind="bitbucket", api_url=api_url, authorization="$PRELOOP_BB_AUTH", branch=branch, execution_link=execution_link)}
+    fi
+    if [ -n "${{PRELOOP_PROVENANCE_FAILED:-}}" ] && [ -z "${{PRELOOP_BODY_UPDATED:-}}" ]; then
+      echo "PRELOOP_PR_METADATA_WARNING: existing pull request body was left unchanged" >&2
+    elif [ -n "${{PR_URL:-}}" ]; then
+      echo "{PR_OPENED_LOG_MARKER} {{\\"url\\": \\"$PR_URL\\", \\"branch\\": \\"{branch}\\", \\"provider\\": \\"bitbucket\\"}}"
+    else
+      echo "No pull request URL could be resolved for branch {branch}"
     fi
 """
 
@@ -633,6 +841,46 @@ def extract_issue_number_from_trigger(
     return None
 
 
+_JIRA_ISSUE_KEY = re.compile(r"^[A-Z][A-Z0-9_]{0,30}-[0-9]{1,10}$")
+_UNSAFE_BRANCH_SLUG_CHARS = re.compile(r"[^a-z0-9._-]+")
+
+
+def extract_jira_issue_key_from_trigger(
+    trigger_data: Optional[Dict[str, Any]],
+) -> Optional[str]:
+    """Return the Jira issue key (``ABC-123``) of a Jira issue trigger.
+
+    Only for branch naming: Jira links a Bitbucket branch to an issue when the
+    branch name carries the key. Callers that need a numeric issue number
+    keep using :func:`extract_issue_number_from_trigger`.
+    """
+    if not isinstance(trigger_data, dict):
+        return None
+    payload = trigger_data.get("payload", trigger_data)
+    if not isinstance(payload, dict):
+        return None
+    issue = payload.get("issue")
+    if not isinstance(issue, dict):
+        return None
+    key = str(issue.get("key") or "").strip()
+    return key if _JIRA_ISSUE_KEY.fullmatch(key) else None
+
+
+def branch_slug(name: Optional[str], *, max_length: int = 30) -> str:
+    """Reduce a free-text name (a flow name) to a safe git branch segment.
+
+    Flow names are user text: a cloned preset is called ``Copy of X (2)``.
+    Anything outside ``[a-z0-9._-]`` collapses to ``-`` so the generated
+    branch passes :func:`_validated_git_ref`; otherwise publication is
+    skipped for the whole run.
+    """
+    slug = _UNSAFE_BRANCH_SLUG_CHARS.sub("-", str(name or "").lower())
+    slug = re.sub(r"\.{2,}", ".", slug)[:max_length].strip("-.")
+    if slug.endswith(".lock"):
+        slug = slug[: -len(".lock")].strip("-.")
+    return slug or "flow"
+
+
 # Bounded tail for terminal-path pod log reads on Kubernetes. The artifact
 # emission always TRAILS the agent output and its payload is capped by the two
 # byte limits above, so a window of (worst-case emission lines + a generous
@@ -687,11 +935,12 @@ K8S_TERMINAL_LOG_TAIL_LINES = _WORST_CASE_EMISSION_LINES + 2000
 # emission wrapper prints starts with this prefix, so operator-facing log
 # consumers can filter the (potentially large, base64) blocks statelessly.
 # Grammar:
-#   PRELOOP_ARTIFACT_BEGIN <channel> <status> [<size_bytes>]
+#   PRELOOP_ARTIFACT_BEGIN <channel> <status> [<size_bytes_or_reason>]
 #   PRELOOP_ARTIFACT_B64 <base64-chunk>          (0..n lines)
 #   PRELOOP_ARTIFACT_END <channel>
-# where <channel> is "result" or "evidence" and <status> is one of
-# present | absent | too_large | error | uploaded.
+# where <channel> is "result", "evidence", or "workspace" and <status> is
+# one of present | absent | too_large | error | uploaded | unavailable |
+# skipped. A non-numeric fourth token is a reason (plaintext_disabled).
 ARTIFACT_STREAM_LINE_PREFIX = "PRELOOP_ARTIFACT_"
 
 # Environment variable carrying the original (unwrapped) agent script when the
@@ -709,6 +958,15 @@ K8S_INNER_SCRIPT_BYTES_ENV = chunk_bytes_env(K8S_INNER_SCRIPT_ENV_PREFIX)
 
 # Where the wrapper reassembles the agent script before running it.
 K8S_INNER_SCRIPT_PATH = f"{LAUNCH_PAYLOAD_DIR}/agent-script.sh"
+
+# Docker: a `bash -c <script>` larger than this travels as chunked env
+# variables and is rebuilt here (same transport as Kubernetes, without the
+# log-artifact epilogue Docker does not need).
+DOCKER_SCRIPT_ENV_PREFIX = "PRELOOP_DOCKER_SCRIPT_"
+DOCKER_SCRIPT_PATH = f"{LAUNCH_PAYLOAD_DIR}/docker-agent-script.sh"
+DOCKER_INLINE_SCRIPT_MAX_BYTES = 64 * 1024
+# Exported by the loader so a script that re-execs itself can find its file.
+DOCKER_SCRIPT_PATH_ENV = "PRELOOP_DOCKER_SCRIPT_PATH"
 
 # Key under which the orchestrator names the SESSION (not the execution) that
 # is being started. One execution can legitimately start several agent
@@ -789,7 +1047,13 @@ async def _sleep_before_job_create_retry(seconds: float) -> None:
 #
 # Direct upload (PRELOOP_EVIDENCE_PUT_TOKEN): the wrapper never prints
 # evidence or result.json bytes. Markers report uploaded/absent/error only.
-# The Kubernetes log channel remains the legacy path when the token is unset.
+# The child script's EXIT trap would PUT the same pack. The wrapper exports
+# PRELOOP_EVIDENCE_WRAPPER_OWNS_UPLOAD before the child starts so that trap
+# skips, and this epilogue is the only evidence emit. Docker has no wrapper,
+# so its trap still uploads once.
+# The Kubernetes log channel remains the legacy path when the token is unset
+# and PRELOOP_EVIDENCE_LOG_PLAINTEXT is not 0. When plaintext is 0 and the
+# token is absent, the wrapper prints unavailable/skipped markers and no bytes.
 K8S_ARTIFACT_WRAPPER_SCRIPT = f"""
 _preloop_emit_artifacts() {{
     if [ -n "${{PRELOOP_EVIDENCE_PUT_TOKEN:-}}" ]; then
@@ -823,6 +1087,15 @@ _preloop_emit_artifacts() {{
             echo "PRELOOP_ARTIFACT_BEGIN result absent"
             echo "PRELOOP_ARTIFACT_END result"
         fi
+        return
+    fi
+    if [ "${{PRELOOP_EVIDENCE_LOG_PLAINTEXT:-1}}" = "0" ]; then
+        echo "PRELOOP_ARTIFACT_BEGIN result unavailable plaintext_disabled"
+        echo "PRELOOP_ARTIFACT_END result"
+        echo "PRELOOP_ARTIFACT_BEGIN evidence unavailable plaintext_disabled"
+        echo "PRELOOP_ARTIFACT_END evidence"
+        echo "PRELOOP_ARTIFACT_BEGIN workspace skipped plaintext_disabled"
+        echo "PRELOOP_ARTIFACT_END workspace"
         return
     fi
     if [ -f {RESULT_ARTIFACT_PATH} ]; then
@@ -901,6 +1174,9 @@ else
     echo "ERROR: {K8S_INNER_SCRIPT_ENV} is not set" >&2
     exit 1
 fi
+if [ -n "${{PRELOOP_EVIDENCE_PUT_TOKEN:-}}" ]; then
+    export PRELOOP_EVIDENCE_WRAPPER_OWNS_UPLOAD=1
+fi
 bash "$_pl_inner"
 _preloop_rc=$?
 _preloop_emit_artifacts
@@ -923,6 +1199,31 @@ except ImportError:
     logger.warning(
         "kubernetes_asyncio not available, Kubernetes execution will not be supported"
     )
+
+
+#: ``execution_context`` key carrying the seconds an agent runtime may live.
+#: The orchestrator writes it; the Kubernetes executor reads it for the Job's
+#: ``activeDeadlineSeconds``. One constant so a rename cannot drop the backstop.
+RUNTIME_DEADLINE_CONTEXT_KEY = "runtime_deadline_seconds"
+
+
+def runtime_deadline_seconds(execution_context: Dict[str, Any]) -> Optional[int]:
+    """``activeDeadlineSeconds`` for an agent Job, or None for no deadline.
+
+    The orchestrator puts the execution's remaining wall-clock budget plus a
+    teardown grace into the context (``RUNTIME_DEADLINE_CONTEXT_KEY``). A
+    confirmation nudge writes its own timeout plus that grace instead. Anything
+    that is not a positive whole number leaves the Job without a deadline,
+    as before.
+    """
+    value = execution_context.get(RUNTIME_DEADLINE_CONTEXT_KEY)
+    if isinstance(value, bool):
+        return None
+    try:
+        seconds = int(value)
+    except (TypeError, ValueError):
+        return None
+    return seconds if seconds > 0 else None
 
 
 class ContainerAgentExecutor(AgentExecutor):
@@ -1124,6 +1425,9 @@ class ContainerAgentExecutor(AgentExecutor):
                 "PRELOOP_EVIDENCE_PUT_TOKEN"
             )
         )
+        # PRELOOP_EVIDENCE_LOG_PLAINTEXT is applied with the token in
+        # _apply_git_credential_env (1 when the log channel is allowed, 0
+        # when it is refused).
         if self.environment_profile and not self.use_kubernetes:
             await self._prepare_environment_services(execution_context)
 
@@ -1250,10 +1554,7 @@ class ContainerAgentExecutor(AgentExecutor):
                 # Mount workspace volume with proper permissions
                 "Binds": [f"{workspace_volume}:/workspace:rw"],
                 # Resource limits
-                "Memory": int(os.getenv("AGENT_MEMORY_LIMIT", "2g").replace("g", ""))
-                * 1024
-                * 1024
-                * 1024,
+                "Memory": docker_memory_bytes(os.getenv("AGENT_MEMORY_LIMIT", "4g")),
                 "CpuQuota": int(os.getenv("AGENT_CPU_QUOTA", "100000")),
             },
         }
@@ -1457,27 +1758,33 @@ class ContainerAgentExecutor(AgentExecutor):
         ]
 
         # Get resource limits from config or use defaults
-        memory_limit = os.getenv("AGENT_MEMORY_LIMIT", "2Gi")
+        memory_limit = os.getenv("AGENT_MEMORY_LIMIT", "4Gi")
         cpu_limit = os.getenv("AGENT_CPU_LIMIT", "1")
         memory_request = os.getenv("AGENT_MEMORY_REQUEST", "512Mi")
         cpu_request = os.getenv("AGENT_CPU_REQUEST", "250m")
 
-        # Determine working directory based on git clone configuration
+        # Optional sandbox runtime and node placement (issue #1076). Each
+        # setting is empty/unset by default, so a stock install renders the
+        # same pod spec as before.
+        runtime_class_name = agent_runtime_class_name()
+        pod_node_selector = agent_node_selector()
+        pod_tolerations = agent_client_tolerations(client)
+
+        # Keep the process cwd on the emptyDir mount root. The CRI creates
+        # workingDir as root after fsGroup chown, so a clone subdirectory
+        # that does not exist yet becomes root:root 0755. Unprivileged
+        # harnesses (DeepSeek/Pi, UID 10000) then fail git clone with
+        # `/workspace/workspace/.git: Permission denied`. Launch scripts
+        # cd into the checkout after clone.
         working_dir = "/workspace"
         git_clone_config = execution_context.get("git_clone_config")
         if git_clone_config:
             repositories = git_clone_config.get("repositories", [])
             if repositories:
-                # Use the first repository's clone path as working directory
-                clone_path = repositories[0].get("clone_path", "/workspace")
-                if clone_path.startswith("/"):
-                    # Absolute path
-                    working_dir = clone_path
-                else:
-                    # Relative path - prepend /workspace/
-                    working_dir = f"/workspace/{clone_path}"
                 self.logger.info(
-                    f"Setting pod working directory to git repository: {working_dir}"
+                    "Pod working directory stays %s; clone target is %s",
+                    working_dir,
+                    self._resolve_repository_clone_path(repositories[0], 0),
                 )
 
         # Check if subclass provided custom command/args (e.g., CodexAgent)
@@ -1603,6 +1910,12 @@ class ContainerAgentExecutor(AgentExecutor):
             ),
             spec=client.V1PodSpec(
                 restart_policy="Never",
+                # Sandbox runtime and node placement for the agent pod.
+                # ``None`` omits the key, which is what keeps a stock
+                # install on the node default.
+                runtime_class_name=runtime_class_name or None,
+                node_selector=pod_node_selector or None,
+                tolerations=pod_tolerations or None,
                 # Isolated agents must not retain cluster authority to create
                 # residual writers after their owned Job has been removed.
                 automount_service_account_token=False
@@ -1641,6 +1954,10 @@ class ContainerAgentExecutor(AgentExecutor):
                 template=pod_template,
                 backoff_limit=0,  # Don't retry failed jobs
                 ttl_seconds_after_finished=ttl_seconds,  # Auto-cleanup after completion
+                # Backstop for the execution's wall-clock deadline: the
+                # orchestrator times the run out and stops the Job itself;
+                # this ends it when the orchestrator cannot.
+                active_deadline_seconds=runtime_deadline_seconds(execution_context),
             ),
         )
 
@@ -2394,7 +2711,35 @@ class ContainerAgentExecutor(AgentExecutor):
 
         Docker's ``Env`` is a list of ``NAME=value`` strings, which is exactly
         the execve form, so it is measured as-is rather than re-joined.
+
+        Every Docker launch passes through here, so this is also where a large
+        ``bash -c <script>`` moves into chunked environment variables, as on
+        Kubernetes. Inline it would be one execve string over MAX_ARG_STRLEN:
+        an implementation flow with the default verification gate generates
+        ~140 KiB of shell.
         """
+        cmd = container_config.get("Cmd")
+        entrypoint = container_config.get("Entrypoint")
+        chunked = None
+        if isinstance(cmd, list) and len(cmd) >= 2:
+            chunked = self._chunk_docker_script_args(list(cmd[-2:]))
+            if chunked is not None:
+                container_config["Cmd"] = list(cmd[:-2]) + chunked[0]
+        elif (
+            isinstance(entrypoint, list)
+            and entrypoint
+            and entrypoint[-1] == "-c"
+            and isinstance(cmd, list)
+            and len(cmd) == 1
+        ):
+            # Aider: Entrypoint ["bash", "-c"], Cmd [script].
+            chunked = self._chunk_docker_script_args(["-c", cmd[0]])
+            if chunked is not None:
+                container_config["Cmd"] = [chunked[0][1]]
+        if chunked is not None:
+            container_config["Env"] = list(container_config.get("Env") or []) + [
+                f"{name}={value}" for name, value in chunked[1].items()
+            ]
         raw_env = container_config.get("Env") or []
         env: Dict[str, Any] = {}
         for entry in raw_env:
@@ -2405,6 +2750,43 @@ class ContainerAgentExecutor(AgentExecutor):
         self._guard_launch_payload(
             command=command or None, args=args or None, env=env, what=what
         )
+
+    @staticmethod
+    def _chunk_docker_script_args(
+        args: Any,
+    ) -> Optional[tuple[list, Dict[str, str]]]:
+        """Move an oversized ``["-c", script]`` into chunked env variables.
+
+        Returns ``(args, env)`` where ``args`` runs a short loader that
+        rebuilds the script at :data:`DOCKER_SCRIPT_PATH` and execs it, or
+        None when the script is small enough to stay inline (the common
+        case keeps its historic shape).
+        """
+        if not (
+            isinstance(args, list)
+            and len(args) == 2
+            and args[0] == "-c"
+            and isinstance(args[1], str)
+            and len(args[1].encode("utf-8")) > DOCKER_INLINE_SCRIPT_MAX_BYTES
+        ):
+            return None
+        script = args[1]
+        loader = (
+            build_chunk_materialization_shell(
+                DOCKER_SCRIPT_ENV_PREFIX,
+                script,
+                DOCKER_SCRIPT_PATH,
+                label="agent script",
+            )
+            + " || exit 1\n"
+            # Readable by a harness that drops privileges (pi/dsh re-exec the
+            # script as uid 10000 through this exported path, since
+            # BASH_EXECUTION_STRING is unset once the script runs from a file).
+            + f"chmod 0644 {shlex.quote(DOCKER_SCRIPT_PATH)} || exit 1\n"
+            + f"export {DOCKER_SCRIPT_PATH_ENV}={shlex.quote(DOCKER_SCRIPT_PATH)}\n"
+            + f"exec bash {shlex.quote(DOCKER_SCRIPT_PATH)}\n"
+        )
+        return ["-c", loader], chunked_env(DOCKER_SCRIPT_ENV_PREFIX, script)
 
     @staticmethod
     def _wrap_kubernetes_args_for_artifacts(
@@ -2434,7 +2816,9 @@ class ContainerAgentExecutor(AgentExecutor):
         Returns ``None`` when no BEGIN marker for ``channel`` exists (wrapper
         not applied, or logs rotated away), otherwise a dict with:
         ``status``: present | absent | too_large | error | truncated | corrupt
+            | unavailable | skipped | uploaded
         ``size``: declared byte size when the marker carried one
+        ``reason``: non-numeric fourth token (for example plaintext_disabled)
         ``data``: decoded payload bytes when status == "present"
         """
         begin_prefix = f"{ARTIFACT_STREAM_LINE_PREFIX}BEGIN {channel}"
@@ -2450,14 +2834,15 @@ class ContainerAgentExecutor(AgentExecutor):
             return None
 
         marker_parts = lines[begin_idx].strip().split()
-        # ["PRELOOP_ARTIFACT_BEGIN", channel, status, size?]
+        # ["PRELOOP_ARTIFACT_BEGIN", channel, status, size_or_reason?]
         status = marker_parts[2] if len(marker_parts) > 2 else "error"
         size: Optional[int] = None
+        reason: Optional[str] = None
         if len(marker_parts) > 3:
             try:
                 size = int(marker_parts[3])
             except ValueError:
-                size = None
+                reason = marker_parts[3]
 
         chunks: list[str] = []
         terminated = False
@@ -2469,14 +2854,40 @@ class ContainerAgentExecutor(AgentExecutor):
             if stripped.startswith(b64_prefix):
                 chunks.append(stripped[len(b64_prefix) :])
         if not terminated:
-            return {"status": "truncated", "size": size, "data": None}
+            return {
+                "status": "truncated",
+                "size": size,
+                "reason": reason,
+                "data": None,
+            }
         if status != "present":
-            return {"status": status, "size": size, "data": None}
+            return {"status": status, "size": size, "reason": reason, "data": None}
         try:
             data = base64.b64decode("".join(chunks), validate=True)
         except (binascii.Error, ValueError):
-            return {"status": "corrupt", "size": size, "data": None}
-        return {"status": "present", "size": size, "data": data}
+            return {"status": "corrupt", "size": size, "reason": reason, "data": None}
+        return {"status": "present", "size": size, "reason": reason, "data": data}
+
+    def _evidence_log_plaintext_enabled(self) -> bool:
+        """Whether this process may decode artifact bytes from pod logs.
+
+        Direct upload never consults this. The default keeps the legacy
+        channel. ``False`` refuses it even when a log line claims ``present``.
+        """
+        return bool(getattr(settings, "flow_evidence_log_plaintext", True))
+
+    def _plaintext_log_refused(self) -> bool:
+        """True when artifact bytes must not be taken from the pod log."""
+        if self._direct_evidence:
+            return False
+        return not self._evidence_log_plaintext_enabled()
+
+    @staticmethod
+    def _marker_plaintext_disabled(stream: Optional[Dict[str, Any]]) -> bool:
+        """True when a channel marker names the plaintext_disabled reason."""
+        if not stream:
+            return False
+        return stream.get("reason") == "plaintext_disabled"
 
     async def _get_kubernetes_terminal_logs(self, job_name: str) -> list[str]:
         """Read the tail of a finished Job's pod log once and cache it.
@@ -2532,6 +2943,9 @@ class ContainerAgentExecutor(AgentExecutor):
                 f"No result artifact emission found in logs of Job {job_name}"
             )
             return None
+        if self._marker_plaintext_disabled(stream) or self._plaintext_log_refused():
+            # Same outcome as a missing result.json: no success, no payload.
+            return None
         status = stream["status"]
         if status == "absent":
             return None
@@ -2582,12 +2996,16 @@ class ContainerAgentExecutor(AgentExecutor):
         """Capture the evidence pack (``/workspace/evidence``) as tar.gz bytes.
 
         Docker legacy: fetches the directory through the archive API and
-        re-packs it as tar.gz. Docker direct upload: the EXIT trap already
-        PUT the pack; logs carry ``PRELOOP_EVIDENCE committed|failed|absent``
-        and this getter returns no bytes so the orchestrator does not store
-        a second copy. Kubernetes: decodes the base64 emission from the pod
-        log stream (see ``K8S_ARTIFACT_WRAPPER_SCRIPT``) unless direct upload
-        is configured, in which case logs carry no evidence payload.
+        re-packs it as tar.gz. That copy does not read the log channel, so
+        ``FLOW_EVIDENCE_LOG_PLAINTEXT`` does not change it. Docker direct
+        upload: the EXIT trap already PUT the pack; logs carry
+        ``PRELOOP_EVIDENCE committed|failed|absent`` and this getter returns
+        no bytes so the orchestrator does not store a second copy. Kubernetes:
+        decodes the base64 emission from the pod log stream (see
+        ``K8S_ARTIFACT_WRAPPER_SCRIPT``) unless direct upload is configured
+        or plaintext logging is off. In those cases logs carry no evidence
+        payload. Plaintext off without a token sets
+        ``evidence_transport_error`` to ``plaintext_disabled``.
         """
         if self.use_kubernetes:
             return await self._get_kubernetes_evidence_archive(session_reference)
@@ -2603,6 +3021,9 @@ class ContainerAgentExecutor(AgentExecutor):
             )
             return None
         stream = self._extract_artifact_stream(lines, "evidence")
+        if self._marker_plaintext_disabled(stream) or self._plaintext_log_refused():
+            self.evidence_transport_error = "plaintext_disabled"
+            return None
         if stream is None or stream["status"] == "absent":
             return None
         if stream["status"] == "error":
@@ -2874,6 +3295,15 @@ class ContainerAgentExecutor(AgentExecutor):
             )
             return None
         stream = self._extract_artifact_stream(lines, "workspace")
+        if stream is not None and (
+            self._marker_plaintext_disabled(stream)
+            or not self._evidence_log_plaintext_enabled()
+        ):
+            self.logger.info(
+                f"Workspace snapshot from Job {job_name} skipped "
+                "(plaintext log channel disabled)"
+            )
+            return None
         if stream is None or stream["status"] == "absent":
             self.logger.info(
                 f"No workspace snapshot emitted by Job {job_name} "
@@ -3154,8 +3584,14 @@ class ContainerAgentExecutor(AgentExecutor):
             )
             return len(pods.items) == 0
         docker = await self._get_docker_client()
-        container = await docker.containers.get(session_reference)
-        state = (await container.show())["State"]
+        try:
+            container = await docker.containers.get(session_reference)
+            state = (await container.show())["State"]
+        except DockerError as exc:
+            # A container that no longer exists is not running.
+            if getattr(exc, "status", None) == 404:
+                return True
+            raise
         return state.get("Running") is False and state.get("Status") in {
             "exited",
             "dead",
@@ -3554,7 +3990,8 @@ class ContainerAgentExecutor(AgentExecutor):
         credentials: Dict[int, GitCredential] = (
             execution_context.get(self.GIT_CREDENTIALS_CONTEXT_KEY) or {}
         )
-        env = dict(
+        env = dict(execution_context.get("_publication_refresh_env") or {})
+        env.update(
             build_credential_env(credentials[index] for index in sorted(credentials))
         )
 
@@ -3574,10 +4011,16 @@ class ContainerAgentExecutor(AgentExecutor):
         if (execution_context.get("git_clone_config") or {}).get(
             "publication_mode"
         ) == "isolated":
-            if execution_context.get(self.GIT_API_TOKENS_CONTEXT_KEY):
+            if execution_context.get(
+                self.GIT_API_TOKENS_CONTEXT_KEY
+            ) or execution_context.get("_publication_refresh_env"):
                 raise ValueError("Write API tokens cannot enter an isolated agent")
         env.update(execution_context.get("checkpoint_env") or {})
         env.update(execution_context.get("evidence_env") or {})
+        if self.use_kubernetes:
+            env["PRELOOP_EVIDENCE_LOG_PLAINTEXT"] = (
+                "1" if self._evidence_log_plaintext_enabled() else "0"
+            )
         # Workspace seeds travel in the environment, not in the launch
         # command: the command is one execve string capped at MAX_ARG_STRLEN
         # (128 KiB) and shared with the rendered prompt. See
@@ -3643,6 +4086,9 @@ class ContainerAgentExecutor(AgentExecutor):
                         git_cmd, execution_context
                     )
                     commands.append(git_cmd)
+                    # After the clone-or-restore wrapper, so a restored
+                    # workspace (which skips the clone) is covered too.
+                    commands.extend(self._evidence_exclude_commands(execution_context))
                     self.logger.info(
                         "Git clone commands added (length=%d)", len(git_cmd)
                     )
@@ -3671,7 +4117,7 @@ class ContainerAgentExecutor(AgentExecutor):
             # provider from the controller's tracker binding (including
             # self-hosted GitLab), then pass it as data to template discovery.
             repos = git_clone_config.get("repositories") or [{}]
-            _, template_provider = self._resolve_repository_token(
+            _, template_provider, _ = self._resolve_repository_token(
                 repos[0], execution_context
             )
             if template_provider not in {"github", "gitlab"}:
@@ -3888,9 +4334,7 @@ class ContainerAgentExecutor(AgentExecutor):
 
         restore_steps = [
             f'echo "Restored workspace found at {repo_path}, skipping git clone"',
-            f"git config --global user.name {shlex.quote(git_user_name)}",
-            f"git config --global user.email {shlex.quote(git_user_email)}",
-            "git config --global --add safe.directory '*'",
+            *_git_identity_commands(git_user_name, git_user_email),
             build_credential_setup_shell(),
             f"cd {shlex.quote(repo_path)}",
         ]
@@ -3909,6 +4353,7 @@ class ContainerAgentExecutor(AgentExecutor):
                 execution_context.get("trigger_event_data") or {}
             )
             if repo_url:
+                repo_url = strip_url_credentials(repo_url)
                 restore_steps.append(
                     f"(git remote add origin {shlex.quote(repo_url)} || git remote set-url origin {shlex.quote(repo_url)})"
                 )
@@ -3955,11 +4400,36 @@ fi
         restore_steps.append("(git log --oneline -3 || true)")
 
         restore_block = " && ".join(restore_steps)
+        metadata_clone = clone_command
         if direct_restore:
             clone_command = "echo PRELOOP_CHECKPOINT repository_missing; exit 1"
+        q_repo = shlex.quote(repo_path)
+        # A metadata-only checkpoint has no .git. The code host still has the
+        # commit, so clone it. A missing repository that was supposed to be a
+        # full restore stays a hard failure.
+        meta_args = " ".join(
+            [
+                shlex.quote("/workspace/.preloop-checkpoint.json"),
+                shlex.quote(repo_path.rstrip("/") + "/.preloop-checkpoint.json"),
+            ]
+        )
+        checker = (
+            "python3 -c '"
+            "import json,sys\n"
+            "for candidate in sys.argv[1:]:\n"
+            "    try:\n"
+            "        document = json.load(open(candidate))\n"
+            "    except Exception:\n"
+            "        continue\n"
+            '    if isinstance(document, dict) and document.get("metadata_only") is True:\n'
+            "        raise SystemExit(0)\n"
+            "raise SystemExit(1)' " + meta_args
+        )
         return (
-            f"if [ -d {shlex.quote(repo_path)}/.git ]; then\n"
+            f"if [ -d {q_repo}/.git ]; then\n"
             f"{restore_block}\n"
+            f"elif {checker}; then\n"
+            f"{metadata_clone}\n"
             "else\n"
             f"{clone_command}\n"
             "fi"
@@ -4028,12 +4498,15 @@ fi
 
             if not target_branch:
                 execution_id = execution_context.get("execution_id", "exec")
-                issue_number = extract_issue_number_from_trigger(trigger_data)
+                issue_number = extract_issue_number_from_trigger(
+                    trigger_data
+                ) or extract_jira_issue_key_from_trigger(trigger_data)
                 if issue_number:
                     target_branch = f"preloop/issue-{issue_number}-{execution_id[:8]}"
                 else:
-                    flow_name = execution_context.get("flow_name", "flow")
-                    safe_flow_name = flow_name.lower().replace(" ", "-")[:30]
+                    safe_flow_name = branch_slug(
+                        execution_context.get("flow_name", "flow")
+                    )
                     target_branch = f"preloop/{safe_flow_name}-{execution_id[:8]}"
 
         commit_sha = self._extract_commit_sha_from_trigger(trigger_data)
@@ -4084,8 +4557,7 @@ fi
 
         return [
             "mkdir -p /workspace",
-            f"git config --global user.name {shlex.quote(git_user_name)}",
-            f"git config --global user.email {shlex.quote(git_user_email)}",
+            *_git_identity_commands(git_user_name, git_user_email),
         ]
 
     def _resolve_repository_clone_url(
@@ -4131,8 +4603,8 @@ fi
         self,
         repo_config: Dict[str, Any],
         execution_context: Dict[str, Any],
-    ) -> tuple[Optional[str], Optional[str]]:
-        """Return ``(token, tracker_type)`` for one repository entry.
+    ) -> tuple[Optional[str], Optional[str], Optional[str]]:
+        """Return ``(token, tracker_type, git_username)`` for one repository.
 
         Sources, in order:
 
@@ -4177,9 +4649,27 @@ fi
                 raise ValueError(
                     "Isolated agent clone requires a controller-issued read-only credential"
                 )
-            return credential.get("token"), credential.get("tracker_type")
+            return (
+                credential.get("token"),
+                credential.get("tracker_type"),
+                credential.get("username"),
+            )
 
         git_credentials_map = execution_context.get("git_credentials_map") or {}
+
+        if execution_context.get("repository_binding"):
+            # A bound execution was triggered by an issue tracker (Jira). Its
+            # token is not a git credential, and sending it to the code host
+            # would leak it, so only the bound code-host tracker counts.
+            tracker_id = repo_config.get("tracker_id")
+            tracker_creds = (
+                (git_credentials_map.get(tracker_id) or {}) if tracker_id else {}
+            )
+            return (
+                tracker_creds.get("token") or None,
+                tracker_creds.get("tracker_type"),
+                tracker_creds.get("username"),
+            )
 
         candidate_ids = [
             repo_config.get("tracker_id"),
@@ -4190,15 +4680,19 @@ fi
                 continue
             tracker_creds = git_credentials_map.get(tracker_id) or {}
             if tracker_creds.get("token"):
-                return tracker_creds.get("token"), tracker_creds.get("tracker_type")
+                return (
+                    tracker_creds.get("token"),
+                    tracker_creds.get("tracker_type"),
+                    tracker_creds.get("username"),
+                )
 
         trigger_project_id = execution_context.get("trigger_project_id")
         if trigger_project_id:
-            token, tracker_type = self._get_token_from_project(
+            token, tracker_type, username = self._get_token_from_project(
                 trigger_project_id, execution_context.get("account_id")
             )
             if token:
-                return token, tracker_type
+                return token, tracker_type, username
 
         # Nothing usable: return the tracker type when known, so the caller can
         # still log which host kind was expected.
@@ -4207,9 +4701,41 @@ fi
                 (git_credentials_map.get(tracker_id) or {}) if tracker_id else {}
             )
             if tracker_creds.get("tracker_type"):
-                return None, tracker_creds.get("tracker_type")
+                return None, tracker_creds.get("tracker_type"), None
 
-        return None, None
+        return None, None, None
+
+    def _resolve_git_username(
+        self,
+        repo_config: Dict[str, Any],
+        execution_context: Dict[str, Any],
+        host_kind: Optional[str],
+        tracker_type: Optional[str],
+        resolved_username: Optional[str] = None,
+    ) -> str:
+        """Return the git username to pair with this repository's token.
+
+        Most providers accept a fixed placeholder username. Bitbucket needs a
+        username that matches the kind of token (the account's Bitbucket
+        username or ``x-bitbucket-api-token-auth`` for an API token,
+        ``x-token-auth`` for access and OAuth tokens), so the orchestrator
+        resolves it per tracker and ships it in ``git_credentials_map``, and
+        the database fallback derives it from the tracker row
+        (``resolved_username``, from :meth:`_resolve_repository_token`).
+        """
+        if resolved_username:
+            return str(resolved_username)
+        git_credentials_map = execution_context.get("git_credentials_map") or {}
+        for tracker_id in (
+            repo_config.get("tracker_id"),
+            execution_context.get("trigger_tracker_id"),
+        ):
+            if not tracker_id:
+                continue
+            creds = git_credentials_map.get(tracker_id) or {}
+            if creds.get("token") and creds.get("username"):
+                return str(creds["username"])
+        return credential_username(host_kind, tracker_type)
 
     def _build_git_credential(
         self,
@@ -4226,7 +4752,7 @@ fi
 
         safe_url = strip_url_credentials(repo_url)
 
-        token, tracker_type = self._resolve_repository_token(
+        token, tracker_type, resolved_username = self._resolve_repository_token(
             repo_config, execution_context
         )
         if not token:
@@ -4249,7 +4775,9 @@ fi
                 tracker_type,
             )
 
-        username = credential_username(host_kind, tracker_type)
+        username = self._resolve_git_username(
+            repo_config, execution_context, host_kind, tracker_type, resolved_username
+        )
         self.logger.info(
             "Prepared git credential for %s (user=%s, token not in URL)",
             repo_url_log_location(safe_url),
@@ -4361,18 +4889,23 @@ cd /workspace
     def _build_git_pre_clone_shell(self, full_path: str) -> str:
         """Build shell that prepares the clone target directory."""
 
+        q_path = shlex.quote(full_path)
         return f"""
-echo "Preparing clone directory: {full_path}"
-if [ -d "{full_path}" ]; then
-    if [ -d "{full_path}/.git" ]; then
-        echo "WARNING: {full_path} already contains a git repository, will reset it"
-        rm -rf "{full_path}"
-    elif [ "$(ls -A {full_path} 2>/dev/null)" ]; then
-        echo "WARNING: {full_path} is not empty, cleaning up non-essential files..."
+echo "Preparing clone directory:" {q_path}
+if [ -d {q_path} ] && [ ! -w {q_path} ]; then
+    echo "WARNING:" {q_path} "exists but is not writable; replacing it"
+    rm -rf {q_path}
+fi
+if [ -d {q_path} ]; then
+    if [ -d {q_path}/.git ]; then
+        echo "WARNING:" {q_path} "already contains a git repository, will reset it"
+        rm -rf {q_path}
+    elif [ "$(ls -A {q_path} 2>/dev/null)" ]; then
+        echo "WARNING:" {q_path} "is not empty, cleaning up non-essential files..."
         # Move any existing files to a backup location, preserving only reports if they exist
         mkdir -p /tmp/workspace-backup
-        mv {full_path}/* /tmp/workspace-backup/ 2>/dev/null || true
-        mv {full_path}/.[!.]* /tmp/workspace-backup/ 2>/dev/null || true
+        mv {q_path}/* /tmp/workspace-backup/ 2>/dev/null || true
+        mv {q_path}/.[!.]* /tmp/workspace-backup/ 2>/dev/null || true
         echo "Backed up existing files to /tmp/workspace-backup"
     fi
 fi
@@ -4518,6 +5051,9 @@ echo "========================================="
 echo "✓ Repository successfully cloned to {q_path}"
 echo "  Branch: {q_target} (from {q_source})"{sha_display}
 echo "========================================="
+if [ -f /tmp/preloop-checkpoint-client.py ]; then
+  python3 /tmp/preloop-checkpoint-client.py record-head {q_path} || true
+fi
 """.strip()
 
     def _build_git_resume_rebase_shell(
@@ -4683,6 +5219,57 @@ true
                     execution_context["_git_resume_rebase"] = True
         return commands
 
+    def _evidence_exclude_commands(self, execution_context: Dict[str, Any]) -> list:
+        """Evidence exclude for every checkout the clone step produced."""
+        git_config = execution_context.get("git_clone_config") or {}
+        if not isinstance(git_config, dict):
+            return []
+        try:
+            repositories = self._resolve_git_clone_repositories(
+                execution_context, git_config
+            )
+        except Exception:  # pragma: no cover - best effort, never fails a run
+            return []
+        shells = []
+        for idx, repo_config in enumerate(repositories or []):
+            if not isinstance(repo_config, dict):
+                continue
+            shell = self._build_evidence_exclude_shell(
+                self._resolve_repository_clone_path(repo_config, idx)
+            )
+            if shell:
+                shells.append(shell)
+        return shells
+
+    @staticmethod
+    def _build_evidence_exclude_shell(full_path: str) -> str:
+        """Keep platform evidence out of the agent's commits.
+
+        ``EVIDENCE_DIR_PATH`` sits inside a checkout cloned at ``/workspace``.
+        A resume writes markers there (``resume-rebased``, the PR template)
+        before the agent runs, and an agent that commits with ``git add -A``
+        then publishes them; the verification gate matches no rule for
+        ``evidence/`` and refuses the repair. A local exclude keeps them
+        untracked without touching the repository's own ``.gitignore``.
+        """
+        root = full_path.rstrip("/")
+        if not EVIDENCE_DIR_PATH.startswith(root + "/"):
+            return ""
+        relative = EVIDENCE_DIR_PATH[len(root) :].rstrip("/") + "/"
+        q_path = shlex.quote(full_path)
+        q_entry = shlex.quote(relative)
+        q_dir = shlex.quote(relative.strip("/"))
+        return (
+            f"( cd {q_path} 2>/dev/null "
+            # A repository that tracks its own top-level evidence/ keeps it:
+            # excluding it would silently drop new agent files there.
+            f"&& ! git ls-files --error-unmatch {q_dir} >/dev/null 2>&1 "
+            "&& _pl_exclude=$(git rev-parse --git-path info/exclude 2>/dev/null) "
+            '&& mkdir -p "$(dirname "$_pl_exclude")" '
+            f'&& {{ grep -qxF {q_entry} "$_pl_exclude" 2>/dev/null '
+            f"|| printf '%s\\n' {q_entry} >> \"$_pl_exclude\"; }} ) || true"
+        )
+
     def _prepare_git_clone_command(self, execution_context: Dict[str, Any]) -> str:
         """
         Prepare git clone commands for multiple repositories with branch management.
@@ -4766,6 +5353,42 @@ true
             self.logger.error(f"Error preparing git clone command: {e}", exc_info=True)
             return ""
 
+    def _resolve_bitbucket_api_email(
+        self,
+        repo_config: Dict[str, Any],
+        execution_context: Dict[str, Any],
+    ) -> str:
+        """The Basic-auth email for a Bitbucket API token, or empty.
+
+        Shipped in ``git_credentials_map`` by the orchestrator only when the
+        tracker authenticates with a personal API token, the one credential
+        kind whose Bearer form Bitbucket can refuse. Constrained to safe
+        characters because it is interpolated into the post-execution shell.
+        """
+        git_credentials_map = execution_context.get("git_credentials_map") or {}
+        for tracker_id in (
+            (repo_config or {}).get("tracker_id"),
+            execution_context.get("trigger_tracker_id"),
+        ):
+            if not tracker_id:
+                continue
+            creds = git_credentials_map.get(tracker_id) or {}
+            if not (creds.get("token") and creds.get("email")):
+                continue
+            if str(creds.get("auth_type") or "").lower() == MANAGED_AUTH_TYPE:
+                # A managed access token is Bearer-only. Mirror the client's
+                # rule here so the generated shell never retries with Basic,
+                # whatever metadata the credential entry happens to carry.
+                return ""
+            email = str(creds["email"])
+            if re.fullmatch(r"[A-Za-z0-9._%+@-]+", email):
+                return email
+            self.logger.warning(
+                "Ignoring a Bitbucket Basic-auth email with unexpected characters"
+            )
+            return ""
+        return ""
+
     def _build_pr_or_mr_create_shell(
         self,
         *,
@@ -4777,13 +5400,13 @@ true
         repo_url: Optional[str],
         safe_target: str,
         safe_source: str,
+        repo_config: Optional[Dict[str, Any]] = None,
     ) -> str:
         """Build post-push PR/MR creation. JSON is encoded by python in-container."""
 
-        effective_type = (
-            tracker_type if tracker_type in {"github", "gitlab"} else host_kind
-        )
-        if effective_type not in {"github", "gitlab"} or not token_ref or not repo_url:
+        supported = {"github", "gitlab", "bitbucket"}
+        effective_type = tracker_type if tracker_type in supported else host_kind
+        if effective_type not in supported or not token_ref or not repo_url:
             if git_config.get("create_pull_request"):
                 self.logger.warning(
                     "create_pull_request is enabled but PR/MR creation was skipped "
@@ -4857,6 +5480,65 @@ true
                     owner=owner,
                     repo=repo,
                     branch=safe_target,
+                    execution_link=execution_link,
+                )
+            )
+
+        if effective_type == "bitbucket":
+            from urllib.parse import urlparse as _urlparse
+
+            parsed = _urlparse(strip_url_credentials(repo_url))
+            repo_path = (parsed.path or "").lstrip("/").removesuffix(".git")
+            repo_path = repo_path.rstrip("/")
+            if len([part for part in repo_path.split("/") if part]) != 2:
+                return ""
+            api_url = (
+                f"https://api.bitbucket.org/2.0/repositories/{repo_path}/pullrequests"
+            )
+            api_email = self._resolve_bitbucket_api_email(
+                repo_config or {}, execution_context
+            )
+            create_curl = f"""curl -sS -o {PR_RESPONSE_FILE} -w "%{{http_code}}" \\
+        -X POST \\
+        -H "$PRELOOP_BB_AUTH" \\
+        -H "Content-Type: application/json" \\
+        --data-binary @{PR_PAYLOAD_FILE} \\
+        "{api_url}" \\
+        || echo "000\""""
+            basic_retry = ""
+            if api_email:
+                # A personal API token can be refused as Bearer; the tracker
+                # client falls back to Basic <email>:<token> and so does this
+                # shell. PRELOOP_BB_AUTH carries the surviving scheme into the
+                # capture shell's lookup and body update.
+                basic_retry = f"""
+      if [ "$HTTP_CODE" = "401" ]; then
+        echo "Bearer auth was refused; retrying with Basic auth"
+        PRELOOP_BB_AUTH="Authorization: Basic $(printf '%s' "{api_email}:{token_ref}" | python3 -c 'import base64,sys;sys.stdout.write(base64.b64encode(sys.stdin.buffer.read()).decode())')"
+        HTTP_CODE=$({create_curl})
+      fi
+"""
+            curl_cmd = f"""
+    echo "Creating pull request on Bitbucket..."
+    PRELOOP_BB_AUTH="Authorization: Bearer {token_ref}"
+    if [ ! -s {PR_PAYLOAD_FILE} ]; then
+      echo "PR payload was not written; skipping create"
+    else
+      HTTP_CODE=$({create_curl})
+{basic_retry}      echo "PR create HTTP $HTTP_CODE"
+      if [ "$HTTP_CODE" != "201" ]; then
+        echo "PR create response:"
+        cat {PR_RESPONSE_FILE} 2>/dev/null || true
+      fi
+    fi
+"""
+            return (
+                prepare
+                + curl_cmd
+                + build_bitbucket_pr_capture_shell(
+                    repo_path=repo_path,
+                    branch=safe_target,
+                    execution_link=execution_link,
                 )
             )
 
@@ -4898,6 +5580,7 @@ true
                 gitlab_host=gitlab_host,
                 encoded_path=encoded_path,
                 branch=safe_target,
+                execution_link=execution_link,
             )
         )
 
@@ -4954,7 +5637,7 @@ true
 
         repo_config = repositories[0]
         clone_path = self._resolve_repository_clone_path(repo_config, 0)
-        token, tracker_type = self._resolve_repository_token(
+        token, tracker_type, _ = self._resolve_repository_token(
             repo_config, execution_context
         )
         trigger_data = execution_context.get("trigger_event_data", {})
@@ -5000,6 +5683,7 @@ true
             repo_url=repo_url,
             safe_target=plan.branch,
             safe_source=base_branch,
+            repo_config=repo_config,
         )
         if not pull_request_shell:
             # No token, or a provider with no pull request API here: pushing a
@@ -5014,7 +5698,9 @@ true
             git_user_email=str(git_config.get("git_user_email") or "hello@preloop.ai"),
             push_auth_shell=build_push_auth_setup_shell(
                 token_ref=token_ref,
-                username=credential_username(host_kind, tracker_type),
+                username=self._resolve_git_username(
+                    repo_config, execution_context, host_kind, tracker_type
+                ),
             ),
             pull_request_shell=pull_request_shell,
         )
@@ -5345,7 +6031,18 @@ true
                     "Skipping post-execution git: unsafe target branch %r",
                     target_branch,
                 )
-                return ""
+                marker = (
+                    'echo "PRELOOP_PUBLICATION_SKIPPED: unsafe target '
+                    'branch name; nothing was pushed"'
+                )
+                if create_pr:
+                    # A flow that must open a pull request cannot report
+                    # success when nothing was pushed.
+                    return f"{marker}\nexit 1"
+                # Without create_pull_request the flow may never intend to
+                # push (a reviewer clones read-only), so failing it would
+                # break reviews; the skip is disclosed in the log instead.
+                return marker
             safe_source = _validated_git_ref(source_branch)
             if source_branch and safe_source is None:
                 self.logger.warning(
@@ -5378,7 +6075,7 @@ true
 
                 # Resolve the tracker token the same way clone does, so a
                 # missing tracker_id still finds the trigger-project token.
-                token, tracker_type = self._resolve_repository_token(
+                token, tracker_type, resolved_username = self._resolve_repository_token(
                     repo_config, execution_context
                 )
 
@@ -5401,8 +6098,79 @@ true
                     if repo_url
                     else None
                 )
-                username = credential_username(host_kind, tracker_type)
-                push_auth = build_push_auth_setup_shell(
+                username = self._resolve_git_username(
+                    repo_config,
+                    execution_context,
+                    host_kind,
+                    tracker_type,
+                    resolved_username,
+                )
+                refresh_auth = ""
+                repo_url = strip_url_credentials(repo_url)
+                credential_map = execution_context.get("git_credentials_map") or {}
+                candidate_ids = [repo_config.get("tracker_id")]
+                if not execution_context.get("repository_binding"):
+                    candidate_ids.append(execution_context.get("trigger_tracker_id"))
+                tracker_id = next(
+                    (
+                        candidate
+                        for candidate in candidate_ids
+                        if (credential_map.get(candidate) or {}).get("token")
+                    ),
+                    None,
+                )
+                credentials = credential_map.get(tracker_id) or {}
+                credential_auth = str(credentials.get("auth_type") or "").lower()
+                managed_bitbucket = (
+                    credential_auth == MANAGED_AUTH_TYPE
+                    and str(tracker_type or "").lower() == "bitbucket"
+                )
+                if (
+                    credential_auth in APP_AUTH_TYPES
+                    and str(tracker_type or "").lower() == "github"
+                ) or managed_bitbucket:
+                    # Hosted legacy publication reacquires credentials from the
+                    # controller right before push and PR REST calls: GitHub
+                    # App installation tokens and managed Bitbucket Cloud
+                    # access tokens both outlive their launch copy only on the
+                    # control plane. The runner receives an access token and
+                    # its git username, never a refresh token.
+                    from preloop.api.endpoints.publication_credentials import (
+                        mint_publication_capability,
+                    )
+                    from preloop.config import settings
+                    from preloop.agents import publication_auth_client
+
+                    capability_var = f"PRELOOP_PUBLICATION_CAPABILITY_{idx}"
+                    execution_context.setdefault("_publication_refresh_env", {})[
+                        capability_var
+                    ] = mint_publication_capability(
+                        account_id=str(execution_context["account_id"]),
+                        execution_id=str(execution_context["execution_id"]),
+                        tracker_id=str(tracker_id),
+                        repository_url=repo_url,
+                    )
+                    token_var = self._register_git_api_token(
+                        execution_context, idx, token or ""
+                    )
+                    token_ref = "${%s}" % token_var
+                    client_source = Path(publication_auth_client.__file__).read_text()
+                    refresh_url = (
+                        settings.preloop_url.rstrip("/")
+                        + f"/api/v1/flows/executions/{execution_context['execution_id']}/publication-credential"
+                    )
+                    refresh_auth = f"""set +x
+export PRELOOP_PUBLICATION_REFRESH_URL={shlex.quote(refresh_url)}
+export PRELOOP_PUBLICATION_REFRESH_CAPABILITY="${{{capability_var}}}"
+export PRELOOP_PUBLICATION_REPOSITORY={shlex.quote(repo_url)}
+{token_var}=$(python3 <<'PRELOOP_PUBLICATION_CLIENT'
+{client_source}
+PRELOOP_PUBLICATION_CLIENT
+) || exit 1
+export {token_var}
+unset PRELOOP_GIT_CREDENTIALS PRELOOP_PUBLICATION_REFRESH_CAPABILITY
+export GIT_TERMINAL_PROMPT=0"""
+                push_auth = refresh_auth or build_push_auth_setup_shell(
                     token_ref=token_ref, username=username
                 )
 
@@ -5452,7 +6220,16 @@ true
                         build_verification_gate_shell(
                             profile=verification_policy.profile.model_dump(),
                             working_dir=full_path,
-                            base_branch=safe_source,
+                            # A resume clones the PR branch as both source
+                            # and target; diffing against it sees no change
+                            # and the gate falls through to the profile's
+                            # unknown_default. Verify against the PR base the
+                            # resume rebase just fetched.
+                            base_branch=(
+                                safe_source
+                                if safe_source != safe_target
+                                else f"origin/{publication_base}"
+                            ),
                             evidence_dir=EVIDENCE_DIR_PATH,
                             gate_budget_seconds=(
                                 verification_policy.gate_budget_seconds
@@ -5477,6 +6254,12 @@ true
 
                 # Add PR/MR creation if enabled, including already-pushed work.
                 if create_pr and token:
+                    if refresh_auth:
+                        repo_post_commands.append(
+                            'if [ "$PUSH_COMMIT_COUNT" -eq "0" ]; then\n'
+                            + refresh_auth
+                            + "\nfi"
+                        )
                     pr_create_cmd = self._build_pr_or_mr_create_shell(
                         execution_context=execution_context,
                         git_config=git_config,
@@ -5486,9 +6269,23 @@ true
                         repo_url=repo_url,
                         safe_target=safe_target,
                         safe_source=publication_base,
+                        repo_config=repo_config,
                     )
                     if pr_create_cmd:
+                        if refresh_auth:
+                            # Bash process substitution supplies curl config via
+                            # a descriptor. The fresh token never enters argv.
+                            pr_create_cmd = pr_create_cmd.replace(
+                                f'-H "Authorization: token {token_ref}"',
+                                "--config <(printf 'header = \"Authorization: token %s\"\\n' "
+                                + f'"{token_ref}")',
+                            ).replace(
+                                '-H "$PRELOOP_BB_AUTH"',
+                                "--config <(printf 'header = \"%s\"\\n' "
+                                '"$PRELOOP_BB_AUTH")',
+                            )
                         repo_post_commands.append(pr_create_cmd)
+                        repo_post_commands.append(provenance_failure_exit_shell())
 
                 repo_post_commands.extend(
                     [
@@ -5504,7 +6301,30 @@ true
                     ]
                 )
 
-                post_commands.extend(repo_post_commands)
+                if refresh_auth:
+                    # A child publication scope owns its EXIT cleanup; the
+                    # harness's checkpoint/finalization trap remains intact.
+                    cleanup_shell = f"""(
+set -e
+export PRELOOP_PUBLICATION_CLEANUP_REPOSITORY={shlex.quote(full_path)}
+_preloop_publication_cleanup() {{
+    python3 - cleanup <<'PRELOOP_PUBLICATION_CLEANUP_CLIENT'
+{client_source}
+PRELOOP_PUBLICATION_CLEANUP_CLIENT
+}}
+trap _preloop_publication_cleanup EXIT
+"""
+                    post_commands.append(cleanup_shell)
+                    post_commands.extend(repo_post_commands)
+                    post_commands.extend(
+                        [
+                            ")",
+                            "PRELOOP_PUBLICATION_RC=$?",
+                            '[ "$PRELOOP_PUBLICATION_RC" -eq 0 ] || exit "$PRELOOP_PUBLICATION_RC"',
+                        ]
+                    )
+                else:
+                    post_commands.extend(repo_post_commands)
 
             push_script = "\n".join(post_commands) if post_commands else ""
             if publishes_report:
@@ -5567,18 +6387,26 @@ true
             from preloop.models.crud import crud_project, crud_tracker
             from preloop.models.db.session import get_db_session
 
+            if not account_id:
+                self.logger.warning(
+                    f"No account for project {project_id}; refusing repo lookup"
+                )
+                return None
             db = next(get_db_session())
             try:
-                # Get project from database - don't filter by account_id since
-                # Project doesn't have a direct account_id field
-                project = crud_project.get(db, id=str(project_id))
+                # Scoped through organization -> tracker -> account.
+                project = crud_project.get(
+                    db, id=str(project_id), account_id=str(account_id)
+                )
                 if not project:
                     self.logger.info(
                         f"Project {project_id} not found by ID, trying slug/identifier"
                     )
                     # Also try looking up by slug or identifier
                     project = crud_project.get_by_slug_or_identifier(
-                        db, slug_or_identifier=str(project_id)
+                        db,
+                        slug_or_identifier=str(project_id),
+                        account_id=str(account_id),
                     )
 
                 if not project:
@@ -5670,6 +6498,15 @@ true
                     self.logger.info(f"Constructed GitHub clone URL for {slug}")
                     return clone_url
 
+                elif tracker_type == "bitbucket":
+                    # Bitbucket Cloud: https://bitbucket.org/{workspace}/{repo}.git
+                    if not slug.endswith(".git"):
+                        slug = f"{slug}.git"
+
+                    clone_url = f"https://bitbucket.org/{slug}"
+                    self.logger.info(f"Constructed Bitbucket clone URL for {slug}")
+                    return clone_url
+
                 else:
                     self.logger.warning(
                         f"Tracker type '{tracker_type}' not supported for git clone"
@@ -5688,31 +6525,51 @@ true
 
     def _get_token_from_project(
         self, project_id: str, account_id: str
-    ) -> tuple[Optional[str], Optional[str]]:
-        """Get the API token and tracker type from a project's tracker.
+    ) -> tuple[Optional[str], Optional[str], Optional[str]]:
+        """Get the API token, tracker type and git username from a project.
 
         Args:
             project_id: Project ID
             account_id: Account ID
 
         Returns:
-            Tuple of (token, tracker_type) or (None, None) if not found
+            Tuple of (token, tracker_type, git_username), all None if not
+            found. The username is only set for trackers whose token must be
+            paired with a specific git user (Bitbucket).
         """
         try:
             from preloop.models.crud import crud_project, crud_tracker
             from preloop.models.db.session import get_db_session
+            from preloop.services.tracker_git_token import resolve_tracker_git_username
 
+            if not account_id:
+                return None, None, None
             db = next(get_db_session())
             try:
-                project = crud_project.get(db, id=str(project_id))
+                project = crud_project.get(
+                    db, id=str(project_id), account_id=str(account_id)
+                )
                 if not project:
-                    return None, None
+                    return None, None, None
 
                 organization = project.organization
                 if not organization:
-                    return None, None
+                    return None, None, None
 
-                tracker = crud_tracker.get(db, id=organization.tracker_id)
+                tracker = crud_tracker.get(
+                    db, id=organization.tracker_id, account_id=str(account_id)
+                )
+                if tracker and (tracker.auth_type or "").lower() == MANAGED_AUTH_TYPE:
+                    # A managed grant is resolved asynchronously by the
+                    # orchestrator, which fails the run when it cannot and
+                    # otherwise ships the token in ``git_credentials_map``.
+                    # This synchronous fallback never reads a stale key.
+                    self.logger.warning(
+                        "Tracker %s uses a managed connection; its credential "
+                        "must arrive through the execution context",
+                        tracker.id,
+                    )
+                    return None, tracker.tracker_type.lower(), None
                 resolved_token = tracker.resolved_api_key if tracker else ""
                 if not tracker or not resolved_token:
                     if tracker and (tracker.auth_type or "").lower() in APP_AUTH_TYPES:
@@ -5726,16 +6583,20 @@ true
                             "context to carry it",
                             tracker.id,
                         )
-                    return None, None
+                    return None, None, None
 
-                return resolved_token, tracker.tracker_type.lower()
+                return (
+                    resolved_token,
+                    tracker.tracker_type.lower(),
+                    resolve_tracker_git_username(tracker),
+                )
 
             finally:
                 db.close()
 
         except Exception as e:
             self.logger.warning(f"Error getting token from project {project_id}: {e}")
-            return None, None
+            return None, None, None
 
     def _extract_merge_request_ref_from_trigger(
         self, trigger_data: Dict[str, Any]
@@ -5814,6 +6675,12 @@ true
                 self.logger.info(f"Extracted target branch from GitLab MR: {branch}")
                 return branch
 
+            # Bitbucket Cloud PR - pullrequest.destination.branch.name
+            branch = bitbucket_pr_target_branch(payload)
+            if branch:
+                self.logger.info(f"Extracted target branch from Bitbucket PR: {branch}")
+                return branch
+
             project = payload.get("project")
             if isinstance(project, dict) and project.get("default_branch"):
                 return project["default_branch"]
@@ -5864,6 +6731,12 @@ true
                 )
                 return branch
 
+            # Bitbucket Cloud PR (and PR comment) - pullrequest.source.branch
+            branch = bitbucket_pr_source_branch(payload)
+            if branch:
+                self.logger.info(f"Extracted source branch from Bitbucket PR: {branch}")
+                return branch
+
             return None
         except Exception as e:
             self.logger.debug(f"Error extracting source branch from trigger: {e}")
@@ -5907,6 +6780,11 @@ true
                 if isinstance(head, dict) and head.get("sha"):
                     return head["sha"]
 
+            # Bitbucket Cloud PR or repo:push
+            sha = bitbucket_payload_commit_hash(payload)
+            if sha:
+                return sha
+
             # Direct references
             if "sha" in payload:
                 return payload["sha"]
@@ -5940,6 +6818,13 @@ true
                     url = repo.get("clone_url") or repo.get("html_url") or ""
                     if url:
                         self.logger.info(f"Found GitHub repo URL in trigger: {url}")
+                        return url
+                    # Bitbucket Cloud: repository.links.html.href
+                    html = (repo.get("links") or {}).get("html") or {}
+                    href = html.get("href") if isinstance(html, dict) else None
+                    if href:
+                        url = f"{href.rstrip('/')}.git"
+                        self.logger.info(f"Found Bitbucket repo URL in trigger: {url}")
                     return url
 
             # GitLab structure

@@ -26,6 +26,7 @@ DISPATCHABLE_TASKS: tuple[str, ...] = (
     "cleanup_tracker_webhooks",
     "reprice_gateway_usage_task",
     "ingest_provider_billing",
+    "ingest_copilot_usage",
     "send_optimization_digest",
     "reconcile_stripe_subscriptions",
     "sync_model_catalog",
@@ -34,6 +35,8 @@ DISPATCHABLE_TASKS: tuple[str, ...] = (
     "cleanup_flow_workspaces",
     "reconcile_flow_feedback",
     "reconcile_security_maintenance",
+    "evaluate_spend_outliers",
+    "evaluate_spend_outlier_sessions",
 )
 
 
@@ -249,6 +252,14 @@ async def process_webhook_event(
         trigger_service = FlowTriggerService(db)
         await trigger_service.process_event(event_data)
 
+        # Approval and merge times for the per-issue cost rollup. Best
+        # effort and replay safe: the earliest timestamp per PR wins.
+        from preloop.services.issue_cost_rollup import (
+            record_pull_request_event_safely,
+        )
+
+        record_pull_request_event_safely(db, event_data)
+
         # Executions for this delivery are committed. Ack now so a drain,
         # crash, or ack_wait expiry later in this handler cannot replay a
         # delivery that already did its durable work. The delivery-key guard
@@ -397,6 +408,46 @@ def ingest_provider_billing(account_id: str | None = None) -> object | None:
         db.close()
 
 
+async def ingest_copilot_usage(account_id: str | None = None) -> object | None:
+    """Import GitHub Copilot seats, premium-request spend and usage metrics.
+
+    Runs daily for every active Copilot connection (or one account when
+    ``account_id`` is given, as the Cost page's "Sync now" does). Imported
+    rows are never gateway usage. Failures are recorded on the connection and
+    shown on the Cost page, so this only logs unexpected errors. The GitHub
+    calls and database work run on a worker thread so a slow GitHub response
+    never blocks the task loop.
+
+    Args:
+        account_id: Restrict the import to one account.
+
+    Returns:
+        Per-account sync summaries, or None on an unexpected failure.
+    """
+    from preloop.config import settings
+    from preloop.services.copilot_usage_import import (
+        ingest_copilot_usage as run_copilot_import,
+    )
+
+    if account_id is None and not settings.copilot_usage_sync_enabled:
+        # A scheduled run queued before the setting was turned off. A manual
+        # "Sync now" (with an account id) still runs.
+        return None
+
+    def run() -> object:
+        db = next(get_db_session())
+        try:
+            return run_copilot_import(db, account_id=account_id)
+        finally:
+            db.close()
+
+    try:
+        return await run_db_off_loop(run)
+    except Exception as e:
+        logger.error("Copilot usage import failed: %s", e, exc_info=True)
+        return None
+
+
 async def sync_model_catalog(account_id: str | None = None) -> dict[str, int] | None:
     """Scheduled model-catalog sync: pull newly released provider models.
 
@@ -504,6 +555,52 @@ def reconcile_stripe_subscriptions(account_id: str | None = None) -> object | No
         db.close()
 
 
+def evaluate_spend_outliers() -> dict[str, int] | None:
+    """Daily spend outlier pass (#960): yesterday's spend and model mix.
+
+    Runs once a day after the UTC day closes, ahead of the Monday digest, and
+    also re-checks sessions active in the last day. Findings are recorded once
+    per fingerprint, so a repeated run on the same day adds nothing.
+
+    The mapped Copilot premium-request source (#1061) is registered here,
+    before the pass, so a fresh worker evaluates imported spend without any
+    HTTP router being imported or a manual sync having run. Registration is
+    idempotent, so repeating it on every run is harmless. With it registered
+    the pass also replays the recent days of accounts with an active Copilot
+    import, which is how a day imported three days late still gets judged.
+    """
+    from preloop.services.copilot_spend_source import register_copilot_spend_source
+    from preloop.services.spend_outliers import run_daily_pass
+
+    register_copilot_spend_source()
+    db = next(get_db_session())
+    try:
+        return run_daily_pass(db)
+    except Exception as e:
+        logger.error("Spend outlier daily pass failed: %s", e, exc_info=True)
+        return None
+    finally:
+        db.close()
+
+
+def evaluate_spend_outlier_sessions() -> dict[str, int] | None:
+    """Periodic session cost check (#960) for accounts with a threshold set.
+
+    Only sessions with gateway activity in the last two hours are summed, so
+    the check does not run on every request and does not rescan history.
+    """
+    from preloop.services.spend_outliers import run_session_pass
+
+    db = next(get_db_session())
+    try:
+        return run_session_pass(db)
+    except Exception as e:
+        logger.error("Spend outlier session check failed: %s", e, exc_info=True)
+        return None
+    finally:
+        db.close()
+
+
 async def cleanup_tracker_webhooks(tracker_id: str) -> None:
     """
     Clean up webhooks when a tracker is deleted.
@@ -595,6 +692,10 @@ async def cleanup_tracker_webhooks(tracker_id: str) -> None:
         if should_delete_external and webhooks:
             try:
                 # Create a tracker client to delete webhooks
+                from preloop.services.managed_credentials import (
+                    tracker_credential_source,
+                )
+
                 client = await create_tracker_client(
                     tracker_type=tracker.tracker_type,
                     tracker_id=tracker_id,
@@ -602,7 +703,13 @@ async def cleanup_tracker_webhooks(tracker_id: str) -> None:
                     connection_details={
                         "url": tracker.url,
                         **(tracker.connection_details or {}),
+                        **(
+                            {"auth_type": tracker.auth_type}
+                            if tracker.tracker_type == "bitbucket"
+                            else {}
+                        ),
                     },
+                    credential_source=tracker_credential_source(tracker),
                 )
 
                 for webhook in webhooks:

@@ -1,9 +1,13 @@
-import { LitElement, html, css, unsafeCSS } from 'lit';
+import { ConsoleStatus } from '../../controllers/console-status';
+import { tableScrollStyles } from '../../styles/table-scroll';
+import { LitElement, html, css, nothing, unsafeCSS } from 'lit';
 import { repeat } from 'lit/directives/repeat.js';
 import { customElement, property, state } from 'lit/decorators.js';
-import { Router } from '../../router';
+import { Router, type RouterCommands, type RouterLocation } from '../../router';
+import type { PreloopFlowForm } from '../../components/preloop-flow-form';
 import {
   getFlow,
+  getFlowExecutions,
   createFlow,
   updateFlow,
   deleteFlow,
@@ -23,7 +27,10 @@ import {
   formatRelativeTime,
 } from '../../utils/date';
 import { executionDurationText } from '../../utils/execution';
-import { executionStatusLabel } from '../../utils/execution-presentation';
+import {
+  executionStatusLabel,
+  executionStatusVariant,
+} from '../../utils/execution-presentation';
 import { flowTriggerSummary } from '../../utils/flow-trigger';
 import { getAgentKindPresentation } from '../../utils/agent-kinds';
 import {
@@ -41,6 +48,7 @@ import '@shoelace-style/shoelace/dist/components/icon/icon.js';
 import '@shoelace-style/shoelace/dist/components/badge/badge.js';
 import '@shoelace-style/shoelace/dist/components/radio-group/radio-group.js';
 import '@shoelace-style/shoelace/dist/components/radio/radio.js';
+import '../../components/flow-governance-card';
 import '../../components/preloop-flow-form';
 import '@shoelace-style/shoelace/dist/components/spinner/spinner.js';
 import '@shoelace-style/shoelace/dist/components/dialog/dialog.js';
@@ -54,6 +62,8 @@ import consoleStyles from '../../styles/console-styles.css?inline';
 import { getTrackerEventOptions } from '../../constants/tracker-event-types';
 import type { Flow } from '../../types';
 import { consoleDialogStyles } from '../../styles/console-dialog';
+import '../../components/capability-extension';
+import '../../components/view-header';
 
 /**
  * Runtime ids as the product spells them.
@@ -64,6 +74,52 @@ import { consoleDialogStyles } from '../../styles/console-dialog';
  * fall back to the shared agent-kind table, then to the id itself, which is
  * still more use than an empty chip.
  */
+/**
+ * The reference lists the detail page loads next to the flow, in the order
+ * the warning names them. Each is fetched (and retried) on its own, so one
+ * list that is down does not blank the others or force a full reload.
+ */
+const REFERENCE_LISTS = [
+  'trackers',
+  'models',
+  'tools',
+  'mcpServers',
+  'organizations',
+  'projects',
+] as const;
+
+type ReferenceList = (typeof REFERENCE_LISTS)[number];
+
+const REFERENCE_LIST_LABELS: Record<ReferenceList, string> = {
+  trackers: 'trackers',
+  models: 'models',
+  tools: 'tools',
+  mcpServers: 'MCP servers',
+  organizations: 'organizations',
+  projects: 'projects',
+};
+
+const REFERENCE_LIST_FETCHERS: Record<ReferenceList, () => Promise<any[]>> = {
+  trackers: () => getTrackers(),
+  models: () => getAIModels(),
+  tools: () => getAllTools(),
+  mcpServers: () => getMCPServers(),
+  organizations: () => listOrganizations(),
+  projects: () => listProjects(),
+};
+
+/** "Trackers", "Trackers and projects", "Trackers, models and projects". */
+export function referenceListsSentence(
+  lists: readonly ReferenceList[]
+): string {
+  const labels = lists.map((list) => REFERENCE_LIST_LABELS[list]);
+  const joined =
+    labels.length <= 1
+      ? labels.join('')
+      : `${labels.slice(0, -1).join(', ')} and ${labels[labels.length - 1]}`;
+  return joined.charAt(0).toUpperCase() + joined.slice(1);
+}
+
 const FLOW_RUNTIME_LABELS: Record<string, string> = {
   codex: 'Codex CLI',
   gemini: 'Gemini CLI',
@@ -85,6 +141,7 @@ export function flowRuntimeLabel(agentType: string | null | undefined): string {
 
 @customElement('flow-view')
 export class FlowView extends LitElement {
+  private readonly accessibilityStatus = new ConsoleStatus(this);
   private initialized = false;
   private _formInstanceId = 0;
   private _routeSearch = '';
@@ -109,126 +166,141 @@ export class FlowView extends LitElement {
   }
 
   static styles = [
-    consoleDialogStyles,
-    unsafeCSS(consoleStyles),
-    unsafeCSS(executionSubjectCss),
-    css`
-      /* No page geometry here: the shell owns the width and the side inset
+    tableScrollStyles,
+    [
+      consoleDialogStyles,
+      unsafeCSS(consoleStyles),
+      unsafeCSS(executionSubjectCss),
+      css`
+        /* No page geometry here: the shell owns the width and the side inset
          (styles/console-styles.css, "The page box"). */
-      :host {
-        display: block;
-      }
-      /* The subject column takes the slack: fixed layout plus a zero max
+        :host {
+          display: block;
+        }
+        /* Named for a screen reader where a heading already says what it is. */
+        .sr-label::part(form-control-label) {
+          position: absolute;
+          width: 1px;
+          height: 1px;
+          padding: 0;
+          margin: -1px;
+          overflow: hidden;
+          clip: rect(0 0 0 0);
+          white-space: nowrap;
+          border: 0;
+        }
+        /* The subject column takes the slack: fixed layout plus a zero max
          width makes the cell shrink to its share and ellipsise inside it,
          instead of a long repo name widening the whole table. */
-      .executions-table {
-        table-layout: fixed;
-      }
-      .executions-table .subject-cell {
-        max-width: 0;
-        overflow: hidden;
-        text-overflow: ellipsis;
-        white-space: nowrap;
-      }
-      /* The details grid: label column in the meta register (no colons, no
+        .executions-table {
+          table-layout: fixed;
+        }
+        .executions-table .subject-cell {
+          max-width: 0;
+          overflow: hidden;
+          text-overflow: ellipsis;
+          white-space: nowrap;
+        }
+        /* The details grid: label column in the meta register (no colons, no
          bold), value column carrying the facts. This was the only place in
          the console that wrote "Name:" in bold. */
-      .detail-grid {
-        display: grid;
-        grid-template-columns: 150px 1fr;
-        gap: var(--sl-spacing-medium);
-        align-items: baseline;
-      }
-      .detail-label {
-        color: var(--console-meta-color);
-        font-size: var(--console-text-meta);
-      }
-      .execution-row {
-        cursor: pointer;
-      }
-      .row-link {
-        color: var(--console-link-color);
-        text-decoration: none;
-      }
-      .row-link:hover,
-      .row-link:focus-visible {
-        text-decoration: underline;
-      }
-      /* The way out of the ten rows, on its own hairline. */
-      .all-executions {
-        border-top: 1px solid var(--console-hairline);
-        display: block;
-        margin-top: var(--sl-spacing-small);
-        padding-top: var(--sl-spacing-small);
-      }
-      .all-executions a {
-        color: var(--console-link-color);
-        font-size: var(--console-text-meta);
-        text-decoration: none;
-      }
-      .all-executions a:hover,
-      .all-executions a:focus-visible {
-        text-decoration: underline;
-      }
-      /* Flow-specific styles */
-      .form-grid {
-        display: grid;
-        grid-template-columns: 1fr 1fr;
-        gap: var(--sl-spacing-large);
-      }
-      sl-card {
-        width: 100%;
-      }
-      sl-card::part(base) {
-        gap: var(--sl-spacing-large);
-      }
-      form {
-        display: flex;
-        flex-direction: column;
-        gap: var(--sl-spacing-large);
-      }
-      sl-input,
-      sl-textarea,
-      sl-select {
-        margin-bottom: var(--sl-spacing-medium);
-      }
-      sl-input:last-child,
-      sl-textarea:last-child,
-      sl-select:last-child {
-        margin-bottom: 0;
-      }
+        .detail-grid {
+          display: grid;
+          grid-template-columns: 150px 1fr;
+          gap: var(--sl-spacing-medium);
+          align-items: baseline;
+        }
+        .detail-label {
+          color: var(--console-meta-color);
+          font-size: var(--console-text-meta);
+        }
+        .execution-row {
+          cursor: pointer;
+        }
+        .row-link {
+          color: var(--console-link-color);
+          text-decoration: none;
+        }
+        .row-link:hover,
+        .row-link:focus-visible {
+          text-decoration: underline;
+        }
+        /* The way out of the ten rows, on its own hairline. */
+        .all-executions {
+          border-top: 1px solid var(--console-hairline);
+          display: block;
+          margin-top: var(--sl-spacing-small);
+          padding-top: var(--sl-spacing-small);
+        }
+        .all-executions a {
+          color: var(--console-link-color);
+          font-size: var(--console-text-meta);
+          text-decoration: none;
+        }
+        .all-executions a:hover,
+        .all-executions a:focus-visible {
+          text-decoration: underline;
+        }
+        /* Flow-specific styles */
+        .form-grid {
+          display: grid;
+          grid-template-columns: 1fr 1fr;
+          gap: var(--sl-spacing-large);
+        }
+        sl-card {
+          width: 100%;
+        }
+        sl-card::part(base) {
+          gap: var(--sl-spacing-large);
+        }
+        form {
+          display: flex;
+          flex-direction: column;
+          gap: var(--sl-spacing-large);
+        }
+        sl-input,
+        sl-textarea,
+        sl-select {
+          margin-bottom: var(--sl-spacing-medium);
+        }
+        sl-input:last-child,
+        sl-textarea:last-child,
+        sl-select:last-child {
+          margin-bottom: 0;
+        }
 
-      sl-textarea.prompt {
-        max-height: 50rem;
-        overflow: auto;
-      }
+        sl-textarea.prompt {
+          max-height: 50rem;
+          overflow: auto;
+        }
 
-      .creation-mode-toggle {
-        margin-bottom: var(--sl-spacing-large);
-        padding: var(--sl-spacing-medium);
-        background: var(--sl-color-neutral-50);
-        border-radius: 8px;
-        border: 1px solid var(--sl-color-neutral-200);
-      }
-      .creation-mode-toggle h3 {
-        margin: 0 0 var(--sl-spacing-small) 0;
-        font-size: 1rem;
-      }
-      .preset-card {
-        cursor: pointer;
-        transition:
-          transform 0.2s ease,
-          box-shadow 0.2s ease;
-      }
-      .preset-card:hover {
-        transform: translateY(-2px);
-        box-shadow: var(--sl-shadow-large);
-      }
+        .creation-mode-toggle {
+          margin-bottom: var(--sl-spacing-large);
+          padding: var(--sl-spacing-medium);
+          background: var(--sl-color-neutral-50);
+          border-radius: 8px;
+          border: 1px solid var(--sl-color-neutral-200);
+        }
+        .creation-mode-toggle h3 {
+          margin: 0 0 var(--sl-spacing-small) 0;
+          font-size: 1rem;
+        }
+        .preset-card {
+          cursor: pointer;
+          transition:
+            transform 0.2s ease,
+            box-shadow 0.2s ease;
+        }
+        .preset-card:hover {
+          transform: translateY(-2px);
+          box-shadow: var(--sl-shadow-large);
+        }
 
-      div[slot='header'] > sl-icon {
-        margin-bottom: -2px;
-      }
-    `,
+        div[slot='header'] > sl-icon {
+          margin-bottom: -2px;
+        }
+      `,
+    ],
   ];
 
   @property()
@@ -256,6 +328,22 @@ export class FlowView extends LitElement {
 
   @state()
   private flowReady = false;
+
+  /**
+   * Why the flow itself could not be loaded (deleted, no access, server
+   * error). Set instead of leaving the page on an endless spinner.
+   */
+  @state()
+  private loadError: string | null = null;
+
+  /** The reference lists that failed to load for the detail page. */
+  @state()
+  private referenceListsFailed: ReferenceList[] = [];
+
+  @state()
+  private retryingReferenceLists = false;
+
+  @state() private governanceOpened = false;
 
   @state()
   private trackers: any[] = [];
@@ -312,6 +400,7 @@ export class FlowView extends LitElement {
 
   disconnectedCallback() {
     super.disconnectedCallback();
+    ++this.flowLoadGeneration;
     // Clean up polling intervals
     if (this.organizationPollingInterval) {
       clearInterval(this.organizationPollingInterval);
@@ -326,14 +415,16 @@ export class FlowView extends LitElement {
   async connectedCallback() {
     super.connectedCallback();
 
-    try {
-      const { getUserProfile } = await import('../../api');
-      const currentUser = await getUserProfile();
-      this.isAdmin = currentUser.is_superuser || false;
-    } catch (error) {
-      console.error('Failed to get current user:', error);
-      this.isAdmin = false;
-    }
+    void (async () => {
+      try {
+        const { getUserProfile } = await import('../../api');
+        const currentUser = await getUserProfile();
+        this.isAdmin = currentUser.is_superuser || false;
+      } catch (error) {
+        console.error('Failed to get current user:', error);
+        this.isAdmin = false;
+      }
+    })();
 
     if (!this.initialized) {
       this.initialized = true;
@@ -344,15 +435,37 @@ export class FlowView extends LitElement {
     }
   }
 
+  private flowLoadGeneration = 0;
+
   private async loadFlowData(urlParams: URLSearchParams) {
+    const generation = ++this.flowLoadGeneration;
     this.flowReady = false;
+    this.loadError = null;
+    this.referenceListsFailed = [];
+    this.governanceOpened = false;
     this._formInstanceId += 1;
 
     const presetId = urlParams.get('preset_id');
 
     if (this.flowId) {
       this.isNew = false;
-      this.flow = await getFlow(this.flowId);
+      let flow: Flow;
+      try {
+        flow = await getFlow(this.flowId);
+      } catch (error) {
+        if (generation !== this.flowLoadGeneration) return;
+        // A deleted flow, a stale link, no access or a server error: say so
+        // and offer a way back instead of spinning forever.
+        this.loadError =
+          error instanceof Error && error.message
+            ? error.message
+            : 'The flow could not be loaded.';
+        this.flowReady = true;
+        return;
+      }
+      if (generation !== this.flowLoadGeneration) return;
+      this.flow = flow;
+      if (!this.isEditing) this.flowReady = true;
 
       this.triggerType =
         this.flow.trigger_event_source === 'webhook'
@@ -363,42 +476,37 @@ export class FlowView extends LitElement {
 
       void this.loadScheduleNextRuns();
 
-      const allExecutions = await import('../../api').then((m) =>
-        m.getFlowExecutions({ flowId: this.flowId, limit: 10 })
-      );
-      this.recentExecutions = allExecutions
-        .sort(
-          (a: any, b: any) =>
-            parseUTCDate(b.start_time).getTime() -
-            parseUTCDate(a.start_time).getTime()
-        )
-        .slice(0, 10);
+      void getFlowExecutions({ flowId: this.flowId, limit: 10 })
+        .then((executions) => {
+          if (generation !== this.flowLoadGeneration) return;
+          this.recentExecutions = executions
+            .sort(
+              (a: any, b: any) =>
+                parseUTCDate(b.start_time).getTime() -
+                parseUTCDate(a.start_time).getTime()
+            )
+            .slice(0, 10);
+        })
+        .catch((error) =>
+          console.error('Failed to load recent flow executions:', error)
+        );
 
       this._loadingReferenceData = true;
       try {
-        const [
-          trackers,
-          models,
-          tools,
-          servers,
-          allOrganizations,
-          allProjects,
-        ] = await Promise.all([
-          getTrackers(),
-          getAIModels(),
-          getAllTools(),
-          getMCPServers(),
-          listOrganizations(),
-          listProjects(),
-        ]);
-        this.trackers = trackers;
-        this.models = models;
-        this.availableTools = tools;
-        this.mcpServers = servers;
-        this.organizations = allOrganizations;
-        this.projects = allProjects;
-      } catch (error) {
-        console.error('Failed to load reference data:', error);
+        // Tools and MCP servers only feed the editor.
+        if (!this.isEditing) {
+          this.availableTools = [];
+          this.mcpServers = [];
+        }
+        const failed = await this.loadReferenceLists(
+          REFERENCE_LISTS.filter(
+            (list) =>
+              this.isEditing || (list !== 'tools' && list !== 'mcpServers')
+          ),
+          generation
+        );
+        if (generation !== this.flowLoadGeneration) return;
+        this.referenceListsFailed = failed;
       } finally {
         this._loadingReferenceData = false;
       }
@@ -440,8 +548,10 @@ export class FlowView extends LitElement {
       };
     }
 
+    if (!this.isEditing && !this.isNew) return;
     try {
       const agentsRes = await getAccountAgents({ limit: 100 });
+      if (generation !== this.flowLoadGeneration) return;
       this.longRunningAgents = agentsRes.items || [];
 
       if (this.flow && this.flow.agent_config) {
@@ -457,7 +567,7 @@ export class FlowView extends LitElement {
     } catch (e) {
       console.error('Failed to load long-running agents', e);
     } finally {
-      this.flowReady = true;
+      if (generation === this.flowLoadGeneration) this.flowReady = true;
     }
 
     if (presetId) {
@@ -470,9 +580,6 @@ export class FlowView extends LitElement {
     this.unsubscribe = unifiedWebSocketManager.subscribe(
       'flow_executions',
       (message) => {
-        // Handle incoming WebSocket messages
-        console.log('Received flow update:', message);
-
         // If this is an execution_started event for our flow, add it to recent executions
         if (
           message.type === 'execution_started' &&
@@ -515,11 +622,6 @@ export class FlowView extends LitElement {
         }
       }
     );
-
-    // Track connection state
-    unifiedWebSocketManager.onStateChange((state) => {
-      console.log(`Flow view WebSocket state: ${state}`);
-    });
   }
 
   /**
@@ -622,6 +724,10 @@ export class FlowView extends LitElement {
       `;
     }
 
+    if (this.loadError) {
+      return this.renderLoadError(this.loadError);
+    }
+
     if (!this.isNew && !this.isEditing) {
       // View mode - show flow details
       return this.renderFlowDetails();
@@ -630,7 +736,7 @@ export class FlowView extends LitElement {
     // Edit/Create mode - show form
     return html`
       <view-header
-        headerText="${this.isNew ? 'Create Flow' : 'Edit Flow'}"
+        headerText="${this.isNew ? 'Create flow' : 'Edit flow'}"
         width="wide"
       >
         <div slot="top" style="margin-bottom: var(--sl-spacing-small);">
@@ -645,9 +751,179 @@ export class FlowView extends LitElement {
         </div>
       </view-header>
       <div class="column-layout wide">
-        <div class="main-column">${this.renderForm()}</div>
+        <div class="main-column">
+          ${this.renderForm()} ${this.isNew ? '' : this.renderGovernanceCard()}
+        </div>
       </div>
     `;
+  }
+
+  /**
+   * Fetch the given reference lists side by side, keeping each list that
+   * loads. Returns the lists that failed, in warning order. Nothing is
+   * assigned once a newer load has started.
+   */
+  private async loadReferenceLists(
+    lists: readonly ReferenceList[],
+    generation: number
+  ): Promise<ReferenceList[]> {
+    const failed = new Set<ReferenceList>();
+    await Promise.all(
+      lists.map(async (list) => {
+        try {
+          const items = await REFERENCE_LIST_FETCHERS[list]();
+          if (generation === this.flowLoadGeneration) {
+            this.assignReferenceList(list, items);
+          }
+        } catch (error) {
+          console.error(
+            `Failed to load ${REFERENCE_LIST_LABELS[list]} for the flow page:`,
+            error
+          );
+          failed.add(list);
+        }
+      })
+    );
+    return REFERENCE_LISTS.filter((list) => failed.has(list));
+  }
+
+  private assignReferenceList(list: ReferenceList, items: any[]): void {
+    switch (list) {
+      case 'trackers':
+        this.trackers = items;
+        break;
+      case 'models':
+        this.models = items;
+        break;
+      case 'tools':
+        this.availableTools = items;
+        break;
+      case 'mcpServers':
+        this.mcpServers = items;
+        break;
+      case 'organizations':
+        this.organizations = items;
+        break;
+      case 'projects':
+        this.projects = items;
+        break;
+    }
+  }
+
+  /**
+   * Retry only the reference lists that failed. Reloading the whole page
+   * would refetch the flow and every list that already loaded.
+   */
+  private async retryReferenceLists(): Promise<void> {
+    if (this.retryingReferenceLists) return;
+    const generation = this.flowLoadGeneration;
+    this.retryingReferenceLists = true;
+    try {
+      const failed = await this.loadReferenceLists(
+        this.referenceListsFailed,
+        generation
+      );
+      if (generation === this.flowLoadGeneration) {
+        this.referenceListsFailed = failed;
+      }
+    } finally {
+      this.retryingReferenceLists = false;
+    }
+  }
+
+  /** Reloads the flow and its reference data after a failed load. */
+  private retryLoad = () => {
+    void this.loadFlowData(new URLSearchParams(window.location.search));
+  };
+
+  /** The page shown when the flow itself could not be loaded. */
+  private renderLoadError(message: string) {
+    return html`
+      <view-header headerText="Flow" width="wide">
+        <div slot="top" style="margin-bottom: var(--sl-spacing-small);">
+          <sl-button
+            variant="text"
+            size="small"
+            href="/console/flows"
+            style="margin-left: -12px;"
+          >
+            <sl-icon slot="prefix" name="arrow-left"></sl-icon> Back to Flows
+          </sl-button>
+        </div>
+      </view-header>
+      <div class="column-layout wide">
+        <div class="main-column">
+          <sl-alert variant="danger" open role="alert" data-flow-load-error>
+            <sl-icon slot="icon" name="exclamation-octagon"></sl-icon>
+            <strong>Could not load this flow</strong><br />
+            ${message}
+            <div style="margin-top: var(--sl-spacing-small);">
+              <sl-button size="small" @click=${this.retryLoad}>
+                <sl-icon slot="prefix" name="arrow-clockwise"></sl-icon>
+                Try again
+              </sl-button>
+            </div>
+          </sl-alert>
+        </div>
+      </div>
+    `;
+  }
+
+  /** Inline warning naming the reference lists that could not be loaded. */
+  private renderReferenceDataWarning() {
+    if (this.referenceListsFailed.length === 0) return nothing;
+    const lists = referenceListsSentence(this.referenceListsFailed);
+    return html`
+      <sl-alert variant="warning" open data-reference-data-warning>
+        <sl-icon slot="icon" name="exclamation-triangle"></sl-icon>
+        ${`${lists} could not be loaded.`} Some names on this page may be
+        missing.
+        <sl-button
+          variant="text"
+          size="small"
+          ?loading=${this.retryingReferenceLists}
+          @click=${() => this.retryReferenceLists()}
+          style="margin-left: var(--sl-spacing-2x-small);"
+          >Try again</sl-button
+        >
+      </sl-alert>
+    `;
+  }
+
+  /** Readonly details do not need governance editor catalogs until opened. */
+  private renderGovernanceDisclosure() {
+    return html`<details
+      class="flow-governance-disclosure"
+      @toggle=${(event: Event) => {
+        if ((event.target as HTMLDetailsElement).open)
+          this.governanceOpened = true;
+      }}
+    >
+      <summary>Governance</summary>
+      ${this.governanceOpened ? this.renderGovernanceCard() : ''}
+    </details>`;
+  }
+
+  /**
+   * Per-flow governance override. Allowed MCP Tools scope what the agent
+   * sees; this card governs how those calls (and model calls) are decided.
+   */
+  renderGovernanceCard() {
+    if (!this.flowId) return '';
+    return html`<flow-governance-card
+      .flowId=${this.flowId}
+      .allowedToolNames=${(this.flow.allowed_mcp_tools || []).map(
+        (tool) => tool.tool_name
+      )}
+      ?inheritsFromAgent=${this.flowRunsAsAgent()}
+    ></flow-governance-card>`;
+  }
+
+  /** Employee flows run as a managed agent, whose settings fill gaps. */
+  private flowRunsAsAgent(): boolean {
+    const trigger = (this.flow as any).trigger_config;
+    const agentConfig = (this.flow as any).agent_config;
+    return Boolean(trigger?.employee_events && agentConfig?.target_agent_id);
   }
 
   renderFlowDetails() {
@@ -710,6 +986,7 @@ export class FlowView extends LitElement {
       </view-header>
       <div class="column-layout wide">
         <div class="main-column">
+          ${this.renderReferenceDataWarning()}
           <!-- Flow Info Card -->
           <sl-card>
             <div slot="header">
@@ -807,6 +1084,10 @@ export class FlowView extends LitElement {
               }
             </div>
           </sl-card>
+          <capability-extension
+            name="resource-access"
+            .context=${{ kind: 'flow', resourceId: this.flowId ?? '' }}
+          ></capability-extension>
 
           ${
             this.flow.prompt_template
@@ -824,10 +1105,27 @@ ${this.flow.prompt_template}</pre>
                 `
               : ''
           }
+          ${
+            typeof this.flow.review_instructions === 'string' &&
+            this.flow.review_instructions.trim()
+              ? html`
+                  <sl-card data-review-instructions>
+                    <div slot="header">
+                      <sl-icon name="shield-check"></sl-icon>
+                      Review instructions
+                    </div>
+                    <pre
+                      style="white-space: pre-wrap; word-wrap: break-word; font-family: var(--sl-font-mono); font-size: var(--sl-font-size-small); background: var(--sl-color-neutral-50); padding: var(--sl-spacing-medium); border-radius: var(--sl-border-radius-medium); margin: 0; max-height: 300px; overflow-y: auto;"
+                    >
+${this.flow.review_instructions}</pre>
+                  </sl-card>
+                `
+              : ''
+          }
           ${this.renderScheduleCard()}
           ${
             this.flow.trigger_event_source === 'webhook' &&
-            this.flow.webhook_config
+            this.flow.webhook_config?.webhook_secret
               ? html`
                   <sl-card>
                     <div slot="header">
@@ -846,6 +1144,8 @@ ${this.flow.prompt_template}</pre>
                       >
                         <sl-input
                           readonly
+                          class="sr-label"
+                          label="Webhook URL"
                           style="flex: 1;"
                           value="${
                             window.location.origin
@@ -863,7 +1163,7 @@ ${this.flow.prompt_template}</pre>
                 `
               : ''
           }
-          ${this.renderPublicationPolicy()}
+          ${this.renderPublicationPolicy()} ${this.renderGovernanceDisclosure()}
           ${
             this.flow.git_clone_config?.enabled &&
             (this.flow.git_clone_config.repositories?.length || 0) > 0
@@ -986,59 +1286,63 @@ ${(this.flow.custom_commands.commands || []).join('\n')}</pre>
               this.recentExecutions.length === 0
                 ? html`<p>No executions yet. Run now starts one.</p>`
                 : html`
-                    <table class="styled-table executions-table">
-                      <thead>
-                        <tr>
-                          <th>Subject</th>
-                          <th>Status</th>
-                          <th>Started</th>
-                          <th>Duration</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        ${this.recentExecutions.map(
-                          (exec) => html`
-                            <!-- The Started cell is the anchor to the run and
+                    <div class="table-scroll">
+                      <table class="styled-table executions-table">
+                        <thead>
+                          <tr>
+                            <th>Subject</th>
+                            <th>Status</th>
+                            <th>Started</th>
+                            <th>Duration</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          ${this.recentExecutions.map(
+                            (exec) => html`
+                              <!-- The Started cell is the anchor to the run and
                                  the whole row is a convenience on top of it,
                                  as on the executions list, so the keyboard
                                  and cmd-click keep a route the View column
                                  used to provide. -->
-                            <tr
-                              class="execution-row"
-                              @click=${(event: MouseEvent) =>
-                                this.openExecution(event, exec.id)}
-                            >
-                              <!-- Every row on this page is the same flow, so
+                              <tr
+                                class="execution-row"
+                                @click=${(event: MouseEvent) =>
+                                  this.openExecution(event, exec.id)}
+                              >
+                                <!-- Every row on this page is the same flow, so
                                    the subject is the only column that says
                                    which run is which; it keeps its link to
                                    the pull request or issue it came from. -->
-                              <td class="subject-cell">
-                                ${renderExecutionSubject(exec)}
-                              </td>
-                              <td>
-                                <sl-badge
-                                  class="chip"
-                                  pill
-                                  variant=${this.getStatusVariant(exec.status)}
-                                >
-                                  ${executionStatusLabel(exec.status)}
-                                </sl-badge>
-                              </td>
-                              <!-- Relative, absolute in the title, as every
+                                <td class="subject-cell">
+                                  ${renderExecutionSubject(exec)}
+                                </td>
+                                <td>
+                                  <sl-badge
+                                    class="chip"
+                                    pill
+                                    variant=${this.getStatusVariant(exec.status)}
+                                  >
+                                    ${executionStatusLabel(exec.status)}
+                                  </sl-badge>
+                                </td>
+                                <!-- Relative, absolute in the title, as every
                                    other list in the console states a time. -->
-                              <td title=${formatLocalDateTime(exec.start_time)}>
-                                <a
-                                  class="row-link"
-                                  href=${`/console/flows/executions/${exec.id}`}
-                                  >${formatRelativeTime(exec.start_time)}</a
+                                <td
+                                  title=${formatLocalDateTime(exec.start_time)}
                                 >
-                              </td>
-                              <td>${executionDurationText(exec) || 'n/a'}</td>
-                            </tr>
-                          `
-                        )}
-                      </tbody>
-                    </table>
+                                  <a
+                                    class="row-link"
+                                    href=${`/console/flows/executions/${exec.id}`}
+                                    >${formatRelativeTime(exec.start_time)}</a
+                                  >
+                                </td>
+                                <td>${executionDurationText(exec) || 'n/a'}</td>
+                              </tr>
+                            `
+                          )}
+                        </tbody>
+                      </table>
+                    </div>
                     ${this.renderAllExecutionsLink()}
                   `
             }
@@ -1205,8 +1509,12 @@ ${(this.flow.custom_commands.commands || []).join('\n')}</pre>
               ? html`
                   <strong>Last run:</strong>
                   <span>
-                    <sl-badge variant=${this.getStatusVariant(lastRun.status)}>
-                      ${lastRun.status}
+                    <sl-badge
+                      class="chip"
+                      pill
+                      variant=${this.getStatusVariant(lastRun.status)}
+                    >
+                      ${executionStatusLabel(lastRun.status)}
                     </sl-badge>
                     <span
                       style="color: var(--sl-color-neutral-600); margin-left: var(--sl-spacing-x-small);"
@@ -1222,17 +1530,9 @@ ${(this.flow.custom_commands.commands || []).join('\n')}</pre>
     `;
   }
 
+  /** The executions pages' taxonomy, so a run reads the same everywhere. */
   getStatusVariant(status: string) {
-    switch (status) {
-      case 'SUCCEEDED':
-        return 'success';
-      case 'FAILED':
-        return 'danger';
-      case 'RUNNING':
-        return 'primary';
-      default:
-        return 'neutral';
-    }
+    return executionStatusVariant(status);
   }
 
   private extractTriggerEventPlaceholders(): string[] {
@@ -1291,14 +1591,20 @@ ${(this.flow.custom_commands.commands || []).join('\n')}</pre>
         is_enabled: newEnabledState,
       };
 
-      // Show feedback
-      const message = newEnabledState
-        ? 'Flow enabled successfully'
-        : 'Flow disabled successfully';
-      console.log(message);
+      // The switch already moved. Say so where the operator can see it.
+      showToast(
+        newEnabledState
+          ? 'Flow enabled successfully'
+          : 'Flow disabled successfully',
+        'success'
+      );
     } catch (error) {
       console.error('Failed to toggle flow enabled state:', error);
-      alert('Failed to update flow. Please try again.');
+      const detail =
+        error instanceof Error && error.message
+          ? error.message
+          : 'Failed to update flow. Please try again.';
+      showToast(detail, 'danger');
     }
   }
 
@@ -1362,7 +1668,7 @@ ${(this.flow.custom_commands.commands || []).join('\n')}</pre>
   }
 
   copyWebhookUrl() {
-    if (!this.flow.webhook_config) return;
+    if (!this.flow.webhook_config?.webhook_secret) return;
     const webhookUrl = `${window.location.origin}/api/v1/webhooks/flows/${this.flowId}/${this.flow.webhook_config.webhook_secret}`;
     navigator.clipboard.writeText(webhookUrl).then(() => {
       alert('Webhook URL copied to clipboard!');
@@ -1393,6 +1699,12 @@ ${(this.flow.custom_commands.commands || []).join('\n')}</pre>
     }
   }
 
+  async onBeforeLeave(_location: RouterLocation, commands: RouterCommands) {
+    const form =
+      this.shadowRoot?.querySelector<PreloopFlowForm>('preloop-flow-form');
+    if (form && !(await form.confirmLeave())) return commands.prevent();
+  }
+
   renderForm() {
     return repeat(
       this.flowReady ? [this._formInstanceId] : [],
@@ -1400,29 +1712,11 @@ ${(this.flow.custom_commands.commands || []).join('\n')}</pre>
       () => html`
         <preloop-flow-form
           .flow=${this.flow}
-          @flow-submit=${async (e: CustomEvent) => {
-            const payload = e.detail.flow;
-            try {
-              if (this.isNew) {
-                if (this.sourcePresetId) {
-                  payload.source_preset_id = this.sourcePresetId;
-                  payload.prompt_customized = false;
-                  payload.tools_customized = false;
-                  payload.preset_update_available = false;
-                }
-                const newFlow = await createFlow(payload);
-                Router.go(`/console/flows/${newFlow.id}`);
-              } else {
-                await updateFlow(this.flowId!, payload);
-                Router.go(`/console/flows/${this.flowId}`);
-              }
-            } catch (error: any) {
-              const target = e.target as { formError?: string } | null;
-              if (target) {
-                target.formError =
-                  error?.message || 'Failed to save flow. Please try again.';
-              }
-            }
+          @flow-submit=${(e: CustomEvent) => {
+            // Hand the save back so the form's button stays busy until the
+            // request settles; a double click must not create two flows.
+            const save = this.saveFlowFromForm(e);
+            e.detail.waitUntil?.(save);
           }}
           @flow-cancel=${() =>
             Router.go(
@@ -1431,6 +1725,38 @@ ${(this.flow.custom_commands.commands || []).join('\n')}</pre>
         ></preloop-flow-form>
       `
     );
+  }
+
+  private async saveFlowFromForm(e: CustomEvent): Promise<void> {
+    const payload = e.detail.flow;
+    // Read the form now: once dispatch ends, a target inside this view's
+    // shadow root is cleared, so a later server error had nowhere to go.
+    const form = e.target as {
+      formError?: string;
+      markSaved?: () => void;
+    } | null;
+    try {
+      if (this.isNew) {
+        if (this.sourcePresetId) {
+          payload.source_preset_id = this.sourcePresetId;
+          payload.prompt_customized = false;
+          payload.tools_customized = false;
+          payload.preset_update_available = false;
+        }
+        const newFlow = await createFlow(payload);
+        if (e.detail.markSaved) e.detail.markSaved();
+        Router.go(`/console/flows/${newFlow.id}`);
+      } else {
+        await updateFlow(this.flowId!, payload);
+        if (e.detail.markSaved) e.detail.markSaved();
+        Router.go(`/console/flows/${this.flowId}`);
+      }
+    } catch (error: any) {
+      if (form) {
+        form.formError =
+          error?.message || 'Failed to save flow. Please try again.';
+      }
+    }
   }
 
   handleInputChange(field: keyof Flow, e: Event) {
@@ -1640,11 +1966,6 @@ ${(this.flow.custom_commands.commands || []).join('\n')}</pre>
     this.requestUpdate();
   }
 
-  openFilterModal() {
-    // TODO: Implement the filter modal
-    alert('Filter modal not yet implemented');
-  }
-
   getDefaultSelectedTools(): { server_name: string; tool_name: string }[] {
     return [];
   }
@@ -1653,7 +1974,7 @@ ${(this.flow.custom_commands.commands || []).join('\n')}</pre>
     if (this._loadingReferenceData || this.availableTools.length === 0) {
       return html`
         <div
-          style="display: flex; align-items: center; gap: var(--sl-spacing-small); padding: var(--sl-spacing-medium); color: var(--sl-color-neutral-500);"
+          style="display: flex; align-items: center; gap: var(--sl-spacing-small); padding: var(--sl-spacing-medium); color: var(--console-meta-color);"
         >
           <sl-spinner style="font-size: 1rem;"></sl-spinner>
           Loading tools...
@@ -1808,9 +2129,9 @@ ${(this.flow.custom_commands.commands || []).join('\n')}</pre>
   }
 
   getGitTrackers() {
-    // Return only GitHub and GitLab trackers
-    return this.trackers.filter(
-      (t) => t.tracker_type === 'github' || t.tracker_type === 'gitlab'
+    // Return only trackers backed by git hosting (GitHub, GitLab, Bitbucket)
+    return this.trackers.filter((t) =>
+      ['github', 'gitlab', 'bitbucket'].includes(t.tracker_type)
     );
   }
 
@@ -2029,7 +2350,7 @@ ${(this.flow.custom_commands.commands || []).join('\n')}</pre>
 
   renderWebhookTriggerFields() {
     // If editing and webhook config exists, show the URL
-    if (!this.isNew && this.flow.webhook_config) {
+    if (!this.isNew && this.flow.webhook_config?.webhook_secret) {
       return html`
         <div>
           <p
@@ -2039,16 +2360,12 @@ ${(this.flow.custom_commands.commands || []).join('\n')}</pre>
             webhook URL below.
           </p>
           <div>
-            <label
-              style="display: block; margin-bottom: var(--sl-spacing-2x-small); font-weight: 600;"
-            >
-              Webhook URL
-            </label>
             <div
-              style="display: flex; gap: var(--sl-spacing-small); align-items: center;"
+              style="display: flex; gap: var(--sl-spacing-small); align-items: flex-end;"
             >
               <sl-input
                 readonly
+                label="Webhook URL"
                 style="flex: 1;"
                 value="${window.location.origin}/api/v1/webhooks/flows/${
                   this.flowId
@@ -2067,6 +2384,7 @@ ${(this.flow.custom_commands.commands || []).join('\n')}</pre>
               Example Payload
             </label>
             <sl-textarea
+              aria-label="Resolved prompt preview"
               readonly
               rows="6"
               value='{
@@ -2382,6 +2700,33 @@ ${(this.flow.custom_commands.commands || []).join('\n')}</pre>
                       this.requestUpdate();
                     }}
                     help-text="Filter by labels (triggers if ANY label matches)"
+                  ></sl-input>
+
+                  <!-- All-of labels filter (route by tag, e.g. complexity) -->
+                  <sl-input
+                    label="Issue must also carry all of these labels"
+                    placeholder="e.g. complexity:low"
+                    .value=${
+                      (
+                        this.flow.trigger_config?.labels_all as
+                          string[] | undefined
+                      )?.join(', ') || ''
+                    }
+                    @sl-input=${(e: any) => {
+                      if (!this.flow.trigger_config)
+                        this.flow.trigger_config = {};
+                      const value = e.target.value.trim();
+                      if (value) {
+                        this.flow.trigger_config.labels_all = value
+                          .split(',')
+                          .map((l: string) => l.trim())
+                          .filter((l: string) => l.length > 0);
+                      } else {
+                        delete this.flow.trigger_config.labels_all;
+                      }
+                      this.requestUpdate();
+                    }}
+                    help-text="Comma-separated. Every label must be on the issue (checked after the change), in addition to the filter above"
                   ></sl-input>
 
                   <!-- Milestone filter (GitHub/GitLab only) -->

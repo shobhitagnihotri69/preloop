@@ -1,10 +1,15 @@
+import { ConsoleStatus } from '../../../controllers/console-status';
+import { parseUTCDate } from '../../../utils/date';
 import { LitElement, html, css, unsafeCSS } from 'lit';
 import { customElement, state } from 'lit/decorators.js';
 import {
+  CliSession,
   changePassword,
   fetchWithAuth,
   getFeatures,
-  performLocalSignOut,
+  listCliSessions,
+  signOut,
+  revokeCliSession,
 } from '../../../api';
 import { confirmDialog } from '../../../components/confirm-dialog';
 import {
@@ -17,9 +22,11 @@ import {
 import '@shoelace-style/shoelace/dist/components/input/input.js';
 import '@shoelace-style/shoelace/dist/components/button/button.js';
 import consoleStyles from '../../../styles/console-styles.css?inline';
+import '../../../components/view-header';
 
 @customElement('security-view')
 export class SecurityView extends LitElement {
+  private readonly accessibilityStatus = new ConsoleStatus(this);
   @state()
   private currentPassword = '';
 
@@ -44,9 +51,113 @@ export class SecurityView extends LitElement {
   @state()
   private passkeyBusy = false;
 
+  @state()
+  private cliSessions: CliSession[] = [];
+
+  @state()
+  private cliSessionsLoaded = false;
+
+  @state()
+  private cliSessionMessage = '';
+
   connectedCallback() {
     super.connectedCallback();
     void this.loadPasskeys();
+    void this.loadCliSessions();
+  }
+
+  private async loadCliSessions() {
+    try {
+      this.cliSessions = await listCliSessions();
+      this.cliSessionsLoaded = true;
+    } catch {
+      // A failed list must not break the security page; hide the card.
+      this.cliSessionsLoaded = false;
+    }
+  }
+
+  private async handleRevokeCliSession(session: CliSession) {
+    const confirmed = await confirmDialog({
+      title: 'Revoke CLI login',
+      message: `Sign out the CLI on ${session.hostname || 'this unknown host'}?`,
+      detail:
+        'Its access and refresh tokens stop working at once. Other logins are not affected.',
+      confirmLabel: 'Revoke',
+      variant: 'danger',
+    });
+    if (!confirmed) {
+      return;
+    }
+    const id = session.id;
+    this.cliSessionMessage = '';
+    try {
+      await revokeCliSession(id);
+      this.cliSessions = this.cliSessions.filter((s) => s.id !== id);
+      this.cliSessionMessage = 'CLI login revoked.';
+    } catch (error) {
+      this.cliSessionMessage =
+        error instanceof Error ? error.message : 'Failed to revoke CLI login.';
+    }
+  }
+
+  private renderCliSessions() {
+    if (!this.cliSessionsLoaded) {
+      return '';
+    }
+    return html`
+      <div class="card" data-testid="cli-sessions">
+        <div class="card-header">
+          <h3>CLI logins</h3>
+        </div>
+        <div class="card-body">
+          <p>
+            Each <code>preloop auth login</code> is listed here. Revoking one
+            signs that CLI out on its next request; the others stay signed in.
+          </p>
+          ${
+            this.cliSessions.length > 0
+              ? html`
+                  <ul class="passkey-list">
+                    ${this.cliSessions.map(
+                      (session) => html`
+                        <li
+                          class="passkey-item"
+                          data-session-id="${session.id}"
+                        >
+                          <span>
+                            ${session.hostname || 'Unknown host'}
+                            <small>
+                              ${session.user_agent || 'unknown client'}, last
+                              used
+                              ${
+                                session.last_seen_at
+                                  ? parseUTCDate(
+                                      session.last_seen_at
+                                    ).toLocaleString()
+                                  : 'never'
+                              }
+                            </small>
+                          </span>
+                          <sl-button
+                            size="small"
+                            variant="danger"
+                            outline
+                            data-testid="revoke-cli-session"
+                            @click="${() =>
+                              this.handleRevokeCliSession(session)}"
+                            >Revoke</sl-button
+                          >
+                        </li>
+                      `
+                    )}
+                  </ul>
+                `
+              : html`<p><em>No active CLI logins.</em></p>`
+          }
+          ${this.cliSessionMessage ? html`<p>${this.cliSessionMessage}</p>` : ''}
+        </div>
+      </div>
+    `;
   }
 
   private async loadPasskeys() {
@@ -145,7 +256,13 @@ export class SecurityView extends LitElement {
       // Local sign-out still proceeds. Other sessions stay valid if the
       // server was unreachable, matching the CLI offline path.
     }
-    performLocalSignOut((url) => this._navigate(url));
+    // revoke-all already ended every session server-side, including this
+    // token, so a server sign out would only be rejected. Extensions see
+    // that revocation through the revoke fan-out (H2), not the logout hook.
+    await signOut({
+      serverSignOut: false,
+      navigate: (url) => this._navigate(url),
+    });
   }
 
   private _navigate(url: string): void {
@@ -229,9 +346,7 @@ export class SecurityView extends LitElement {
                                         ${passkey.name}
                                         <small>
                                           added
-                                          ${new Date(
-                                            passkey.created_at
-                                          ).toLocaleDateString()}
+                                          ${parseUTCDate(passkey.created_at).toLocaleDateString()}
                                         </small>
                                       </span>
                                       <sl-button
@@ -265,6 +380,7 @@ export class SecurityView extends LitElement {
                 `
               : ''
           }
+          ${this.renderCliSessions()}
           <div class="sign-out-everywhere">
             <sl-button
               variant="danger"
@@ -320,7 +436,7 @@ export class SecurityView extends LitElement {
       }
 
       .passkey-item small {
-        color: var(--sl-color-neutral-500);
+        color: var(--console-meta-color);
         margin-left: 0.5rem;
       }
 

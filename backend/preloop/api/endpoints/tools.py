@@ -42,16 +42,23 @@ from preloop.schemas.tool_approval_condition import (
     ConditionTestRequest,
     ConditionTestResponse,
 )
+from preloop.services.mcp_tool_collisions import (
+    warnings_from_loaded,
+    exposed_tool_name,
+)
 from preloop.services.policy.loader import _detect_condition_type
 from preloop.services.policy_evaluator import evaluate_cel_expression
 from preloop.services.tool_schema_tokens import estimate_tool_schema_tokens
 from preloop.services.tool_usage_stats import ToolUsageStatsService
 from preloop.schemas.gateway_usage import GatewayUsageByTool
+from preloop.schemas.tool_summary import ToolSummaryResponse
 from preloop.utils.audit import log_config_change
 from preloop.utils.permissions import require_permission
 
 from preloop.tools.builtin_defs import (
     ASK_USER_TOOL,
+    DEPOSIT_ARTIFACT_TOOL,
+    GET_ARTIFACT_TOOL,
     GET_EXECUTION_TOOL,
     GET_ISSUE_DESCRIPTION,
     GET_ISSUE_SCHEMA,
@@ -59,8 +66,11 @@ from preloop.tools.builtin_defs import (
     REQUEST_APPROVAL_TOOL,
     RESOLVE_SBOM_UPSTREAMS_TOOL,
     RUN_FLOW_TOOL,
+    SEARCH_ARTIFACTS_TOOL,
+    LIST_SESSIONS_TOOL,
     SEARCH_SESSIONS_TOOL,
     SEND_NOTE_TOOL,
+    TOOL_NAME_ALIASES as TOOL_NAME_ALIASES,
     UPDATE_ISSUE_DESCRIPTION,
     UPDATE_ISSUE_SCHEMA,
 )
@@ -80,6 +90,10 @@ BUILTIN_TOOLS = [
     RUN_FLOW_TOOL,
     GET_EXECUTION_TOOL,
     SEARCH_SESSIONS_TOOL,
+    LIST_SESSIONS_TOOL,
+    DEPOSIT_ARTIFACT_TOOL,
+    SEARCH_ARTIFACTS_TOOL,
+    GET_ARTIFACT_TOOL,
     {
         "name": "get_issue",
         "description": GET_ISSUE_DESCRIPTION,
@@ -121,11 +135,38 @@ BUILTIN_TOOLS = [
         "schema": UPDATE_ISSUE_SCHEMA,
     },
     {
-        "name": "search",
-        "description": "Search for issues and comments using similarity or fulltext search",
+        "name": "search_issues",
+        "description": "Search issues and comments across connected trackers using similarity or fulltext search. Read-only.",
         "source": "builtin",
         "requires_tracker": True,
         "required_tracker_types": [],
+        "schema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Search query"},
+                "project": {
+                    "type": "string",
+                    "description": "Project identifier or slug to narrow search scope",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Maximum number of results to return",
+                    "default": 10,
+                },
+            },
+            "required": ["query"],
+        },
+    },
+    {
+        "name": "search",
+        "description": (
+            "Search for issues and comments in connected trackers. "
+            "(Deprecated: use search_issues instead. Will be removed in 0.18.0.)"
+        ),
+        "source": "builtin",
+        "requires_tracker": True,
+        "required_tracker_types": [],
+        "default_enabled": False,
         "schema": {
             "type": "object",
             "properties": {
@@ -216,7 +257,7 @@ BUILTIN_TOOLS = [
         "description": "Update or resolve an existing comment on a pull request or merge request. Supports both inline review comments and PR conversation comments (issue comments). To update the comment text: provide body with new content. To resolve/unresolve a thread: provide resolved as true/false (only works for review_comment type). Use comment_type to specify the comment type, or omit to auto-detect.",
         "source": "builtin",
         "requires_tracker": True,
-        "required_tracker_types": ["github", "gitlab"],
+        "required_tracker_types": ["github", "gitlab", "bitbucket"],
         "schema": {
             "type": "object",
             "properties": {
@@ -251,10 +292,10 @@ BUILTIN_TOOLS = [
     },
     {
         "name": "get_pull_request",
-        "description": "Get details of a pull request (GitHub) or merge request (GitLab). Auto-detects platform from URL. Returns PR metadata, comments, and file changes.",
+        "description": "Get details of a pull request (GitHub, Bitbucket Cloud) or merge request (GitLab). Auto-detects platform from URL. Returns PR metadata, comments, and file changes.",
         "source": "builtin",
         "requires_tracker": True,
-        "required_tracker_types": ["github", "gitlab"],
+        "required_tracker_types": ["github", "gitlab", "bitbucket"],
         "schema": {
             "type": "object",
             "properties": {
@@ -281,7 +322,7 @@ BUILTIN_TOOLS = [
         "description": "Update a pull request's metadata, submit a review, and/or manage reactions. To update PR properties: provide title, description, labels, state, assignees, reviewers, draft. To submit a review: provide review_action (approve/request_changes/comment) with optional review_body and review_comments for inline feedback. To add/remove reactions: use add_reaction or remove_reaction with emoji names.",
         "source": "builtin",
         "requires_tracker": True,
-        "required_tracker_types": ["github", "gitlab"],
+        "required_tracker_types": ["github", "gitlab", "bitbucket"],
         "schema": {
             "type": "object",
             "properties": {
@@ -317,8 +358,14 @@ BUILTIN_TOOLS = [
                 "draft": {"type": "boolean", "description": "Mark as draft"},
                 "review_action": {
                     "type": "string",
-                    "enum": ["approve", "request_changes", "comment"],
-                    "description": "Submit a review with this action",
+                    "enum": [
+                        "approve",
+                        "request_changes",
+                        "comment",
+                        "unapprove",
+                        "remove_request_changes",
+                    ],
+                    "description": "Submit a review with this action. unapprove and remove_request_changes withdraw an earlier verdict (Bitbucket only).",
                 },
                 "review_body": {
                     "type": "string",
@@ -327,7 +374,7 @@ BUILTIN_TOOLS = [
                 "review_comments": {
                     "type": "array",
                     "items": {"type": "object"},
-                    "description": "Inline comments: [{path, line, body, side}]. Each comment requires path, line, and body.",
+                    "description": "Inline comments: [{path, line, body, side}]. Each comment requires path, line, and body. On Bitbucket, task: true also opens a pull request task on the comment.",
                 },
                 "add_reaction": {
                     "type": "string",
@@ -512,6 +559,26 @@ def list_all_tools(
     current_user: User = Depends(get_current_active_user),
     db: Session = Depends(get_db_session),
 ) -> List[Dict]:
+    """Return full tool definitions, preserving the existing API contract."""
+    return _list_tools(account=account, db=db)
+
+
+@router.get("/tools/summary", response_model=List[ToolSummaryResponse])
+@require_permission("view_tools")
+def list_tool_summaries(
+    account: Account = Depends(get_account_for_user),
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db_session),
+) -> List[ToolSummaryResponse]:
+    """Return list metadata and policy state without input schemas/parameters.
+
+    The full ``/tools`` catalogue remains available for editors that need the
+    input definitions. Estimates are calculated from those same full definitions.
+    """
+    return [ToolSummaryResponse.model_validate(row) for row in _list_tools(account, db)]
+
+
+def _list_tools(account: Account, db: Session) -> List[Dict]:
     """List all available tools (builtin + external) with their configuration status.
 
     Returns a comprehensive list of:
@@ -652,13 +719,38 @@ def list_all_tools(
         )
 
     # Add external MCP tools
-    mcp_servers = crud_mcp_server.get_active_by_account(db, account_id=str(account.id))
+    from preloop.plugins.account_hooks import VISIBLE_MCP_SERVER, extra_visible_ids
 
+    has_shared_servers = bool(extra_visible_ids(db, account.id, VISIBLE_MCP_SERVER))
+    list_servers = (
+        crud_mcp_server.get_active_visible_by_account
+        if has_shared_servers
+        else crud_mcp_server.get_active_by_account
+    )
+    mcp_servers = list_servers(db, account_id=str(account.id))
+    list_tools = (
+        crud_mcp_tool.get_by_visible_servers_for_account
+        if has_shared_servers
+        else crud_mcp_tool.get_by_servers_for_account
+    )
+    tools_by_server: Dict[str, list] = {}
+    for tool in list_tools(
+        db, account_id=str(account.id), server_ids=[server.id for server in mcp_servers]
+    ):
+        tools_by_server.setdefault(str(tool.mcp_server_id), []).append(tool)
+
+    # Warnings from the rows just loaded, so this list does not read them again.
+    mcp_warnings = (
+        warnings_from_loaded(mcp_servers, tools_by_server) if mcp_servers else {}
+    )
     for server in mcp_servers:
-        mcp_tools = crud_mcp_tool.get_by_server(db, server_id=server.id)
+        mcp_tools = tools_by_server.get(str(server.id), [])
 
         for mcp_tool in mcp_tools:
-            mcp_key = (mcp_tool.name, "mcp", str(server.id))
+            # Exposed name: '<tool_prefix>_<tool>' on a prefixed server. Tool
+            # configuration is keyed by it (#1135).
+            exposed_name = exposed_tool_name(server.tool_prefix, mcp_tool.name)
+            mcp_key = (exposed_name, "mcp", str(server.id))
             config = config_map.get(mcp_key)
             config_id = str(config.id) if config else None
             justification_mode = config.justification_mode if config else None
@@ -669,7 +761,7 @@ def list_all_tools(
             description = mcp_tool.description or ""
             tools.append(
                 {
-                    "name": mcp_tool.name,
+                    "name": exposed_name,
                     "description": description,
                     "source": "mcp",
                     "source_id": str(server.id),
@@ -692,8 +784,10 @@ def list_all_tools(
                     else [],
                     "justification_mode": justification_mode,
                     "enabled_for_agents": agent_scoped_enables.get(mcp_key, []),
+                    "shadowed": bool(mcp_tool.shadowed),
+                    "warnings": mcp_warnings.get(str(mcp_tool.id), []),
                     "schema_tokens_estimate": estimate_tool_schema_tokens(
-                        name=mcp_tool.name,
+                        name=exposed_name,
                         description=description,
                         schema=mcp_tool.input_schema,
                         justification_mode=justification_mode,
@@ -776,7 +870,7 @@ async def create_tool_configuration(
     """
     # An agent-scoped configuration must reference an agent of this account.
     if config_data.managed_agent_id:
-        agent = crud_managed_agent.get_for_account(
+        agent = crud_managed_agent.get_visible_target(
             db,
             account_id=str(account.id),
             agent_id=str(config_data.managed_agent_id),
@@ -1173,6 +1267,32 @@ async def list_approval_workflows(
     return [ApprovalWorkflowResponse.model_validate(p) for p in policies]
 
 
+WEBHOOK_SECRET_KEY = "webhook_secret"
+
+
+def _response_with_new_webhook_secret(db: Session, workflow: Any) -> Any:
+    """Build the workflow response, generating and showing a secret once.
+
+    When the workflow now has a webhook but no signing secret, one is
+    generated, stored and returned in ``webhook_secret``. Later reads only
+    carry ``webhook_secret_hint``.
+    """
+    from preloop.services.event_webhooks.approval_shim import ensure_webhook_secret
+
+    secret = ensure_webhook_secret(workflow)
+    if not secret:
+        return ApprovalWorkflowResponse.model_validate(workflow)
+    db.add(workflow)
+    db.flush()
+    # Build the response before committing, so a serialization failure rolls
+    # the secret back with everything else instead of persisting a secret the
+    # caller never saw.
+    response = ApprovalWorkflowResponse.model_validate(workflow)
+    response.webhook_secret = secret
+    db.commit()
+    return response
+
+
 def _empty_human_approver_default(
     *,
     approval_mode: str | None,
@@ -1282,7 +1402,7 @@ async def create_approval_workflow(
             f"Created approval workflow '{workflow_data.name}' (user: {account.id}, is_default: {new_workflow.is_default})"
         )
 
-        return ApprovalWorkflowResponse.model_validate(new_workflow)
+        return _response_with_new_webhook_secret(db, new_workflow)
 
     except Exception as e:
         db.rollback()
@@ -1418,6 +1538,16 @@ async def update_approval_workflow(
                     detail=f"Approval workflow with name '{update_data['name']}' already exists",
                 )
 
+        # A client that round-trips approval_config never sees the stored
+        # signing secret (reads hide it), so carry it over rather than wipe it.
+        if isinstance(update_data.get("approval_config"), dict):
+            stored = (workflow.approval_config or {}).get(WEBHOOK_SECRET_KEY)
+            if stored and not update_data["approval_config"].get(WEBHOOK_SECRET_KEY):
+                update_data["approval_config"] = {
+                    **update_data["approval_config"],
+                    WEBHOOK_SECRET_KEY: stored,
+                }
+
         # Use CRUD layer for proper default workflow handling
         updated_workflow = crud_approval_workflow.update(
             db, db_obj=workflow, obj_in=update_data
@@ -1436,7 +1566,7 @@ async def update_approval_workflow(
             f"Updated approval workflow {workflow_id} for user {account.id} (is_default: {updated_workflow.is_default})"
         )
 
-        return ApprovalWorkflowResponse.model_validate(updated_workflow)
+        return _response_with_new_webhook_secret(db, updated_workflow)
 
     except HTTPException:
         db.rollback()
@@ -1450,6 +1580,69 @@ async def update_approval_workflow(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Error updating approval workflow: {str(e)}",
         )
+
+
+@router.post(
+    "/approval-workflows/{workflow_id}/webhook-secret/rotate",
+    response_model=ApprovalWorkflowResponse,
+)
+@require_permission("manage_approval_workflows")
+def rotate_approval_workflow_webhook_secret(
+    workflow_id: UUID,
+    account: Account = Depends(get_account_for_user),
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db_session),
+) -> ApprovalWorkflowResponse:
+    """Replace the workflow's webhook signing secret and return it once.
+
+    Deliveries are signed with the new secret from the next one on. Use this
+    to obtain a secret for a workflow created by policy apply, or one whose
+    secret was not kept.
+
+    Sync handler on purpose: FastAPI runs it in the threadpool, so the sync
+    session never blocks the event loop.
+
+    Raises:
+        HTTPException: 404 if the workflow is not found, 400 if it has no
+            webhook configured.
+    """
+    from preloop.services.event_webhooks.approval_shim import (
+        resolve_webhook_target,
+        rotate_webhook_secret,
+        sync_shim_endpoint,
+    )
+    from preloop.utils.permissions import ensure_permission_in_oss
+
+    ensure_permission_in_oss(db, current_user, "manage_approval_workflows")
+    workflow = crud_approval_workflow.get(
+        db, id=workflow_id, account_id=str(account.id)
+    )
+    if not workflow:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Approval workflow not found or access denied",
+        )
+    if resolve_webhook_target(workflow) is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Approval workflow has no webhook configured",
+        )
+
+    secret = rotate_webhook_secret(workflow)
+    db.add(workflow)
+    sync_shim_endpoint(db, workflow)
+    db.commit()
+    db.refresh(workflow)
+    log_config_change(
+        db,
+        user=current_user,
+        config_type="approval_workflow",
+        action="webhook_secret_rotated",
+        new_value={"id": str(workflow.id), "name": workflow.name},
+    )
+    response = ApprovalWorkflowResponse.model_validate(workflow)
+    response.webhook_secret = secret
+    return response
 
 
 @router.delete("/approval-workflows/{workflow_id}", status_code=status.HTTP_200_OK)

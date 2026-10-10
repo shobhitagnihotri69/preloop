@@ -1,14 +1,74 @@
 """Factory for creating tracker clients."""
 
 import logging
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Type
+
+from preloop.services.managed_credentials import (
+    CredentialSource,
+    is_managed_auth_type,
+)
 
 from .base import BaseTracker
+from .bitbucket import BitbucketTracker
+from .bitbucket_dc import BitbucketDCTracker
 from .github import GitHubTracker
 from .gitlab import GitLabTracker
 from .jira import JiraTracker
 
 logger = logging.getLogger(__name__)
+
+# Tracker type to client class. create_tracker_client builds instances; this
+# map answers class-level questions (hosts_repositories, hosts_issues) without
+# credentials or network access. A new provider registers here once.
+TRACKER_CLASSES: Dict[str, Type[BaseTracker]] = {
+    "github": GitHubTracker,
+    "gitlab": GitLabTracker,
+    "jira": JiraTracker,
+    "bitbucket": BitbucketTracker,
+    "bitbucket_dc": BitbucketDCTracker,
+}
+
+
+def tracker_class_for_type(tracker_type: Optional[str]) -> Optional[Type[BaseTracker]]:
+    """Return the client class for ``tracker_type``, or None if unsupported.
+
+    Args:
+        tracker_type: Tracker type string, case-insensitive.
+
+    Returns:
+        The ``BaseTracker`` subclass implementing that provider.
+    """
+    return TRACKER_CLASSES.get((tracker_type or "").lower())
+
+
+def tracker_hosts_repositories(tracker_type: Optional[str]) -> bool:
+    """Whether trackers of ``tracker_type`` host git repositories.
+
+    Args:
+        tracker_type: Tracker type string, case-insensitive.
+
+    Returns:
+        True for code hosts that declare ``hosts_repositories``, False for
+        issue-only trackers, providers not yet wired for clone, or unknown
+        types.
+    """
+    tracker_class = tracker_class_for_type(tracker_type)
+    return bool(tracker_class and tracker_class.hosts_repositories)
+
+
+def tracker_hosts_issues(tracker_type: Optional[str]) -> bool:
+    """Whether trackers of ``tracker_type`` are issue-only triggers.
+
+    Args:
+        tracker_type: Tracker type string, case-insensitive.
+
+    Returns:
+        True for issue trackers (Jira) that may need a repository binding.
+        Independent of ``hosts_repositories`` so a registered code host that
+        has not set that flag is not treated as issue-only.
+    """
+    tracker_class = tracker_class_for_type(tracker_type)
+    return bool(tracker_class and tracker_class.hosts_issues)
 
 
 async def create_tracker_client(
@@ -16,22 +76,42 @@ async def create_tracker_client(
     tracker_id: str,
     api_key: str,
     connection_details: Dict[str, Any],
+    *,
+    credential_source: Optional[CredentialSource] = None,
 ) -> Optional[BaseTracker]:
     """Create a tracker client.
 
     Args:
-        tracker_type: Type of tracker ("github", "jira", "gitlab").
+        tracker_type: Type of tracker ("github", "jira", "gitlab", "bitbucket").
         tracker_id: ID of the tracker in the database (UUID string).
         api_key: API key or token for the tracker.
         connection_details: Connection details for the tracker.
             For GitHub App OAuth, include:
             - auth_type: "github_app" or "oauth_app"
             - github_installation_id: The GitHub App installation ID
+            For a managed grant, ``auth_type`` is ``managed_oauth`` and
+            ``credential_source`` is required.
+        credential_source: Managed grants only: the bound resolver built by
+            ``preloop.services.managed_credentials.tracker_credential_source``.
 
     Returns:
-        A tracker client or None if the tracker type is not supported.
+        A tracker client or None if the tracker type is not supported, or when
+        a managed tracker was requested without a credential source (a managed
+        tracker never degrades to an anonymous or stale-token client).
     """
     try:
+        managed = credential_source is not None or is_managed_auth_type(
+            (connection_details or {}).get("auth_type")
+        )
+        if managed and credential_source is None:
+            raise ValueError(
+                "A managed tracker requires a provider credential resolver; "
+                "refusing to build an unauthenticated client."
+            )
+        if managed and tracker_type != "bitbucket":
+            raise ValueError(
+                f"Managed grants are not supported for tracker type {tracker_type}"
+            )
         if tracker_type == "github":
             # Check if this is a GitHub App OAuth tracker
             auth_type = connection_details.get("auth_type", "api_token")
@@ -78,6 +158,15 @@ async def create_tracker_client(
             return GitLabTracker(tracker_id, api_key, connection_details)
         elif tracker_type == "jira":
             return JiraTracker(tracker_id, api_key, connection_details)
+        elif tracker_type == "bitbucket_dc":
+            return BitbucketDCTracker(tracker_id, api_key, connection_details)
+        elif tracker_type == "bitbucket":
+            return BitbucketTracker(
+                tracker_id,
+                "" if credential_source is not None else api_key,
+                connection_details,
+                credential_source=credential_source,
+            )
         else:
             logger.warning(f"Unsupported tracker type: {tracker_type}")
             return None
